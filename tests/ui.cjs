@@ -25,12 +25,15 @@ function settings() {
 }
 
 async function fixture(run) {
-  const data = { settings: settings(), agents: [], threads: [], projects: [{ id: 1, name: 'example', path: '/projects/example' }, { id: 2, name: 'other', path: '/projects/other' }], requests: [], hardLimit: false };
+  const data = { settings: settings(), agents: [], threads: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 1 }, { id: 2, name: 'other', path: '/projects/other', config: 1 }], requests: [], hardLimit: false };
+  data.configs = [{ id: 1, name: 'Default', settings: data.settings }];
+  const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
+  const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = raw ? JSON.parse(raw) : null;
-    if (req.method !== 'GET') data.requests.push({ url: req.url, body });
+    if (req.method !== 'GET') data.requests.push({ url: req.url, method: req.method, body });
     res.setHeader('Content-Type', 'application/json');
     const send = value => res.end(JSON.stringify(value));
     if (new URL(req.url, 'http://localhost').pathname === '/') {
@@ -41,10 +44,10 @@ async function fixture(run) {
       const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
       const project = data.projects.find(p => p.id === id) || data.projects[0] || null;
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
-      return send({ ...data, threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: [], limits: data.settings.limits }, project, url: `http://127.0.0.1:${server.address().port}` });
+      return send({ ...data, configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
     }
     if (req.url === '/projects') {
-      const p = { id: Math.max(0, ...data.projects.map(p => p.id)) + 1, path: body.path, name: body.path.split('/').at(-1) };
+      const p = { id: Math.max(0, ...data.projects.map(p => p.id)) + 1, path: body.path, name: body.path.split('/').at(-1), config: 1 };
       data.projects.push(p);
       return send({ id: p.id });
     }
@@ -52,9 +55,26 @@ async function fixture(run) {
       data.projects = data.projects.filter(p => p.id !== Number(req.url.split('/')[2]));
       return send({});
     }
-    if (req.url === '/settings') {
-      if (body) data.settings = body.settings;
-      return send(data.settings);
+    if (req.url === '/configs') {
+      if (req.method === 'GET') return send(configs());
+      if (data.configs.some(c => c.name === body.name)) { res.statusCode = 409; return send({ error: 'Config name already exists' }); }
+      const id = Math.max(...data.configs.map(c => c.id)) + 1;
+      data.configs.push({ id, ...body }); return send({ id });
+    }
+    if (/^\/configs\/\d+(\/remove)?$/.test(req.url)) {
+      if (data.writeDelay) await new Promise(resolve => setTimeout(resolve, data.writeDelay));
+      const id = Number(req.url.split('/')[2]);
+      if (req.url.endsWith('/remove')) data.configs = data.configs.filter(c => c.id !== id);
+      else {
+        Object.assign(data.configs.find(c => c.id === id), body);
+        if (id === 1) data.settings = body.settings;
+      }
+      return send({});
+    }
+    if (/^\/projects\/\d+\/config$/.test(req.url)) {
+      const p = data.projects.find(p => p.id === Number(req.url.split('/')[2]));
+      Object.assign(p, body.custom ? { config: null, custom: body.custom } : { config: body.config });
+      return send({});
     }
     if (req.url === '/agents') {
       if (data.hardLimit && !body.force) { res.statusCode = 409; return send({ error: 'hard limit reached: confirm to continue' }); }
@@ -179,7 +199,7 @@ test('custom launch uses the full ID without mutating settings', async () => fix
   await page.locator('#launch-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#launch-dialog').open);
   assert.equal(data.settings.harnesses.codex.models.includes('gpt-new-release'), false);
-  assert.equal(data.requests.filter(r => r.url === '/settings').length, 0);
+  assert.equal(data.requests.filter(r => r.url.startsWith('/configs')).length, 0);
   assert.equal(data.requests.at(-1).body.model, 'gpt-new-release');
   assert.equal(data.requests.at(-1).body.harness, 'codex');
   assert.equal('custom_model' in data.requests.at(-1).body, false);
@@ -305,4 +325,162 @@ test('project identity and settings fit a narrow screen', async () => fixture(as
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   await openLaunch(page);
   assert.ok(await page.evaluate(() => document.querySelector('#launch-dialog').scrollWidth <= document.querySelector('#launch-dialog').clientWidth));
+}));
+
+test('shared edits name affected projects; Custom starts from Default and stays isolated', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  assert.match(await page.locator('#config-scope').textContent(), /example \(#1\), other \(#2\)/);
+  await page.locator('[data-limit=active] [name=hard]').fill('10');
+  await saveSettings(page);
+  assert.equal(data.settings.limits.active.hard, 10);
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('[data-limit=active] [name=hard]')?.value === '10');
+  await page.locator('#config-select').selectOption('custom');
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '10');
+  await page.locator('[data-limit=active] [name=soft]').fill('');
+  await page.locator('[data-limit=active] [name=hard]').fill('2');
+  await saveSettings(page);
+  assert.equal(data.projects[1].config, null);
+  assert.equal(data.projects[1].custom.limits.active.hard, 2);
+  assert.equal(data.settings.limits.active.hard, 10);
+  await page.reload(); await page.locator('[data-page=settings]').click();
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'custom');
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '2');
+  await page.locator('#project-select').selectOption('1');
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '10');
+  assert.doesNotMatch(await page.locator('#config-scope').textContent(), /other/);
+}));
+
+test('named configs can be saved, reused, renamed and removed only when unused', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('[data-limit=active] [name=hard]').fill('12');
+  await page.locator('#save-config-as').click();
+  await page.locator('#config-form button.primary').click();
+  assert.equal(await page.locator('#config-dialog').isVisible(), true);
+  await page.locator('[data-close=config-dialog]').click();
+  assert.equal(data.requests.length, 0);
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '12');
+  await page.locator('#save-config-as').click();
+  await page.locator('#config-form [name=name]').fill('Large jobs');
+  await page.locator('#config-form button.primary').click();
+  await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
+  assert.equal(data.projects[0].config, 2);
+  assert.equal(data.configs[1].settings.limits.active.hard, 12);
+  assert.equal(data.settings.limits.active.hard, 8);
+  assert.equal(await page.locator('#remove-config').isDisabled(), true);
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+  await page.locator('#config-select').selectOption('2');
+  await saveSettings(page);
+  assert.deepEqual(data.projects.map(p => p.config), [2, 2]);
+  await page.locator('[name=config_name]').fill('Bigger jobs');
+  await saveSettings(page);
+  assert.equal(data.configs[1].name, 'Bigger jobs');
+  for (const project of ['1', '2']) {
+    await page.locator('#project-select').selectOption(project);
+    await page.waitForFunction(() => !!document.querySelector('#config-select'));
+    await page.locator('#config-select').selectOption('1');
+    await saveSettings(page);
+  }
+  await page.locator('#config-select').selectOption('2');
+  assert.equal(await page.locator('#remove-config').isEnabled(), true);
+  page.once('dialog', d => d.accept()); await page.locator('#remove-config').click();
+  await page.waitForFunction(() => !document.querySelector('#config-select option[value="2"]'));
+  assert.equal(data.configs.length, 1);
+  assert.equal(await page.locator('#remove-config').count(), 0);
+}));
+
+test('duplicate config names keep the draft and dialog for correction', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('[data-limit=active] [name=hard]').fill('9');
+  await page.locator('#save-config-as').click();
+  await page.locator('#config-form [name=name]').fill('Default');
+  await page.locator('#config-form button.primary').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('already exists'));
+  assert.equal(await page.locator('#config-dialog').isVisible(), true);
+  assert.equal(await page.locator('#config-form button.primary').isEnabled(), true);
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '9');
+  assert.equal(data.configs.length, 1);
+  assert.equal(data.projects[0].config, 1);
+}));
+
+test('project/config switches ask before discarding drafts, and cancelled switches keep them', async () => fixture(async page => {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('[data-limit=active] [name=hard]').fill('9');
+  for (const selector of ['#project-select', '#config-select']) {
+    page.once('dialog', d => d.dismiss());
+    await page.locator(selector).selectOption(selector === '#project-select' ? '2' : 'custom');
+    assert.equal(await page.locator(selector).inputValue(), '1');
+    assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '9');
+  }
+  page.once('dialog', d => d.accept());
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('[data-limit=active] [name=hard]')?.value === '8');
+}));
+
+test('launch loads the target project defaults and ignores stale target responses', async () => fixture(async (page, data) => {
+  const custom = settings(); custom.harnesses.claude.enabled = false;
+  custom.harnesses.codex.model = 'gpt-6-luna'; custom.harnesses.codex.effort = 'low';
+  data.projects[1].config = null; data.projects[1].custom = custom;
+  await openLaunch(page);
+  await page.locator('#launch-project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#launch-model').value === 'gpt-6-luna');
+  assert.equal(await page.locator('#launch-harness').inputValue(), 'codex');
+  assert.equal(await page.locator('#launch-harness option[value=claude]').count(), 0);
+  assert.equal(await page.locator('#launch-effort').inputValue(), 'low');
+  data.delays = { 1: 350 };
+  await page.locator('#launch-project-select').selectOption('1');
+  await page.locator('#launch-project-select').selectOption('2');
+  await page.waitForTimeout(450);
+  assert.equal(await page.locator('#launch-model').inputValue(), 'gpt-6-luna');
+  await page.locator('#launch-form [name=task]').fill('Scoped defaults');
+  await page.locator('#launch-form button.primary').click();
+  await page.waitForFunction(() => !document.querySelector('#launch-dialog').open);
+  assert.equal(data.requests.at(-1).body.model, 'gpt-6-luna');
+  assert.equal(data.requests.at(-1).body.effort, 'low');
+  assert.equal(data.requests.at(-1).body.project, 2);
+}));
+
+test('without projects Default remains editable and named configs can be created', async () => fixture(async (page, data) => {
+  data.projects = []; await page.reload();
+  await page.locator('[data-page=settings]').click();
+  await page.locator('[data-limit=active] [name=hard]').fill('9');
+  await saveSettings(page);
+  assert.equal(data.settings.limits.active.hard, 9);
+  await page.locator('#save-config-as').click();
+  await page.locator('#config-form [name=name]').fill('Unused');
+  await page.locator('#config-form button.primary').click();
+  await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
+  assert.equal(await page.locator('#config-select').inputValue(), '2');
+  assert.equal(data.projects.length, 0);
+  assert.equal(data.requests.some(r => r.url.startsWith('/projects')), false);
+}));
+
+test('a project with no enabled harness cannot launch', async () => fixture(async (page, data) => {
+  const custom = settings();
+  for (const h of Object.values(custom.harnesses)) h.enabled = false;
+  data.projects[1].config = null; data.projects[1].custom = custom;
+  await openLaunch(page);
+  await page.locator('#launch-project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('No harnesses are enabled'));
+  assert.equal(await page.locator('#launch-form button.primary').isDisabled(), true);
+  await page.locator('[data-close=launch-dialog]').click();
+  assert.equal(data.requests.length, 0);
+}));
+
+test('polling cannot unlock project controls during a settings save', async () => fixture(async (page, data) => {
+  data.writeDelay = 2400;
+  await page.locator('[data-page=settings]').click();
+  await page.locator('[data-limit=active] [name=hard]').fill('9');
+  await page.locator('[form=settings-form]').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Saving settings…');
+  await page.waitForTimeout(2100);
+  for (const selector of ['#project-select', '#remove-project', '[data-open=project-dialog]', '[form=settings-form]']) {
+    assert.equal(await page.locator(selector).isDisabled(), true, selector);
+  }
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
+  assert.equal(await page.locator('#project-select').isEnabled(), true);
+  assert.equal(data.projects[0].config, 1);
+  assert.equal(data.settings.limits.active.hard, 9);
 }));

@@ -198,7 +198,7 @@
 
     <section class="page" id="page-settings">
       <section class="panel">
-        <div class="panel-head"><h2>Settings <span class="meta">· all projects</span></h2><button class="primary" form="settings-form">Save</button></div>
+        <div class="panel-head"><h2>Settings</h2><button class="primary" form="settings-form">Save</button></div>
         <form class="settings" id="settings-form"></form>
       </section>
     </section>
@@ -241,6 +241,14 @@
     </form>
   </dialog>
 
+  <dialog id="config-dialog">
+    <form method="dialog" id="config-form">
+      <h2>Save as new config</h2>
+      <label>Name <input name="name" required><span id="config-save-copy"></span></label>
+      <div class="dialog-actions"><button type="button" data-close="config-dialog">Cancel</button><button class="primary">Save</button></div>
+    </form>
+  </dialog>
+
   <dialog id="agent-dialog"><form method="dialog"><h2 id="agent-title">Agent</h2><dl class="details" id="agent-details"></dl><div class="dialog-actions"><button value="cancel">Close</button></div></form></dialog>
   <dialog id="pause-dialog">
     <form method="dialog">
@@ -261,7 +269,7 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -298,6 +306,7 @@
         if (request !== state.overviewRequest) return;
         for (const key of ['agents', 'threads', 'locks', 'activity', 'limits']) state[key] = overview[key];
         state.settings = overview.settings;
+        state.configs = overview.configs || [];
         state.catalog = overview.model_catalog || {};
         state.projects = overview.projects || [];
         state.project = overview.project;
@@ -309,7 +318,7 @@
       $('#live-dot').classList.toggle('off', !healthy);
       $('#live-text').textContent = healthy ? 'live' : 'connection error';
       render();
-      if ((initial || !$('#settings-form').children.length) && state.settings) renderSettings();
+      syncSettings(initial);
       if (state.selectedThread) await refreshThread(false);
     }
 
@@ -318,10 +327,10 @@
     function renderProject() {
       const p = state.project;
       $('#project-select').innerHTML = state.projects.length ? projectOptions(state.selectedProject) : '<option>No projects yet</option>';
-      $('#project-select').disabled = !state.projects.length;
+      $('#project-select').disabled = state.saving || !state.projects.length;
       $('#project-path').textContent = p?.path || 'Add a project folder to get started';
       $('#project-url').textContent = state.url || '';
-      $('#remove-project').disabled = !p || state.agents.length > 0;
+      $('#remove-project').disabled = state.saving || !p || state.agents.length > 0;
       $('#remove-project').title = state.agents.length ? 'Projects with agents cannot be removed' : 'Remove the registration, not files';
       document.title = p ? `${p.name} · acom` : 'acom';
       const url = new URL(location.href);
@@ -432,9 +441,29 @@
       } catch (error) { if (showError) toast(error.message, true); }
     }
 
+    function syncSettings(force = false) {
+      if (!state.settings || state.saving || (state.editor?.dirty && !force)) return;
+      const project = state.project?.id ?? null;
+      const config = state.project ? state.project.config : (state.editor?.project == null ? state.editor?.config ?? 1 : 1);
+      const s = config == null ? state.settings : state.configs.find(c => c.id === config)?.settings || state.settings;
+      const signature = JSON.stringify([project, config, s, state.configs.map(c => [c.id, c.name, c.projects]), state.projects.map(p => [p.id, p.name])]);
+      if (!force && signature === state.editor?.signature) return;
+      state.editor = { project, config, settings: structuredClone(s), signature, dirty: false };
+      renderSettings();
+    }
     function renderSettings() {
-      const s = state.settings;
+      const s = state.editor?.settings;
       if (!s) return;
+      const config = state.configs.find(c => c.id === state.editor.config);
+      const usedBy = (config?.projects || []).map(id => {
+        const p = state.projects.find(p => p.id === id);
+        return p ? `${p.name} (#${id})` : `#${id}`;
+      });
+      const binding = state.editor.project == null ? 'Configuration' : 'This project uses';
+      const configControls = `<div class="form-grid"><label>${binding} <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
+        ${config && config.id !== 1 ? `<label>Config name <input name="config_name" value="${esc(config.name)}" required></label>` : '<span></span>'}</div>
+        <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}</p>
+        <div class="actions"><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 1 ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
       const harnesses = Object.entries(s.harnesses || {}).map(([name, h]) => `<div class="harness-settings" data-harness="${esc(name)}"><h4>${esc(name)}</h4><div class="form-grid">
         <label><span><input type="checkbox" name="enabled" ${h.enabled ? 'checked' : ''} style="width:auto"> Enabled</span></label><span></span>
         <label>Default model <select name="model">${modelOptions(name, h.models, h.model)}</select></label><label>Default effort <select name="effort">${options(h.efforts, h.effort)}</select></label>
@@ -449,7 +478,7 @@
       const capital = name => name.charAt(0).toUpperCase() + name.slice(1);
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${capital(n)} subscription %`, `usage.${n}`, v)).join('');
-      $('#settings-form').innerHTML = `<h3>Harnesses</h3>${harnesses}<h3>Limits</h3>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
+      $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
         <h3>Behavior</h3><div class="form-grid"><label><span><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''} style="width:auto"> Auto-resume after limits clear</span></label><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents wake only for user messages or explicit reopen. Turn this off to allow peer messages to wake done agents.</span></label></div>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
@@ -554,6 +583,28 @@
     document.addEventListener('click', async event => {
       const close = event.target.closest('[data-close]');
       if (close) { document.getElementById(close.dataset.close).close('cancel'); return; }
+      if (event.target.closest('#save-config-as')) {
+        if ($('#settings-form').reportValidity()) {
+          try {
+            collectSettings(); $('#config-form').reset();
+            $('#config-save-copy').textContent = state.project ? 'The current settings will be saved and used by this project.' : 'The current settings will be saved for reuse.';
+            $('#config-dialog').showModal();
+          }
+          catch (error) { toast(error.message, true); }
+        }
+        return;
+      }
+      if (event.target.closest('#remove-config')) {
+        const config = state.configs.find(c => c.id === state.editor.config);
+        if (!config || !confirm(`Remove config “${config.name}”?`)) return;
+        setSettingsBusy(true);
+        try {
+          await api(`/configs/${config.id}/remove`, { method: 'POST', body: '{}' });
+          state.editor = null; await refresh();
+        } catch (error) { toast(error.message, true); }
+        finally { setSettingsBusy(false); syncSettings(true); }
+        return;
+      }
       const addModel = event.target.closest('[data-add-model]');
       if (addModel) {
         const root = addModel.closest('[data-harness]');
@@ -573,7 +624,6 @@
           if (!state.projects.length) {
             toast('Add a project folder before launching an agent.'); $('#project-dialog').showModal(); return;
           }
-          setLaunchHarnesses();
           $('#launch-project-select').innerHTML = projectOptions(state.selectedProject);
           setLaunchProject();
         }
@@ -630,46 +680,70 @@
     $('#launch-harness').addEventListener('change', setLaunchChoices);
     $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); });
     $('#launch-project-select').addEventListener('change', setLaunchProject);
-    function setLaunchProject() {
+    async function setLaunchProject() {
       const p = state.projects.find(x => x.id === Number($('#launch-project-select').value));
       $('#launch-project').textContent = p ? `Agents will work in ${p.path}` : 'Select a project';
+      const request = ++state.launchRequest;
+      const button = $('#launch-form button.primary');
+      button.disabled = true;
+      state.launchSettings = null;
+      try {
+        const overview = await api(`/overview?project=${p.id}`);
+        if (request !== state.launchRequest) return;
+        state.launchSettings = overview.settings;
+        setLaunchHarnesses(); button.disabled = !$('#launch-harness').value;
+        if (button.disabled) toast('No harnesses are enabled in this project’s config.', true);
+      } catch (error) { if (request === state.launchRequest) toast(error.message, true); }
     }
     $('#project-select').addEventListener('change', async event => {
+      if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
+      state.editor = null;
       state.selectedProject = Number(event.target.value);
       state.project = state.projects.find(p => p.id === state.selectedProject);
       for (const key of ['agents', 'threads', 'locks', 'activity']) state[key] = [];
-      resetThread(); render(); await refresh();
+      resetThread(); $('#settings-form').replaceChildren(); render(); await refresh();
     });
     $('#remove-project').addEventListener('click', async () => {
       const p = state.project;
+      if (!discardSettings()) return;
       if (!p || !confirm(`Remove project “${p.name}” from acom? Its files will not be deleted.`)) return;
       try {
         await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
-        state.selectedProject = null; resetThread(); await refresh();
+        state.selectedProject = null; state.editor = null; resetThread(); await refresh();
       } catch (error) { toast(error.message, true); }
     });
     $('#settings-form').addEventListener('change', event => {
+      if (event.target.id === 'config-select') {
+        if (!discardSettings()) { event.target.value = state.editor.config ?? 'custom'; return; }
+        const config = event.target.value === 'custom' ? null : Number(event.target.value);
+        const s = state.configs.find(c => c.id === (config ?? 1))?.settings;
+        state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: true };
+        renderSettings(); return;
+      }
+      if (state.editor) state.editor.dirty = true;
       const root = event.target.closest('[data-harness]');
       if (!root) return;
       if (['allowed_model', 'allowed_effort'].includes(event.target.name)) syncHarnessChoices(root);
       if (event.target.name === 'model') { showCustom(event.target, $('[data-custom-default]', root)); syncDefaultEfforts(root); }
     });
+    $('#settings-form').addEventListener('input', event => { if (state.editor && event.target.id !== 'config-select') state.editor.dirty = true; });
+    function discardSettings() { return !state.editor?.dirty || confirm('Discard unsaved settings?'); }
     function setLaunchChoices() {
       const name = $('#launch-harness').value;
-      const h = state.settings?.harnesses?.[name];
+      const h = state.launchSettings?.harnesses?.[name];
       $('#launch-model').innerHTML = modelOptions(name, [...new Set([...(state.catalog[name] || []).map(x => x.id), ...(h?.models || [])])], h?.model);
       setLaunchEfforts(true);
       showCustom($('#launch-model'), $('#launch-custom-row'));
     }
     function setLaunchEfforts(useDefault = false) {
       const name = $('#launch-harness').value;
-      const h = state.settings?.harnesses?.[name];
+      const h = state.launchSettings?.harnesses?.[name];
       const efforts = modelEfforts(name, $('#launch-model').value) || (name === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
       const selected = useDefault ? h?.effort : $('#launch-effort').value;
       $('#launch-effort').innerHTML = options(efforts, efforts.includes(selected) ? selected : efforts.includes(h?.effort) ? h.effort : efforts.includes('medium') ? 'medium' : efforts[0]);
     }
     function setLaunchHarnesses() {
-      $('#launch-harness').innerHTML = Object.entries(state.settings?.harnesses || {}).filter(([,h]) => h.enabled).map(([name]) => `<option>${esc(name)}</option>`).join('');
+      $('#launch-harness').innerHTML = Object.entries(state.launchSettings?.harnesses || {}).filter(([,h]) => h.enabled).map(([name]) => `<option>${esc(name)}</option>`).join('');
       setLaunchChoices();
     }
 
@@ -717,8 +791,9 @@
       const button = event.submitter;
       if (button) button.disabled = true;
       try {
+        if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
-        state.selectedProject = Number(result.id); resetThread(); await refresh();
+        state.selectedProject = Number(result.id); state.editor = null; resetThread(); await refresh();
         $('#project-dialog').close(); form.reset();
       } catch (error) { toast(error.message, true); }
       finally { if (button) button.disabled = false; }
@@ -735,38 +810,82 @@
       } catch (error) { toast(error.message, true); }
     });
 
+    function collectSettings() {
+      const form = $('#settings-form');
+      const next = structuredClone(state.editor.settings);
+      form.querySelectorAll('[data-harness]').forEach(root => {
+        const h = next.harnesses[root.dataset.harness];
+        h.enabled = $('[name=enabled]', root).checked;
+        h.model = $('[name=model]', root).value; h.effort = $('[name=effort]', root).value;
+        h.models = checked(root, 'allowed_model'); h.efforts = checked(root, 'allowed_effort');
+        if (h.model === '__custom__') {
+          h.model = customModel($('[name=custom_model]', root).value);
+          if (!h.models.includes(h.model)) h.models.push(h.model);
+        }
+        h.flags = parseFlags($('[name=flags]', root).value);
+      });
+      form.querySelectorAll('[data-limit]').forEach(root => {
+        const [kind, name] = root.dataset.limit.split('.');
+        const target = name ? next.limits[kind][name] : next.limits[kind];
+        const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
+        target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
+      });
+      next.auto_resume = $('[name=auto_resume]', form).checked;
+      next.done_closes = $('[name=done_closes]', form).checked;
+      return next;
+    }
+    function setSettingsBusy(busy) {
+      state.saving = busy;
+      $('#project-select').disabled = busy || !state.projects.length;
+      $('[data-open="project-dialog"]').disabled = busy;
+      $('#remove-project').disabled = busy || !state.project || state.agents.length > 0;
+      $('#project-form button.primary').disabled = busy;
+      $('#settings-form').querySelectorAll('input, select, button').forEach(el => el.disabled = busy);
+      $('[form="settings-form"]').disabled = busy;
+      $('#config-form button.primary').disabled = busy;
+      if (!busy) {
+        const config = state.configs.find(c => c.id === state.editor?.config);
+        if ($('#remove-config')) $('#remove-config').disabled = !!config?.projects.length;
+      }
+    }
+    async function saveConfig(name) {
+      const editor = state.editor;
+      const next = collectSettings();
+      setSettingsBusy(true);
+      toast('Saving settings…');
+      try {
+        let config = editor.config;
+        if (name !== undefined) {
+          const result = await api('/configs', { method: 'POST', body: JSON.stringify({ name, settings: next }) });
+          config = result.id;
+        } else if (config != null) {
+          const rename = $('[name=config_name]', $('#settings-form'))?.value;
+          if (JSON.stringify(next) !== JSON.stringify(editor.settings) || (rename != null && rename !== state.configs.find(c => c.id === config)?.name)) {
+            await api(`/configs/${config}`, { method: 'PUT', body: JSON.stringify({ settings: next, ...(rename == null ? {} : { name: rename }) }) });
+          }
+        }
+        if (editor.project != null) {
+          await api(`/projects/${editor.project}/config`, { method: 'PUT', body: JSON.stringify(config == null ? { custom: next } : { config }) });
+        }
+        state.editor = { project: editor.project, config, dirty: false };
+        await refresh();
+      } finally { setSettingsBusy(false); }
+      syncSettings(true); toast('Settings saved');
+    }
     $('#settings-form').addEventListener('submit', async event => {
       event.preventDefault();
+      try { await saveConfig(); } catch (error) { toast(error.message, true); }
+    });
+    $('#config-form').addEventListener('submit', async event => {
+      event.preventDefault();
       const form = event.currentTarget;
-      const button = event.submitter;
-      const next = structuredClone(state.settings);
-      if (button) button.disabled = true;
       try {
-        form.querySelectorAll('[data-harness]').forEach(root => {
-          const h = next.harnesses[root.dataset.harness];
-          h.enabled = $('[name=enabled]', root).checked;
-          h.model = $('[name=model]', root).value; h.effort = $('[name=effort]', root).value;
-          h.models = checked(root, 'allowed_model'); h.efforts = checked(root, 'allowed_effort');
-          if (h.model === '__custom__') {
-            h.model = customModel($('[name=custom_model]', root).value);
-            if (!h.models.includes(h.model)) h.models.push(h.model);
-          }
-          h.flags = parseFlags($('[name=flags]', root).value);
-        });
-        form.querySelectorAll('[data-limit]').forEach(root => {
-          const [kind, name] = root.dataset.limit.split('.');
-          const target = name ? next.limits[kind][name] : next.limits[kind];
-          const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
-          target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
-        });
-        next.auto_resume = $('[name=auto_resume]', form).checked;
-        next.done_closes = $('[name=done_closes]', form).checked;
-        await api('/settings', { method: 'PUT', body: JSON.stringify({ settings: next }) }); state.settings = next; await refresh(); renderSettings(); setLaunchHarnesses(); toast('Settings saved');
+        await saveConfig(new FormData(form).get('name').trim());
+        $('#config-dialog').close(); form.reset();
       } catch (error) { toast(error.message, true); }
-      finally { if (button) button.disabled = false; }
     });
 
-    refresh(true).then(setLaunchHarnesses).catch(e => toast(e.message, true));
+    refresh(true).catch(e => toast(e.message, true));
     setInterval(() => refresh(false), 2000);
   </script>
 </body>
