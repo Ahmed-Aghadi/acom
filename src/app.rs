@@ -1179,7 +1179,7 @@ impl App {
         }
         st.unfreeze_locks(id)?;
         st.db.execute(
-            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL WHERE id=?1",
+            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL, seen_model=NULL WHERE id=?1",
             [id],
         )?;
         st.log_for(id, by, &format!("resumed agent {id}"))?;
@@ -1769,13 +1769,34 @@ impl App {
                 .query_row("SELECT pause_reason FROM agents WHERE id=?1", [id], |r| {
                     r.get(0)
                 })?;
-        if a.state == "paused" && reason.as_deref() == Some(why) {
-            return Ok(()); // one refusal often arrives as several events
+        if a.state == "paused" {
+            // One refusal often arrives as several events, and a flag outranks
+            // everything else: a flagged agent must never be resumed automatically.
+            if reason.as_deref() == Some(why) || reason.as_deref() == Some("flagged") {
+                return Ok(());
+            }
+            if why != "flagged" {
+                return Ok(());
+            }
+            st.release_all(id, "you were flagged and paused")?;
+            st.db.execute(
+                "UPDATE agents SET pause_reason='flagged', problem=?2 WHERE id=?1",
+                params![id, problem],
+            )?;
+            return st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"));
         }
         st.db.execute(
             "UPDATE agents SET problem=?2 WHERE id=?1",
             params![id, problem],
         )?;
+        if why == "limit" {
+            // Until the harness reports the window's real reset time, assume a few minutes,
+            // so an older reading below 100% can't resume the agent straight away.
+            st.db.execute(
+                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,'limit',100,?2,?3)",
+                params![a.harness, now() + 300, now()],
+            )?;
+        }
         if matches!(a.state.as_str(), "working" | "idle" | "done") {
             self.pause_locked(&mut st, id, LockMode::Release, why, "acom")?;
         }
@@ -1792,23 +1813,25 @@ impl App {
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            if seen.is_none() {
-                st.db.execute(
-                    "UPDATE agents SET seen_model=?2 WHERE id=?1",
-                    params![id, answered],
-                )?;
-            }
             // A short alias (e.g. "opus") can't be compared with what answers.
             let full_id = asked.contains('-');
-            match seen {
-                Some(seen) if !same_model(&seen, answered) => Some(format!(
+            let reason = match &seen {
+                Some(seen) if !same_model(seen, answered) => Some(format!(
                     "the model changed from {seen} to {answered} during the session"
                 )),
                 _ if full_id && !same_model(&asked, answered) => {
                     Some(format!("{answered} answered instead of {asked}"))
                 }
                 _ => None,
+            };
+            // Remember the session's model only once it's a good one.
+            if seen.is_none() && reason.is_none() {
+                st.db.execute(
+                    "UPDATE agents SET seen_model=?2 WHERE id=?1",
+                    params![id, answered],
+                )?;
             }
+            reason
         };
         match reason {
             Some(r) => self.flag(id, &r),
