@@ -17,7 +17,7 @@ Incompatible development databases are left untouched; startup explains how to u
 
 ## Projects
 
-A project is a folder. Agents run in their project's folder, and only see that project's agents, threads and locks. Limits and settings cover all projects, since they protect your machine and subscriptions.
+A project is a folder. Agents run in their project's folder, and only see that project's agents, threads and locks. Each project has its own settings: limits, models, permissions and rules. New projects use the **Default** config. You can save named configs and reuse them across projects, or give a project its own custom settings (starting from Default). There's no cap across projects.
 
 Add a project in the UI, with `acom project add [path]`, or just run `acom launch` inside the folder: it's added the first time. Your own `acom` commands act on the project the current folder is in; `acom projects` lists them all.
 

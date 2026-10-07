@@ -8,7 +8,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 
 **Server.** One per machine, for all your projects. `acom serve` runs it on `127.0.0.1:7400` (`--port` to change it); a second `acom serve` refuses to start. All state is kept in `~/.acom/acom.db` (SQLite; `ACOM_HOME` moves the folder), so a restart loses nothing; the server also writes its port to `~/.acom/port`, which is how `acom` commands find it. acom keeps none of its own state in projects. The server is also what launches and supervises agents.
 
-**Project.** A folder. Every agent, thread and lock belongs to one project: agents run in its folder and only see that project's agents, threads and locks (agent IDs are unique across projects; lock names only within a project). Projects are added in the UI, with `acom project add`, or by running `acom launch` inside a folder that isn't one yet. A project without agents can be removed. Limits, settings and usage cover all projects, since they protect your machine and subscriptions.
+**Project.** A folder. Every agent, thread and lock belongs to one project: agents run in its folder and only see that project's agents, threads and locks (agent IDs are unique across projects; lock names only within a project). Projects are added in the UI, with `acom project add`, or by running `acom launch` inside a folder that isn't one yet. A project without agents can be removed. Each project has its own settings (see Settings): its own limits, models, permissions and rules. There's no cap across projects. Subscription usage is per account, so every project sees the same usage %, but acts on it with its own thresholds.
 
 **Harness.** A coding-agent CLI that acom knows how to run: `claude` and `codex` in this version. Adding another later means teaching acom how to start it, resume it, read its usage, and install its hook (see Build notes).
 
@@ -90,11 +90,11 @@ Every launched agent has subagents turned off (Claude Code: no `Agent`, `Workflo
 
 ## Limits
 
-Each limit has a soft and a hard value, and either can be left unset (no limit). The soft value warns; the hard value acts.
+Limits are part of each project's settings (see Settings) and apply to that project's agents. Each limit has a soft and a hard value, and either can be left unset (no limit). The soft value warns; the hard value acts.
 
 | Limit | Soft | Hard |
 |---|---|---|
-| **Active agents** (working or idle, not counting ones that ran `acom done`), in total and per harness | Agents launching, and you, are told it's reached and what the hard value is | Agents' launch requests are refused, and done or closed agents aren't woken (they wait in line); you can confirm a launch past it |
+| **Active agents** in the project (working or idle, not counting ones that ran `acom done`), in total and per harness | Agents launching, and you, are told it's reached and what the hard value is | Agents' launch requests are refused, and done or closed agents aren't woken (they wait in line); you can confirm a launch past it |
 | **Subscription usage**, per provider (the highest of its usage windows, in %) | That provider's agents are told | When usage crosses it, that provider's agents are paused. Agents' launches on that provider are refused and wakes wait in line while it's over |
 | **Context size**, per agent (tokens) | That agent is told its context is getting large | The harness auto-compacts at this size (Claude `--autocompact`, which takes 100k to 1M; Codex `model_auto_compact_token_limit`) |
 
@@ -210,7 +210,7 @@ Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshin
 - **Threads:** click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and members, by ID or selector. After posting you're told who couldn't be woken yet.
 - **Locks:** name, description, holder, since, expires (or frozen with the time left), queue, and a **Free** button.
 - **Activity:** launches, pauses, resumes, limits reached, wake-line changes, locks freed by you, and who did each.
-- **Settings:** everything below. Models are chosen from acom's catalog (full IDs) with a custom option for newer ones; efforts follow what the chosen model supports. An empty limit field means no limit.
+- **Settings:** for the selected project: which config it uses (Default, a saved config, or Custom), and the editor for it, saying which projects a saved config affects; "Save as new config". Models are chosen from acom's catalog (full IDs) with a custom option for newer ones; efforts follow what the chosen model supports. An empty limit field means no limit.
 
 Every dialog can be cancelled without filling it in.
 
@@ -218,7 +218,15 @@ Confirmations: launching past a hard limit; pausing an agent that holds locks (r
 
 ## Settings
 
-Edited on the UI's settings page and stored in the database.
+Edited on the UI's settings page, per project, and stored in the database. A **config** is a full set of settings:
+
+- **Default** is built in. New projects use it; it can be edited but not removed.
+- **Saved configs** have names. You save one from the settings page ("Save as new config"), and any project can use it. Editing a saved config changes every project using it, and the page says which. A saved config no project uses can be removed.
+- **Custom**: a project can have its own settings instead, starting as a copy of Default.
+
+Every rule reads the settings of the agent's project. Active-agent limits count only that project's agents, and a project's usage thresholds pause only that project's agents. When a change alters a project's limits or the `done` rule, that project's agents are told.
+
+A config holds:
 
 - **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags. Defaults: every catalog model allowed; Claude `claude-opus-5-5` / medium with `--dangerously-skip-permissions`; Codex `gpt-6.1-sol` / medium with `--dangerously-bypass-approvals-and-sandbox`. Agents run unattended and nobody can answer a permission prompt, so they get full permissions by default; restrict them here (e.g. `--permission-mode acceptEdits`, `--sandbox workspace-write`) and anything the harness would ask about is denied. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
 - **Limits:** soft and hard values for active agents (total and per harness), subscription usage (per provider) and context size. Any value can be empty.
@@ -237,12 +245,13 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 
 | Area | Requests |
 |---|---|
-| UI | `GET /` (the page), `GET /overview?project=` (projects, the selected project's agents, threads, locks and activity, plus limits, settings and the model catalog, in one call) |
+| UI | `GET /` (the page), `GET /overview?project=` (projects, the selected project's agents, threads, locks, activity, limits and settings, plus the configs and the model catalog, in one call) |
 | Projects | `GET /projects`, `GET /projects?path=` (the project a folder is in), `POST /projects` (`path`), `POST /projects/{id}/remove` |
 | Agents | `GET /agents?project=`, `GET /agents/{id}` (adds the project's name and path, `limits` text and `lost_locks`), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (`locks`: `release` or `keep`), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all` |
 | Threads & messages | `GET /threads?project=`, `POST /threads` (`project` for the user), `GET /threads/{tid}`, `POST /threads/{tid}/members`, `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}`, `GET /inbox/{agent}?mark=`, `POST /marks` |
 | Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
-| Other | `GET /limits`, `GET /activity?project=`, `GET /settings`, `PUT /settings` (`{"settings": {...}}`), `POST /hook/{agent}` (what's new for that agent) |
+| Configs | `GET /configs` (each with its settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: a saved config's id, or `custom`: settings) |
+| Other | `GET /limits?project=`, `GET /activity?project=`, `POST /hook/{agent}` (what's new for that agent) |
 
 ## Build notes
 
@@ -265,7 +274,7 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 Tables:
 
 ```
-projects (id, path, name, created_at)                  -- id never reused
+projects (id, path, name, created_at, config, custom)  -- id never reused; custom JSON overrides config
 agents   (id, project, name, grp, task, problem, seen_model, harness, model, effort, state, rest, status_text, session_id, session_started,
           launched_by, launched_at, pid, pause_reason, pause_from, paused_at, done_req,
           context, context_warned, fresh_in, cache_write, cache_read, output, turns, ended_at,
@@ -278,7 +287,7 @@ locks    (project, name, about, created_at, holder, acquired_at, expires_at, fro
 notices  (id, agent_id, text, at, shown)                -- what to tell an agent next, incl. lost locks
 usage    (provider, win, used_pct, resets_at, at)
 activity (id, project, at, actor, what)                -- project NULL: about all projects
-settings (key, value)                                   -- one JSON value
+configs  (id, name, settings)                          -- id 1 is Default; settings is JSON
 ```
 
 ## Not included
