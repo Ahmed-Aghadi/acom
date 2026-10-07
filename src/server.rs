@@ -231,6 +231,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 name: opt_text(b, "name"),
                 group: opt_text(b, "group"),
                 force: b["force"].as_bool().unwrap_or(false),
+                done: b["done"].as_bool().unwrap_or(false),
             };
             let (new, warnings) = app.launch(by, opt_int(b, "via"), req)?;
             J(json!({ "id": new, "warnings": warnings }))
@@ -287,12 +288,16 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? }))
         }
         ("POST", ["messages"]) => {
-            let mid = app.post(
+            let (mid, not_woken) = app.post(
                 opt_int(b, "agent").unwrap_or(0),
                 int(b, "thread")?,
                 &text(b, "text")?,
             )?;
-            J(json!({ "id": mid }))
+            let not_woken: Vec<Value> = not_woken
+                .into_iter()
+                .map(|(agent, reason)| json!({ "agent": agent, "reason": reason }))
+                .collect();
+            J(json!({ "id": mid, "not_woken": not_woken }))
         }
         ("GET", ["messages", m]) => J(app.message(id(m)?)?),
         ("GET", ["inbox", a]) => J(json!(

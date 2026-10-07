@@ -44,8 +44,48 @@ pub fn not_found(m: impl Into<String>) -> Fail {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Limit {
-    pub soft: f64,
-    pub hard: f64,
+    pub soft: Option<f64>,
+    pub hard: Option<f64>,
+}
+
+impl Limit {
+    /// "soft 6, hard 8", "soft none, hard 95%", or "no limit".
+    pub fn text(&self, unit: &str) -> String {
+        let v = |x: Option<f64>| x.map_or("none".to_string(), |x| format!("{x}{unit}"));
+        match (self.soft, self.hard) {
+            (None, None) => "no limit".into(),
+            (s, h) => format!("soft {}, hard {}", v(s), v(h)),
+        }
+    }
+}
+
+/// One limit, checked against the value it would have after a launch or wake.
+pub struct Check {
+    what: String,
+    value: f64,
+    lim: Limit,
+    unit: &'static str,
+}
+
+impl Check {
+    fn over(&self, limit: Option<f64>) -> bool {
+        // Counts are over once the new agent would exceed them; percentages once reached.
+        limit.is_some_and(|l| {
+            if self.unit.is_empty() {
+                self.value > l
+            } else {
+                self.value >= l
+            }
+        })
+    }
+    fn line(&self, kind: &str) -> String {
+        let now = if self.unit.is_empty() {
+            format!("{} {}", self.value - 1.0, self.what)
+        } else {
+            format!("{} {:.0}{}", self.what, self.value, self.unit)
+        };
+        format!("{kind} limit reached: {now} ({})", self.lim.text(self.unit))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -103,7 +143,10 @@ impl Default for Settings {
                 flags: strs(&["--sandbox", "workspace-write"]),
             },
         );
-        let per = |s, h| Limit { soft: s, hard: h };
+        let per = |s, h| Limit {
+            soft: Some(s),
+            hard: Some(h),
+        };
         let mut active_per_harness = BTreeMap::new();
         let mut usage = BTreeMap::new();
         for h in ["claude", "codex"] {
@@ -155,8 +198,12 @@ impl Settings {
         );
         all.extend(l.usage.iter().map(|(k, v)| (format!("{k} usage"), v)));
         for (name, lim) in all {
-            if lim.soft < 0.0 || lim.hard < lim.soft {
-                return Err(bad(format!("{name}: need 0 <= soft <= hard")));
+            let negative = [lim.soft, lim.hard].iter().flatten().any(|v| *v < 0.0);
+            let backwards = matches!((lim.soft, lim.hard), (Some(s), Some(h)) if s > h);
+            if negative || backwards {
+                return Err(bad(format!(
+                    "{name}: limits can't be negative, and soft can't be above hard"
+                )));
             }
         }
         Ok(())
@@ -196,7 +243,7 @@ CREATE TABLE IF NOT EXISTS agents (
   context INTEGER NOT NULL DEFAULT 0, context_warned INTEGER NOT NULL DEFAULT 0,
   fresh_in INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
   cache_read INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
-  turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER);
+  turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER);
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
@@ -343,7 +390,7 @@ impl St {
         let mut total = 0;
         for r in rows(
             &self.db,
-            "SELECT harness h, count(*) n FROM agents WHERE state IN ('working','idle') GROUP BY harness",
+            "SELECT harness h, count(*) n FROM agents WHERE state IN ('working','idle') AND done_req=0 GROUP BY harness",
             [],
         )? {
             let n = r["n"].as_i64().unwrap_or(0);
@@ -366,17 +413,9 @@ impl St {
         let s = self.settings();
         let l = &s.limits;
         let (total, per) = self.active_counts()?;
-        let mut out = format!(
-            "Active agents: {total} (soft {}, hard {})",
-            l.active.soft, l.active.hard
-        );
+        let mut out = format!("Active agents: {total} ({})", l.active.text(""));
         for (h, lim) in &l.active_per_harness {
-            out += &format!(
-                "; {h}: {} (soft {}, hard {})",
-                per.get(h).unwrap_or(&0),
-                lim.soft,
-                lim.hard
-            );
+            out += &format!("; {h}: {} ({})", per.get(h).unwrap_or(&0), lim.text(""));
         }
         out += "\nSubscription usage:";
         for (i, (h, lim)) in l.usage.iter().enumerate() {
@@ -385,17 +424,54 @@ impl St {
                 None => "unknown".into(),
             };
             out += &format!(
-                "{} {h} {used} (soft {}%, hard {}%)",
+                "{} {h} {used} ({})",
                 if i > 0 { ";" } else { "" },
-                lim.soft,
-                lim.hard
+                lim.text("%")
             );
         }
-        out += &format!(
-            "\nContext per agent: soft {} tokens, hard {} (the harness compacts at the hard value)",
-            l.context.soft, l.context.hard
-        );
+        out += &format!("\nContext per agent: {}", l.context.text(" tokens"));
+        if l.context.hard.is_some() {
+            out += " (the harness compacts at the hard value)";
+        }
         Ok(out)
+    }
+
+    /// The limits a new active agent of this harness would be checked against.
+    fn limit_checks(&self, harness: &str) -> R<Vec<Check>> {
+        let l = self.settings().limits;
+        let (total, per) = self.active_counts()?;
+        let mut checks = vec![Check {
+            what: "active agents".into(),
+            value: (total + 1) as f64,
+            lim: l.active.clone(),
+            unit: "",
+        }];
+        if let Some(lim) = l.active_per_harness.get(harness) {
+            checks.push(Check {
+                what: format!("active {harness} agents"),
+                value: (per.get(harness).unwrap_or(&0) + 1) as f64,
+                lim: lim.clone(),
+                unit: "",
+            });
+        }
+        if let (Some(lim), Some(used)) = (l.usage.get(harness), self.used_pct(harness)?) {
+            checks.push(Check {
+                what: format!("{harness} subscription usage"),
+                value: used,
+                lim: lim.clone(),
+                unit: "%",
+            });
+        }
+        Ok(checks)
+    }
+
+    /// Why an agent of this harness can't become active right now, if it can't.
+    fn no_room(&self, harness: &str) -> R<Option<String>> {
+        let checks = self.limit_checks(harness)?;
+        Ok(checks
+            .iter()
+            .find(|c| c.over(c.lim.hard))
+            .map(|c| c.line("Hard")))
     }
 
     // ---------- locks ----------
@@ -557,6 +633,8 @@ pub struct LaunchReq {
     pub name: Option<String>,
     pub group: Option<String>,
     pub force: bool,
+    /// The launching agent marks itself done in the same step.
+    pub done: bool,
 }
 
 pub enum LockMode {
@@ -571,6 +649,8 @@ impl App {
         std::fs::create_dir_all(data.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
         let db = Connection::open(data.join("acom.db"))?;
         db.execute_batch(SCHEMA)?;
+        // Added after the first release; older databases need the column.
+        let _ = db.execute("ALTER TABLE agents ADD COLUMN wake_queued_at INTEGER", []);
         db.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
             [serde_json::to_string(&Settings::default()).unwrap()],
@@ -627,9 +707,18 @@ impl App {
     ) -> R<(i64, Vec<String>)> {
         let mut st = self.lock();
         let s = st.settings();
-        if by > 0 && st.agent(by)?.state != "working" {
-            return Err(conflict("only a working agent can launch others"));
-        }
+        let caller_done = if by > 0 {
+            let a = st.agent(by)?;
+            if a.state != "working" {
+                return Err(conflict("only a working agent can launch others"));
+            }
+            a.done_req
+        } else {
+            if req.done {
+                return Err(bad("only an agent can mark itself done"));
+            }
+            false
+        };
         let harness = req.harness.unwrap_or_else(|| {
             s.harnesses
                 .iter()
@@ -671,54 +760,24 @@ impl App {
         }
 
         // Limits: soft warns, hard refuses agents and needs confirming for the user.
-        let (total, per) = st.active_counts()?;
-        let l = &s.limits;
-        let mut checks = vec![(
-            "Active agents".to_string(),
-            (total + 1) as f64,
-            l.active.clone(),
-            "",
-        )];
-        if let Some(lim) = l.active_per_harness.get(&harness) {
-            checks.push((
-                format!("Active {harness} agents"),
-                (per.get(&harness).unwrap_or(&0) + 1) as f64,
-                lim.clone(),
-                "",
-            ));
+        // An agent handing over with `done` no longer counts.
+        if req.done {
+            st.db
+                .execute("UPDATE agents SET done_req=1 WHERE id=?1", [by])?;
         }
-        if let (Some(lim), Some(used)) = (l.usage.get(&harness), st.used_pct(&harness)?) {
-            checks.push((
-                format!("{harness} subscription usage"),
-                used,
-                lim.clone(),
-                "%",
-            ));
-        }
+        let undo_done = |st: &St| {
+            if req.done && !caller_done {
+                let _ = st
+                    .db
+                    .execute("UPDATE agents SET done_req=0 WHERE id=?1", [by]);
+            }
+        };
         let mut warnings = Vec::new();
-        for (what, value, lim, unit) in checks {
-            let is_count = unit.is_empty();
-            let over_hard = if is_count {
-                value > lim.hard
-            } else {
-                value >= lim.hard
-            };
-            let over_soft = if is_count {
-                value > lim.soft
-            } else {
-                value >= lim.soft
-            };
-            let shown = if is_count {
-                format!("{}", value - 1.0)
-            } else {
-                format!("{value:.0}{unit}")
-            };
-            if over_hard {
-                let msg = format!(
-                    "Hard limit reached: {what} {shown} (soft {}{unit}, hard {}{unit})",
-                    lim.soft, lim.hard
-                );
+        for c in st.limit_checks(&harness)? {
+            if c.over(c.lim.hard) {
+                let msg = c.line("Hard");
                 if by > 0 {
+                    undo_done(&st);
                     return Err(conflict(format!("{msg}. Launch refused.")));
                 }
                 if !req.force {
@@ -727,11 +786,8 @@ impl App {
                     )));
                 }
                 warnings.push(format!("{msg}; launched anyway."));
-            } else if over_soft {
-                warnings.push(format!(
-                    "Soft limit reached: {what} {shown} (soft {}{unit}, hard {}{unit})",
-                    lim.soft, lim.hard
-                ));
+            } else if c.over(c.lim.soft) {
+                warnings.push(c.line("Soft"));
             }
         }
 
@@ -781,26 +837,73 @@ impl App {
     }
 
     /// Wake an agent that's resting (idle, done, or closed) if something it should hear about arrived.
-    pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+    /// A done or closed agent isn't counted as active, so waking it needs room under the hard limits;
+    /// without room it waits in line (returns why) and is woken by `drain_wakes` later.
+    pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<Option<String>> {
         if st.procs.contains_key(&id) {
-            return Ok(()); // still stopping; turn_ended wakes it if needed
+            return Ok(None); // still stopping; turn_ended wakes it if needed
         }
         let a = st.agent(id)?;
         let only_user = match a.state.as_str() {
             "idle" | "done" => false,
             "closed" => true,
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
         if st.pending(id, only_user)?.is_empty() {
-            return Ok(());
+            st.db
+                .execute("UPDATE agents SET wake_queued_at=NULL WHERE id=?1", [id])?;
+            return Ok(None);
+        }
+        if a.state != "idle"
+            && let Some(why) = st.no_room(&a.harness)?
+        {
+            let n = st.db.execute(
+                "UPDATE agents SET wake_queued_at=?2 WHERE id=?1 AND wake_queued_at IS NULL",
+                params![id, now()],
+            )?;
+            if n > 0 {
+                st.log("acom", &format!("agent {id} is waiting to be woken: {why}"))?;
+            }
+            return Ok(Some(why));
+        }
+        let queued: Option<i64> =
+            st.db
+                .query_row("SELECT wake_queued_at FROM agents WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+        if queued.is_some() {
+            st.log(
+                "acom",
+                &format!("woke agent {id} (it was waiting for room under the limits)"),
+            )?;
         }
         st.db.execute(
-            "UPDATE agents SET rest=?2 WHERE id=?1",
+            "UPDATE agents SET rest=?2, wake_queued_at=NULL WHERE id=?1",
             params![id, a.state],
         )?;
         let updates = st.take_updates(id)?;
         let prompt = format!("{updates}\n\nYou were woken up because of the above. Carry on.");
-        run::start_turn(self, st, id, &prompt)
+        run::start_turn(self, st, id, &prompt)?;
+        Ok(None)
+    }
+
+    /// Wake agents waiting for room, oldest first, while there's room.
+    fn drain_wakes(self: &Arc<Self>, st: &mut St) -> R<bool> {
+        let ids: Vec<i64> = rows(
+            &st.db,
+            "SELECT id FROM agents WHERE wake_queued_at IS NOT NULL ORDER BY wake_queued_at, id",
+            [],
+        )?
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+        let mut woke = false;
+        for id in ids {
+            if self.maybe_wake(st, id)?.is_none() {
+                woke = true;
+            }
+        }
+        Ok(woke)
     }
 
     /// Called when an agent's process exits.
@@ -961,7 +1064,7 @@ impl App {
             run::start_turn(self, st, id, &prompt)
         } else {
             st.set_state(id, &from)?;
-            self.maybe_wake(st, id)
+            self.maybe_wake(st, id).map(|_| ())
         }
     }
 
@@ -1023,7 +1126,7 @@ impl App {
         }
         st.set_state(id, "idle")?;
         st.log(by, &format!("reopened agent {id}"))?;
-        self.maybe_wake(&mut st, id)
+        self.maybe_wake(&mut st, id).map(|_| ())
     }
 
     // ---------- agent self-service ----------
@@ -1176,7 +1279,13 @@ impl App {
         }
     }
 
-    pub fn post(self: &Arc<Self>, sender: i64, tid: i64, text: &str) -> R<i64> {
+    /// Post a message. Returns its ID and the members it couldn't wake (and why).
+    pub fn post(
+        self: &Arc<Self>,
+        sender: i64,
+        tid: i64,
+        text: &str,
+    ) -> R<(i64, Vec<(i64, String)>)> {
         let mut st = self.lock();
         Self::thread_exists(&st, tid)?;
         if text.trim().is_empty() {
@@ -1209,11 +1318,14 @@ impl App {
         .iter()
         .map(|r| r["a"].as_i64().unwrap())
         .collect();
+        let mut not_woken = Vec::new();
         for m in members {
-            self.maybe_wake(&mut st, m)?;
+            if let Some(why) = self.maybe_wake(&mut st, m)? {
+                not_woken.push((m, why));
+            }
         }
         self.cv.notify_all();
-        Ok(mid)
+        Ok((mid, not_woken))
     }
 
     pub fn inbox(&self, agent: i64, mark: &str) -> R<Vec<Value>> {
@@ -1430,19 +1542,23 @@ impl App {
 
     pub fn record_context(&self, id: i64, tokens: u64) -> R<()> {
         let st = self.lock();
-        let soft = st.settings().limits.context;
+        let lim = st.settings().limits.context;
         let warned: i64 =
             st.db
                 .query_row("SELECT context_warned FROM agents WHERE id=?1", [id], |r| {
                     r.get(0)
                 })?;
-        let over = tokens as f64 >= soft.soft;
+        let over = lim.soft.is_some_and(|s| tokens as f64 >= s);
         if over && warned == 0 {
+            let then = match lim.hard {
+                Some(h) => format!("It will be compacted at {h}."),
+                None => "There's no hard limit, so it won't be compacted early.".into(),
+            };
             st.notice(
                 id,
                 &format!(
-                    "Your context is {tokens} tokens, past the soft limit of {}. It will be compacted at {}.",
-                    soft.soft, soft.hard
+                    "Your context is {tokens} tokens, past the soft limit of {}. {then}",
+                    lim.soft.unwrap_or_default()
                 ),
             )?;
         }
@@ -1491,11 +1607,12 @@ impl App {
                 }
                 continue;
             };
-            let line = format!(
-                "{p} subscription usage {used:.0}% (soft {}%, hard {}%)",
-                lim.soft, lim.hard
+            let line = format!("{p} subscription usage {used:.0}% ({})", lim.text("%"));
+            let (over_soft, over_hard) = (
+                lim.soft.is_some_and(|v| used >= v),
+                lim.hard.is_some_and(|v| used >= v),
             );
-            if used >= lim.soft && st.over_soft.insert(p.clone()) {
+            if over_soft && st.over_soft.insert(p.clone()) {
                 for r in rows(
                     &st.db,
                     "SELECT id FROM agents WHERE harness=?1 AND state NOT IN ('closed','crashed')",
@@ -1506,10 +1623,10 @@ impl App {
                         &format!("Soft limit reached: {line}."),
                     )?;
                 }
-            } else if used < lim.soft {
+            } else if !over_soft {
                 st.over_soft.remove(p);
             }
-            if used >= lim.hard {
+            if over_hard {
                 if st.over_hard.insert(p.clone()) {
                     let ids: Vec<i64> = rows(
                         &st.db,
@@ -1535,6 +1652,7 @@ impl App {
                 }
             }
         }
+        changed |= self.drain_wakes(&mut st)?;
         if changed {
             self.cv.notify_all();
         }
@@ -1592,7 +1710,7 @@ impl App {
             &st.db,
             "SELECT id, name, grp \"group\", task, harness, model, effort, state, status_text status, session_id session,
                     launched_by, launched_at, pause_reason, paused_at, context, fresh_in, cache_write, cache_read, output,
-                    turns, ended_at
+                    turns, ended_at, wake_queued_at
              FROM agents WHERE ?1 IS NULL OR grp=?1 ORDER BY id",
             [group],
         )?;
@@ -1611,6 +1729,11 @@ impl App {
             .find(|a| a["id"] == id)
             .unwrap();
         a["limits"] = json!(st.limits_text()?);
+        a["lost_locks"] = json!(rows(
+            &st.db,
+            "SELECT at, text FROM notices WHERE agent_id=?1 AND text LIKE 'You no longer hold lock %' ORDER BY id DESC LIMIT 20",
+            [id],
+        )?);
         Ok(a)
     }
 
@@ -1824,12 +1947,54 @@ mod tests {
     }
 
     #[test]
+    fn room_follows_the_hard_limits_and_unset_means_no_limit() {
+        let st = st(); // three working claude agents
+        let mut s = Settings::default();
+        s.limits.active = Limit {
+            soft: None,
+            hard: Some(3.0),
+        };
+        s.limits.active_per_harness.clear();
+        let save = |st: &St, s: &Settings| {
+            st.db
+                .execute(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES('settings',?1)",
+                    [serde_json::to_string(s).unwrap()],
+                )
+                .unwrap();
+        };
+        save(&st, &s);
+        let why = st.no_room("claude").unwrap().unwrap();
+        assert_eq!(
+            why,
+            "Hard limit reached: 3 active agents (soft none, hard 3)"
+        );
+        // An agent that marked itself done no longer takes a slot.
+        st.db
+            .execute("UPDATE agents SET done_req=1 WHERE id=1", [])
+            .unwrap();
+        assert_eq!(st.no_room("claude").unwrap(), None);
+        s.limits.active = Limit {
+            soft: None,
+            hard: None,
+        };
+        save(&st, &s);
+        st.db.execute("UPDATE agents SET done_req=0", []).unwrap();
+        assert_eq!(st.no_room("claude").unwrap(), None);
+        assert!(
+            st.limits_text()
+                .unwrap()
+                .starts_with("Active agents: 3 (no limit)")
+        );
+    }
+
+    #[test]
     fn settings_reject_soft_above_hard() {
         let mut s = Settings::default();
         assert!(s.check().is_ok());
         s.limits.context = Limit {
-            soft: 10.0,
-            hard: 5.0,
+            soft: Some(10.0),
+            hard: Some(5.0),
         };
         assert!(s.check().is_err());
     }

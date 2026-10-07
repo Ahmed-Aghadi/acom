@@ -24,8 +24,9 @@ Agent commands (your ID comes from ACOM_ID):
   done                                    Mark your task finished, then end your turn
   agents [--group <name>]                 List agents
   agent <ID>                              One agent's details
-  launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g]
-                                          Launch a helper agent
+  launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done]
+                                          Launch a helper agent; --done also marks you done,
+                                          so you hand over without needing a second slot
   threads                                 List threads
   thread new --title <text> [--members <ID or selector,...>]
   thread read <TID>                       A thread's full history
@@ -94,6 +95,8 @@ enum Cmd {
         group: Option<String>,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        done: bool,
     },
     Threads,
     Thread {
@@ -459,15 +462,19 @@ fn main() {
             name,
             group,
             force,
+            done,
         } => {
             let task = task.unwrap_or_else(|| text_or_stdin(vec![]));
-            let mut b = json!({ "task": task, "harness": harness, "model": model, "effort": effort, "name": name, "group": group, "force": force });
+            let mut b = json!({ "task": task, "harness": harness, "model": model, "effort": effort, "name": name, "group": group, "force": force, "done": done });
             match my_id() {
                 Some(id) => b["agent"] = json!(id),
                 None => b = user_body(b),
             }
             let v = post("/agents", b);
             println!("launched agent {}", v["id"]);
+            if done {
+                println!("marked you done; end your turn now");
+            }
             for w in v["warnings"].as_array().into_iter().flatten() {
                 println!("{}", w.as_str().unwrap_or(""));
             }
@@ -557,6 +564,13 @@ fn main() {
             }
             let v = post("/messages", b);
             println!("sent #{} to thread {thread}", v["id"]);
+            for n in v["not_woken"].as_array().into_iter().flatten() {
+                println!(
+                    "agent {} wasn't woken: {}. It will be woken when there's room.",
+                    n["agent"],
+                    n["reason"].as_str().unwrap_or("")
+                );
+            }
         }
         Cmd::Inbox { mark } => {
             let msgs = get(&format!("/inbox/{}?mark={mark}", me()));

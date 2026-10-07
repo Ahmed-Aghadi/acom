@@ -65,7 +65,8 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         session: a.session.as_deref(),
         resume,
         prompt,
-        context_limit: s.limits.context.hard as u64,
+        // 0: no hard context limit, so the harness keeps its own default.
+        context_limit: s.limits.context.hard.map_or(0, |h| h as u64),
         flags: &flags,
         acom: &app.exe,
     };
