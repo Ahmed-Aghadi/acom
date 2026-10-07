@@ -2654,6 +2654,119 @@ mod tests {
         assert_eq!(st.settings_for(None).limits.active.hard, Some(3.0));
     }
 
+    /// A real App on a temporary database, with two projects and one idle claude agent each
+    /// (agent 1 in project 1, agent 2 in project 2). Nothing here starts a process.
+    fn app_with_two_projects() -> Arc<App> {
+        let home = std::env::temp_dir().join(format!("acom-test-{}", crate::harness::new_uuid()));
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        {
+            let st = app.lock();
+            st.db
+                .execute_batch(
+                    "INSERT INTO projects(id,path,name,created_at) VALUES(1,'/p1','p1',0),(2,'/p2','p2',0);
+                     INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at)
+                       VALUES(1,1,'a','t','claude','m','e','idle',0,0),(2,2,'b','t','claude','m','e','idle',0,0);",
+                )
+                .unwrap();
+        }
+        app
+    }
+
+    fn custom(app: &App, project: i64, change: impl Fn(&mut Settings)) {
+        let mut s = Settings::default();
+        change(&mut s);
+        let st = app.lock();
+        st.db
+            .execute(
+                "UPDATE projects SET config=NULL, custom=?2 WHERE id=?1",
+                params![project, serde_json::to_string(&s).unwrap()],
+            )
+            .unwrap();
+    }
+
+    fn state(app: &App, id: i64) -> (String, Option<String>) {
+        let st = app.lock();
+        st.db
+            .query_row(
+                "SELECT state, pause_reason FROM agents WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn set_usage(app: &App, pct: f64) {
+        let st = app.lock();
+        st.db
+            .execute(
+                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES('claude','five_hour',?1,?2,0)",
+                params![pct, now() + 3600],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn usage_thresholds_act_per_project() {
+        let app = app_with_two_projects();
+        // Project 2 stops at 50%; project 1 keeps the Default 95%.
+        custom(&app, 2, |s| {
+            s.limits.usage.insert(
+                "claude".into(),
+                Limit {
+                    soft: None,
+                    hard: Some(50.0),
+                },
+            );
+        });
+        set_usage(&app, 60.0);
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1), ("idle".into(), None));
+        assert_eq!(state(&app, 2), ("paused".into(), Some("limit".into())));
+    }
+
+    #[test]
+    fn auto_resume_follows_each_projects_setting() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.auto_resume = false);
+        {
+            let st = app.lock();
+            st.db
+                .execute(
+                    "UPDATE agents SET state='paused', pause_reason='limit', pause_from='idle', paused_at=?1",
+                    [now() - 60],
+                )
+                .unwrap();
+        }
+        set_usage(&app, 10.0);
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1), ("paused".into(), Some("limit".into())));
+        assert_eq!(state(&app, 2), ("idle".into(), None));
+    }
+
+    #[test]
+    fn a_full_project_leaves_room_in_another() {
+        // The wake line asks no_room for the agent's own project.
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            s.limits.active = Limit {
+                soft: None,
+                hard: Some(1.0),
+            }
+        });
+        custom(&app, 2, |s| {
+            s.limits.active = Limit {
+                soft: None,
+                hard: Some(1.0),
+            }
+        });
+        let st = app.lock();
+        assert!(st.no_room(1, "claude").unwrap().is_some());
+        st.db
+            .execute("UPDATE agents SET state='done' WHERE id=2", [])
+            .unwrap();
+        assert_eq!(st.no_room(2, "claude").unwrap(), None);
+    }
+
     #[test]
     fn members_and_selectors_stay_within_the_project() {
         let st = st();
