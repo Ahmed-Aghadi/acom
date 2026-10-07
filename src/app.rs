@@ -297,6 +297,39 @@ CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// Development schemas changed before release; don't serve a half-working old
+/// database or alter its records. Starting with a separate ACOM_HOME is safe.
+fn check_stored_schema(db: &Connection) -> R<()> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let project_sql: Option<String> = db
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if db
+        .prepare(
+            "SELECT a.project, a.seen_model, a.problem, t.project, l.project, x.project
+                   FROM agents a, threads t, locks l, activity x LIMIT 0",
+        )
+        .is_err()
+        || !project_sql.is_some_and(|s| s.to_ascii_uppercase().contains("AUTOINCREMENT"))
+    {
+        return Err(bad(
+            "this database uses an earlier development schema. It has not been changed. Keep it as a backup and start with a separate ACOM_HOME folder.",
+        ));
+    }
+    Ok(())
+}
+
 /// An agent row, as the rules need it.
 pub struct Agent {
     pub project: i64,
@@ -725,6 +758,7 @@ impl App {
     pub fn open(home: PathBuf, url: String) -> R<Arc<App>> {
         std::fs::create_dir_all(home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
         let db = Connection::open(home.join("acom.db"))?;
+        check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
         db.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
@@ -2191,6 +2225,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_development_state_is_refused_without_changing_records() {
+        let db = Connection::open_in_memory().unwrap();
+        assert!(check_stored_schema(&db).is_ok());
+        db.execute_batch(&SCHEMA.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY"))
+            .unwrap();
+        db.execute(
+            "INSERT INTO projects(id,path,name,created_at) VALUES(42,'/test','test',0)",
+            [],
+        )
+        .unwrap();
+        let error = check_stored_schema(&db).unwrap_err();
+        assert!(error.1.contains("earlier development schema"));
+        assert_eq!(
+            db.query_row("SELECT id FROM projects", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        let current = Connection::open_in_memory().unwrap();
+        current.execute_batch(SCHEMA).unwrap();
+        assert!(check_stored_schema(&current).is_ok());
+    }
 
     /// Project 1 with three working claude agents (1, 2, 3); project 2 with agent 4.
     fn st() -> St {

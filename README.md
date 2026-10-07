@@ -13,6 +13,8 @@ acom serve
 
 Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it; acom keeps none of its own state in your projects (the agents, of course, work on their files).
 
+Incompatible development databases are left untouched; startup explains how to use a separate data folder.
+
 ## Projects
 
 A project is a folder. Agents run in their project's folder, and only see that project's agents, threads and locks. Limits and settings cover all projects, since they protect your machine and subscriptions.
