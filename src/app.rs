@@ -187,6 +187,11 @@ impl Settings {
             }
         }
         let l = &self.limits;
+        for k in l.active_per_harness.keys().chain(l.usage.keys()) {
+            if !crate::harness::KNOWN.contains(&k.as_str()) {
+                return Err(bad(format!("unknown harness {k} in limits")));
+            }
+        }
         let mut all = vec![
             ("active agents".to_string(), &l.active),
             ("context".to_string(), &l.context),
@@ -2028,6 +2033,15 @@ mod tests {
             soft: Some(10.0),
             hard: Some(5.0),
         };
+        assert!(s.check().is_err());
+        let mut s = Settings::default();
+        s.limits.usage.insert(
+            "<img src=x onerror=alert(1)>".into(),
+            Limit {
+                soft: None,
+                hard: None,
+            },
+        );
         assert!(s.check().is_err());
     }
 }
