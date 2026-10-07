@@ -14,6 +14,14 @@ pub const GUIDE: &str = include_str!("guide.md");
 pub const STATES: [&str; 6] = ["working", "idle", "paused", "done", "closed", "crashed"];
 pub const MARKS: [&str; 3] = ["new", "in-progress", "handled"];
 
+/// Where acom keeps its data: `ACOM_HOME`, or `~/.acom`.
+pub fn acom_home() -> PathBuf {
+    match std::env::var_os("ACOM_HOME") {
+        Some(h) => PathBuf::from(h),
+        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".acom"),
+    }
+}
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,34 +122,42 @@ pub struct Settings {
     pub done_closes: bool,
 }
 
-fn strs(v: &[&str]) -> Vec<String> {
-    v.iter().map(|s| s.to_string()).collect()
-}
-
 impl Default for Settings {
     fn default() -> Self {
+        // Allow every model acom knows, and every effort any of them supports.
+        let cfg = |harness: &str, model: &str, flag: &str| {
+            let models = crate::harness::catalog(harness);
+            let mut efforts: Vec<String> = Vec::new();
+            for e in models.iter().flat_map(|m| m.efforts) {
+                if !efforts.iter().any(|x| x == e) {
+                    efforts.push(e.to_string());
+                }
+            }
+            HarnessCfg {
+                enabled: true,
+                models: models.iter().map(|m| m.id.to_string()).collect(),
+                efforts,
+                model: model.into(),
+                effort: "medium".into(),
+                flags: vec![flag.into()],
+            }
+        };
         let mut harnesses = BTreeMap::new();
         harnesses.insert(
             "claude".into(),
-            HarnessCfg {
-                enabled: true,
-                models: strs(&["fable", "opus", "sonnet", "haiku"]),
-                efforts: strs(&["low", "medium", "high", "xhigh", "max"]),
-                model: "sonnet".into(),
-                effort: "medium".into(),
-                flags: strs(&["--permission-mode", "acceptEdits"]),
-            },
+            cfg(
+                "claude",
+                "claude-opus-5-5",
+                "--dangerously-skip-permissions",
+            ),
         );
         harnesses.insert(
             "codex".into(),
-            HarnessCfg {
-                enabled: true,
-                models: strs(&["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]),
-                efforts: strs(&["low", "medium", "high", "xhigh", "max", "ultra"]),
-                model: "gpt-6.1-sol".into(),
-                effort: "medium".into(),
-                flags: strs(&["--sandbox", "workspace-write"]),
-            },
+            cfg(
+                "codex",
+                "gpt-6.1-sol",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ),
         );
         let per = |s, h| Limit {
             soft: Some(s),
@@ -162,7 +178,7 @@ impl Default for Settings {
                 context: per(160_000.0, 200_000.0),
             },
             auto_resume: true,
-            done_closes: false,
+            done_closes: true,
         }
     }
 }
@@ -224,7 +240,8 @@ pub struct Proc {
 
 pub struct St {
     pub db: Connection,
-    pub queues: HashMap<String, Vec<i64>>,
+    /// Lock queues by (project, lock name).
+    pub queues: HashMap<(i64, String), Vec<i64>>,
     pub procs: HashMap<i64, Proc>,
     pub over_hard: HashSet<String>,
     pub over_soft: HashSet<String>,
@@ -233,14 +250,16 @@ pub struct St {
 pub struct App {
     pub st: Mutex<St>,
     pub cv: Condvar,
-    pub dir: PathBuf,
+    /// Where acom keeps its data (`~/.acom`).
+    pub home: PathBuf,
     pub url: String,
     pub exe: PathBuf,
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, grp TEXT, task TEXT NOT NULL,
+  id INTEGER PRIMARY KEY, project INTEGER NOT NULL, name TEXT NOT NULL, grp TEXT, task TEXT NOT NULL,
   harness TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL,
   state TEXT NOT NULL, rest TEXT NOT NULL DEFAULT 'idle', status_text TEXT, session_id TEXT,
   launched_by INTEGER NOT NULL, launched_at INTEGER NOT NULL, pid INTEGER,
@@ -250,20 +269,22 @@ CREATE TABLE IF NOT EXISTS agents (
   cache_read INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
   turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER, wake_why TEXT,
   session_started INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, project INTEGER NOT NULL, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS marks (agent_id INTEGER NOT NULL, message_id INTEGER NOT NULL, mark TEXT NOT NULL, PRIMARY KEY (agent_id, message_id));
-CREATE TABLE IF NOT EXISTS locks (name TEXT PRIMARY KEY, about TEXT NOT NULL, created_at INTEGER NOT NULL,
-  holder INTEGER, acquired_at INTEGER, expires_at INTEGER, frozen INTEGER NOT NULL DEFAULT 0, frozen_left INTEGER);
+CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, about TEXT NOT NULL, created_at INTEGER NOT NULL,
+  holder INTEGER, acquired_at INTEGER, expires_at INTEGER, frozen INTEGER NOT NULL DEFAULT 0, frozen_left INTEGER,
+  PRIMARY KEY (project, name));
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
-CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 /// An agent row, as the rules need it.
 pub struct Agent {
+    pub project: i64,
     pub name: String,
     pub grp: Option<String>,
     pub task: String,
@@ -342,7 +363,7 @@ impl St {
         self.db
             .query_row(
                 "SELECT name,grp,task,harness,model,effort,state,rest,session_id,launched_by,
-                        pause_from,paused_at,done_req FROM agents WHERE id=?1",
+                        pause_from,paused_at,done_req,project FROM agents WHERE id=?1",
                 [id],
                 |r| {
                     Ok(Agent {
@@ -359,11 +380,22 @@ impl St {
                         pause_from: r.get(10)?,
                         paused_at: r.get(11)?,
                         done_req: r.get::<_, i64>(12)? != 0,
+                        project: r.get(13)?,
                     })
                 },
             )
             .optional()?
             .ok_or_else(|| not_found(format!("no agent {id}")))
+    }
+
+    /// A project's name and folder.
+    pub fn project(&self, id: i64) -> R<(String, String)> {
+        self.db
+            .query_row("SELECT name, path FROM projects WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?
+            .ok_or_else(|| not_found(format!("no project {id}")))
     }
 
     pub fn set_state(&self, id: i64, state: &str) -> R<()> {
@@ -375,12 +407,19 @@ impl St {
         Ok(())
     }
 
-    pub fn log(&self, actor: &str, what: &str) -> R<()> {
+    /// Record an activity line, for one project or (None) for all of them.
+    pub fn log(&self, project: Option<i64>, actor: &str, what: &str) -> R<()> {
         self.db.execute(
-            "INSERT INTO activity(at,actor,what) VALUES(?1,?2,?3)",
-            params![now(), actor, what],
+            "INSERT INTO activity(project,at,actor,what) VALUES(?1,?2,?3,?4)",
+            params![project, now(), actor, what],
         )?;
         Ok(())
+    }
+
+    /// Record an activity line about an agent, in its project.
+    pub fn log_for(&self, agent: i64, actor: &str, what: &str) -> R<()> {
+        let project = self.agent(agent)?.project;
+        self.log(Some(project), actor, what)
     }
 
     pub fn notice(&self, agent: i64, text: &str) -> R<()> {
@@ -439,6 +478,11 @@ impl St {
         if l.context.hard.is_some() {
             out += " (the harness compacts at the hard value)";
         }
+        out += if s.done_closes {
+            "\nWhen an agent runs `acom done` it's closed: only the user's messages wake it again."
+        } else {
+            "\nWhen an agent runs `acom done` it's done: any new message in its threads wakes it again."
+        };
         Ok(out)
     }
 
@@ -482,15 +526,16 @@ impl St {
 
     // ---------- locks ----------
 
-    fn release_lock(&mut self, name: &str, why: Option<&str>) -> R<()> {
-        let holder: Option<i64> =
-            self.db
-                .query_row("SELECT holder FROM locks WHERE name=?1", [name], |r| {
-                    r.get(0)
-                })?;
+    fn release_lock(&mut self, project: i64, name: &str, why: Option<&str>) -> R<()> {
+        let holder: Option<i64> = self.db.query_row(
+            "SELECT holder FROM locks WHERE project=?1 AND name=?2",
+            params![project, name],
+            |r| r.get(0),
+        )?;
         self.db.execute(
-            "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL, frozen=0, frozen_left=NULL WHERE name=?1",
-            [name],
+            "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL, frozen=0, frozen_left=NULL
+             WHERE project=?1 AND name=?2",
+            params![project, name],
         )?;
         if let (Some(h), Some(why)) = (holder, why) {
             self.notice(h, &format!("You no longer hold lock `{name}`: {why}. Acquire it again if you still need it."))?;
@@ -509,8 +554,9 @@ impl St {
     }
 
     pub fn release_all(&mut self, agent: i64, why: &str) -> R<()> {
+        let project = self.agent(agent)?.project;
         for name in self.held_by(agent)? {
-            self.release_lock(&name, Some(why))?;
+            self.release_lock(project, &name, Some(why))?;
         }
         Ok(())
     }
@@ -518,16 +564,16 @@ impl St {
     /// Expired TTLs free their locks. Frozen locks never expire.
     pub fn expire_locks(&mut self) -> R<bool> {
         let mut s = self.db.prepare(
-            "SELECT name FROM locks WHERE holder IS NOT NULL AND frozen=0 AND expires_at <= ?1",
+            "SELECT project, name FROM locks WHERE holder IS NOT NULL AND frozen=0 AND expires_at <= ?1",
         )?;
-        let names: Vec<String> = s
-            .query_map([now()], |r| r.get(0))?
+        let expired: Vec<(i64, String)> = s
+            .query_map([now()], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         drop(s);
-        for n in &names {
-            self.release_lock(n, Some("its TTL ran out"))?;
+        for (project, name) in &expired {
+            self.release_lock(*project, name, Some("its TTL ran out"))?;
         }
-        Ok(!names.is_empty())
+        Ok(!expired.is_empty())
     }
 
     /// Keep an agent's locks while it's paused: stop their TTL clocks.
@@ -650,10 +696,9 @@ pub enum LockMode {
 }
 
 impl App {
-    pub fn open(dir: PathBuf, url: String) -> R<Arc<App>> {
-        let data = dir.join(".acom");
-        std::fs::create_dir_all(data.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
-        let db = Connection::open(data.join("acom.db"))?;
+    pub fn open(home: PathBuf, url: String) -> R<Arc<App>> {
+        std::fs::create_dir_all(home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
+        let db = Connection::open(home.join("acom.db"))?;
         db.execute_batch(SCHEMA)?;
         db.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
@@ -684,7 +729,8 @@ impl App {
                 "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2, pid=NULL WHERE id=?1",
                 params![id, now()],
             )?;
-            st.log(
+            st.log_for(
+                id,
                 "acom",
                 &format!("paused agent {id}: the server restarted during its turn"),
             )?;
@@ -693,7 +739,7 @@ impl App {
         Ok(Arc::new(App {
             st: Mutex::new(st),
             cv: Condvar::new(),
-            dir,
+            home,
             url,
             exe,
         }))
@@ -711,11 +757,12 @@ impl App {
         self: &Arc<Self>,
         by: i64,
         via: Option<i64>,
+        project: Option<i64>,
         req: LaunchReq,
     ) -> R<(i64, Vec<String>)> {
         let mut st = self.lock();
         st.db.execute_batch("SAVEPOINT launch")?;
-        let r = self.launch_in(&mut st, by, via, req);
+        let r = self.launch_in(&mut st, by, via, project, req);
         let end = if r.is_ok() {
             "RELEASE launch"
         } else {
@@ -730,16 +777,25 @@ impl App {
         st: &mut St,
         by: i64,
         via: Option<i64>,
+        project: Option<i64>,
         req: LaunchReq,
     ) -> R<(i64, Vec<String>)> {
         let s = st.settings();
-        if by > 0 {
-            if st.agent(by)?.state != "working" {
+        // An agent's helpers join its project; the user picks one.
+        let project = if by > 0 {
+            let a = st.agent(by)?;
+            if a.state != "working" {
                 return Err(conflict("only a working agent can launch others"));
             }
-        } else if req.done {
-            return Err(bad("only an agent can mark itself done"));
-        }
+            a.project
+        } else {
+            if req.done {
+                return Err(bad("only an agent can mark itself done"));
+            }
+            let p = project.ok_or_else(|| bad("choose a project to launch the agent in"))?;
+            st.project(p)?;
+            p
+        };
         let harness = req.harness.unwrap_or_else(|| {
             s.harnesses
                 .iter()
@@ -762,18 +818,32 @@ impl App {
                     "harness {harness:?} isn't enabled (enabled: {ok:?})"
                 ))
             })?;
+        // The allowed lists restrict agents; the user can launch any model.
         let model = req.model.unwrap_or_else(|| h.model.clone());
-        if !h.models.contains(&model) {
+        if model.trim().is_empty() || model.contains(char::is_whitespace) {
+            return Err(bad(format!("{model:?} isn't a model ID")));
+        }
+        if by > 0 && !h.models.contains(&model) {
             return Err(bad(format!(
                 "model {model} isn't allowed for {harness} (allowed: {})",
                 h.models.join(", ")
             )));
         }
         let effort = req.effort.unwrap_or_else(|| h.effort.clone());
-        if !h.efforts.contains(&effort) {
+        if by > 0 && !h.efforts.contains(&effort) {
             return Err(bad(format!(
                 "effort {effort} isn't allowed for {harness} (allowed: {})",
                 h.efforts.join(", ")
+            )));
+        }
+        if let Some(m) = crate::harness::catalog(&harness)
+            .into_iter()
+            .find(|m| m.id == model)
+            && !m.efforts.contains(&effort.as_str())
+        {
+            return Err(bad(format!(
+                "{model} doesn't support effort {effort} (it supports {})",
+                m.efforts.join(", ")
             )));
         }
         if req.task.trim().is_empty() {
@@ -810,9 +880,9 @@ impl App {
             None
         };
         st.db.execute(
-            "INSERT INTO agents(name,grp,task,harness,model,effort,state,session_id,launched_by,launched_at)
-             VALUES(?1,?2,?3,?4,?5,?6,'idle',?7,?8,?9)",
-            params![req.name.clone().unwrap_or_default(), req.group, req.task, harness, model, effort, session, by, now()],
+            "INSERT INTO agents(project,name,grp,task,harness,model,effort,state,session_id,launched_by,launched_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'idle',?8,?9,?10)",
+            params![project, req.name.clone().unwrap_or_default(), req.group, req.task, harness, model, effort, session, by, now()],
         )?;
         let id = st.db.last_insert_rowid();
         if req.name.as_deref().unwrap_or("").is_empty() {
@@ -822,6 +892,7 @@ impl App {
             )?;
         }
         st.log(
+            Some(project),
             &actor(by, via),
             &format!("launched agent {id} ({harness} / {model} / {effort})"),
         )?;
@@ -837,8 +908,9 @@ impl App {
             .as_ref()
             .map(|g| format!(", group \"{g}\""))
             .unwrap_or_default();
+        let (project, path) = st.project(a.project)?;
         Ok(format!(
-            "You are agent {id} (\"{}\"{group}), launched by {} through acom, running {} / {} / effort {}.\n\n{GUIDE}\n## Limits right now\n\n{}\n\n## Your task\n\n{}\n",
+            "You are agent {id} (\"{}\"{group}) in project \"{project}\" ({path}), launched by {} through acom, running {} / {} / effort {}.\n\n{GUIDE}\n## Limits and rules right now\n\n{}\n\n## Your task\n\n{}\n",
             a.name,
             who(a.launched_by),
             a.harness,
@@ -918,12 +990,17 @@ impl App {
                             "UPDATE agents SET wake_why=?2 WHERE id=?1",
                             params![id, why],
                         )?;
-                        st.log("acom", &format!("agent {id} is waiting to be woken: {why}"))?;
+                        st.log_for(
+                            id,
+                            "acom",
+                            &format!("agent {id} is waiting to be woken: {why}"),
+                        )?;
                     }
                 }
                 None => {
                     if !r["wake_why"].is_null() {
-                        st.log(
+                        st.log_for(
+                            id,
                             "acom",
                             &format!("woke agent {id} (it was waiting for room under the limits)"),
                         )?;
@@ -973,12 +1050,13 @@ impl App {
             st.release_all(id, &why)?;
         }
         if next == "crashed" {
-            st.log(
+            st.log_for(
+                id,
                 "acom",
                 &format!("agent {id} crashed (its process exited with an error)"),
             )?;
         } else if a.done_req {
-            st.log(&who(id), &format!("finished: {next}"))?;
+            st.log_for(id, &who(id), &format!("finished: {next}"))?;
         }
         self.maybe_wake(&mut st, id)?;
         self.cv.notify_all();
@@ -1025,7 +1103,7 @@ impl App {
             p.stopping = true;
             run::stop(p.pid);
         }
-        st.log(by, &format!("paused agent {id}"))?;
+        st.log_for(id, by, &format!("paused agent {id}"))?;
         self.cv.notify_all();
         Ok(())
     }
@@ -1075,7 +1153,7 @@ impl App {
             "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL WHERE id=?1",
             [id],
         )?;
-        st.log(by, &format!("resumed agent {id}"))?;
+        st.log_for(id, by, &format!("resumed agent {id}"))?;
         if a.state == "crashed" {
             let updates = st.take_updates(id)?;
             let prompt = format!(
@@ -1144,7 +1222,7 @@ impl App {
         st.release_all(id, "you were closed")?;
         st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, rest='idle' WHERE id=?1", [id])?;
         st.set_state(id, "closed")?;
-        st.log(by, &format!("closed agent {id}"))?;
+        st.log_for(id, by, &format!("closed agent {id}"))?;
         self.cv.notify_all();
         Ok(())
     }
@@ -1155,11 +1233,15 @@ impl App {
             return Err(conflict(format!("agent {id} isn't closed")));
         }
         st.set_state(id, "idle")?;
-        st.log(by, &format!("reopened agent {id}"))?;
+        st.log_for(id, by, &format!("reopened agent {id}"))?;
         self.maybe_wake(&mut st, id)
     }
 
     // ---------- agent self-service ----------
+
+    pub fn agent_project(&self, id: i64) -> R<i64> {
+        Ok(self.lock().agent(id)?.project)
+    }
 
     pub fn set_status(&self, id: i64, text: &str) -> R<()> {
         let st = self.lock();
@@ -1204,7 +1286,8 @@ impl App {
 
     // ---------- threads and messages ----------
 
-    fn resolve(st: &St, sel: &[String]) -> R<Vec<i64>> {
+    /// Agents named by IDs or selectors, all within one project.
+    fn resolve(st: &St, project: i64, sel: &[String]) -> R<Vec<i64>> {
         let mut ids = Vec::new();
         for s in sel
             .iter()
@@ -1213,25 +1296,25 @@ impl App {
             .filter(|s| !s.is_empty())
         {
             let found: Vec<i64> = if let Ok(id) = s.parse::<i64>() {
-                st.agent(id)?;
+                if st.agent(id)?.project != project {
+                    return Err(bad(format!("agent {id} is in another project")));
+                }
                 vec![id]
             } else {
-                let (sql, arg) = if let Some(g) = s.strip_prefix("group:") {
-                    ("SELECT id FROM agents WHERE grp=?1", g.to_string())
+                let (cond, arg) = if let Some(g) = s.strip_prefix("group:") {
+                    ("grp=?1", g.to_string())
                 } else if s == "active" {
-                    (
-                        "SELECT id FROM agents WHERE state IN ('working','idle') AND ?1=?1",
-                        String::new(),
-                    )
+                    ("state IN ('working','idle') AND ?1=?1", String::new())
                 } else if STATES.contains(&s) {
-                    ("SELECT id FROM agents WHERE state=?1", s.to_string())
+                    ("state=?1", s.to_string())
                 } else {
                     return Err(bad(format!(
                         "unknown member {s:?}: use agent IDs, active, {}, or group:<name>",
                         STATES.join(", ")
                     )));
                 };
-                rows(&st.db, sql, [arg])?
+                let sql = format!("SELECT id FROM agents WHERE {cond} AND project=?2 ORDER BY id");
+                rows(&st.db, &sql, params![arg, project])?
                     .iter()
                     .map(|r| r["id"].as_i64().unwrap())
                     .collect()
@@ -1248,6 +1331,7 @@ impl App {
     pub fn new_thread(
         self: &Arc<Self>,
         by: i64,
+        project: Option<i64>,
         title: &str,
         members: &[String],
     ) -> R<(i64, Vec<i64>)> {
@@ -1255,19 +1339,23 @@ impl App {
         if title.trim().is_empty() {
             return Err(bad("the thread needs a title"));
         }
-        let mut ids = Self::resolve(&st, members)?;
-        if by > 0 {
-            st.agent(by)?;
-            if !ids.contains(&by) {
-                ids.insert(0, by);
-            }
+        let project = if by > 0 {
+            st.agent(by)?.project
+        } else {
+            let p = project.ok_or_else(|| bad("choose a project for the thread"))?;
+            st.project(p)?;
+            p
+        };
+        let mut ids = Self::resolve(&st, project, members)?;
+        if by > 0 && !ids.contains(&by) {
+            ids.insert(0, by);
         }
         if ids.is_empty() {
             return Err(bad("the thread has no members"));
         }
         st.db.execute(
-            "INSERT INTO threads(title,created_by,created_at) VALUES(?1,?2,?3)",
-            params![title.trim(), by, now()],
+            "INSERT INTO threads(project,title,created_by,created_at) VALUES(?1,?2,?3,?4)",
+            params![project, title.trim(), by, now()],
         )?;
         let tid = st.db.last_insert_rowid();
         for id in &ids {
@@ -1281,8 +1369,8 @@ impl App {
 
     pub fn add_members(self: &Arc<Self>, tid: i64, members: &[String]) -> R<Vec<i64>> {
         let mut st = self.lock();
-        Self::thread_exists(&st, tid)?;
-        let ids = Self::resolve(&st, members)?;
+        let project = Self::thread_project(&st, tid)?;
+        let ids = Self::resolve(&st, project, members)?;
         for id in &ids {
             st.db.execute(
                 "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
@@ -1296,17 +1384,13 @@ impl App {
         Ok(ids)
     }
 
-    fn thread_exists(st: &St, tid: i64) -> R<()> {
-        let n: i64 = st
-            .db
-            .query_row("SELECT count(*) FROM threads WHERE id=?1", [tid], |r| {
+    fn thread_project(st: &St, tid: i64) -> R<i64> {
+        st.db
+            .query_row("SELECT project FROM threads WHERE id=?1", [tid], |r| {
                 r.get(0)
-            })?;
-        if n == 0 {
-            Err(not_found(format!("no thread {tid}")))
-        } else {
-            Ok(())
-        }
+            })
+            .optional()?
+            .ok_or_else(|| not_found(format!("no thread {tid}")))
     }
 
     /// Post a message. Returns its ID and the members it couldn't wake (and why).
@@ -1317,12 +1401,14 @@ impl App {
         text: &str,
     ) -> R<(i64, Vec<(i64, String)>)> {
         let mut st = self.lock();
-        Self::thread_exists(&st, tid)?;
+        let project = Self::thread_project(&st, tid)?;
         if text.trim().is_empty() {
             return Err(bad("the message is empty"));
         }
         if sender > 0 {
-            st.agent(sender)?;
+            if st.agent(sender)?.project != project {
+                return Err(bad(format!("thread {tid} is in another project")));
+            }
             st.db.execute(
                 "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
                 params![tid, sender],
@@ -1351,13 +1437,23 @@ impl App {
         for &m in &members {
             self.maybe_wake(&mut st, m)?;
         }
+        // Tell the sender who won't see it yet, and why.
         let mut not_woken = Vec::new();
         for m in members {
+            let state = st.agent(m)?.state;
             let why: Option<String> =
                 st.db
                     .query_row("SELECT wake_why FROM agents WHERE id=?1", [m], |r| r.get(0))?;
-            if let Some(why) = why {
-                not_woken.push((m, why));
+            let reason = match state.as_str() {
+                "closed" if sender != 0 => {
+                    Some("it's closed, so only the user's messages wake it".to_string())
+                }
+                "paused" => Some("it's paused; it will see this when it's resumed".into()),
+                "crashed" => Some("it crashed; it will see this if the user resumes it".into()),
+                _ => why.map(|w| format!("{w}; it will be woken when there's room")),
+            };
+            if let Some(reason) = reason {
+                not_woken.push((m, reason));
             }
         }
         self.cv.notify_all();
@@ -1409,14 +1505,15 @@ impl App {
 
     // ---------- locks ----------
 
-    pub fn new_lock(&self, name: &str, about: &str) -> R<()> {
+    pub fn new_lock(&self, project: i64, name: &str, about: &str) -> R<()> {
         let st = self.lock();
+        st.project(project)?;
         if name.trim().is_empty() || name.contains('\n') {
             return Err(bad("a lock name is non-empty text on one line"));
         }
         let n = st.db.execute(
-            "INSERT OR IGNORE INTO locks(name,about,created_at) VALUES(?1,?2,?3)",
-            params![name, about, now()],
+            "INSERT OR IGNORE INTO locks(project,name,about,created_at) VALUES(?1,?2,?3,?4)",
+            params![project, name, about, now()],
         )?;
         if n == 0 {
             return Err(conflict(format!("lock {name} already exists")));
@@ -1424,11 +1521,11 @@ impl App {
         Ok(())
     }
 
-    fn lock_row(st: &St, name: &str) -> R<(Option<i64>, i64)> {
+    fn lock_row(st: &St, project: i64, name: &str) -> R<(Option<i64>, i64)> {
         st.db
             .query_row(
-                "SELECT holder, coalesce(acquired_at,0) FROM locks WHERE name=?1",
-                [name],
+                "SELECT holder, coalesce(acquired_at,0) FROM locks WHERE project=?1 AND name=?2",
+                params![project, name],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
@@ -1439,12 +1536,15 @@ impl App {
             })
     }
 
-    /// Take a lock, waiting in a first-come-first-served queue for up to `wait` seconds.
+    /// Take a lock in the agent's project, waiting in a first-come-first-served queue
+    /// for up to `wait` seconds.
     pub fn acquire(&self, agent: i64, name: &str, wait: u64, ttl: Option<u64>) -> R<String> {
         let deadline = Instant::now() + Duration::from_secs(wait);
         let mut st = self.lock();
+        let project = st.agent(agent)?.project;
+        let key = (project, name.to_string());
         let leave = |st: &mut St| {
-            if let Some(q) = st.queues.get_mut(name) {
+            if let Some(q) = st.queues.get_mut(&key) {
                 q.retain(|&a| a != agent);
             }
         };
@@ -1457,35 +1557,30 @@ impl App {
                     "you're not working (paused or stopped), so you left the queue",
                 ));
             }
-            let (holder, since) = Self::lock_row(&st, name)?;
+            let (holder, since) = Self::lock_row(&st, project, name)?;
             let expires = ttl.map(|t| now() + t as i64);
+            let until = |e: Option<i64>| {
+                e.map(|e| format!(", expires {}", hhmm(e)))
+                    .unwrap_or_default()
+            };
             if holder == Some(agent) {
                 st.db.execute(
-                    "UPDATE locks SET expires_at=?2 WHERE name=?1",
-                    params![name, expires],
+                    "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
+                    params![project, name, expires],
                 )?;
                 leave(&mut st);
-                return Ok(format!(
-                    "renewed {name}{}",
-                    expires
-                        .map(|e| format!(", expires {}", hhmm(e)))
-                        .unwrap_or_default()
-                ));
+                return Ok(format!("renewed {name}{}", until(expires)));
             }
-            let first = st.queues.get(name).and_then(|q| q.first().copied());
+            let first = st.queues.get(&key).and_then(|q| q.first().copied());
             if holder.is_none() && (first.is_none() || first == Some(agent)) {
                 st.db.execute(
-                    "UPDATE locks SET holder=?2, acquired_at=?3, expires_at=?4, frozen=0, frozen_left=NULL WHERE name=?1",
-                    params![name, agent, now(), expires],
+                    "UPDATE locks SET holder=?3, acquired_at=?4, expires_at=?5, frozen=0, frozen_left=NULL
+                     WHERE project=?1 AND name=?2",
+                    params![project, name, agent, now(), expires],
                 )?;
                 leave(&mut st);
                 self.cv.notify_all();
-                return Ok(format!(
-                    "acquired {name}{}",
-                    expires
-                        .map(|e| format!(", expires {}", hhmm(e)))
-                        .unwrap_or_default()
-                ));
+                return Ok(format!("acquired {name}{}", until(expires)));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -1503,7 +1598,7 @@ impl App {
                 };
                 return Err(conflict(format!("{name} is {by}")));
             }
-            let q = st.queues.entry(name.to_string()).or_default();
+            let q = st.queues.entry(key.clone()).or_default();
             if !q.contains(&agent) {
                 q.push(agent);
             }
@@ -1518,45 +1613,48 @@ impl App {
     pub fn release(&self, agent: i64, name: &str) -> R<()> {
         let mut st = self.lock();
         st.expire_locks()?;
-        let (holder, _) = Self::lock_row(&st, name)?;
+        let project = st.agent(agent)?.project;
+        let (holder, _) = Self::lock_row(&st, project, name)?;
         if holder != Some(agent) {
             return Err(conflict(format!("you don't hold {name}")));
         }
-        st.release_lock(name, None)?;
+        st.release_lock(project, name, None)?;
         self.cv.notify_all();
         Ok(())
     }
 
-    pub fn free(&self, name: &str, by: &str) -> R<()> {
+    pub fn free(&self, project: i64, name: &str, by: &str) -> R<()> {
         let mut st = self.lock();
-        let (holder, _) = Self::lock_row(&st, name)?;
-        if holder.is_none() {
+        let (holder, _) = Self::lock_row(&st, project, name)?;
+        let Some(holder) = holder else {
             return Err(conflict(format!("{name} isn't held")));
-        }
-        st.release_lock(name, Some("the user freed it"))?;
+        };
+        st.release_lock(project, name, Some("the user freed it"))?;
         st.log(
+            Some(project),
             by,
-            &format!("freed lock {name} (held by agent {})", holder.unwrap()),
+            &format!("freed lock {name} (held by agent {holder})"),
         )?;
         self.cv.notify_all();
         Ok(())
     }
 
-    pub fn locks(&self) -> R<Vec<Value>> {
+    pub fn locks(&self, project: Option<i64>) -> R<Vec<Value>> {
         let st = self.lock();
         let mut v = rows(
             &st.db,
-            "SELECT l.name, l.about, l.holder, a.name holder_name, a.state holder_state, l.acquired_at, l.expires_at, l.frozen, l.frozen_left
-             FROM locks l LEFT JOIN agents a ON a.id=l.holder ORDER BY l.name",
-            [],
+            "SELECT l.project, l.name, l.about, l.holder, a.name holder_name, a.state holder_state,
+                    l.acquired_at, l.expires_at, l.frozen, l.frozen_left
+             FROM locks l LEFT JOIN agents a ON a.id=l.holder
+             WHERE ?1 IS NULL OR l.project=?1 ORDER BY l.project, l.name",
+            [project],
         )?;
         for l in &mut v {
-            let q = st
-                .queues
-                .get(l["name"].as_str().unwrap())
-                .cloned()
-                .unwrap_or_default();
-            l["queue"] = json!(q);
+            let key = (
+                l["project"].as_i64().unwrap(),
+                l["name"].as_str().unwrap().to_string(),
+            );
+            l["queue"] = json!(st.queues.get(&key).cloned().unwrap_or_default());
         }
         Ok(v)
     }
@@ -1677,6 +1775,7 @@ impl App {
                         self.pause_locked(&mut st, *id, LockMode::Release, "limit", "acom")?;
                     }
                     st.log(
+                        None,
                         "acom",
                         &format!("hard limit reached: {line}; paused {} agent(s)", ids.len()),
                     )?;
@@ -1721,9 +1820,12 @@ impl App {
             "INSERT OR REPLACE INTO settings(key,value) VALUES('settings',?1)",
             [serde_json::to_string(&new).unwrap()],
         )?;
-        st.log(by, "changed settings")?;
-        if old.limits != new.limits {
-            let text = format!("The user changed the limits. Now:\n{}", st.limits_text()?);
+        st.log(None, by, "changed settings")?;
+        if old.limits != new.limits || old.done_closes != new.done_closes {
+            let text = format!(
+                "The user changed the limits or rules. Now:\n{}",
+                st.limits_text()?
+            );
             for r in rows(
                 &st.db,
                 "SELECT id FROM agents WHERE state NOT IN ('closed','crashed')",
@@ -1735,21 +1837,106 @@ impl App {
         Ok(())
     }
 
-    // ---------- views ----------
+    // ---------- projects ----------
 
-    pub fn agents(&self, group: Option<&str>) -> R<Vec<Value>> {
+    /// Add a folder as a project, or return it if it already is one.
+    pub fn add_project(&self, path: &str, by: &str) -> R<Value> {
         let st = self.lock();
-        Self::agents_locked(&st, group)
+        let p = std::fs::canonicalize(path).map_err(|e| bad(format!("{path}: {e}")))?;
+        if !p.is_dir() {
+            return Err(bad(format!("{} isn't a folder", p.display())));
+        }
+        let path = p.to_string_lossy().to_string();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        let added = st.db.execute(
+            "INSERT OR IGNORE INTO projects(path,name,created_at) VALUES(?1,?2,?3)",
+            params![path, name, now()],
+        )? > 0;
+        let id: i64 = st
+            .db
+            .query_row("SELECT id FROM projects WHERE path=?1", [&path], |r| {
+                r.get(0)
+            })?;
+        if added {
+            st.log(Some(id), by, &format!("added project {path}"))?;
+        }
+        let (name, path) = st.project(id)?;
+        Ok(json!({ "id": id, "name": name, "path": path, "added": added }))
     }
 
-    fn agents_locked(st: &St, group: Option<&str>) -> R<Vec<Value>> {
+    /// The project a folder is in: the closest project folder at or above it.
+    pub fn project_at(&self, path: &str) -> R<Value> {
+        let st = self.lock();
+        let p = std::fs::canonicalize(path).map_err(|e| bad(format!("{path}: {e}")))?;
+        let mut dir = Some(p.as_path());
+        while let Some(d) = dir {
+            let found = rows(
+                &st.db,
+                "SELECT id, name, path FROM projects WHERE path=?1",
+                [d.to_string_lossy()],
+            )?;
+            if let Some(v) = found.into_iter().next() {
+                return Ok(v);
+            }
+            dir = d.parent();
+        }
+        Err(not_found(format!(
+            "{} isn't in an acom project; add it with `acom project add`",
+            p.display()
+        )))
+    }
+
+    pub fn projects(&self) -> R<Vec<Value>> {
+        let st = self.lock();
+        rows(
+            &st.db,
+            "SELECT p.id, p.name, p.path,
+                    (SELECT count(*) FROM agents a WHERE a.project=p.id) agents,
+                    (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active
+             FROM projects p ORDER BY p.name, p.id",
+            [],
+        )
+    }
+
+    /// Remove a project that never had agents (e.g. one added by mistake).
+    pub fn remove_project(&self, id: i64, by: &str) -> R<()> {
+        let st = self.lock();
+        let (_, path) = st.project(id)?;
+        let n: i64 =
+            st.db
+                .query_row("SELECT count(*) FROM agents WHERE project=?1", [id], |r| {
+                    r.get(0)
+                })?;
+        if n > 0 {
+            return Err(conflict(format!(
+                "{path} has agents, so it stays; only a project without agents can be removed"
+            )));
+        }
+        st.db.execute("DELETE FROM locks WHERE project=?1", [id])?;
+        st.db.execute("DELETE FROM projects WHERE id=?1", [id])?;
+        st.log(None, by, &format!("removed project {path}"))?;
+        Ok(())
+    }
+
+    // ---------- views ----------
+
+    pub fn agents(&self, project: Option<i64>, group: Option<&str>) -> R<Vec<Value>> {
+        let st = self.lock();
+        Self::agents_locked(&st, project, group)
+    }
+
+    fn agents_locked(st: &St, project: Option<i64>, group: Option<&str>) -> R<Vec<Value>> {
         let mut v = rows(
             &st.db,
-            "SELECT id, name, grp \"group\", task, harness, model, effort, state, status_text status, session_id session,
-                    launched_by, launched_at, pause_reason, paused_at, context, fresh_in, cache_write, cache_read, output,
-                    turns, ended_at, wake_queued_at, wake_why wake_reason
-             FROM agents WHERE ?1 IS NULL OR grp=?1 ORDER BY id",
-            [group],
+            "SELECT id, project, name, grp \"group\", task, harness, model, effort, state, status_text status,
+                    session_id session, launched_by, launched_at, pause_reason, paused_at, context,
+                    fresh_in, cache_write, cache_read, output, turns, ended_at, wake_queued_at,
+                    wake_why wake_reason
+             FROM agents WHERE (?1 IS NULL OR project=?1) AND (?2 IS NULL OR grp=?2) ORDER BY id",
+            params![project, group],
         )?;
         for a in &mut v {
             let id = a["id"].as_i64().unwrap();
@@ -1760,11 +1947,14 @@ impl App {
 
     pub fn agent_view(&self, id: i64) -> R<Value> {
         let st = self.lock();
-        st.agent(id)?;
-        let mut a = Self::agents_locked(&st, None)?
+        let project = st.agent(id)?.project;
+        let mut a = Self::agents_locked(&st, Some(project), None)?
             .into_iter()
             .find(|a| a["id"] == id)
             .unwrap();
+        let (name, path) = st.project(project)?;
+        a["project_name"] = json!(name);
+        a["project_path"] = json!(path);
         a["limits"] = json!(st.limits_text()?);
         a["lost_locks"] = json!(rows(
             &st.db,
@@ -1774,16 +1964,18 @@ impl App {
         Ok(a)
     }
 
-    pub fn threads(&self, agent: Option<i64>) -> R<Vec<Value>> {
+    pub fn threads(&self, project: Option<i64>, agent: Option<i64>) -> R<Vec<Value>> {
         let st = self.lock();
         let mut v = rows(
             &st.db,
-            "SELECT t.id, t.title, t.created_by, t.created_at,
+            "SELECT t.id, t.project, t.title, t.created_by, t.created_at,
                     (SELECT count(*) FROM messages m WHERE m.thread_id=t.id) messages,
                     (SELECT max(at) FROM messages m WHERE m.thread_id=t.id) last_at
-             FROM threads t WHERE ?1 IS NULL OR EXISTS (SELECT 1 FROM members b WHERE b.thread_id=t.id AND b.agent_id=?1)
+             FROM threads t
+             WHERE (?1 IS NULL OR t.project=?1)
+               AND (?2 IS NULL OR EXISTS (SELECT 1 FROM members b WHERE b.thread_id=t.id AND b.agent_id=?2))
              ORDER BY coalesce(last_at, t.created_at) DESC",
-            [agent],
+            params![project, agent],
         )?;
         for t in &mut v {
             let ids = rows(
@@ -1798,10 +1990,10 @@ impl App {
 
     pub fn thread(&self, tid: i64) -> R<Value> {
         let st = self.lock();
-        Self::thread_exists(&st, tid)?;
+        Self::thread_project(&st, tid)?;
         let mut t = rows(
             &st.db,
-            "SELECT id, title, created_by, created_at FROM threads WHERE id=?1",
+            "SELECT id, project, title, created_by, created_at FROM threads WHERE id=?1",
             [tid],
         )?
         .remove(0);
@@ -1844,12 +2036,14 @@ impl App {
         )
     }
 
-    pub fn activity(&self, limit: i64) -> R<Vec<Value>> {
+    /// Recent activity for a project (with the lines about all projects), or for everything.
+    pub fn activity(&self, project: Option<i64>, limit: i64) -> R<Vec<Value>> {
         let st = self.lock();
         rows(
             &st.db,
-            "SELECT id, at, actor, what FROM activity ORDER BY id DESC LIMIT ?1",
-            [limit],
+            "SELECT id, project, at, actor, what FROM activity
+             WHERE ?1 IS NULL OR project IS NULL OR project=?1 ORDER BY id DESC LIMIT ?2",
+            params![project, limit],
         )
     }
 
@@ -1862,14 +2056,19 @@ impl App {
 mod tests {
     use super::*;
 
+    /// Project 1 with three working claude agents (1, 2, 3); project 2 with agent 4.
     fn st() -> St {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
-        for id in 1..=3 {
+        db.execute_batch(
+            "INSERT INTO projects(id,path,name,created_at) VALUES(1,'/p1','p1',0),(2,'/p2','p2',0)",
+        )
+        .unwrap();
+        for (id, project) in [(1, 1), (2, 1), (3, 1), (4, 2)] {
             db.execute(
-                "INSERT INTO agents(id,name,task,harness,model,effort,state,launched_by,launched_at)
-                 VALUES(?1,'a','t','claude','m','e','working',0,0)",
-                [id],
+                "INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at)
+                 VALUES(?1,?2,'a','t','claude','m','e','working',0,0)",
+                [id, project],
             )
             .unwrap();
         }
@@ -1885,7 +2084,7 @@ mod tests {
     fn hold(st: &St, name: &str, holder: i64, expires_at: Option<i64>) {
         st.db
             .execute(
-                "INSERT INTO locks(name,about,created_at,holder,acquired_at,expires_at) VALUES(?1,'x',0,?2,0,?3)",
+                "INSERT INTO locks(project,name,about,created_at,holder,acquired_at,expires_at) VALUES(1,?1,'x',0,?2,0,?3)",
                 params![name, holder, expires_at],
             )
             .unwrap();
@@ -1947,7 +2146,7 @@ mod tests {
         let mut st = st();
         st.db
             .execute(
-                "INSERT INTO threads(id,title,created_by,created_at) VALUES(1,'t',0,0)",
+                "INSERT INTO threads(id,project,title,created_by,created_at) VALUES(1,1,'t',0,0)",
                 [],
             )
             .unwrap();
@@ -1985,11 +2184,11 @@ mod tests {
 
     #[test]
     fn room_follows_the_hard_limits_and_unset_means_no_limit() {
-        let st = st(); // three working claude agents
+        let st = st(); // four working claude agents, across two projects
         let mut s = Settings::default();
         s.limits.active = Limit {
             soft: None,
-            hard: Some(3.0),
+            hard: Some(4.0),
         };
         s.limits.active_per_harness.clear();
         let save = |st: &St, s: &Settings| {
@@ -2004,7 +2203,7 @@ mod tests {
         let why = st.no_room("claude").unwrap().unwrap();
         assert_eq!(
             why,
-            "Hard limit reached: 3 active agents (soft none, hard 3)"
+            "Hard limit reached: 4 active agents (soft none, hard 4)"
         );
         // An agent that marked itself done no longer takes a slot.
         st.db
@@ -2021,8 +2220,56 @@ mod tests {
         assert!(
             st.limits_text()
                 .unwrap()
-                .starts_with("Active agents: 3 (no limit)")
+                .starts_with("Active agents: 4 (no limit)")
         );
+    }
+
+    #[test]
+    fn members_and_selectors_stay_within_the_project() {
+        let st = st();
+        let p1 = App::resolve(&st, 1, &["active".into()]).unwrap();
+        assert_eq!(p1, [1, 2, 3]);
+        assert_eq!(App::resolve(&st, 2, &["working".into()]).unwrap(), [4]);
+        let err = App::resolve(&st, 1, &["2,4".into()]).unwrap_err();
+        assert_eq!(err.1, "agent 4 is in another project");
+    }
+
+    #[test]
+    fn the_same_lock_name_is_separate_in_each_project() {
+        let mut st = st();
+        hold(&st, "build", 1, None);
+        st.db
+            .execute(
+                "INSERT INTO locks(project,name,about,created_at,holder) VALUES(2,'build','x',0,4)",
+                [],
+            )
+            .unwrap();
+        st.release_all(1, "test").unwrap();
+        let holders: Vec<Option<i64>> = rows(
+            &st.db,
+            "SELECT holder FROM locks WHERE name='build' ORDER BY project",
+            [],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r["holder"].as_i64())
+        .collect();
+        assert_eq!(holders, [None, Some(4)]);
+    }
+
+    #[test]
+    fn defaults_skip_permissions_close_on_done_and_allow_the_catalog() {
+        let s = Settings::default();
+        assert!(s.done_closes);
+        let claude = &s.harnesses["claude"];
+        assert_eq!(claude.flags, ["--dangerously-skip-permissions"]);
+        assert_eq!(claude.model, "claude-opus-5-5");
+        assert!(claude.models.contains(&"claude-mythos-5-1".to_string()));
+        assert!(s.check().is_ok());
+        let st = st();
+        assert!(st.limits_text().unwrap().ends_with(
+            "When an agent runs `acom done` it's closed: only the user's messages wake it again."
+        ));
     }
 
     #[test]

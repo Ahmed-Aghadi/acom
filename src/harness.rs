@@ -36,6 +36,22 @@ pub enum Event {
     Text(String),
 }
 
+/// A model the harness offers, with the effort levels it supports.
+#[derive(serde::Serialize, Clone)]
+pub struct Model {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub efforts: &'static [&'static str],
+}
+
+/// The models acom knows for a harness. Others can still be used by typing their ID.
+pub fn catalog(harness: &str) -> Vec<Model> {
+    match harness {
+        "claude" => claude_catalog(),
+        _ => codex_catalog(),
+    }
+}
+
 /// The command for one turn, plus what to write to its stdin (None means stdin is closed).
 pub fn command(l: &Launch) -> (Command, Option<String>) {
     match l.harness {
@@ -102,6 +118,26 @@ fn quote(p: &Path) -> String {
 }
 
 // ---------- Claude Code ----------
+
+pub fn claude_catalog() -> Vec<Model> {
+    let efforts: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    [
+        ("claude-opus-5-5", "Opus 5.5"),
+        ("claude-fable-5-1", "Fable 5.1"),
+        ("claude-sonnet-5-5", "Sonnet 5.5"),
+        ("claude-haiku-4-5", "Haiku 4.5"),
+        ("claude-sonnet-5", "Sonnet 5"),
+        ("claude-opus-5", "Opus 5"),
+        ("claude-fable-5", "Fable 5"),
+        ("claude-opus-4-8", "Opus 4.8"),
+        ("claude-opus-4-7", "Opus 4.7"),
+        ("claude-sonnet-4-6", "Sonnet 4.6"),
+        ("claude-mythos-5-1", "Mythos 5.1"),
+    ]
+    .into_iter()
+    .map(|(id, name)| Model { id, name, efforts })
+    .collect()
+}
 
 fn claude_command(l: &Launch) -> (Command, Option<String>) {
     let mut c = Command::new("claude");
@@ -208,6 +244,23 @@ fn claude_events(v: &Value) -> Vec<Event> {
 }
 
 // ---------- Codex ----------
+
+pub fn codex_catalog() -> Vec<Model> {
+    let full: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    let luna: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    [
+        ("gpt-6.1-sol", "GPT-6.1 Sol", full),
+        ("gpt-6-astra", "GPT-6 Astra", full),
+        ("gpt-6-sol", "GPT-6 Sol", full),
+        ("gpt-6-luna", "GPT-6 Luna", luna),
+        ("gpt-5.6-sol", "GPT-5.6 Sol", full),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", full),
+        ("gpt-5.6-luna", "GPT-5.6 Luna", luna),
+    ]
+    .into_iter()
+    .map(|(id, name, efforts)| Model { id, name, efforts })
+    .collect()
+}
 
 fn codex_command(l: &Launch) -> (Command, Option<String>) {
     let mut c = Command::new("codex");
@@ -585,5 +638,46 @@ mod tests {
         assert!(args.iter().any(|x| x == "--skip-git-repo-check"));
         assert_eq!(args[args.len() - 2..], ["session-1", "-"]);
         assert_eq!(input.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn permission_defaults_are_used_on_first_and_resumed_turns() {
+        let settings = crate::app::Settings::default();
+        for (harness, permission) in [
+            ("claude", "--dangerously-skip-permissions"),
+            ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+        ] {
+            let cfg = &settings.harnesses[harness];
+            assert_eq!(cfg.flags, [permission]);
+            for resume in [false, true] {
+                let launch = Launch {
+                    harness,
+                    model: &cfg.model,
+                    effort: &cfg.effort,
+                    session: Some("session-1"),
+                    resume,
+                    prompt: "hello",
+                    context_limit: 0,
+                    flags: &cfg.flags,
+                    acom: Path::new("/tmp/acom"),
+                };
+                let (command, _) = command(&launch);
+                assert!(command.get_args().any(|arg| arg == permission));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_catalog_has_full_ids_and_model_specific_efforts() {
+        let models = codex_catalog();
+        assert_eq!(models.len(), 7);
+        for model in models {
+            assert!(model.id.starts_with("gpt-"));
+            assert!(model.efforts.contains(&"medium"));
+            assert_eq!(
+                model.efforts.contains(&"ultra"),
+                !model.id.ends_with("luna")
+            );
+        }
     }
 }

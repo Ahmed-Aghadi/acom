@@ -41,7 +41,7 @@ pub fn stop(pid: u32) {
 }
 
 pub fn log_path(app: &App, id: i64, ext: &str) -> PathBuf {
-    app.dir.join(".acom/logs").join(format!("{id}.{ext}"))
+    app.home.join("logs").join(format!("{id}.{ext}"))
 }
 
 fn append(path: &PathBuf, line: &str) {
@@ -103,7 +103,8 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         .append(true)
         .open(log_path(app, id, "err"))
         .map_err(|e| Fail(500, e.to_string()))?;
-    cmd.current_dir(&app.dir)
+    let (_, project_dir) = st.project(a.project)?;
+    cmd.current_dir(project_dir)
         .env("ACOM_ID", id.to_string())
         .env("ACOM_URL", &app.url)
         .env("PATH", path)

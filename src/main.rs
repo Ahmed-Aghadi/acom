@@ -7,15 +7,17 @@ use app::{GUIDE, hhmm, who};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::exit;
 
 const HELP: &str = "\
 acom: launch coding agents and let them talk and share locks.
 
+One server runs every project: start it once with `acom serve`. A project is a folder;
+agents run in their project's folder and only see that project's agents, threads and locks.
+
 Agents never run user commands.
 
-Agent commands (your ID comes from ACOM_ID):
+Agent commands (your ID comes from ACOM_ID; they act on your project):
   guide                                   Print the guide for agents
   me                                      Your details, usage and locks
   limits                                  Limits and current usage
@@ -40,9 +42,13 @@ Agent commands (your ID comes from ACOM_ID):
   lock acquire <name> [--wait <dur>] [--ttl <dur>]
   lock release <name>
 
-User commands:
-  serve [--port N]                        Run the server in this folder (default port 7400)
-  launch ... [--force]                    Launch an agent; --force confirms past a hard limit
+User commands (they act on the project the current folder is in):
+  serve [--port N]                        Run the server (default port 7400; data in ~/.acom)
+  projects                                List projects
+  project add [path]                      Add a folder as a project (default: this folder)
+  project remove <ID>                     Remove a project that has no agents
+  launch ... [--force]                    Launch an agent in this folder's project (added if
+                                          needed); --force confirms past a hard limit
   send --thread <TID> [text]              Post as user
   pause <ID> [--release-locks|--keep-locks]
   pause-all / resume-all
@@ -146,8 +152,19 @@ enum Cmd {
     Reopen {
         id: i64,
     },
+    Projects,
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     #[command(hide = true)]
     Hook,
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    Add { path: Option<String> },
+    Remove { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -195,20 +212,15 @@ fn die(msg: &str) -> ! {
 }
 
 /// The server's address: ACOM_URL, or .acom/port in this folder or a parent.
+/// The server's address: ACOM_URL, or the port the running server wrote to ~/.acom/port.
 fn base_url() -> String {
     if let Ok(u) = std::env::var("ACOM_URL") {
         return u.trim_end_matches('/').to_string();
     }
-    let mut dir: Option<PathBuf> = std::env::current_dir().ok();
-    while let Some(d) = dir {
-        if let Ok(p) = std::fs::read_to_string(d.join(".acom/port")) {
-            return format!("http://127.0.0.1:{}", p.trim());
-        }
-        dir = d.parent().map(|p| p.to_path_buf());
+    match std::fs::read_to_string(app::acom_home().join("port")) {
+        Ok(p) => format!("http://127.0.0.1:{}", p.trim()),
+        Err(_) => die("acom isn't running. Start it with `acom serve`."),
     }
-    die(
-        "can't find the acom server: no .acom/port here or in a parent folder, and ACOM_URL isn't set. Start it with `acom serve`.",
-    )
 }
 
 fn my_id() -> Option<i64> {
@@ -220,6 +232,11 @@ fn me() -> i64 {
 }
 
 fn call(method: &str, path: &str, body: Option<Value>) -> Value {
+    request(method, path, body).unwrap_or_else(|(_, msg)| die(&msg))
+}
+
+/// One API call; an error status comes back as (status, message).
+fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value, (u16, String)> {
     let url = format!("{}{path}", base_url());
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -250,9 +267,39 @@ fn call(method: &str, path: &str, body: Option<Value>) -> Value {
     let text = res.body_mut().read_to_string().unwrap_or_default();
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if status >= 400 {
-        die(v["error"].as_str().unwrap_or(&text));
+        return Err((status, v["error"].as_str().unwrap_or(&text).to_string()));
     }
-    v
+    Ok(v)
+}
+
+fn cwd() -> String {
+    std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_else(|e| die(&format!("can't read the current folder: {e}")))
+}
+
+/// The project the current folder is in, if any.
+fn project_here() -> Option<i64> {
+    request("GET", &format!("/projects?path={}", encode(&cwd())), None)
+        .ok()
+        .and_then(|p| p["id"].as_i64())
+}
+
+/// For user commands that act on a project: the one the current folder is in.
+fn user_project() -> i64 {
+    project_here().unwrap_or_else(|| {
+        die("this folder isn't in an acom project. Run the command inside one, or add it with `acom project add`.")
+    })
+}
+
+/// What listings cover: an agent sees its own project; the user sees the project of the
+/// current folder, or every project when the folder isn't in one.
+fn scope() -> String {
+    let project = match my_id() {
+        Some(id) => get(&format!("/agents/{id}"))["project"].as_i64(),
+        None => project_here(),
+    };
+    project.map(|p| format!("project={p}")).unwrap_or_default()
 }
 
 fn get(path: &str) -> Value {
@@ -361,6 +408,11 @@ fn print_agent_line(a: &Value) {
 
 fn print_agent(a: &Value) {
     println!("Agent {}: {}", a["id"], a["name"].as_str().unwrap_or(""));
+    println!(
+        "Project: {} ({})",
+        a["project_name"].as_str().unwrap_or(""),
+        a["project_path"].as_str().unwrap_or("")
+    );
     if let Some(g) = a["group"].as_str() {
         println!("Group: {g}");
     }
@@ -451,10 +503,10 @@ fn main() {
             println!("marked done; end your turn now");
         }
         Cmd::Agents { group } => {
-            let path = match group {
-                Some(g) => format!("/agents?group={}", encode(&g)),
-                None => "/agents".into(),
-            };
+            let mut path = format!("/agents?{}", scope());
+            if let Some(g) = group {
+                path += &format!("&group={}", encode(&g));
+            }
             for a in get(&path).as_array().into_iter().flatten() {
                 print_agent_line(a);
             }
@@ -474,7 +526,15 @@ fn main() {
             let mut b = json!({ "task": task, "harness": harness, "model": model, "effort": effort, "name": name, "group": group, "force": force, "done": done });
             match my_id() {
                 Some(id) => b["agent"] = json!(id),
-                None => b = user_body(b),
+                None => {
+                    let project = project_here().unwrap_or_else(|| {
+                        let p = post("/projects", user_body(json!({ "path": cwd() })));
+                        println!("added project {}", p["path"].as_str().unwrap_or(""));
+                        p["id"].as_i64().unwrap_or(0)
+                    });
+                    b["project"] = json!(project);
+                    b = user_body(b);
+                }
             }
             let v = post("/agents", b);
             println!("launched agent {}", v["id"]);
@@ -486,7 +546,11 @@ fn main() {
             }
         }
         Cmd::Threads => {
-            for th in get("/threads").as_array().into_iter().flatten() {
+            for th in get(&format!("/threads?{}", scope()))
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
                 let members: Vec<String> = th["members"]
                     .as_array()
                     .into_iter()
@@ -509,8 +573,9 @@ fn main() {
                     .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                     .unwrap_or_default();
                 let mut b = json!({ "title": title, "members": members });
-                if let Some(id) = my_id() {
-                    b["agent"] = json!(id);
+                match my_id() {
+                    Some(id) => b["agent"] = json!(id),
+                    None => b["project"] = json!(user_project()),
                 }
                 let v = post("/threads", b);
                 let m: Vec<String> = v["members"]
@@ -572,7 +637,7 @@ fn main() {
             println!("sent #{} to thread {thread}", v["id"]);
             for n in v["not_woken"].as_array().into_iter().flatten() {
                 println!(
-                    "agent {} wasn't woken: {}. It will be woken when there's room.",
+                    "agent {} wasn't woken: {}.",
                     n["agent"],
                     n["reason"].as_str().unwrap_or("")
                 );
@@ -602,7 +667,11 @@ fn main() {
             println!("marked {list} {mark}");
         }
         Cmd::Locks => {
-            for l in get("/locks").as_array().into_iter().flatten() {
+            for l in get(&format!("/locks?{}", scope()))
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
                 println!(
                     "{} · {}",
                     l["name"].as_str().unwrap_or(""),
@@ -640,7 +709,12 @@ fn main() {
         }
         Cmd::Lock { cmd } => match cmd {
             LockCmd::New { name, about } => {
-                post("/locks", json!({ "name": name, "about": about }));
+                let mut b = json!({ "name": name, "about": about });
+                match my_id() {
+                    Some(id) => b["agent"] = json!(id),
+                    None => b["project"] = json!(user_project()),
+                }
+                post("/locks", b);
                 println!("created lock {name}");
             }
             LockCmd::Acquire { name, wait, ttl } => {
@@ -659,7 +733,10 @@ fn main() {
                 println!("released {name}");
             }
             LockCmd::Free { name } => {
-                post("/locks/free", user_body(json!({ "name": name })));
+                post(
+                    "/locks/free",
+                    user_body(json!({ "project": user_project(), "name": name })),
+                );
                 println!("freed {name}");
             }
         },
@@ -712,5 +789,33 @@ fn main() {
             post(&format!("/agents/{id}/reopen"), user_body(json!({})));
             println!("reopened agent {id}");
         }
+        Cmd::Projects => {
+            for p in get("/projects").as_array().into_iter().flatten() {
+                println!(
+                    "{:>3}  {} · {} · {} agents, {} active",
+                    p["id"],
+                    p["name"].as_str().unwrap_or(""),
+                    p["path"].as_str().unwrap_or(""),
+                    p["agents"],
+                    p["active"]
+                );
+            }
+        }
+        Cmd::Project { cmd } => match cmd {
+            ProjectCmd::Add { path } => {
+                let path = path.unwrap_or_else(cwd);
+                let p = post("/projects", user_body(json!({ "path": path })));
+                let (id, path) = (&p["id"], p["path"].as_str().unwrap_or(""));
+                if p["added"] == true {
+                    println!("added project {id} ({path})");
+                } else {
+                    println!("project {id} already exists ({path})");
+                }
+            }
+            ProjectCmd::Remove { id } => {
+                post(&format!("/projects/{id}/remove"), user_body(json!({})));
+                println!("removed project {id}");
+            }
+        },
     }
 }

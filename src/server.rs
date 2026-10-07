@@ -1,7 +1,9 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
-use crate::app::{App, Fail, LaunchReq, LockMode, R, Settings, actor, bad, not_found};
+use crate::app::{App, Fail, LaunchReq, LockMode, R, Settings, acom_home, actor, bad, not_found};
+use crate::harness::catalog;
 use serde_json::{Value, json};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -9,7 +11,21 @@ use std::time::Duration;
 const UI: &str = include_str!("ui.html");
 
 pub fn serve(port: u16) {
-    let dir = std::env::current_dir().expect("current dir");
+    let home = acom_home();
+    if let Err(e) = std::fs::create_dir_all(&home) {
+        eprintln!("can't create {}: {e}", home.display());
+        std::process::exit(1);
+    }
+    // One server per machine: it owns every project's agents.
+    let lock = std::fs::File::create(home.join("serve.lock")).expect("serve.lock");
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let port = std::fs::read_to_string(home.join("port")).unwrap_or_default();
+        eprintln!(
+            "acom is already running (port {}). One server handles every project.",
+            port.trim()
+        );
+        std::process::exit(1);
+    }
     let url = format!("http://127.0.0.1:{port}");
     let server = match tiny_http::Server::http(("127.0.0.1", port)) {
         Ok(s) => s,
@@ -18,15 +34,15 @@ pub fn serve(port: u16) {
             std::process::exit(1);
         }
     };
-    let app = match App::open(dir.clone(), url.clone()) {
+    let app = match App::open(home.clone(), url.clone()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("can't start: {}", e.1);
             std::process::exit(1);
         }
     };
-    let _ = std::fs::write(dir.join(".acom/port"), port.to_string());
-    println!("acom is serving {} at {url}", dir.display());
+    let _ = std::fs::write(home.join("port"), port.to_string());
+    println!("acom is running at {url} (data in {})", home.display());
     {
         let app = app.clone();
         thread::spawn(move || {
@@ -42,6 +58,7 @@ pub fn serve(port: u16) {
         let app = app.clone();
         thread::spawn(move || handle(&app, req));
     }
+    drop(lock);
 }
 
 fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
@@ -202,17 +219,53 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
     use Reply::Json as J;
     Ok(match (method, p) {
         ("GET", []) => Reply::Html(UI),
-        ("GET", ["overview"]) => J(json!({
-            "agents": app.agents(None)?,
-            "threads": app.threads(None)?,
-            "locks": app.locks()?,
-            "limits": app.limits()?,
-            "activity": app.activity(100)?,
-            "settings": app.settings(),
-        })),
+        ("GET", ["overview"]) => {
+            // Everything the page shows, for one project (the first one by default).
+            let projects = app.projects()?;
+            let wanted = q.int("project")?;
+            let current = projects
+                .iter()
+                .find(|p| wanted.is_none_or(|w| p["id"] == w))
+                .or(projects.first())
+                .cloned();
+            let pid = current.as_ref().and_then(|p| p["id"].as_i64());
+            let (agents, threads, locks) = match pid {
+                Some(p) => (
+                    json!(app.agents(Some(p), None)?),
+                    json!(app.threads(Some(p), None)?),
+                    json!(app.locks(Some(p))?),
+                ),
+                None => (json!([]), json!([]), json!([])),
+            };
+            J(json!({
+                "url": app.url,
+                "projects": projects,
+                "project": current,
+                "agents": agents,
+                "threads": threads,
+                "locks": locks,
+                "limits": app.limits()?,
+                "activity": app.activity(pid, 100)?,
+                "settings": app.settings(),
+                "model_catalog": { "claude": catalog("claude"), "codex": catalog("codex") },
+            }))
+        }
+
+        // projects
+        ("GET", ["projects"]) => match q.get("path") {
+            Some(path) => J(app.project_at(&path)?),
+            None => J(json!(app.projects()?)),
+        },
+        ("POST", ["projects"]) => J(app.add_project(&text(b, "path")?, &user(b))?),
+        ("POST", ["projects", p, "remove"]) => {
+            app.remove_project(id(p)?, &user(b))?;
+            J(json!({}))
+        }
 
         // agents
-        ("GET", ["agents"]) => J(json!(app.agents(q.get("group").as_deref())?)),
+        ("GET", ["agents"]) => J(json!(
+            app.agents(q.int("project")?, q.get("group").as_deref())?
+        )),
         ("GET", ["agents", a]) => J(app.agent_view(id(a)?)?),
         ("GET", ["agents", a, "log"]) => {
             let n = q.int("lines")?.unwrap_or(200).max(1) as usize;
@@ -233,7 +286,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 force: b["force"].as_bool().unwrap_or(false),
                 done: b["done"].as_bool().unwrap_or(false),
             };
-            let (new, warnings) = app.launch(by, opt_int(b, "via"), req)?;
+            let (new, warnings) = app.launch(by, opt_int(b, "via"), opt_int(b, "project"), req)?;
             J(json!({ "id": new, "warnings": warnings }))
         }
         ("POST", ["agents", a, "status"]) => {
@@ -274,10 +327,11 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("POST", ["hook", a]) => J(json!({ "text": app.hook(id(a)?)? })),
 
         // threads and messages
-        ("GET", ["threads"]) => J(json!(app.threads(q.int("agent")?)?)),
+        ("GET", ["threads"]) => J(json!(app.threads(q.int("project")?, q.int("agent")?)?)),
         ("POST", ["threads"]) => {
             let (tid, members) = app.new_thread(
                 opt_int(b, "agent").unwrap_or(0),
+                opt_int(b, "project"),
                 &text(b, "title")?,
                 &list(b, "members"),
             )?;
@@ -316,9 +370,14 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // locks
-        ("GET", ["locks"]) => J(json!(app.locks()?)),
+        ("GET", ["locks"]) => J(json!(app.locks(q.int("project")?)?)),
         ("POST", ["locks"]) => {
-            app.new_lock(&text(b, "name")?, &text(b, "about")?)?;
+            // An agent's lock goes in its own project.
+            let project = match opt_int(b, "agent") {
+                Some(a) => app.agent_project(a)?,
+                None => int(b, "project")?,
+            };
+            app.new_lock(project, &text(b, "name")?, &text(b, "about")?)?;
             J(json!({}))
         }
         ("POST", ["locks", "acquire"]) => {
@@ -331,13 +390,15 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({}))
         }
         ("POST", ["locks", "free"]) => {
-            app.free(&text(b, "name")?, &user(b))?;
+            app.free(int(b, "project")?, &text(b, "name")?, &user(b))?;
             J(json!({}))
         }
 
         // limits, activity, settings
         ("GET", ["limits"]) => J(app.limits()?),
-        ("GET", ["activity"]) => J(json!(app.activity(q.int("limit")?.unwrap_or(100))?)),
+        ("GET", ["activity"]) => J(json!(
+            app.activity(q.int("project")?, q.int("limit")?.unwrap_or(100))?
+        )),
         ("GET", ["settings"]) => J(json!(app.settings())),
         ("PUT", ["settings"]) => {
             let s: Settings = serde_json::from_value(b["settings"].clone())

@@ -1,6 +1,6 @@
 # acom guide
 
-acom launched you. Other agents may be working in the same folder, and you can talk to them, share locks, and launch helpers, all with the `acom` command. Your agent ID is in `ACOM_ID`; acom reads it, so you never pass it.
+acom launched you in a project: the folder you're working in. Other agents may be working in the same project, and you can talk to them, share locks, and launch helpers, all with the `acom` command. You only see your own project's agents, threads and locks. Your agent ID is in `ACOM_ID`; acom reads it, so you never pass it.
 
 How you coordinate is up to you and your task. This explains the tool.
 
@@ -12,7 +12,7 @@ While you work, lines starting with `[acom]` may appear after your tool calls. T
 
 ## Threads
 
-A thread is a conversation with a title and members. Any agent can read, post in, or add members to any thread, and posting in one makes you a member. A message lands in the inbox of every member.
+A thread is a conversation with a title and members, all from your project. Any agent can read, post in, or add members to any thread, and posting in one makes you a member. A message lands in the inbox of every member.
 
 - `acom thread new --title "lexer coverage" --members 2,5` starts a thread and prints its ID. Start a new thread for each new topic rather than reusing an old one, so conversations stay short.
 - Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `group:<name>`. A selector is resolved once, when it's used.
@@ -39,7 +39,7 @@ Locks are named, and any agent can create one when it needs it: `acom lock new <
 
 ## Other agents
 
-There are no subagents. If you need help, launch another agent with `acom launch --task "..."`. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults.
+There are no subagents. If you need help, launch another agent with `acom launch --task "..."`; it works in your project. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults.
 
 To hand your work over, add `--done`: you're marked done and the new agent is launched in one step, so it fits even when the limits only leave room for one of you. If the launch is refused, you stay as you were.
 
@@ -49,11 +49,11 @@ To hand your work over, add `--done`: you're marked done and the new agent is la
 
 `acom limits` shows them. A limit can have a soft value, a hard value, both, or neither. At the soft value you're told about it. At the hard value acom acts: your launches are refused, agents are paused when their subscription runs low, and your context is compacted.
 
-A done agent doesn't count toward the active-agent limits. If a message for it arrives when there's no room, it waits in line and is woken, oldest first, once there is. Whoever sent the message is told.
+A finished agent doesn't count toward the active-agent limits. If a message should wake it but there's no room, it waits in line and is woken, oldest first, once there is. When you send a message, acom tells you which members it didn't wake and why.
 
 ## Finishing
 
-When your task is finished, run `acom done` and then end your turn. You stop counting toward the active-agent limits straight away. A new message can still wake you later.
+When your task is finished, run `acom done` and then end your turn. You stop counting toward the active-agent limits straight away. What happens next depends on a setting, shown at the end of `acom limits` and of your briefing: either you're closed (only the user's messages wake you again) or you're done (any new message in your threads wakes you).
 
 ## Commands
 
