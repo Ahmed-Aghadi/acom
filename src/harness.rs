@@ -215,7 +215,9 @@ fn codex_command(l: &Launch) -> (Command, Option<String>) {
     if l.resume {
         c.arg("resume");
     }
-    c.arg("--json");
+    // A project folder need not be a Git worktree. acom already scopes the
+    // process to the folder selected by the user.
+    c.args(["--json", "--skip-git-repo-check"]);
 
     if l.resume {
         // `exec resume` has a smaller option set than `exec`. In particular it
@@ -580,6 +582,7 @@ mod tests {
         assert_eq!(args[multi - 1], "--disable");
         assert!(args.iter().any(|x| x.starts_with("hooks.PostToolUse=")));
         assert!(args.iter().any(|x| x == "--dangerously-bypass-hook-trust"));
+        assert!(args.iter().any(|x| x == "--skip-git-repo-check"));
         assert_eq!(args[args.len() - 2..], ["session-1", "-"]);
         assert_eq!(input.as_deref(), Some("hello"));
     }
