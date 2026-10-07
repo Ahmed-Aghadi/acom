@@ -508,6 +508,34 @@ mod tests {
     }
 
     #[test]
+    fn unset_context_limit_leaves_harness_defaults_alone() {
+        for harness in ["claude", "codex"] {
+            let launch = Launch {
+                harness,
+                model: "model",
+                effort: "low",
+                session: None,
+                resume: false,
+                prompt: "hello",
+                context_limit: 0,
+                flags: &[],
+                acom: Path::new("/tmp/acom"),
+            };
+            let (command, _) = command(&launch);
+            let args: Vec<String> = command
+                .get_args()
+                .map(|x| x.to_string_lossy().into_owned())
+                .collect();
+            assert!(!args.iter().any(|x| x == "--autocompact"));
+            assert!(
+                !args
+                    .iter()
+                    .any(|x| x.starts_with("model_auto_compact_token_limit="))
+            );
+        }
+    }
+
+    #[test]
     fn codex_resume_drops_new_turn_only_flags() {
         let flags = vec![
             "--sandbox".into(),

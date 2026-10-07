@@ -441,8 +441,9 @@
           $('#agent-title').textContent = `${a.name} · #${a.id}`;
           const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
           const fields = Object.entries(a).filter(([,v]) => !Array.isArray(v) && typeof v !== 'object').map(([k,v]) => `<dt>${esc(k.replaceAll('_',' '))}</dt><dd>${esc(display(k, v))}</dd>`).join('');
-          const locks = `<dt>locks</dt><dd>${a.locks?.map(esc).join(', ') || '—'}</dd>`;
-          $('#agent-details').innerHTML = `${fields}${locks}<dt>recent activity</dt><dd><pre class="agent-log">${esc((log.lines || []).join('\n')) || 'No activity yet'}</pre></dd>`;
+          const held = `<dt>locks held</dt><dd>${a.locks?.map(esc).join(', ') || '—'}</dd>`;
+          const lost = `<dt>locks lost</dt><dd>${a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'}</dd>`;
+          $('#agent-details').innerHTML = `${fields}${held}${lost}<dt>recent activity</dt><dd><pre class="agent-log">${esc((log.lines || []).join('\n')) || 'No activity yet'}</pre></dd>`;
           $('#agent-dialog').showModal();
         } else if (action.dataset.action === 'pause') {
           const agent = state.agents.find(a => a.id === id);
