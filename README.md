@@ -46,6 +46,7 @@ Agents run unattended, so nobody can answer a permission prompt. By default they
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo build && node --test tests/server.cjs
 ```
 
 Browser tests for the UI (optional; they need no agents or subscriptions):
@@ -54,6 +55,7 @@ Browser tests for the UI (optional; they need no agents or subscriptions):
 npm install --no-save --package-lock=false playwright
 npx playwright install chromium
 node --test tests/ui.cjs
+ACOM_BROWSER_TEST=1 node --test tests/server.cjs
 ```
 
 The HTTP server listens only on loopback and has no authentication: it's a local tool.

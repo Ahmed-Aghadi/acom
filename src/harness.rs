@@ -407,6 +407,7 @@ fn codex_command(l: &Launch) -> (Command, Option<String>) {
     // These invariants come after user flags so an extra `-c` or feature flag
     // cannot accidentally disconnect the agent or re-enable untracked helpers.
     c.args(["-m", l.model]);
+    c.args(["-c", &format!("model={}", toml_string(l.model))]);
     c.args([
         "-c",
         &format!("model_reasoning_effort={}", toml_string(l.effort)),
@@ -440,6 +441,94 @@ fn codex_command(l: &Launch) -> (Command, Option<String>) {
 }
 
 fn codex_events(v: &Value) -> Vec<Event> {
+    // Reroutes are observable in the core event stream/rollout. Some clients
+    // expose the equivalent app-server notification with camelCase fields.
+    let event = if v["type"] == "event_msg" {
+        &v["payload"]
+    } else if v["method"] == "model/rerouted" {
+        &v["params"]
+    } else if v["type"] == "item.completed" && v["item"]["type"] == "error" {
+        &v["item"]
+    } else {
+        v
+    };
+    let kind = event["type"].as_str().unwrap_or("");
+    if matches!(kind, "model_reroute" | "model.rerouted" | "model_rerouted")
+        || v["method"] == "model/rerouted"
+    {
+        let from = event["from_model"]
+            .as_str()
+            .or(event["fromModel"].as_str())
+            .unwrap_or("the selected model");
+        let to = event["to_model"]
+            .as_str()
+            .or(event["toModel"].as_str())
+            .unwrap_or("another model");
+        let reason = event["reason"].as_str().unwrap_or("unspecified reason");
+        return vec![Event::Flagged(short(
+            &format!("Codex rerouted from {from} to {to} ({reason})"),
+            300,
+        ))];
+    }
+    if kind == "refusal" || v["type"] == "response.refusal.done" {
+        return vec![Event::Flagged("Codex reported a model refusal".into())];
+    }
+    if kind == "error" || v["type"] == "turn.failed" {
+        let error = if event["error"].is_object() {
+            &event["error"]
+        } else {
+            event
+        };
+        let message = error["message"]
+            .as_str()
+            .or(event["error"].as_str())
+            .unwrap_or("Codex error");
+        let code = error["code"]
+            .as_str()
+            .or(event["codex_error_info"].as_str())
+            .unwrap_or("");
+        let mut out = vec![Event::Text(format!("error: {}", short(message, 300)))];
+        // Match error frames only, never user/tool text or an assistant merely
+        // discussing policies. Free-form refusals have no reliable classifier.
+        let lower = message.to_ascii_lowercase();
+        if matches!(
+            code,
+            "content_policy_violation" | "policy_violation" | "content_filter" | "safety_violation"
+        ) || lower.contains("usage policy")
+            || lower.contains("safeguards flagged")
+            || lower.contains("high-risk cyber")
+            || lower.contains("high risk cyber")
+        {
+            out.push(Event::Flagged(short(message, 300)));
+        } else if matches!(
+            code,
+            "usage_limit_reached" | "rate_limit_exceeded" | "insufficient_quota"
+        ) || lower.contains("usage limit")
+            || lower.contains("rate limit")
+            || lower.contains("quota exceeded")
+            || lower.contains("out of usage credits")
+        {
+            out.push(Event::LimitHit(short(message, 200)));
+        }
+        return out;
+    }
+    if v["type"] == "response_item" && event["payload"]["type"] == "message" {
+        let message = &event["payload"];
+        if message["role"] == "assistant"
+            && message["content"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|p| p["type"] == "refusal"))
+        {
+            return vec![Event::Flagged("Codex reported a model refusal".into())];
+        }
+    }
+    if matches!(
+        v["type"].as_str(),
+        Some("response.completed" | "response.created")
+    ) && let Some(model) = v["response"]["model"].as_str()
+    {
+        return vec![Event::Model(model.to_string())];
+    }
     let n = |x: &Value| x.as_u64().unwrap_or(0);
     let tokens = |u: &Value, add| {
         let input = n(&u["input_tokens"]);
@@ -463,13 +552,6 @@ fn codex_events(v: &Value) -> Vec<Event> {
             .map(|s| vec![Event::Session(s.to_string())])
             .unwrap_or_default(),
         "turn.completed" => vec![tokens(&v["usage"], false)],
-        "turn.failed" | "error" => {
-            let message = v["error"]["message"]
-                .as_str()
-                .or(v["message"].as_str())
-                .unwrap_or("Codex error");
-            vec![Event::Text(format!("error: {}", short(message, 300)))]
-        }
         "item.completed" => {
             let item = &v["item"];
             let text = match item["type"].as_str().unwrap_or("") {
@@ -834,5 +916,56 @@ mod tests {
                 !model.id.ends_with("luna")
             );
         }
+    }
+
+    #[test]
+    fn codex_flags_observable_reroutes_and_structured_refusals() {
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"model_reroute","from_model":"gpt-6-sol","to_model":"gpt-other","reason":"high_risk_cyber_activity"}}"#,
+            r#"{"method":"model/rerouted","params":{"fromModel":"gpt-6-sol","toModel":"gpt-other","reason":"highRiskCyberActivity"}}"#,
+            r#"{"type":"turn.failed","error":{"code":"policy_violation","message":"request blocked under the usage policy"}}"#,
+            r#"{"type":"item.completed","item":{"type":"error","message":"the safeguards flagged this request"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"not permitted"}]}}"#,
+            r#"{"type":"response.refusal.done","refusal":"not permitted"}"#,
+        ] {
+            assert!(
+                parse_line("codex", line)
+                    .iter()
+                    .any(|e| matches!(e, Event::Flagged(_))),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_does_not_classify_prose_tool_output_or_network_errors_as_flags() {
+        for line in [
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"This test explains usage policy refusals and model reroutes."}}"#,
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"test","aggregated_output":"safeguards flagged this request"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"refusal","refusal":"quoted example"}]}}"#,
+            r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-requested-model"}}"#,
+        ] {
+            assert!(
+                parse_line("codex", line)
+                    .iter()
+                    .all(|e| !matches!(e, Event::Flagged(_) | Event::Model(_))),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_usage_errors_pause_and_actual_response_models_are_reported() {
+        let events = parse_line(
+            "codex",
+            r#"{"type":"turn.failed","error":{"code":"usage_limit_reached","message":"You've hit your usage limit"}}"#,
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::LimitHit(_))));
+        let events = parse_line(
+            "codex",
+            r#"{"type":"response.completed","response":{"model":"gpt-6-sol"}}"#,
+        );
+        assert!(matches!(&events[0], Event::Model(m) if m == "gpt-6-sol"));
     }
 }

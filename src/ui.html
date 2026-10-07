@@ -19,6 +19,7 @@
       --shadow: 0 10px 28px rgba(54, 50, 40, .08);
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
     button, input, select, textarea { font: inherit; }
     button { cursor: pointer; }
@@ -36,8 +37,14 @@
     .fill.warn { background: var(--warn); }
     .fill.hard { background: var(--danger); }
     .actions { display: flex; gap: 8px; }
+    .project-banner { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; margin-bottom: 18px; }
+    .project-banner code, .launch-project { overflow-wrap: anywhere; white-space: normal; }
+    .project-banner .meta { margin-left: auto; }
+    .project-banner label { max-width: 100%; }
+    .project-banner select { min-width: 180px; max-width: 100%; width: auto; }
     button { min-height: 34px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: var(--ink); }
     button:hover { border-color: #a9a59a; background: #faf8f2; }
+    button:disabled { cursor: default; opacity: .5; }
     button.primary { border-color: var(--accent); background: var(--accent); color: white; }
     button.danger { color: var(--danger); }
     button.small { min-height: 27px; padding: 3px 8px; font-size: 12px; }
@@ -65,7 +72,9 @@
     .pill.idle { background: #e3eaf2; color: #3b5878; }
     .pill.waiting { background: #f5ead7; color: #855510; }
     .meta { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+    .meta.launch-project { white-space: normal; overflow-wrap: anywhere; }
     .agent-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+    .problem { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; white-space: normal; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 9px 12px; border-bottom: 1px solid #ebe8df; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
@@ -90,7 +99,7 @@
     .composer { display: flex; gap: 9px; padding: 12px; border-top: 1px solid var(--line); }
     .composer textarea { flex: 1; min-height: 58px; resize: vertical; }
     input, select, textarea { width: 100%; padding: 8px 9px; border: 1px solid #c9c5ba; border-radius: 7px; background: white; color: var(--ink); }
-    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    label { display: grid; min-width: 0; gap: 5px; color: var(--muted); font-size: 12px; }
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
     .wide { grid-column: 1 / -1; }
     dialog { width: min(560px, calc(100% - 30px)); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 80px rgba(20,20,15,.25); }
@@ -107,7 +116,16 @@
     .settings h3:first-child { margin-top: 0; }
     .harness-settings { margin-bottom: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; }
     .harness-settings h4 { margin: 0 0 11px; text-transform: capitalize; }
-    .limit-row { display: grid; grid-template-columns: minmax(140px, 1fr) 130px 130px; gap: 10px; align-items: end; margin-bottom: 9px; }
+    .model-picker { border: 1px solid var(--line); border-radius: 7px; padding: 9px; }
+    .model-picker summary { cursor: pointer; color: var(--ink); }
+    .model-options { display: grid; gap: 7px; max-height: 280px; overflow: auto; margin: 12px 0; }
+    .model-options label, .effort-options label { display: flex; align-items: center; gap: 7px; }
+    .model-options input, .effort-options input { width: auto; }
+    .model-options code { margin-left: auto; }
+    .custom-model-row { display: flex; align-items: end; gap: 8px; }
+    .custom-model-row label { flex: 1; }
+    .effort-options { display: flex; flex-wrap: wrap; gap: 10px; }
+    .limit-row { display: grid; max-width: 620px; grid-template-columns: minmax(140px, 1fr) 110px 110px; gap: 10px; align-items: end; margin-bottom: 9px; }
     .toast { position: fixed; right: 20px; bottom: 20px; z-index: 20; max-width: 430px; padding: 11px 14px; border-radius: 8px; background: #282824; color: white; box-shadow: var(--shadow); opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; white-space: pre-line; }
     .toast.show { opacity: 1; transform: none; }
     .toast.error { background: var(--danger); }
@@ -122,6 +140,11 @@
       .agent { grid-template-columns: 1fr; gap: 5px; }
       .agent-buttons { justify-content: flex-start; }
     }
+    @media (max-width: 600px) {
+      .form-grid, .limit-row { grid-template-columns: minmax(0, 1fr); }
+      .model-options label { flex-wrap: wrap; }
+      .model-options code { margin-left: 0; overflow-wrap: anywhere; }
+    }
   </style>
 </head>
 <body>
@@ -131,12 +154,13 @@
     <div class="usage" id="usage"></div>
     <div class="actions">
       <button class="primary" data-open="launch-dialog">Launch</button>
-      <button id="pause-all">Pause all</button>
-      <button id="resume-all">Resume all</button>
+      <button id="pause-all" title="All projects">Pause all</button>
+      <button id="resume-all" title="All projects">Resume all</button>
     </div>
   </header>
 
   <main>
+    <div class="project-banner"><label>Project <select id="project-select" aria-label="Project"></select></label><code id="project-path">Connecting…</code><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button><span class="meta" id="project-url"></span></div>
     <nav>
       <button class="active" data-page="overview">Overview</button>
       <button data-page="threads">Threads</button>
@@ -174,7 +198,7 @@
 
     <section class="page" id="page-settings">
       <section class="panel">
-        <div class="panel-head"><h2>Settings</h2><button class="primary" form="settings-form">Save</button></div>
+        <div class="panel-head"><h2>Settings <span class="meta">· all projects</span></h2><button class="primary" form="settings-form">Save</button></div>
         <form class="settings" id="settings-form"></form>
       </section>
     </section>
@@ -183,15 +207,26 @@
   <dialog id="launch-dialog">
     <form method="dialog" id="launch-form">
       <h2>Launch agent</h2>
+      <p class="meta launch-project" id="launch-project"></p>
       <div class="form-grid">
+        <label class="wide">Project <select name="project" id="launch-project-select" required></select></label>
         <label>Name <input name="name" placeholder="optional"></label>
         <label>Group <input name="group" placeholder="optional"></label>
         <label>Harness <select name="harness" id="launch-harness"></select></label>
         <label>Model <select name="model" id="launch-model"></select></label>
+        <label class="wide" id="launch-custom-row" hidden>Custom model ID <input id="launch-custom-model" name="custom_model" placeholder="Full model ID"><span>Launches this model without changing the allowed list for agents.</span></label>
         <label>Effort <select name="effort" id="launch-effort"></select></label>
         <label class="wide">Task <textarea name="task" rows="6" required></textarea></label>
       </div>
-      <div class="dialog-actions"><button value="cancel">Cancel</button><button class="primary" value="default">Launch</button></div>
+      <div class="dialog-actions"><button type="button" data-close="launch-dialog">Cancel</button><button class="primary" value="default">Launch</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="project-dialog">
+    <form method="dialog" id="project-form">
+      <h2>Add project</h2>
+      <label>Folder path <input name="path" placeholder="/path/to/project" required><span>An existing folder on the machine running acom. Agents will work in this folder.</span></label>
+      <div class="dialog-actions"><button type="button" data-close="project-dialog">Cancel</button><button class="primary">Add</button></div>
     </form>
   </dialog>
 
@@ -202,7 +237,7 @@
         <label class="wide">Title <input name="title" required></label>
         <label class="wide">Members <input name="members" placeholder="1, 2, active, group:review"></label>
       </div>
-      <div class="dialog-actions"><button value="cancel">Cancel</button><button class="primary" value="default">Create</button></div>
+      <div class="dialog-actions"><button type="button" data-close="thread-dialog">Cancel</button><button class="primary" value="default">Create</button></div>
     </form>
   </dialog>
 
@@ -226,7 +261,7 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, thread: null, selectedThread: null, threadRequest: 0 };
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -257,20 +292,49 @@
 
     async function refresh(initial = false) {
       let healthy = false;
+      const request = ++state.overviewRequest;
       try {
-        const overview = await api('/overview');
+        const overview = await api(`/overview${state.selectedProject ? `?project=${state.selectedProject}` : ''}`);
+        if (request !== state.overviewRequest) return;
         for (const key of ['agents', 'threads', 'locks', 'activity', 'limits']) state[key] = overview[key];
         state.settings = overview.settings;
+        state.catalog = overview.model_catalog || {};
+        state.projects = overview.projects || [];
+        state.project = overview.project;
+        state.selectedProject = overview.project?.id ?? null;
+        state.url = overview.url;
         healthy = true;
       } catch (_) {}
+      if (request !== state.overviewRequest) return;
       $('#live-dot').classList.toggle('off', !healthy);
       $('#live-text').textContent = healthy ? 'live' : 'connection error';
       render();
-      if (initial && state.settings) renderSettings();
+      if ((initial || !$('#settings-form').children.length) && state.settings) renderSettings();
       if (state.selectedThread) await refreshThread(false);
     }
 
-    function render() { renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); }
+    function render() { renderProject(); renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); }
+
+    function renderProject() {
+      const p = state.project;
+      $('#project-select').innerHTML = state.projects.length ? projectOptions(state.selectedProject) : '<option>No projects yet</option>';
+      $('#project-select').disabled = !state.projects.length;
+      $('#project-path').textContent = p?.path || 'Add a project folder to get started';
+      $('#project-url').textContent = state.url || '';
+      $('#remove-project').disabled = !p || state.agents.length > 0;
+      $('#remove-project').title = state.agents.length ? 'Projects with agents cannot be removed' : 'Remove the registration, not files';
+      document.title = p ? `${p.name} · acom` : 'acom';
+      const url = new URL(location.href);
+      if (p) url.searchParams.set('project', p.id); else url.searchParams.delete('project');
+      history.replaceState(null, '', url);
+    }
+    function projectOptions(selected) {
+      return state.projects.map(p => `<option value="${p.id}" title="${esc(p.path)}" ${p.id === Number(selected) ? 'selected' : ''}>${esc(p.name)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${p.id}` : ''}</option>`).join('');
+    }
+    function resetThread() {
+      state.selectedThread = null; state.thread = null; state.threadRequest++;
+      $('#thread-main').innerHTML = '<div class="empty">Select a thread</div>';
+    }
 
     function renderUsage() {
       const root = $('#usage');
@@ -302,14 +366,15 @@
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
       const buttons = ['working', 'idle', 'done'].includes(a.state)
         ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
-        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">Resume</button>`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.pause_reason === 'flagged' ? 'Resume same model' : 'Resume'}</button>`
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
       const close = a.state !== 'closed' ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
       const waiting = a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
+      const problem = a.problem ? `<div class="problem">${a.pause_reason === 'flagged' ? 'Flagged' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(a.problem)}</div>${a.pause_reason === 'flagged' ? '<div class="meta">Choose another model by launching a new agent.</div>' : ''}` : '';
       return `<div class="agent" data-agent="${a.id}">
-        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div>${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
+        <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div>${problem}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -372,19 +437,87 @@
       if (!s) return;
       const harnesses = Object.entries(s.harnesses || {}).map(([name, h]) => `<div class="harness-settings" data-harness="${esc(name)}"><h4>${esc(name)}</h4><div class="form-grid">
         <label><span><input type="checkbox" name="enabled" ${h.enabled ? 'checked' : ''} style="width:auto"> Enabled</span></label><span></span>
-        <label>Default model <input name="model" value="${esc(h.model)}"></label><label>Default effort <input name="effort" value="${esc(h.effort)}"></label>
-        <label class="wide">Allowed models <input name="models" value="${esc((h.models || []).join(', '))}"></label>
-        <label class="wide">Allowed efforts <input name="efforts" value="${esc((h.efforts || []).join(', '))}"></label>
-        <label class="wide">Extra launch flags <input name="flags" value="${esc((h.flags || []).join(' '))}"></label>
+        <label>Default model <select name="model">${modelOptions(name, h.models, h.model)}</select></label><label>Default effort <select name="effort">${options(h.efforts, h.effort)}</select></label>
+        <label class="wide" data-custom-default hidden>Custom default model ID <input name="custom_model" placeholder="Full model ID"><span>Saving adds it to the allowed models.</span></label>
+        <details class="model-picker wide"><summary>Allowed models (${h.models.length} selected)</summary><div class="model-options">${[...new Set([...(state.catalog[name] || []).map(x => x.id), ...h.models])].map(id => modelCheckbox(name, id, h.models.includes(id))).join('')}</div>
+          <div class="custom-model-row"><label>Custom model ID <input name="add_model" placeholder="Full model ID"></label><button type="button" data-add-model>Add</button></div>
+        </details>
+        <div class="wide"><label>Allowed efforts</label><div class="effort-options">${[...new Set([...(name === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']), ...h.efforts])].map(x => `<label><input type="checkbox" name="allowed_effort" value="${esc(x)}" ${h.efforts.includes(x) ? 'checked' : ''}>${esc(x)}</label>`).join('')}</div></div>
+        <label class="wide">Extra launch flags <input name="flags" value="${esc(flagsText(h.flags || []))}"><span>Separate arguments with spaces; double-quote values containing spaces.</span></label>
       </div></div>`).join('');
       const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" placeholder="no limit"></label></div>`;
-      const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${n} active agents`, `active_per_harness.${n}`, v)).join('');
-      const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${n} subscription %`, `usage.${n}`, v)).join('');
+      const capital = name => name.charAt(0).toUpperCase() + name.slice(1);
+      const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
+      const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${capital(n)} subscription %`, `usage.${n}`, v)).join('');
       $('#settings-form').innerHTML = `<h3>Harnesses</h3>${harnesses}<h3>Limits</h3>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
-        <h3>Behavior</h3><div class="form-grid"><label><span><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''} style="width:auto"> Auto-resume after limits clear</span></label><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span></label></div>`;
+        <h3>Behavior</h3><div class="form-grid"><label><span><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''} style="width:auto"> Auto-resume after limits clear</span></label><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents wake only for user messages or explicit reopen. Turn this off to allow peer messages to wake done agents.</span></label></div>
+        <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
+      $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
     }
 
     function splitList(value) { return value.split(',').map(x => x.trim()).filter(Boolean); }
+    function flagsText(flags) {
+      return flags.map(x => !x || /[\s"\\]/.test(x) ? JSON.stringify(x) : x).join(' ');
+    }
+    function parseFlags(value) {
+      const args = [], token = /"(?:\\.|[^"\\])*"|[^\s"]+/gy;
+      let cursor = 0;
+      while (cursor < value.length) {
+        if (/\s/.test(value[cursor])) { cursor++; continue; }
+        token.lastIndex = cursor;
+        const match = token.exec(value);
+        if (!match) throw new Error('Unclosed quote in launch flags.');
+        args.push(match[0].startsWith('"') ? JSON.parse(match[0]) : match[0]);
+        cursor = token.lastIndex;
+        if (value[cursor] && !/\s/.test(value[cursor])) throw new Error('Separate launch arguments with spaces.');
+      }
+      return args;
+    }
+    function options(values, selected) {
+      return (values || []).map(x => `<option value="${esc(x)}" ${x === selected ? 'selected' : ''}>${esc(x)}</option>`).join('');
+    }
+    function modelLabel(name, id) {
+      const label = state.catalog[name]?.find(x => x.id === id)?.name;
+      return label ? `${label} · ${id}` : id;
+    }
+    function modelOptions(name, ids, selected) {
+      return (ids || []).map(id => `<option value="${esc(id)}" ${id === selected ? 'selected' : ''}>${esc(modelLabel(name, id))}</option>`).join('') + '<option value="__custom__">Custom model…</option>';
+    }
+    function modelCheckbox(name, id, checked) {
+      return `<label><input type="checkbox" name="allowed_model" value="${esc(id)}" ${checked ? 'checked' : ''}><span>${esc(state.catalog[name]?.find(x => x.id === id)?.name || 'Custom')}</span><code>${esc(id)}</code></label>`;
+    }
+    function checked(root, name) {
+      return [...root.querySelectorAll(`input[name="${name}"]:checked`)].map(x => x.value);
+    }
+    function customModel(value) {
+      const id = value.trim();
+      if (!id || /\s/.test(id)) throw new Error('Enter a full model ID without spaces.');
+      return id;
+    }
+    function showCustom(select, row) {
+      const custom = select.value === '__custom__';
+      row.hidden = !custom;
+      $('input', row).required = custom;
+    }
+    function modelEfforts(name, id) {
+      return state.catalog[name]?.find(x => x.id === id)?.efforts;
+    }
+    function syncDefaultEfforts(root) {
+      const supported = modelEfforts(root.dataset.harness, $('[name=model]', root).value);
+      const allowed = checked(root, 'allowed_effort').filter(x => !supported || supported.includes(x));
+      const effort = $('[name=effort]', root);
+      effort.innerHTML = options(allowed, effort.value);
+    }
+    function syncHarnessChoices(root) {
+      const ids = checked(root, 'allowed_model');
+      const model = $('[name=model]', root);
+      const selected = model.value;
+      model.innerHTML = modelOptions(root.dataset.harness, ids, selected);
+      if (selected === '__custom__') model.value = selected;
+      showCustom(model, $('[data-custom-default]', root));
+      $('.model-picker summary', root).textContent = `Allowed models (${ids.length} selected)`;
+      syncDefaultEfforts(root);
+    }
 
     async function mutate(path, body = {}) {
       const result = await api(path, { method: 'POST', body: JSON.stringify(body) });
@@ -419,9 +552,32 @@
     }
 
     document.addEventListener('click', async event => {
+      const close = event.target.closest('[data-close]');
+      if (close) { document.getElementById(close.dataset.close).close('cancel'); return; }
+      const addModel = event.target.closest('[data-add-model]');
+      if (addModel) {
+        const root = addModel.closest('[data-harness]');
+        const input = $('[name=add_model]', root);
+        try {
+          const id = customModel(input.value);
+          const existing = [...root.querySelectorAll('[name=allowed_model]')].find(x => x.value === id);
+          if (existing) existing.checked = true;
+          else $('.model-options', root).insertAdjacentHTML('beforeend', modelCheckbox(root.dataset.harness, id, true));
+          input.value = ''; syncHarnessChoices(root);
+        } catch (error) { toast(error.message, true); }
+        return;
+      }
       const open = event.target.closest('[data-open]');
       if (open) {
-        if (open.dataset.open === 'launch-dialog') setLaunchHarnesses();
+        if (open.dataset.open === 'launch-dialog') {
+          if (!state.projects.length) {
+            toast('Add a project folder before launching an agent.'); $('#project-dialog').showModal(); return;
+          }
+          setLaunchHarnesses();
+          $('#launch-project-select').innerHTML = projectOptions(state.selectedProject);
+          setLaunchProject();
+        }
+        if (open.dataset.open === 'thread-dialog' && !state.project) { toast('Add a project first.', true); return; }
         document.getElementById(open.dataset.open).showModal();
         return;
       }
@@ -454,7 +610,7 @@
           const { choice, frozen } = await resumeChoice(id);
           if (choice === 'cancel') return;
           if (choice === 'release') {
-            for (const lock of frozen) await api('/locks/free', { method: 'POST', body: JSON.stringify({ name: lock.name }) });
+            for (const lock of frozen) await api('/locks/free', { method: 'POST', body: JSON.stringify({ project: lock.project, name: lock.name }) });
           }
           const result = await mutate(`/agents/${id}/resume`);
           if (result.warnings?.length) toast(result.warnings.join('\n'));
@@ -463,20 +619,54 @@
             await mutate(`/agents/${id}/${action.dataset.action}`);
           }
         } else if (action.dataset.action === 'free-lock') {
-          if (confirm(`Free lock “${action.dataset.name}”?`)) await mutate('/locks/free', { name: action.dataset.name });
+          if (confirm(`Free lock “${action.dataset.name}”?`)) await mutate('/locks/free', { project: state.selectedProject, name: action.dataset.name });
         }
       } catch (error) { toast(error.message, true); }
     });
 
-    $('#pause-all').addEventListener('click', async () => { try { if (confirm('Pause all agents and freeze their locks?')) await mutate('/pause-all'); } catch (e) { toast(e.message, true); } });
+    $('#pause-all').addEventListener('click', async () => { try { if (confirm('Pause all agents in all projects and freeze their locks?')) await mutate('/pause-all'); } catch (e) { toast(e.message, true); } });
     $('#resume-all').addEventListener('click', async () => { try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); } });
 
     $('#launch-harness').addEventListener('change', setLaunchChoices);
+    $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); });
+    $('#launch-project-select').addEventListener('change', setLaunchProject);
+    function setLaunchProject() {
+      const p = state.projects.find(x => x.id === Number($('#launch-project-select').value));
+      $('#launch-project').textContent = p ? `Agents will work in ${p.path}` : 'Select a project';
+    }
+    $('#project-select').addEventListener('change', async event => {
+      state.selectedProject = Number(event.target.value);
+      state.project = state.projects.find(p => p.id === state.selectedProject);
+      for (const key of ['agents', 'threads', 'locks', 'activity']) state[key] = [];
+      resetThread(); render(); await refresh();
+    });
+    $('#remove-project').addEventListener('click', async () => {
+      const p = state.project;
+      if (!p || !confirm(`Remove project “${p.name}” from acom? Its files will not be deleted.`)) return;
+      try {
+        await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
+        state.selectedProject = null; resetThread(); await refresh();
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#settings-form').addEventListener('change', event => {
+      const root = event.target.closest('[data-harness]');
+      if (!root) return;
+      if (['allowed_model', 'allowed_effort'].includes(event.target.name)) syncHarnessChoices(root);
+      if (event.target.name === 'model') { showCustom(event.target, $('[data-custom-default]', root)); syncDefaultEfforts(root); }
+    });
     function setLaunchChoices() {
       const name = $('#launch-harness').value;
       const h = state.settings?.harnesses?.[name];
-      $('#launch-model').innerHTML = (h?.models || []).map(x => `<option ${x === h.model ? 'selected' : ''}>${esc(x)}</option>`).join('');
-      $('#launch-effort').innerHTML = (h?.efforts || []).map(x => `<option ${x === h.effort ? 'selected' : ''}>${esc(x)}</option>`).join('');
+      $('#launch-model').innerHTML = modelOptions(name, [...new Set([...(state.catalog[name] || []).map(x => x.id), ...(h?.models || [])])], h?.model);
+      setLaunchEfforts(true);
+      showCustom($('#launch-model'), $('#launch-custom-row'));
+    }
+    function setLaunchEfforts(useDefault = false) {
+      const name = $('#launch-harness').value;
+      const h = state.settings?.harnesses?.[name];
+      const efforts = modelEfforts(name, $('#launch-model').value) || (name === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+      const selected = useDefault ? h?.effort : $('#launch-effort').value;
+      $('#launch-effort').innerHTML = options(efforts, efforts.includes(selected) ? selected : efforts.includes(h?.effort) ? h.effort : efforts.includes('medium') ? 'medium' : efforts[0]);
     }
     function setLaunchHarnesses() {
       $('#launch-harness').innerHTML = Object.entries(state.settings?.harnesses || {}).filter(([,h]) => h.enabled).map(([name]) => `<option>${esc(name)}</option>`).join('');
@@ -484,33 +674,54 @@
     }
 
     $('#launch-form').addEventListener('submit', async event => {
-      if (event.submitter?.value === 'cancel') return;
       event.preventDefault();
-      const data = Object.fromEntries(new FormData(event.currentTarget));
+      const form = event.currentTarget;
+      const button = event.submitter;
+      const data = Object.fromEntries(new FormData(form));
+      data.project = Number(data.project);
+      if (button) button.disabled = true;
       try {
-        const result = await mutate('/agents', data);
-        $('#launch-dialog').close(); event.currentTarget.reset();
+        if (data.model === '__custom__') {
+          data.model = customModel(data.custom_model);
+        }
+        delete data.custom_model;
+        let result;
+        try { result = await mutate('/agents', data); }
+        catch (error) {
+          if (!/confirm|hard limit/i.test(error.message) || !confirm(`${error.message}\n\nLaunch anyway?`)) throw error;
+          result = await mutate('/agents', {...data, force: true});
+        }
+        $('#launch-dialog').close(); form.reset(); setLaunchChoices();
         toast(['Agent launched', ...(result.warnings || [])].join('\n'));
-      } catch (error) {
-        if (/confirm|hard limit/i.test(error.message) && confirm(`${error.message}\n\nLaunch anyway?`)) {
-          try {
-            const result = await mutate('/agents', {...data, force: true});
-            $('#launch-dialog').close();
-            toast(['Agent launched past the limit', ...(result.warnings || [])].join('\n'));
-          } catch (e) { toast(e.message, true); }
-        } else toast(error.message, true);
-      }
+      } catch (error) { toast(error.message, true); }
+      finally { if (button) button.disabled = false; }
     });
 
     $('#thread-form').addEventListener('submit', async event => {
-      if (event.submitter?.value === 'cancel') return;
       event.preventDefault();
-      const form = new FormData(event.currentTarget);
+      const form = event.currentTarget;
+      const button = event.submitter;
+      const data = new FormData(form);
+      if (button) button.disabled = true;
       try {
-        const result = await mutate('/threads', { title: form.get('title'), members: splitList(form.get('members')) });
-        $('#thread-dialog').close(); event.currentTarget.reset();
+        const result = await mutate('/threads', { project: state.selectedProject, title: data.get('title'), members: splitList(data.get('members')) });
+        $('#thread-dialog').close(); form.reset();
         state.selectedThread = Number(result.id ?? result.thread_id); await refreshThread();
       } catch (error) { toast(error.message, true); }
+      finally { if (button) button.disabled = false; }
+    });
+
+    $('#project-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const button = event.submitter;
+      if (button) button.disabled = true;
+      try {
+        const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
+        state.selectedProject = Number(result.id); resetThread(); await refresh();
+        $('#project-dialog').close(); form.reset();
+      } catch (error) { toast(error.message, true); }
+      finally { if (button) button.disabled = false; }
     });
 
     document.addEventListener('submit', async event => {
@@ -520,29 +731,39 @@
       try {
         const result = await mutate('/messages', { thread: state.selectedThread, text });
         event.target.reset(); await refreshThread();
-        if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}; it will be woken when a slot frees.`).join('\n'));
+        if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}.`).join('\n'));
       } catch (error) { toast(error.message, true); }
     });
 
     $('#settings-form').addEventListener('submit', async event => {
       event.preventDefault();
+      const form = event.currentTarget;
+      const button = event.submitter;
       const next = structuredClone(state.settings);
-      event.currentTarget.querySelectorAll('[data-harness]').forEach(root => {
-        const h = next.harnesses[root.dataset.harness];
-        h.enabled = $('[name=enabled]', root).checked;
-        h.model = $('[name=model]', root).value.trim(); h.effort = $('[name=effort]', root).value.trim();
-        h.models = splitList($('[name=models]', root).value); h.efforts = splitList($('[name=efforts]', root).value);
-        h.flags = $('[name=flags]', root).value.match(/(?:[^\s"]+|"[^"]*")+/g)?.map(x => x.replace(/^"|"$/g, '')) || [];
-      });
-      event.currentTarget.querySelectorAll('[data-limit]').forEach(root => {
-        const [kind, name] = root.dataset.limit.split('.');
-        const target = name ? next.limits[kind][name] : next.limits[kind];
-        const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
-        target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
-      });
-      next.auto_resume = $('[name=auto_resume]', event.currentTarget).checked;
-      next.done_closes = $('[name=done_closes]', event.currentTarget).checked;
-      try { await api('/settings', { method: 'PUT', body: JSON.stringify({ settings: next }) }); state.settings = next; await refresh(); renderSettings(); setLaunchHarnesses(); toast('Settings saved'); } catch (error) { toast(error.message, true); }
+      if (button) button.disabled = true;
+      try {
+        form.querySelectorAll('[data-harness]').forEach(root => {
+          const h = next.harnesses[root.dataset.harness];
+          h.enabled = $('[name=enabled]', root).checked;
+          h.model = $('[name=model]', root).value; h.effort = $('[name=effort]', root).value;
+          h.models = checked(root, 'allowed_model'); h.efforts = checked(root, 'allowed_effort');
+          if (h.model === '__custom__') {
+            h.model = customModel($('[name=custom_model]', root).value);
+            if (!h.models.includes(h.model)) h.models.push(h.model);
+          }
+          h.flags = parseFlags($('[name=flags]', root).value);
+        });
+        form.querySelectorAll('[data-limit]').forEach(root => {
+          const [kind, name] = root.dataset.limit.split('.');
+          const target = name ? next.limits[kind][name] : next.limits[kind];
+          const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
+          target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
+        });
+        next.auto_resume = $('[name=auto_resume]', form).checked;
+        next.done_closes = $('[name=done_closes]', form).checked;
+        await api('/settings', { method: 'PUT', body: JSON.stringify({ settings: next }) }); state.settings = next; await refresh(); renderSettings(); setLaunchHarnesses(); toast('Settings saved');
+      } catch (error) { toast(error.message, true); }
+      finally { if (button) button.disabled = false; }
     });
 
     refresh(true).then(setLaunchHarnesses).catch(e => toast(e.message, true));
