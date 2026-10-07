@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>acom</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f2ec;
+      --panel: #fffefa;
+      --ink: #21211e;
+      --muted: #6d6b63;
+      --line: #d9d5ca;
+      --accent: #27615b;
+      --accent-soft: #e2efeb;
+      --warn: #9a5c17;
+      --danger: #a43934;
+      --shadow: 0 10px 28px rgba(54, 50, 40, .08);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 18px; padding: 14px 24px; border-bottom: 1px solid var(--line); background: rgba(255,254,250,.94); backdrop-filter: blur(12px); }
+    .brand { font: 700 21px/1 ui-monospace, monospace; letter-spacing: -.5px; }
+    .live { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #419176; box-shadow: 0 0 0 3px #dfeee9; }
+    .dot.off { background: var(--danger); box-shadow: 0 0 0 3px #f4dfdd; }
+    .usage { display: flex; gap: 14px; margin-left: auto; }
+    .meter { width: 132px; }
+    .meter-label { display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
+    .track { position: relative; height: 6px; overflow: hidden; border-radius: 9px; background: #e6e2d9; }
+    .fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s; }
+    .fill.warn { background: var(--warn); }
+    .fill.hard { background: var(--danger); }
+    .actions { display: flex; gap: 8px; }
+    button { min-height: 34px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: var(--ink); }
+    button:hover { border-color: #a9a59a; background: #faf8f2; }
+    button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    button.danger { color: var(--danger); }
+    button.small { min-height: 27px; padding: 3px 8px; font-size: 12px; }
+    main { max-width: 1500px; margin: 0 auto; padding: 22px 24px 48px; }
+    nav { display: flex; gap: 3px; margin-bottom: 17px; }
+    nav button { border-color: transparent; background: transparent; color: var(--muted); }
+    nav button.active { background: var(--accent-soft); color: var(--accent); }
+    .page { display: none; }
+    .page.active { display: block; }
+    .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(310px, 1fr); gap: 18px; align-items: start; }
+    .stack { display: grid; gap: 18px; }
+    .panel { overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
+    .panel-head { display: flex; align-items: center; gap: 10px; min-height: 50px; padding: 10px 15px; border-bottom: 1px solid var(--line); }
+    .panel-head h2 { margin: 0; font-size: 15px; }
+    .panel-head .count { color: var(--muted); font-size: 12px; }
+    .panel-head button { margin-left: auto; }
+    .empty { padding: 30px 18px; color: var(--muted); text-align: center; }
+    .group-title { padding: 11px 15px 7px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .agent { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(170px, 1.2fr) auto; gap: 14px; align-items: center; padding: 11px 15px; border-top: 1px solid #ebe8df; }
+    .agent:hover { background: #fbfaf5; }
+    .agent-name { display: flex; align-items: center; gap: 8px; font-weight: 650; }
+    .pill { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 20px; background: #ece9e1; color: #55534d; font-size: 11px; font-weight: 600; }
+    .pill.working { background: #dceee8; color: #1f6658; }
+    .pill.paused, .pill.crashed { background: #f5dfdc; color: #923b34; }
+    .pill.idle { background: #e3eaf2; color: #3b5878; }
+    .meta { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 9px 12px; border-bottom: 1px solid #ebe8df; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .activity { max-height: 365px; overflow: auto; }
+    .event { display: grid; grid-template-columns: 58px 1fr; gap: 8px; padding: 8px 14px; border-bottom: 1px solid #ebe8df; }
+    .event time { color: var(--muted); font: 11px/1.6 ui-monospace, monospace; }
+    .actor { color: var(--muted); }
+    .thread-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 610px; }
+    .thread-list { border-right: 1px solid var(--line); }
+    .thread-row { display: block; width: 100%; min-height: 0; padding: 12px 14px; border: 0; border-bottom: 1px solid #ebe8df; border-radius: 0; background: transparent; text-align: left; }
+    .thread-row.active { background: var(--accent-soft); }
+    .thread-row strong { display: block; margin-bottom: 3px; }
+    .thread-main { display: flex; min-width: 0; flex-direction: column; }
+    .thread-header { padding: 13px 16px; border-bottom: 1px solid var(--line); }
+    .thread-header h2 { margin: 0 0 3px; font-size: 16px; }
+    .messages { flex: 1; min-height: 400px; max-height: 580px; padding: 16px; overflow: auto; }
+    .message { max-width: 780px; margin-bottom: 13px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; }
+    .message.user { margin-left: auto; background: var(--accent-soft); }
+    .message-head { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 5px; color: var(--muted); font-size: 11px; }
+    .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .composer { display: flex; gap: 9px; padding: 12px; border-top: 1px solid var(--line); }
+    .composer textarea { flex: 1; min-height: 58px; resize: vertical; }
+    input, select, textarea { width: 100%; padding: 8px 9px; border: 1px solid #c9c5ba; border-radius: 7px; background: white; color: var(--ink); }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+    .wide { grid-column: 1 / -1; }
+    dialog { width: min(560px, calc(100% - 30px)); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 80px rgba(20,20,15,.25); }
+    dialog::backdrop { background: rgba(30,29,25,.36); backdrop-filter: blur(2px); }
+    dialog form { padding: 18px; }
+    dialog h2 { margin: 0 0 16px; font-size: 18px; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    .details { display: grid; grid-template-columns: 130px 1fr; gap: 8px 13px; }
+    .details dt { color: var(--muted); }
+    .details dd { margin: 0; overflow-wrap: anywhere; }
+    .agent-log { max-height: 180px; margin: 4px 0 0; padding: 9px; overflow: auto; border-radius: 7px; background: #292925; color: #efeee8; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+    .settings { padding: 18px; }
+    .settings h3 { margin: 22px 0 10px; font-size: 14px; }
+    .settings h3:first-child { margin-top: 0; }
+    .harness-settings { margin-bottom: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; }
+    .harness-settings h4 { margin: 0 0 11px; text-transform: capitalize; }
+    .limit-row { display: grid; grid-template-columns: minmax(140px, 1fr) 130px 130px; gap: 10px; align-items: end; margin-bottom: 9px; }
+    .toast { position: fixed; right: 20px; bottom: 20px; z-index: 20; max-width: 430px; padding: 11px 14px; border-radius: 8px; background: #282824; color: white; box-shadow: var(--shadow); opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; white-space: pre-line; }
+    .toast.show { opacity: 1; transform: none; }
+    .toast.error { background: var(--danger); }
+    code { font: 12px ui-monospace, monospace; }
+    @media (max-width: 900px) {
+      .top { flex-wrap: wrap; padding: 12px 15px; }
+      .usage { order: 3; width: 100%; margin: 0; }
+      .meter { flex: 1; }
+      main { padding: 15px; }
+      .grid, .thread-layout { grid-template-columns: 1fr; }
+      .thread-list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 220px; overflow: auto; }
+      .agent { grid-template-columns: 1fr; gap: 5px; }
+      .agent-buttons { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">acom</div>
+    <div class="live"><span class="dot" id="live-dot"></span><span id="live-text">connecting</span></div>
+    <div class="usage" id="usage"></div>
+    <div class="actions">
+      <button class="primary" data-open="launch-dialog">Launch</button>
+      <button id="pause-all">Pause all</button>
+      <button id="resume-all">Resume all</button>
+    </div>
+  </header>
+
+  <main>
+    <nav>
+      <button class="active" data-page="overview">Overview</button>
+      <button data-page="threads">Threads</button>
+      <button data-page="settings">Settings</button>
+    </nav>
+
+    <section class="page active" id="page-overview">
+      <div class="grid">
+        <div class="stack">
+          <section class="panel">
+            <div class="panel-head"><h2>Agents</h2><span class="count" id="agent-count"></span></div>
+            <div id="agents"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>Locks</h2><span class="count" id="lock-count"></span></div>
+            <div id="locks"></div>
+          </section>
+        </div>
+        <section class="panel">
+          <div class="panel-head"><h2>Activity</h2></div>
+          <div class="activity" id="activity"></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="page" id="page-threads">
+      <section class="panel thread-layout">
+        <div class="thread-list">
+          <div class="panel-head"><h2>Threads</h2><span class="count" id="thread-count"></span><button class="small" data-open="thread-dialog">New</button></div>
+          <div id="thread-list"></div>
+        </div>
+        <div class="thread-main" id="thread-main"><div class="empty">Select a thread</div></div>
+      </section>
+    </section>
+
+    <section class="page" id="page-settings">
+      <section class="panel">
+        <div class="panel-head"><h2>Settings</h2><button class="primary" form="settings-form">Save</button></div>
+        <form class="settings" id="settings-form"></form>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="launch-dialog">
+    <form method="dialog" id="launch-form">
+      <h2>Launch agent</h2>
+      <div class="form-grid">
+        <label>Name <input name="name" placeholder="optional"></label>
+        <label>Group <input name="group" placeholder="optional"></label>
+        <label>Harness <select name="harness" id="launch-harness"></select></label>
+        <label>Model <select name="model" id="launch-model"></select></label>
+        <label>Effort <select name="effort" id="launch-effort"></select></label>
+        <label class="wide">Task <textarea name="task" rows="6" required></textarea></label>
+      </div>
+      <div class="dialog-actions"><button value="cancel">Cancel</button><button class="primary" value="default">Launch</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="thread-dialog">
+    <form method="dialog" id="thread-form">
+      <h2>New thread</h2>
+      <div class="form-grid">
+        <label class="wide">Title <input name="title" required></label>
+        <label class="wide">Members <input name="members" placeholder="1, 2, active, group:review"></label>
+      </div>
+      <div class="dialog-actions"><button value="cancel">Cancel</button><button class="primary" value="default">Create</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="agent-dialog"><form method="dialog"><h2 id="agent-title">Agent</h2><dl class="details" id="agent-details"></dl><div class="dialog-actions"><button value="cancel">Close</button></div></form></dialog>
+  <dialog id="pause-dialog">
+    <form method="dialog">
+      <h2>Pause agent</h2>
+      <p id="pause-copy"></p>
+      <p class="meta">Keeping locks freezes their TTL clocks. Nobody else can get them until this agent resumes.</p>
+      <div class="dialog-actions"><button value="cancel">Cancel</button><button value="keep">Keep locks frozen</button><button class="primary" value="release">Release locks (recommended)</button></div>
+    </form>
+  </dialog>
+  <dialog id="resume-dialog">
+    <form method="dialog">
+      <h2>Resume agent</h2>
+      <p>These other paused agents still hold frozen locks:</p>
+      <div id="resume-copy"></div>
+      <div class="dialog-actions"><button value="cancel">Cancel</button><button value="only">Resume only</button><button class="primary" value="release">Resume and release those locks</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, thread: null, selectedThread: null, threadRequest: 0 };
+    const $ = (s, root = document) => root.querySelector(s);
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const fmt = n => Number(n || 0).toLocaleString();
+    const when = n => n ? new Date(n * 1000).toLocaleString() : '—';
+    const who = id => Number(id) === 0 ? 'user' : `agent ${id}`;
+    function duration(seconds) {
+      const n = Math.max(0, Number(seconds || 0));
+      if (n >= 3600) return `${Math.ceil(n / 3600)}h`;
+      if (n >= 60) return `${Math.ceil(n / 60)}m`;
+      return `${Math.ceil(n)}s`;
+    }
+    async function api(path, options = {}) {
+      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+      const text = await response.text();
+      let body = text;
+      try { body = text ? JSON.parse(text) : {}; } catch (_) {}
+      if (!response.ok) throw new Error(body?.error || text || `${response.status} ${response.statusText}`);
+      return body;
+    }
+
+    function toast(message, error = false) {
+      const el = $('#toast');
+      el.textContent = message;
+      el.className = `toast show${error ? ' error' : ''}`;
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => el.className = 'toast', 3400);
+    }
+
+    async function refresh(initial = false) {
+      let healthy = false;
+      try {
+        const overview = await api('/overview');
+        for (const key of ['agents', 'threads', 'locks', 'activity', 'limits']) state[key] = overview[key];
+        state.settings = overview.settings;
+        healthy = true;
+      } catch (_) {}
+      $('#live-dot').classList.toggle('off', !healthy);
+      $('#live-text').textContent = healthy ? 'live' : 'connection error';
+      render();
+      if (initial && state.settings) renderSettings();
+      if (state.selectedThread) await refreshThread(false);
+    }
+
+    function render() { renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); }
+
+    function renderUsage() {
+      const root = $('#usage');
+      const usages = state.limits?.usage || [];
+      const limits = state.limits?.limits?.usage || {};
+      const providers = Object.keys(limits);
+      root.innerHTML = providers.map(provider => {
+        const now = Date.now() / 1000;
+        const readings = usages.filter(u => u.provider === provider && (!u.resets_at || u.resets_at > now));
+        const known = readings.length > 0;
+        const value = known ? Math.max(...readings.map(u => Number(u.used_pct))) : 0;
+        const lim = limits[provider] || { soft: 80, hard: 95 };
+        const kind = value >= lim.hard ? 'hard' : value >= lim.soft ? 'warn' : '';
+        return `<div class="meter"><div class="meter-label"><span>${esc(provider)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track"><div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div></div>`;
+      }).join('');
+    }
+
+    function renderAgents() {
+      const root = $('#agents');
+      $('#agent-count').textContent = `${state.agents.length} total`;
+      if (!state.agents.length) { root.innerHTML = '<div class="empty">No agents yet</div>'; return; }
+      const groups = new Map();
+      state.agents.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
+      root.innerHTML = [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join('');
+    }
+
+    function agentRow(a) {
+      const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
+      const buttons = ['working', 'idle', 'done'].includes(a.state)
+        ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">Resume</button>`
+        : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
+      const close = a.state !== 'closed' ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
+      return `<div class="agent" data-agent="${a.id}">
+        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}</span></div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
+        <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div><div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
+      </div>`;
+    }
+
+    function renderLocks() {
+      $('#lock-count').textContent = `${state.locks.length} total`;
+      if (!state.locks.length) { $('#locks').innerHTML = '<div class="empty">No locks</div>'; return; }
+      $('#locks').innerHTML = `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => `<tr>
+        <td><code>${esc(l.name)}</code>${l.frozen ? ' <span class="pill paused">frozen</span>' : ''}</td><td>${esc(l.about)}</td>
+        <td>${l.holder ? `#${l.holder} ${esc(l.holder_name || '')}` : 'free'}${l.queue?.length ? `<div class="meta">queue: ${l.queue.map(x => `#${x}`).join(', ')}</div>` : ''}</td>
+        <td>${when(l.acquired_at)}</td><td>${l.frozen ? `frozen, ${l.frozen_left == null ? 'no TTL' : `${duration(l.frozen_left)} left`}` : l.expires_at ? when(l.expires_at) : '—'}</td><td>${l.holder ? `<button class="small danger" data-action="free-lock" data-name="${esc(l.name)}">Free</button>` : ''}</td>
+      </tr>`).join('')}</tbody></table>`;
+    }
+
+    function renderActivity() {
+      $('#activity').innerHTML = state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div><span class="actor">${esc(e.actor)}</span> ${esc(e.what)}</div></div>`).join('') : '<div class="empty">No activity yet</div>';
+    }
+
+    function renderThreads() {
+      $('#thread-count').textContent = `${state.threads.length}`;
+      $('#thread-list').innerHTML = state.threads.length ? state.threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong><span class="meta">${fmt(t.messages)} messages · ${t.members?.map(x => `#${x}`).join(', ') || 'no members'}</span></button>`).join('') : '<div class="empty">No threads yet</div>';
+    }
+
+    function messageHtml(m) {
+      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''}" data-message="${m.id}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}</span><span>${when(m.at)}</span></div><div class="message-text">${esc(m.text)}</div></div>`;
+    }
+
+    async function refreshThread(showError = true) {
+      const selected = state.selectedThread;
+      const request = ++state.threadRequest;
+      try {
+        const t = await api(`/threads/${selected}`);
+        if (request !== state.threadRequest || selected !== state.selectedThread) return;
+        const sameThread = state.thread?.id === t.id && $('#messages');
+        if (!sameThread) {
+          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta">Members: ${t.members?.map(x => `#${x}`).join(', ') || 'none'}</div></div>
+            <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
+            <form class="composer" id="message-form"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
+          const messages = $('#messages');
+          messages.scrollTop = messages.scrollHeight;
+        } else {
+          const messages = $('#messages');
+          const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36;
+          const last = state.thread?.messages?.at(-1)?.id || 0;
+          const added = (t.messages || []).filter(m => m.id > last);
+          if (added.length) {
+            $('.empty', messages)?.remove();
+            messages.insertAdjacentHTML('beforeend', added.map(messageHtml).join(''));
+            if (atBottom) messages.scrollTop = messages.scrollHeight;
+          }
+          $('.thread-header h2', $('#thread-main')).textContent = t.title;
+          $('.thread-header .meta', $('#thread-main')).textContent = `Members: ${t.members?.map(x => `#${x}`).join(', ') || 'none'}`;
+        }
+        state.thread = t;
+      } catch (error) { if (showError) toast(error.message, true); }
+    }
+
+    function renderSettings() {
+      const s = state.settings;
+      if (!s) return;
+      const harnesses = Object.entries(s.harnesses || {}).map(([name, h]) => `<div class="harness-settings" data-harness="${esc(name)}"><h4>${esc(name)}</h4><div class="form-grid">
+        <label><span><input type="checkbox" name="enabled" ${h.enabled ? 'checked' : ''} style="width:auto"> Enabled</span></label><span></span>
+        <label>Default model <input name="model" value="${esc(h.model)}"></label><label>Default effort <input name="effort" value="${esc(h.effort)}"></label>
+        <label class="wide">Allowed models <input name="models" value="${esc((h.models || []).join(', '))}"></label>
+        <label class="wide">Allowed efforts <input name="efforts" value="${esc((h.efforts || []).join(', '))}"></label>
+        <label class="wide">Extra launch flags <input name="flags" value="${esc((h.flags || []).join(' '))}"></label>
+      </div></div>`).join('');
+      const limit = (label, path, value) => `<div class="limit-row" data-limit="${path}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? 0}" min="0"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? 0}" min="0"></label></div>`;
+      const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${n} active agents`, `active_per_harness.${n}`, v)).join('');
+      const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${n} subscription %`, `usage.${n}`, v)).join('');
+      $('#settings-form').innerHTML = `<h3>Harnesses</h3>${harnesses}<h3>Limits</h3>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
+        <h3>Behavior</h3><div class="form-grid"><label><span><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''} style="width:auto"> Auto-resume after limits clear</span></label><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span></label></div>`;
+    }
+
+    function splitList(value) { return value.split(',').map(x => x.trim()).filter(Boolean); }
+
+    async function mutate(path, body = {}) {
+      const result = await api(path, { method: 'POST', body: JSON.stringify(body) });
+      await refresh();
+      return result;
+    }
+
+    function dialogChoice(dialog) {
+      return new Promise(resolve => {
+        dialog.returnValue = 'cancel';
+        dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true });
+        dialog.showModal();
+      });
+    }
+
+    async function pauseChoice(agent) {
+      if (!agent?.locks?.length) return 'release';
+      $('#pause-copy').textContent = `Agent ${agent.id} holds: ${agent.locks.join(', ')}`;
+      return dialogChoice($('#pause-dialog'));
+    }
+
+    async function resumeChoice(id) {
+      const frozen = state.locks.filter(lock => lock.frozen && lock.holder_state === 'paused' && Number(lock.holder) !== id);
+      if (!frozen.length) return { choice: 'only', frozen };
+      const groups = new Map();
+      frozen.forEach(lock => {
+        if (!groups.has(lock.holder)) groups.set(lock.holder, []);
+        groups.get(lock.holder).push(lock.name);
+      });
+      $('#resume-copy').innerHTML = [...groups].map(([holder, names]) => `<p><strong>agent ${holder}</strong>: ${names.map(esc).join(', ')}</p>`).join('');
+      return { choice: await dialogChoice($('#resume-dialog')), frozen };
+    }
+
+    document.addEventListener('click', async event => {
+      const open = event.target.closest('[data-open]');
+      if (open) {
+        if (open.dataset.open === 'launch-dialog') setLaunchHarnesses();
+        document.getElementById(open.dataset.open).showModal();
+        return;
+      }
+      const page = event.target.closest('[data-page]');
+      if (page) {
+        document.querySelectorAll('[data-page]').forEach(x => x.classList.toggle('active', x === page));
+        document.querySelectorAll('.page').forEach(x => x.classList.toggle('active', x.id === `page-${page.dataset.page}`));
+        return;
+      }
+      const thread = event.target.closest('[data-thread]');
+      if (thread) { state.selectedThread = Number(thread.dataset.thread); renderThreads(); await refreshThread(); return; }
+      const action = event.target.closest('[data-action]');
+      if (!action) return;
+      try {
+        const id = Number(action.dataset.id);
+        if (action.dataset.action === 'details') {
+          const [a, log] = await Promise.all([api(`/agents/${id}`), api(`/agents/${id}/log?lines=100`)]);
+          $('#agent-title').textContent = `${a.name} · #${a.id}`;
+          const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
+          const fields = Object.entries(a).filter(([,v]) => !Array.isArray(v) && typeof v !== 'object').map(([k,v]) => `<dt>${esc(k.replaceAll('_',' '))}</dt><dd>${esc(display(k, v))}</dd>`).join('');
+          const locks = `<dt>locks</dt><dd>${a.locks?.map(esc).join(', ') || '—'}</dd>`;
+          $('#agent-details').innerHTML = `${fields}${locks}<dt>recent activity</dt><dd><pre class="agent-log">${esc((log.lines || []).join('\n')) || 'No activity yet'}</pre></dd>`;
+          $('#agent-dialog').showModal();
+        } else if (action.dataset.action === 'pause') {
+          const agent = state.agents.find(a => a.id === id);
+          const locks = await pauseChoice(agent);
+          if (locks !== 'cancel') await mutate(`/agents/${id}/pause`, { locks });
+        } else if (action.dataset.action === 'resume') {
+          const { choice, frozen } = await resumeChoice(id);
+          if (choice === 'cancel') return;
+          if (choice === 'release') {
+            for (const lock of frozen) await api('/locks/free', { method: 'POST', body: JSON.stringify({ name: lock.name }) });
+          }
+          const result = await mutate(`/agents/${id}/resume`);
+          if (result.warnings?.length) toast(result.warnings.join('\n'));
+        } else if (['close','reopen'].includes(action.dataset.action)) {
+          if (action.dataset.action !== 'close' || confirm(`Close agent ${id}?`)) {
+            await mutate(`/agents/${id}/${action.dataset.action}`);
+          }
+        } else if (action.dataset.action === 'free-lock') {
+          if (confirm(`Free lock “${action.dataset.name}”?`)) await mutate('/locks/free', { name: action.dataset.name });
+        }
+      } catch (error) { toast(error.message, true); }
+    });
+
+    $('#pause-all').addEventListener('click', async () => { try { if (confirm('Pause all agents and freeze their locks?')) await mutate('/pause-all'); } catch (e) { toast(e.message, true); } });
+    $('#resume-all').addEventListener('click', async () => { try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); } });
+
+    $('#launch-harness').addEventListener('change', setLaunchChoices);
+    function setLaunchChoices() {
+      const name = $('#launch-harness').value;
+      const h = state.settings?.harnesses?.[name];
+      $('#launch-model').innerHTML = (h?.models || []).map(x => `<option ${x === h.model ? 'selected' : ''}>${esc(x)}</option>`).join('');
+      $('#launch-effort').innerHTML = (h?.efforts || []).map(x => `<option ${x === h.effort ? 'selected' : ''}>${esc(x)}</option>`).join('');
+    }
+    function setLaunchHarnesses() {
+      $('#launch-harness').innerHTML = Object.entries(state.settings?.harnesses || {}).filter(([,h]) => h.enabled).map(([name]) => `<option>${esc(name)}</option>`).join('');
+      setLaunchChoices();
+    }
+
+    $('#launch-form').addEventListener('submit', async event => {
+      if (event.submitter?.value === 'cancel') return;
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(event.currentTarget));
+      try {
+        const result = await mutate('/agents', data);
+        $('#launch-dialog').close(); event.currentTarget.reset();
+        toast(['Agent launched', ...(result.warnings || [])].join('\n'));
+      } catch (error) {
+        if (/confirm|hard limit/i.test(error.message) && confirm(`${error.message}\n\nLaunch anyway?`)) {
+          try {
+            const result = await mutate('/agents', {...data, force: true});
+            $('#launch-dialog').close();
+            toast(['Agent launched past the limit', ...(result.warnings || [])].join('\n'));
+          } catch (e) { toast(e.message, true); }
+        } else toast(error.message, true);
+      }
+    });
+
+    $('#thread-form').addEventListener('submit', async event => {
+      if (event.submitter?.value === 'cancel') return;
+      event.preventDefault();
+      const form = new FormData(event.currentTarget);
+      try {
+        const result = await mutate('/threads', { title: form.get('title'), members: splitList(form.get('members')) });
+        $('#thread-dialog').close(); event.currentTarget.reset();
+        state.selectedThread = Number(result.id ?? result.thread_id); await refreshThread();
+      } catch (error) { toast(error.message, true); }
+    });
+
+    document.addEventListener('submit', async event => {
+      if (event.target.id !== 'message-form') return;
+      event.preventDefault();
+      const text = new FormData(event.target).get('text');
+      try { await mutate('/messages', { thread: state.selectedThread, text }); event.target.reset(); await refreshThread(); } catch (error) { toast(error.message, true); }
+    });
+
+    $('#settings-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const next = structuredClone(state.settings);
+      event.currentTarget.querySelectorAll('[data-harness]').forEach(root => {
+        const h = next.harnesses[root.dataset.harness];
+        h.enabled = $('[name=enabled]', root).checked;
+        h.model = $('[name=model]', root).value.trim(); h.effort = $('[name=effort]', root).value.trim();
+        h.models = splitList($('[name=models]', root).value); h.efforts = splitList($('[name=efforts]', root).value);
+        h.flags = $('[name=flags]', root).value.match(/(?:[^\s"]+|"[^"]*")+/g)?.map(x => x.replace(/^"|"$/g, '')) || [];
+      });
+      event.currentTarget.querySelectorAll('[data-limit]').forEach(root => {
+        const [kind, name] = root.dataset.limit.split('.');
+        const target = name ? next.limits[kind][name] : next.limits[kind];
+        target.soft = Number($('[name=soft]', root).value); target.hard = Number($('[name=hard]', root).value);
+      });
+      next.auto_resume = $('[name=auto_resume]', event.currentTarget).checked;
+      next.done_closes = $('[name=done_closes]', event.currentTarget).checked;
+      try { await api('/settings', { method: 'PUT', body: JSON.stringify({ settings: next }) }); state.settings = next; await refresh(); renderSettings(); setLaunchHarnesses(); toast('Settings saved'); } catch (error) { toast(error.message, true); }
+    });
+
+    refresh(true).then(setLaunchHarnesses).catch(e => toast(e.message, true));
+    setInterval(() => refresh(false), 2000);
+  </script>
+</body>
+</html>
