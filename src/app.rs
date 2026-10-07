@@ -1157,7 +1157,7 @@ impl App {
         if a.state == "crashed" {
             let updates = st.take_updates(id)?;
             let prompt = format!(
-                "Your last turn ended with an error and you've been resumed.\n{updates}\n\nCarry on."
+                "Your last turn ended with an error and you've been resumed. Background tasks and monitors from before are gone: don't wait for them.\n{updates}\n\nCarry on."
             );
             return run::start_turn(self, st, id, &prompt);
         }
@@ -1165,7 +1165,7 @@ impl App {
         if from == "working" {
             let updates = st.take_updates(id)?;
             let prompt = format!(
-                "[acom] You were paused at {} and resumed at {}. Anything you were running then was stopped, so check it and redo it if needed.\n{updates}\n\nCarry on.",
+                "[acom] You were paused at {} and resumed at {}. Your process was stopped, so every command, background task and monitor from before the pause is gone: don't wait for any of them. Check what finished and redo the rest.\n{updates}\n\nCarry on.",
                 hhmm(a.paused_at.unwrap_or(now())),
                 hhmm(now())
             );

@@ -6,7 +6,7 @@ How you coordinate is up to you and your task. This explains the tool.
 
 ## Turns and messages
 
-You work in turns. When you end your turn you become idle, which costs nothing. A new message in any of your threads wakes you up again, in the same conversation.
+You work in turns. When you end your turn you become idle, which costs nothing. A new message in any of your threads wakes you up again, in the same conversation. Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
 
 While you work, lines starting with `[acom]` may appear after your tool calls. They tell you what's new, such as new messages, limits reached, or a lock you lost. They never include message content, so finish what you're doing first if you need to, then read your messages with `acom inbox`.
 
