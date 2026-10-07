@@ -243,7 +243,8 @@ CREATE TABLE IF NOT EXISTS agents (
   context INTEGER NOT NULL DEFAULT 0, context_warned INTEGER NOT NULL DEFAULT 0,
   fresh_in INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
   cache_read INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
-  turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER, wake_why TEXT);
+  turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER, wake_why TEXT,
+  session_started INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
@@ -649,9 +650,6 @@ impl App {
         std::fs::create_dir_all(data.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
         let db = Connection::open(data.join("acom.db"))?;
         db.execute_batch(SCHEMA)?;
-        // Added after the first release; older databases need the column.
-        let _ = db.execute("ALTER TABLE agents ADD COLUMN wake_queued_at INTEGER", []);
-        let _ = db.execute("ALTER TABLE agents ADD COLUMN wake_why TEXT", []);
         db.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
             [serde_json::to_string(&Settings::default()).unwrap()],
@@ -827,7 +825,7 @@ impl App {
         Ok((id, warnings))
     }
 
-    fn briefing(&self, st: &St, id: i64) -> R<String> {
+    pub fn briefing(&self, st: &St, id: i64) -> R<String> {
         let a = st.agent(id)?;
         let group = a
             .grp
@@ -1621,7 +1619,7 @@ impl App {
     pub fn set_session(&self, id: i64, session: &str) -> R<()> {
         let st = self.lock();
         st.db.execute(
-            "UPDATE agents SET session_id=?2 WHERE id=?1 AND session_id IS NULL",
+            "UPDATE agents SET session_id=coalesce(session_id, ?2), session_started=1 WHERE id=?1",
             params![id, session],
         )?;
         Ok(())

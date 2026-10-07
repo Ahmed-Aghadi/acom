@@ -59,15 +59,26 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
     }
     let a = st.agent(id)?;
     let s = st.settings();
-    let turns: i64 = st
-        .db
-        .query_row("SELECT turns FROM agents WHERE id=?1", [id], |r| r.get(0))?;
+    let (turns, started): (i64, bool) = st.db.query_row(
+        "SELECT turns, session_started FROM agents WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     let flags = s
         .harnesses
         .get(&a.harness)
         .map(|h| h.flags.clone())
         .unwrap_or_default();
-    let resume = turns > 0 && a.session.is_some();
+    // Resume only a session the harness actually started. Otherwise this is a fresh
+    // session (e.g. the first turn crashed early), which needs the briefing again.
+    let resume = started && a.session.is_some();
+    let briefed;
+    let prompt = if turns > 0 && !resume {
+        briefed = format!("{}\n{prompt}", app.briefing(st, id)?);
+        &briefed
+    } else {
+        prompt
+    };
     let launch = Launch {
         harness: &a.harness,
         model: &a.model,
