@@ -782,6 +782,9 @@ impl App {
 
     /// Wake an agent that's resting (idle, done, or closed) if something it should hear about arrived.
     pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+        if st.procs.contains_key(&id) {
+            return Ok(()); // still stopping; turn_ended wakes it if needed
+        }
         let a = st.agent(id)?;
         let only_user = match a.state.as_str() {
             "idle" | "done" => false,
@@ -801,14 +804,21 @@ impl App {
     }
 
     /// Called when an agent's process exits.
-    pub fn turn_ended(self: &Arc<Self>, id: i64, ok: bool) -> R<()> {
+    pub fn turn_ended(self: &Arc<Self>, id: i64, pid: u32, ok: bool) -> R<()> {
         let mut st = self.lock();
+        if st.procs.get(&id).is_some_and(|p| p.pid != pid) {
+            return Ok(()); // not this process's entry; never happens since turns don't overlap
+        }
         let stopping = st.procs.remove(&id).map(|p| p.stopping).unwrap_or(false);
-        st.db
-            .execute("UPDATE agents SET pid=NULL WHERE id=?1", [id])?;
+        st.db.execute(
+            "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
+            params![id, pid],
+        )?;
         let a = st.agent(id)?;
         if a.state != "working" {
-            // Paused or closed by someone: they already set the state.
+            // Paused or closed by someone: they already set the state. A closed agent may
+            // have a message from the user waiting that couldn't wake it while it stopped.
+            self.maybe_wake(&mut st, id)?;
             self.cv.notify_all();
             return Ok(());
         }
@@ -887,8 +897,22 @@ impl App {
         Ok(())
     }
 
+    /// Wait (a few seconds at most) for these agents' old processes to exit,
+    /// so a new turn never overlaps one that's still stopping.
+    fn wait_stopped<'a>(&'a self, mut st: MutexGuard<'a, St>, ids: &[i64]) -> MutexGuard<'a, St> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ids.iter().any(|i| st.procs.contains_key(i)) && Instant::now() < deadline {
+            st = self
+                .cv
+                .wait_timeout(st, Duration::from_millis(200))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        st
+    }
+
     pub fn resume(self: &Arc<Self>, id: i64, by: &str) -> R<Vec<String>> {
-        let mut st = self.lock();
+        let mut st = self.wait_stopped(self.lock(), &[id]);
         self.resume_locked(&mut st, id, by)?;
         // Warn about agents still paused that keep frozen locks.
         let mut warn = Vec::new();
@@ -953,11 +977,12 @@ impl App {
     }
 
     pub fn resume_all(self: &Arc<Self>, by: &str) -> R<Vec<i64>> {
-        let mut st = self.lock();
+        let st = self.lock();
         let ids: Vec<i64> = rows(&st.db, "SELECT id FROM agents WHERE state='paused'", [])?
             .iter()
             .map(|r| r["id"].as_i64().unwrap())
             .collect();
+        let mut st = self.wait_stopped(st, &ids);
         for &id in &ids {
             self.resume_locked(&mut st, id, by)?;
         }
@@ -983,7 +1008,7 @@ impl App {
     }
 
     pub fn reopen(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
-        let mut st = self.lock();
+        let mut st = self.wait_stopped(self.lock(), &[id]);
         if st.agent(id)?.state != "closed" {
             return Err(conflict(format!("agent {id} isn't closed")));
         }
@@ -1517,7 +1542,9 @@ impl App {
         .map(|r| r["id"].as_i64().unwrap())
         .collect();
         for id in &ids {
-            self.resume_locked(st, *id, "acom")?;
+            if !st.procs.contains_key(id) {
+                self.resume_locked(st, *id, "acom")?;
+            }
         }
         Ok(!ids.is_empty())
     }

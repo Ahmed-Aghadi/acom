@@ -42,6 +42,11 @@ fn append(path: &PathBuf, line: &str) {
 
 /// Start one turn of an agent with this prompt. The agent becomes `working`.
 pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
+    if st.procs.contains_key(&id) {
+        return Err(crate::app::conflict(format!(
+            "agent {id} is still stopping; try again in a moment"
+        )));
+    }
     let a = st.agent(id)?;
     let s = st.settings();
     let turns: i64 = st
@@ -52,12 +57,13 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         .get(&a.harness)
         .map(|h| h.flags.clone())
         .unwrap_or_default();
+    let resume = turns > 0 && a.session.is_some();
     let launch = Launch {
         harness: &a.harness,
         model: &a.model,
         effort: &a.effort,
         session: a.session.as_deref(),
-        resume: turns > 0 && a.session.is_some(),
+        resume,
         prompt,
         context_limit: s.limits.context.hard as u64,
         flags: &flags,
@@ -120,7 +126,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         let done = Arc::new(AtomicBool::new(false));
         let side = {
             let (app, harness, done) = (app.clone(), harness.clone(), done.clone());
-            thread::spawn(move || follow_side_file(&app, id, &harness, &done))
+            thread::spawn(move || follow_side_file(&app, id, &harness, resume, &done))
         };
         if let Some(out) = child.stdout.take() {
             let raw = log_path(&app, id, "jsonl");
@@ -142,7 +148,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
                 if ok { "" } else { " (exit with error)" }
             ),
         );
-        if let Err(e) = app.turn_ended(id, ok) {
+        if let Err(e) = app.turn_ended(id, pid, ok) {
             eprintln!("agent {id}: {}", e.1);
         }
     });
@@ -170,27 +176,33 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, ev: Event) {
 }
 
 /// Some harnesses write usage to a file instead of stdout. Read it while the turn runs.
-fn follow_side_file(app: &Arc<App>, id: i64, harness: &str, done: &AtomicBool) {
+/// On a resumed session the file already holds earlier turns, so start at its end.
+fn follow_side_file(app: &Arc<App>, id: i64, harness: &str, resume: bool, done: &AtomicBool) {
     let mut pos = 0u64;
     let mut path: Option<PathBuf> = None;
-    let mut partial = String::new();
+    let mut partial = Vec::new();
     loop {
         let finished = done.load(Ordering::SeqCst);
         if path.is_none() {
             let session = app.lock().agent(id).ok().and_then(|a| a.session);
             path = session.and_then(|s| harness::side_file(harness, &s));
+            if resume && let Some(p) = &path {
+                pos = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            }
         }
         if let Some(p) = &path
             && let Ok(mut f) = File::open(p)
             && f.seek(SeekFrom::Start(pos)).is_ok()
         {
-            let mut buf = String::new();
-            if let Ok(n) = f.read_to_string(&mut buf) {
+            let mut buf = Vec::new();
+            if let Ok(n) = f.read_to_end(&mut buf) {
                 pos += n as u64;
-                partial.push_str(&buf);
-                while let Some(i) = partial.find('\n') {
-                    let line: String = partial.drain(..=i).collect();
-                    for ev in harness::parse_line(harness, line.trim_end()) {
+                partial.extend_from_slice(&buf);
+                while let Some(i) = partial.iter().position(|&c| c == b'\n') {
+                    let line: Vec<u8> = partial.drain(..=i).collect();
+                    for ev in
+                        harness::parse_line(harness, String::from_utf8_lossy(&line).trim_end())
+                    {
                         if !matches!(ev, Event::Text(_)) {
                             apply(app, id, harness, ev);
                         }
