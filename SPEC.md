@@ -50,10 +50,10 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 |---|---|---|
 | `working` | In a turn: thinking and running tools | — |
 | `idle` | Its turn ended. Costs nothing | Any new message in its threads |
-| `paused` | Stopped by you, by a limit, or by a server restart. Messages wait | You resume it, or the limit clears (if auto-resume is on) |
+| `paused` | Stopped by you, by a limit, by a safety flag, or by a server restart. Messages wait | You resume it, or the limit clears (if auto-resume is on) |
 | `done` | It ran `acom done`: task finished | Any new message in its threads, when there's room (see Limits) |
 | `closed` | You closed it | Only your messages, when there's room, or you reopening it |
-| `crashed` | Its process exited with an error | You resume it |
+| `crashed` | Its process exited with an error (the error is shown) | You resume it |
 
 A **turn** is one stretch of work: it starts when the agent gets a prompt (its task, or a wake-up) and lasts until it stops and waits. Under the hood a turn is one run of `claude -p` or `codex exec`; when the run exits the agent is idle, and waking it resumes the same session. After a woken `done` or `closed` agent finishes its turn, it goes back to being `done` or `closed`.
 
@@ -103,6 +103,16 @@ A subscription limit only affects that provider's agents: Claude hitting its lim
 Agents paused by a limit resume by themselves when it clears, e.g. when the usage window resets or you raise the limit. A setting turns that off, so they wait for you.
 
 **The wake line.** Waking a done or closed agent makes it active again, so it needs room under the hard limits. If there isn't any, the agent waits in line, the sender is told (`agent 5 wasn't woken: Hard limit reached: 1 active agents (soft none, hard 1). It will be woken when there's room.`), and the UI shows it waiting. Waiting agents are woken oldest first as soon as there's room; a new message never jumps the line. Idle agents already count as active, so they're always woken at once.
+
+## Flags and model switches
+
+A model can refuse a request under its safeguards (e.g. a false cyber flag on security work), and harnesses can quietly switch to another model when that happens or when a model is unavailable. acom never lets that happen silently:
+
+- Claude agents run with `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` and `CLAUDE_CODE_NO_MODEL_FALLBACK=1`, so Claude Code doesn't switch models; Codex agents are run so that Codex doesn't either.
+- When an agent is refused or flagged, acom pauses it (its locks are released), shows the reason on the agent (e.g. "claude-fable-5-1 refused under its safeguards (cyber): ..."), and logs it. It isn't resumed automatically: you resume it with the same model, or launch an agent with another model.
+- As a safety net, acom checks the model that actually answers. If it isn't the one the agent was launched with (a dated ID like `claude-haiku-4-5-20251001` counts as `claude-haiku-4-5`), or it changes during the session, the agent is paused the same way.
+- When an agent hits its subscription's usage limit mid-turn ("You've hit your session limit"), acom pauses it with reason `limit` and resumes it automatically once the usage window resets, even if no hard limit is set.
+- When a turn crashes, the harness's last error (or its last line on stderr) is shown on the agent.
 
 ## Pausing
 
@@ -195,7 +205,7 @@ Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshin
 
 - **Project picker:** every project with its folder, plus adding and removing projects. Agents, threads, locks and activity below are for the selected project.
 - **Top bar:** subscription usage per provider (or "unknown"); **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
-- **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, and whether it's waiting in the wake line and why. Buttons to pause, resume, close and reopen. Details show the task, launch details, usage, held and lost locks, and recent activity (the harness's output).
+- **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, whether it's waiting in the wake line and why, and any problem (flagged, usage limit, crash) with its reason. Buttons to pause, resume, close and reopen. Details show the task, launch details, usage, held and lost locks, and recent activity (the harness's output).
 - **Threads:** click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and members, by ID or selector. After posting you're told who couldn't be woken yet.
 - **Locks:** name, description, holder, since, expires (or frozen with the time left), queue, and a **Free** button.
 - **Activity:** launches, pauses, resumes, limits reached, wake-line changes, locks freed by you, and who did each.
@@ -255,7 +265,7 @@ Tables:
 
 ```
 projects (id, path, name, created_at)                  -- id never reused
-agents   (id, project, name, grp, task, harness, model, effort, state, rest, status_text, session_id, session_started,
+agents   (id, project, name, grp, task, problem, seen_model, harness, model, effort, state, rest, status_text, session_id, session_started,
           launched_by, launched_at, pid, pause_reason, pause_from, paused_at, done_req,
           context, context_warned, fresh_in, cache_write, cache_read, output, turns, ended_at,
           wake_queued_at, wake_why)
