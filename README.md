@@ -11,7 +11,7 @@ cargo install --path .
 acom serve
 ```
 
-Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it. Nothing is written into your projects.
+Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it; acom keeps none of its own state in your projects (the agents, of course, work on their files).
 
 ## Projects
 
@@ -25,7 +25,7 @@ Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACO
 
 When an agent runs `acom done` it's closed by default: only your messages wake it again. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a finished agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
-Each limit has an optional soft and hard value; leave a field empty in Settings for no limit.
+Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Settings are saved in the database and kept across upgrades; new defaults only apply to a fresh `~/.acom`.
 
 ## Models
 
