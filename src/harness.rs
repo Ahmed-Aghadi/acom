@@ -105,16 +105,11 @@ fn quote(p: &Path) -> String {
 
 fn claude_command(l: &Launch) -> (Command, Option<String>) {
     let mut c = Command::new("claude");
-    c.args([
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--model",
-        l.model,
-        "--effort",
-        l.effort,
-    ]);
+    c.args(["-p", "--output-format", "stream-json", "--verbose"]);
+    c.args(l.flags);
+    // Keep session, model, compaction, hook and subagent controls after the
+    // configurable flags so project settings cannot replace these invariants.
+    c.args(["--model", l.model, "--effort", l.effort]);
     if let Some(s) = l.session {
         c.args([if l.resume { "--resume" } else { "--session-id" }, s]);
     }
@@ -129,7 +124,6 @@ fn claude_command(l: &Launch) -> (Command, Option<String>) {
     // No subagents or side channels: every agent goes through acom.
     c.args(["--disallowedTools", "Agent,Workflow,SendMessage,ListAgents"]);
     c.args(["--allowedTools", "Bash(acom *)"]);
-    c.args(l.flags);
     c.stdin(Stdio::piped());
     (c, Some(l.prompt.to_string()))
 }
@@ -435,6 +429,41 @@ mod tests {
                 add: true
             }
         ));
+    }
+
+    #[test]
+    fn claude_enforced_flags_follow_configurable_flags() {
+        let flags = vec![
+            "--model".into(),
+            "wrong-model".into(),
+            "--settings".into(),
+            "{}".into(),
+            "--allowedTools".into(),
+            "Agent".into(),
+        ];
+        let launch = Launch {
+            harness: "claude",
+            model: "right-model",
+            effort: "high",
+            session: Some("session-1"),
+            resume: true,
+            prompt: "hello",
+            context_limit: 160_000,
+            flags: &flags,
+            acom: Path::new("/tmp/acom"),
+        };
+        let (command, input) = command(&launch);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        let last_model = args.iter().rposition(|x| x == "--model").unwrap();
+        assert_eq!(args[last_model + 1], "right-model");
+        let last_settings = args.iter().rposition(|x| x == "--settings").unwrap();
+        assert!(args[last_settings + 1].contains("PostToolUse"));
+        let denied = args.iter().rposition(|x| x == "--disallowedTools").unwrap();
+        assert!(args[denied + 1].contains("Agent"));
+        assert_eq!(input.as_deref(), Some("hello"));
     }
 
     #[test]
