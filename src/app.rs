@@ -189,6 +189,21 @@ impl Settings {
             if !crate::harness::KNOWN.contains(&name.as_str()) {
                 return Err(bad(format!("unknown harness {name}")));
             }
+            if h.model.trim().is_empty() || h.effort.trim().is_empty() {
+                return Err(bad(format!("{name}: choose a default model and effort")));
+            }
+            if let Some(m) = crate::harness::catalog(name)
+                .into_iter()
+                .find(|m| m.id == h.model)
+                && !m.efforts.contains(&h.effort.as_str())
+            {
+                return Err(bad(format!(
+                    "{name}: {} doesn't support effort {} (it supports {})",
+                    h.model,
+                    h.effort,
+                    m.efforts.join(", ")
+                )));
+            }
             if !h.models.contains(&h.model) {
                 return Err(bad(format!(
                     "{name}: default model {} isn't in its allowed models",
@@ -257,7 +272,7 @@ pub struct App {
 }
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY, project INTEGER NOT NULL, name TEXT NOT NULL, grp TEXT, task TEXT NOT NULL,
   harness TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL,
@@ -1125,13 +1140,14 @@ impl App {
     pub fn resume(self: &Arc<Self>, id: i64, by: &str) -> R<Vec<String>> {
         let mut st = self.wait_stopped(self.lock(), &[id]);
         self.resume_locked(&mut st, id, by)?;
-        // Warn about agents still paused that keep frozen locks.
+        // Warn about agents in its project still paused that keep frozen locks.
+        let project = st.agent(id)?.project;
         let mut warn = Vec::new();
         for r in rows(
             &st.db,
             "SELECT l.holder h, group_concat(l.name, ', ') n FROM locks l JOIN agents a ON a.id=l.holder
-             WHERE l.frozen=1 AND a.state='paused' GROUP BY l.holder",
-            [],
+             WHERE l.frozen=1 AND a.state='paused' AND l.project=?1 GROUP BY l.holder",
+            [project],
         )? {
             warn.push(format!("agent {} is still paused and holds {}", r["h"], r["n"].as_str().unwrap_or("")));
         }
@@ -2281,6 +2297,16 @@ mod tests {
             hard: Some(5.0),
         };
         assert!(s.check().is_err());
+        let mut s = Settings::default();
+        let codex = s.harnesses.get_mut("codex").unwrap();
+        codex.model = "gpt-6-luna".into();
+        codex.effort = "ultra".into();
+        assert!(
+            s.check()
+                .unwrap_err()
+                .1
+                .contains("doesn't support effort ultra")
+        );
         let mut s = Settings::default();
         s.limits.usage.insert(
             "<img src=x onerror=alert(1)>".into(),
