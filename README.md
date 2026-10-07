@@ -17,6 +17,10 @@ The server owns agent processes and stores project state in `.acom/acom.db`. Its
 
 Run `acom --help` for user and agent commands. Agents receive `ACOM_ID` and `ACOM_URL` automatically and can print their full operating guide with `acom guide`.
 
+An agent can use `acom launch --task "..." --done` to finish its own work and launch a replacement atomically, including when the active-agent limit is full. If a message reaches a finished or closed agent while no slot is available, acom keeps the wake request queued and starts that agent when capacity returns.
+
+Every soft and hard limit is optional. Leave its field empty in Settings to disable that threshold.
+
 ## Test
 
 ```sh

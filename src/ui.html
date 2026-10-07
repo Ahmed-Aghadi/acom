@@ -32,6 +32,7 @@
     .meter-label { display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
     .track { position: relative; height: 6px; overflow: hidden; border-radius: 9px; background: #e6e2d9; }
     .fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s; }
+    .mark { position: absolute; top: 0; bottom: 0; z-index: 1; width: 1px; background: rgba(255,255,255,.9); box-shadow: 0 0 0 1px rgba(40,40,35,.28); }
     .fill.warn { background: var(--warn); }
     .fill.hard { background: var(--danger); }
     .actions { display: flex; gap: 8px; }
@@ -62,6 +63,7 @@
     .pill.working { background: #dceee8; color: #1f6658; }
     .pill.paused, .pill.crashed { background: #f5dfdc; color: #923b34; }
     .pill.idle { background: #e3eaf2; color: #3b5878; }
+    .pill.waiting { background: #f5ead7; color: #855510; }
     .meta { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
     .agent-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
     table { width: 100%; border-collapse: collapse; }
@@ -280,9 +282,10 @@
         const readings = usages.filter(u => u.provider === provider && (!u.resets_at || u.resets_at > now));
         const known = readings.length > 0;
         const value = known ? Math.max(...readings.map(u => Number(u.used_pct))) : 0;
-        const lim = limits[provider] || { soft: 80, hard: 95 };
-        const kind = value >= lim.hard ? 'hard' : value >= lim.soft ? 'warn' : '';
-        return `<div class="meter"><div class="meter-label"><span>${esc(provider)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track"><div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div></div>`;
+        const lim = limits[provider] || { soft: null, hard: null };
+        const kind = lim.hard != null && value >= lim.hard ? 'hard' : lim.soft != null && value >= lim.soft ? 'warn' : '';
+        const marks = [['soft', lim.soft], ['hard', lim.hard]].filter(([,n]) => n != null).map(([kind,n]) => `<span class="mark ${kind}" title="${kind} ${esc(n)}%" style="left:${Math.max(0, Math.min(Number(n), 100))}%"></span>`).join('');
+        return `<div class="meter"><div class="meter-label"><span>${esc(provider)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div></div>`;
       }).join('');
     }
 
@@ -302,8 +305,9 @@
         : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">Resume</button>`
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
       const close = a.state !== 'closed' ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
+      const waiting = a.wake_queued_at ? `<span class="pill waiting">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       return `<div class="agent" data-agent="${a.id}">
-        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}</span></div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
+        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
         <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div><div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
@@ -372,7 +376,7 @@
         <label class="wide">Allowed efforts <input name="efforts" value="${esc((h.efforts || []).join(', '))}"></label>
         <label class="wide">Extra launch flags <input name="flags" value="${esc((h.flags || []).join(' '))}"></label>
       </div></div>`).join('');
-      const limit = (label, path, value) => `<div class="limit-row" data-limit="${path}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? 0}" min="0"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? 0}" min="0"></label></div>`;
+      const limit = (label, path, value) => `<div class="limit-row" data-limit="${path}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" placeholder="no limit"></label></div>`;
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${n} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${n} subscription %`, `usage.${n}`, v)).join('');
       $('#settings-form').innerHTML = `<h3>Harnesses</h3>${harnesses}<h3>Limits</h3>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
@@ -511,7 +515,11 @@
       if (event.target.id !== 'message-form') return;
       event.preventDefault();
       const text = new FormData(event.target).get('text');
-      try { await mutate('/messages', { thread: state.selectedThread, text }); event.target.reset(); await refreshThread(); } catch (error) { toast(error.message, true); }
+      try {
+        const result = await mutate('/messages', { thread: state.selectedThread, text });
+        event.target.reset(); await refreshThread();
+        if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}; it will be woken when a slot frees.`).join('\n'));
+      } catch (error) { toast(error.message, true); }
     });
 
     $('#settings-form').addEventListener('submit', async event => {
@@ -527,7 +535,8 @@
       event.currentTarget.querySelectorAll('[data-limit]').forEach(root => {
         const [kind, name] = root.dataset.limit.split('.');
         const target = name ? next.limits[kind][name] : next.limits[kind];
-        target.soft = Number($('[name=soft]', root).value); target.hard = Number($('[name=hard]', root).value);
+        const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
+        target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
       });
       next.auto_resume = $('[name=auto_resume]', event.currentTarget).checked;
       next.done_closes = $('[name=done_closes]', event.currentTarget).checked;
