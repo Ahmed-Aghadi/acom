@@ -932,6 +932,11 @@ impl App {
         if a.state != "paused" && a.state != "crashed" {
             return Err(conflict(format!("agent {id} is {}, not paused", a.state)));
         }
+        if st.procs.contains_key(&id) {
+            return Err(conflict(format!(
+                "agent {id} is still stopping; try again in a moment"
+            )));
+        }
         st.unfreeze_locks(id)?;
         st.db.execute(
             "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL WHERE id=?1",
@@ -983,6 +988,10 @@ impl App {
             .map(|r| r["id"].as_i64().unwrap())
             .collect();
         let mut st = self.wait_stopped(st, &ids);
+        let ids: Vec<i64> = ids
+            .into_iter()
+            .filter(|i| !st.procs.contains_key(i))
+            .collect();
         for &id in &ids {
             self.resume_locked(&mut st, id, by)?;
         }
@@ -1686,5 +1695,142 @@ impl App {
 
     pub fn settings(&self) -> Settings {
         self.lock().settings()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st() -> St {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        for id in 1..=3 {
+            db.execute(
+                "INSERT INTO agents(id,name,task,harness,model,effort,state,launched_by,launched_at)
+                 VALUES(?1,'a','t','claude','m','e','working',0,0)",
+                [id],
+            )
+            .unwrap();
+        }
+        St {
+            db,
+            queues: HashMap::new(),
+            procs: HashMap::new(),
+            over_hard: HashSet::new(),
+            over_soft: HashSet::new(),
+        }
+    }
+
+    fn hold(st: &St, name: &str, holder: i64, expires_at: Option<i64>) {
+        st.db
+            .execute(
+                "INSERT INTO locks(name,about,created_at,holder,acquired_at,expires_at) VALUES(?1,'x',0,?2,0,?3)",
+                params![name, holder, expires_at],
+            )
+            .unwrap();
+    }
+
+    fn lock(st: &St, name: &str) -> (Option<i64>, Option<i64>, i64, Option<i64>) {
+        st.db
+            .query_row(
+                "SELECT holder, expires_at, frozen, frozen_left FROM locks WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn freezing_stops_the_ttl_and_resuming_restarts_it() {
+        let mut st = st();
+        hold(&st, "a", 1, Some(now() + 100));
+        hold(&st, "b", 1, None);
+        st.freeze_locks(1).unwrap();
+        let (holder, expires, frozen, left) = lock(&st, "a");
+        assert_eq!((holder, expires, frozen), (Some(1), None, 1));
+        assert!((99..=100).contains(&left.unwrap()));
+        assert_eq!(lock(&st, "b"), (Some(1), None, 1, None));
+
+        // A frozen lock never expires, however long the holder stays paused.
+        st.db
+            .execute("UPDATE locks SET frozen_left=-50 WHERE name='a'", [])
+            .unwrap();
+        assert!(!st.expire_locks().unwrap());
+        assert_eq!(lock(&st, "a").0, Some(1));
+
+        st.db
+            .execute("UPDATE locks SET frozen_left=60 WHERE name='a'", [])
+            .unwrap();
+        st.unfreeze_locks(1).unwrap();
+        let (holder, expires, frozen, left) = lock(&st, "a");
+        assert_eq!((holder, frozen, left), (Some(1), 0, None));
+        assert!((now() + 59..=now() + 60).contains(&expires.unwrap()));
+        assert_eq!(lock(&st, "b"), (Some(1), None, 0, None));
+    }
+
+    #[test]
+    fn a_lock_already_past_its_ttl_is_released_not_frozen() {
+        let mut st = st();
+        hold(&st, "late", 1, Some(now() - 1));
+        st.freeze_locks(1).unwrap();
+        assert_eq!(lock(&st, "late"), (None, None, 0, None));
+        let text = st.take_updates(1).unwrap();
+        assert!(
+            text.contains("You no longer hold lock `late`: its TTL ran out"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn updates_list_senders_never_content_and_only_once() {
+        let mut st = st();
+        st.db
+            .execute(
+                "INSERT INTO threads(id,title,created_by,created_at) VALUES(1,'t',0,0)",
+                [],
+            )
+            .unwrap();
+        for a in 1..=3 {
+            st.db
+                .execute("INSERT INTO members(thread_id,agent_id) VALUES(1,?1)", [a])
+                .unwrap();
+        }
+        for (sender, text) in [(2, "secret plan"), (0, "hi"), (2, "more"), (1, "mine")] {
+            st.db
+                .execute(
+                    "INSERT INTO messages(thread_id,sender,text,at) VALUES(1,?1,?2,0)",
+                    params![sender, text],
+                )
+                .unwrap();
+        }
+        let text = st.take_updates(1).unwrap();
+        assert_eq!(
+            text,
+            "[acom] 3 new messages from agent 2, user. Read them with `acom inbox` when you're ready."
+        );
+        assert_eq!(st.take_updates(1).unwrap(), "");
+        // A closed agent is only woken by the user.
+        assert_eq!(st.pending(3, true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn long_sender_lists_are_cut_in_the_middle() {
+        assert_eq!(sender_list(&[2, 0]), "agent 2, user");
+        assert_eq!(
+            sender_list(&[1, 2, 3, 4, 5, 6, 7, 0]),
+            "agent 1, agent 2, agent 3, … agent 7, user"
+        );
+    }
+
+    #[test]
+    fn settings_reject_soft_above_hard() {
+        let mut s = Settings::default();
+        assert!(s.check().is_ok());
+        s.limits.context = Limit {
+            soft: 10.0,
+            hard: 5.0,
+        };
+        assert!(s.check().is_err());
     }
 }
