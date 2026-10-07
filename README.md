@@ -7,8 +7,8 @@
 You need a Rust toolchain and at least one supported harness installed and signed in (`claude` or `codex`). The current process supervisor targets Unix systems.
 
 ```sh
-cargo build --release
-./target/release/acom serve
+cargo install --path .
+acom serve
 ```
 
 Open <http://127.0.0.1:7400/>. Use `--port` to choose another port.

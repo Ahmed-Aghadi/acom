@@ -281,7 +281,7 @@ fn codex_command(l: &Launch) -> (Command, Option<String>) {
     c.args(["-c", "sandbox_workspace_write.network_access=true"]);
     let hook_command = format!("{} hook", quote(l.acom));
     let hooks = format!(
-        "hooks.PostToolUse=[{{matcher=\".*\",hooks=[{{type=\"command\",command={},timeout=10,additionalContextLimit=500}}]}}]",
+        "hooks.PostToolUse=[{{matcher=\".*\",hooks=[{{type=\"command\",command={},timeout=10,additionalContextLimit=4000}}]}}]",
         toml_string(&hook_command)
     );
     c.args(["-c", &hooks, "--dangerously-bypass-hook-trust"]);
