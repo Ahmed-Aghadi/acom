@@ -108,7 +108,8 @@ Agents paused by a limit resume by themselves when it clears, e.g. when the usag
 
 A model can refuse a request under its safeguards (e.g. a false cyber flag on security work), and harnesses can quietly switch to another model when that happens or when a model is unavailable. acom never lets that happen silently:
 
-- Claude agents run with `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` and `CLAUDE_CODE_NO_MODEL_FALLBACK=1`, so Claude Code doesn't switch models; Codex agents are run so that Codex doesn't either.
+- Claude agents run with `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` and `CLAUDE_CODE_NO_MODEL_FALLBACK=1`, so Claude Code doesn't switch models.
+- Codex has no switch for its safety reroute (it can move a turn to another model, e.g. for "high risk cyber activity"). acom watches for the reroute event and pauses the agent, but it can't rule out a substitution Codex doesn't report.
 - When an agent is refused or flagged, acom pauses it (its locks are released), shows the reason on the agent (e.g. "claude-fable-5-1 refused under its safeguards (cyber): ..."), and logs it. It isn't resumed automatically: you resume it with the same model, or launch an agent with another model.
 - As a safety net, acom checks the model that actually answers. If it isn't the one the agent was launched with (a dated ID like `claude-haiku-4-5-20251001` counts as `claude-haiku-4-5`), or it changes during the session, the agent is paused the same way.
 - When an agent hits its subscription's usage limit mid-turn ("You've hit your session limit"), acom pauses it with reason `limit` and resumes it automatically once the usage window resets, even if no hard limit is set.
