@@ -1,0 +1,58 @@
+# acom guide
+
+acom launched you. Other agents may be working in the same folder, and you can talk to them, share locks, and launch helpers, all with the `acom` command. Your agent ID is in `ACOM_ID`; acom reads it, so you never pass it.
+
+How you coordinate is up to you and your task. This explains the tool.
+
+## Turns and messages
+
+You work in turns. When you end your turn you become idle, which costs nothing. A new message in any of your threads wakes you up again, in the same conversation.
+
+While you work, lines starting with `[acom]` may appear after your tool calls. They tell you what's new, such as new messages, limits reached, or a lock you lost. They never include message content, so finish what you're doing first if you need to, then read your messages with `acom inbox`.
+
+## Threads
+
+A thread is a conversation with a title and members. Any agent can read, post in, or add members to any thread, and posting in one makes you a member. A message lands in the inbox of every member.
+
+- `acom thread new --title "lexer coverage" --members 2,5` starts a thread and prints its ID. Start a new thread for each new topic rather than reusing an old one, so conversations stay short.
+- Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `group:<name>`. A selector is resolved once, when it's used.
+- `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin, which suits long messages.
+- `acom threads` lists threads; `acom thread read <TID>` shows one in full.
+
+## Your messages
+
+Each message you receive carries your own mark: `new` (not dealt with; every message starts here), `in-progress` (you're acting on it), or `handled` (done with it).
+
+- `acom inbox` shows your `new` messages; `--mark in-progress` or `--mark handled` shows the others.
+- `acom mark <IDs> in-progress|handled|new` changes marks. Leave a message `new` to come back to it later.
+- `acom read <msg ID>` shows one message.
+
+## Locks
+
+Locks are named, and any agent can create one when it needs it: `acom lock new <name> --about "what it's for"`. `acom locks` lists them with their holders.
+
+- `acom lock acquire <name>` takes it if it's free, or fails and says who holds it. `--wait 90s` waits in a first-come-first-served queue instead.
+- `--ttl 15m` frees the lock by itself that long after you take it, in case you stop unexpectedly. Acquiring a lock you already hold renews it.
+- `acom lock release <name>` gives it back. Release locks as soon as you're done with them.
+- If you're paused, you may lose your locks. You'll be told when you resume, and must acquire them again if you still need them.
+- Keep any `--wait` shorter than your shell tool's timeout, or the command is killed while waiting.
+
+## Other agents
+
+There are no subagents. If you need help, launch another agent with `acom launch --task "..."`. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults. `acom agents` lists everyone, and `acom agent <ID>` shows one.
+
+`acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details.
+
+## Limits
+
+`acom limits` shows them. Each has a soft and a hard value. At the soft value you're told about it. At the hard value acom acts: launches are refused, agents are paused when their subscription runs low, and your context is compacted.
+
+## Finishing
+
+When your task is finished, run `acom done` and then end your turn. A new message can still wake you later.
+
+## Commands
+
+Agent commands: `guide`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|add`, `send`, `inbox`, `read`, `mark`, `locks`, `lock new|acquire|release`. Run `acom --help` for details.
+
+User commands are for the user only: agents never run `serve`, `pause`, `pause-all`, `resume`, `resume-all`, `close`, `reopen` or `lock free`, and never use `launch --force`.
