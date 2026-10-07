@@ -39,17 +39,21 @@ Locks are named, and any agent can create one when it needs it: `acom lock new <
 
 ## Other agents
 
-There are no subagents. If you need help, launch another agent with `acom launch --task "..."`. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults. `acom agents` lists everyone, and `acom agent <ID>` shows one.
+There are no subagents. If you need help, launch another agent with `acom launch --task "..."`. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults.
+
+To hand your work over, add `--done`: you're marked done and the new agent is launched in one step, so it fits even when the limits only leave room for one of you. If the launch is refused, you stay as you were. `acom agents` lists everyone, and `acom agent <ID>` shows one.
 
 `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details.
 
 ## Limits
 
-`acom limits` shows them. Each has a soft and a hard value. At the soft value you're told about it. At the hard value acom acts: launches are refused, agents are paused when their subscription runs low, and your context is compacted.
+`acom limits` shows them. A limit can have a soft value, a hard value, both, or neither. At the soft value you're told about it. At the hard value acom acts: your launches are refused, agents are paused when their subscription runs low, and your context is compacted.
+
+A done agent doesn't count toward the active-agent limits. If a message for it arrives when there's no room, it waits in line and is woken, oldest first, once there is. Whoever sent the message is told.
 
 ## Finishing
 
-When your task is finished, run `acom done` and then end your turn. A new message can still wake you later.
+When your task is finished, run `acom done` and then end your turn. You stop counting toward the active-agent limits straight away. A new message can still wake you later.
 
 ## Commands
 

@@ -243,7 +243,7 @@ CREATE TABLE IF NOT EXISTS agents (
   context INTEGER NOT NULL DEFAULT 0, context_warned INTEGER NOT NULL DEFAULT 0,
   fresh_in INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
   cache_read INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
-  turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER);
+  turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER, wake_why TEXT);
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
@@ -651,6 +651,7 @@ impl App {
         db.execute_batch(SCHEMA)?;
         // Added after the first release; older databases need the column.
         let _ = db.execute("ALTER TABLE agents ADD COLUMN wake_queued_at INTEGER", []);
+        let _ = db.execute("ALTER TABLE agents ADD COLUMN wake_why TEXT", []);
         db.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
             [serde_json::to_string(&Settings::default()).unwrap()],
@@ -701,6 +702,8 @@ impl App {
 
     // ---------- launching and turns ----------
 
+    /// Launch an agent. All or nothing: if anything fails, including starting the
+    /// process, nothing is recorded and a caller handing over with `done` stays working.
     pub fn launch(
         self: &Arc<Self>,
         by: i64,
@@ -708,19 +711,32 @@ impl App {
         req: LaunchReq,
     ) -> R<(i64, Vec<String>)> {
         let mut st = self.lock();
+        st.db.execute_batch("SAVEPOINT launch")?;
+        let r = self.launch_in(&mut st, by, via, req);
+        let end = if r.is_ok() {
+            "RELEASE launch"
+        } else {
+            "ROLLBACK TO launch; RELEASE launch"
+        };
+        st.db.execute_batch(end)?;
+        r
+    }
+
+    fn launch_in(
+        self: &Arc<Self>,
+        st: &mut St,
+        by: i64,
+        via: Option<i64>,
+        req: LaunchReq,
+    ) -> R<(i64, Vec<String>)> {
         let s = st.settings();
-        let caller_done = if by > 0 {
-            let a = st.agent(by)?;
-            if a.state != "working" {
+        if by > 0 {
+            if st.agent(by)?.state != "working" {
                 return Err(conflict("only a working agent can launch others"));
             }
-            a.done_req
-        } else {
-            if req.done {
-                return Err(bad("only an agent can mark itself done"));
-            }
-            false
-        };
+        } else if req.done {
+            return Err(bad("only an agent can mark itself done"));
+        }
         let harness = req.harness.unwrap_or_else(|| {
             s.harnesses
                 .iter()
@@ -767,19 +783,11 @@ impl App {
             st.db
                 .execute("UPDATE agents SET done_req=1 WHERE id=?1", [by])?;
         }
-        let undo_done = |st: &St| {
-            if req.done && !caller_done {
-                let _ = st
-                    .db
-                    .execute("UPDATE agents SET done_req=0 WHERE id=?1", [by]);
-            }
-        };
         let mut warnings = Vec::new();
         for c in st.limit_checks(&harness)? {
             if c.over(c.lim.hard) {
                 let msg = c.line("Hard");
                 if by > 0 {
-                    undo_done(&st);
                     return Err(conflict(format!("{msg}. Launch refused.")));
                 }
                 if !req.force {
@@ -814,8 +822,8 @@ impl App {
             &actor(by, via),
             &format!("launched agent {id} ({harness} / {model} / {effort})"),
         )?;
-        let prompt = self.briefing(&st, id)?;
-        run::start_turn(self, &mut st, id, &prompt)?;
+        let prompt = self.briefing(st, id)?;
+        run::start_turn(self, st, id, &prompt)?;
         Ok((id, warnings))
     }
 
@@ -838,71 +846,88 @@ impl App {
         ))
     }
 
-    /// Wake an agent that's resting (idle, done, or closed) if something it should hear about arrived.
-    /// A done or closed agent isn't counted as active, so waking it needs room under the hard limits;
-    /// without room it waits in line (returns why) and is woken by `drain_wakes` later.
-    pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<Option<String>> {
+    /// Something arrived for an agent. An idle agent is woken at once. A done or closed agent
+    /// isn't counted as active, so it joins the wake line instead, which `drain_wakes` serves
+    /// oldest first whenever there's room under the hard limits.
+    pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
         if st.procs.contains_key(&id) {
-            return Ok(None); // still stopping; turn_ended wakes it if needed
+            return Ok(()); // still stopping; turn_ended wakes it if needed
         }
         let a = st.agent(id)?;
         let only_user = match a.state.as_str() {
             "idle" | "done" => false,
             "closed" => true,
-            _ => return Ok(None),
+            _ => return Ok(()),
         };
         if st.pending(id, only_user)?.is_empty() {
-            st.db
-                .execute("UPDATE agents SET wake_queued_at=NULL WHERE id=?1", [id])?;
-            return Ok(None);
+            return Ok(());
         }
-        if a.state != "idle"
-            && let Some(why) = st.no_room(&a.harness)?
-        {
-            let n = st.db.execute(
-                "UPDATE agents SET wake_queued_at=?2 WHERE id=?1 AND wake_queued_at IS NULL",
-                params![id, now()],
-            )?;
-            if n > 0 {
-                st.log("acom", &format!("agent {id} is waiting to be woken: {why}"))?;
-            }
-            return Ok(Some(why));
-        }
-        let queued: Option<i64> =
-            st.db
-                .query_row("SELECT wake_queued_at FROM agents WHERE id=?1", [id], |r| {
-                    r.get(0)
-                })?;
-        if queued.is_some() {
-            st.log(
-                "acom",
-                &format!("woke agent {id} (it was waiting for room under the limits)"),
-            )?;
+        if a.state == "idle" {
+            return self.wake(st, id, "idle");
         }
         st.db.execute(
-            "UPDATE agents SET rest=?2, wake_queued_at=NULL WHERE id=?1",
-            params![id, a.state],
+            "UPDATE agents SET wake_queued_at=?2 WHERE id=?1 AND wake_queued_at IS NULL",
+            params![id, now()],
+        )?;
+        self.drain_wakes(st)?;
+        Ok(())
+    }
+
+    fn wake(self: &Arc<Self>, st: &mut St, id: i64, rest: &str) -> R<()> {
+        st.db.execute(
+            "UPDATE agents SET rest=?2, wake_queued_at=NULL, wake_why=NULL WHERE id=?1",
+            params![id, rest],
         )?;
         let updates = st.take_updates(id)?;
         let prompt = format!("{updates}\n\nYou were woken up because of the above. Carry on.");
-        run::start_turn(self, st, id, &prompt)?;
-        Ok(None)
+        run::start_turn(self, st, id, &prompt)
     }
 
-    /// Wake agents waiting for room, oldest first, while there's room.
+    /// Wake agents in the wake line, oldest first, while there's room. Returns whether any woke.
     fn drain_wakes(self: &Arc<Self>, st: &mut St) -> R<bool> {
-        let ids: Vec<i64> = rows(
+        let queued = rows(
             &st.db,
-            "SELECT id FROM agents WHERE wake_queued_at IS NOT NULL ORDER BY wake_queued_at, id",
+            "SELECT id, wake_why FROM agents WHERE wake_queued_at IS NOT NULL ORDER BY wake_queued_at, id",
             [],
-        )?
-        .iter()
-        .map(|r| r["id"].as_i64().unwrap())
-        .collect();
+        )?;
         let mut woke = false;
-        for id in ids {
-            if self.maybe_wake(st, id)?.is_none() {
-                woke = true;
+        for r in queued {
+            let id = r["id"].as_i64().unwrap();
+            if st.procs.contains_key(&id) {
+                continue;
+            }
+            let a = st.agent(id)?;
+            let only_user = a.state == "closed";
+            if !matches!(a.state.as_str(), "done" | "closed")
+                || st.pending(id, only_user)?.is_empty()
+            {
+                // Reopened, paused, or nothing left to hear about: it leaves the line.
+                st.db.execute(
+                    "UPDATE agents SET wake_queued_at=NULL, wake_why=NULL WHERE id=?1",
+                    [id],
+                )?;
+                continue;
+            }
+            match st.no_room(&a.harness)? {
+                Some(why) => {
+                    if r["wake_why"].is_null() {
+                        st.db.execute(
+                            "UPDATE agents SET wake_why=?2 WHERE id=?1",
+                            params![id, why],
+                        )?;
+                        st.log("acom", &format!("agent {id} is waiting to be woken: {why}"))?;
+                    }
+                }
+                None => {
+                    if !r["wake_why"].is_null() {
+                        st.log(
+                            "acom",
+                            &format!("woke agent {id} (it was waiting for room under the limits)"),
+                        )?;
+                    }
+                    self.wake(st, id, &a.state)?;
+                    woke = true;
+                }
             }
         }
         Ok(woke)
@@ -1066,7 +1091,7 @@ impl App {
             run::start_turn(self, st, id, &prompt)
         } else {
             st.set_state(id, &from)?;
-            self.maybe_wake(st, id).map(|_| ())
+            self.maybe_wake(st, id)
         }
     }
 
@@ -1128,7 +1153,7 @@ impl App {
         }
         st.set_state(id, "idle")?;
         st.log(by, &format!("reopened agent {id}"))?;
-        self.maybe_wake(&mut st, id).map(|_| ())
+        self.maybe_wake(&mut st, id)
     }
 
     // ---------- agent self-service ----------
@@ -1320,9 +1345,15 @@ impl App {
         .iter()
         .map(|r| r["a"].as_i64().unwrap())
         .collect();
+        for &m in &members {
+            self.maybe_wake(&mut st, m)?;
+        }
         let mut not_woken = Vec::new();
         for m in members {
-            if let Some(why) = self.maybe_wake(&mut st, m)? {
+            let why: Option<String> =
+                st.db
+                    .query_row("SELECT wake_why FROM agents WHERE id=?1", [m], |r| r.get(0))?;
+            if let Some(why) = why {
                 not_woken.push((m, why));
             }
         }
@@ -1713,7 +1744,7 @@ impl App {
             &st.db,
             "SELECT id, name, grp \"group\", task, harness, model, effort, state, status_text status, session_id session,
                     launched_by, launched_at, pause_reason, paused_at, context, fresh_in, cache_write, cache_read, output,
-                    turns, ended_at, wake_queued_at
+                    turns, ended_at, wake_queued_at, wake_why wake_reason
              FROM agents WHERE ?1 IS NULL OR grp=?1 ORDER BY id",
             [group],
         )?;
