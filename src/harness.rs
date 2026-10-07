@@ -34,6 +34,12 @@ pub enum Event {
     },
     /// A short readable line for the agent's activity view.
     Text(String),
+    /// The model refused or was safety-flagged, or the harness switched models. acom pauses the agent.
+    Flagged(String),
+    /// The subscription's usage limit was hit mid-turn. acom pauses the agent until the window resets.
+    LimitHit(String),
+    /// The model that actually answered.
+    Model(String),
 }
 
 /// A model the harness offers, with the effort levels it supports.
@@ -161,21 +167,89 @@ fn claude_command(l: &Launch) -> (Command, Option<String>) {
     c.args(["--settings", &hook.to_string()]);
     // No subagents or side channels: every agent goes through acom.
     c.args(["--disallowedTools", "Agent,Workflow,SendMessage,ListAgents"]);
+    // Never switch to another model on its own, e.g. after a safeguards flag:
+    // acom pauses the agent and tells the user instead.
+    c.env("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "1");
+    c.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
     c.args(["--allowedTools", "Bash(acom *)"]);
     c.stdin(Stdio::piped());
     (c, Some(l.prompt.to_string()))
 }
 
+fn refused(model: &str, category: &str, explanation: &str) -> String {
+    let category = if category.is_empty() {
+        String::new()
+    } else {
+        format!(" ({category})")
+    };
+    let explanation = if explanation.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", short(explanation, 200))
+    };
+    format!("{model} refused under its safeguards{category}{explanation}")
+}
+
 fn claude_events(v: &Value) -> Vec<Event> {
     let n = |x: &Value| x.as_u64().unwrap_or(0);
+    // The stream uses snake_case; transcripts use camelCase.
+    let field = |snake: &str, camel: &str| {
+        v[snake]
+            .as_str()
+            .or(v[camel].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let mut out = Vec::new();
     match v["type"].as_str().unwrap_or("") {
-        "system" if v["subtype"] == "init" => {
-            if let Some(s) = v["session_id"].as_str() {
-                out.push(Event::Session(s.to_string()));
+        "system" => match v["subtype"].as_str().unwrap_or("") {
+            "init" => {
+                if let Some(s) = v["session_id"].as_str() {
+                    out.push(Event::Session(s.to_string()));
+                }
             }
-        }
+            sub @ ("model_refusal_no_fallback"
+            | "model_refusal_fallback"
+            | "model_fallback"
+            | "model_consent_fallback") => {
+                let from = field("original_model", "originalModel");
+                let to = field("fallback_model", "fallbackModel");
+                let mut reason = refused(
+                    &from,
+                    &field("api_refusal_category", "apiRefusalCategory"),
+                    &field("api_refusal_explanation", "apiRefusalExplanation"),
+                );
+                if sub != "model_refusal_no_fallback" {
+                    reason = if sub == "model_refusal_fallback" {
+                        format!("{reason}, and Claude Code switched to {to}")
+                    } else {
+                        format!("Claude Code switched from {from} to {to}")
+                    };
+                }
+                out.push(Event::Flagged(reason));
+            }
+            _ => {}
+        },
         "assistant" => {
+            let m = &v["message"];
+            if let Some(model) = m["model"].as_str().filter(|x| !x.starts_with('<')) {
+                out.push(Event::Model(model.to_string()));
+            }
+            if m["stop_reason"] == "refusal" {
+                let d = &m["stop_details"];
+                out.push(Event::Flagged(refused(
+                    m["model"].as_str().unwrap_or("the model"),
+                    d["category"].as_str().unwrap_or(""),
+                    d["explanation"].as_str().unwrap_or(""),
+                )));
+            }
+            // A synthetic message stands in for errors such as the session limit.
+            if matches!(v["error"].as_str(), Some("rate_limit" | "billing_error")) {
+                let text = m["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("usage limit reached");
+                out.push(Event::LimitHit(short(text, 200)));
+            }
             let u = &v["message"]["usage"];
             let ctx = n(&u["input_tokens"])
                 + n(&u["cache_creation_input_tokens"])
@@ -217,18 +291,22 @@ fn claude_events(v: &Value) -> Vec<Event> {
                 add: true,
             });
             if v["is_error"] == true {
-                out.push(Event::Text(format!(
-                    "error: {}",
-                    short(v["result"].as_str().unwrap_or(""), 300)
-                )));
+                let text = v["result"].as_str().unwrap_or("");
+                out.push(Event::Text(format!("error: {}", short(text, 300))));
+                let lower = text.to_lowercase();
+                if lower.contains("safeguards flagged") {
+                    out.push(Event::Flagged(short(text, 300)));
+                } else if ["session limit", "usage limit", "out of usage credits"]
+                    .iter()
+                    .any(|x| lower.contains(x))
+                {
+                    out.push(Event::LimitHit(short(text, 200)));
+                }
             }
         }
         "rate_limit_event" => {
-            for (win, w) in v["rate_limit_info"]["unifiedWindows"]
-                .as_object()
-                .into_iter()
-                .flatten()
-            {
+            let info = &v["rate_limit_info"];
+            for (win, w) in info["unifiedWindows"].as_object().into_iter().flatten() {
                 if let Some(u) = w["utilization"].as_f64() {
                     out.push(Event::Usage {
                         win: win.clone(),
@@ -236,6 +314,17 @@ fn claude_events(v: &Value) -> Vec<Event> {
                         resets_at: w["resetsAt"].as_i64(),
                     });
                 }
+            }
+            // Rejected means that window is used up until it resets.
+            if info["status"] == "rejected" {
+                out.push(Event::Usage {
+                    win: info["rateLimitType"]
+                        .as_str()
+                        .unwrap_or("limit")
+                        .to_string(),
+                    used_pct: 100.0,
+                    resets_at: info["resetsAt"].as_i64(),
+                });
             }
         }
         _ => {}
@@ -475,6 +564,72 @@ mod tests {
         assert!(
             matches!(&ev[0], Event::Usage { win, used_pct, resets_at: Some(100) } if win == "five_hour" && (*used_pct - 25.0).abs() < 1e-9)
         );
+    }
+
+    #[test]
+    fn claude_refusals_fallbacks_and_limits_are_reported() {
+        let refusal = r#"{"type":"assistant","message":{"model":"claude-fable-5-1","stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"This request triggered restrictions."},"content":[]}}"#;
+        let ev = parse_line("claude", refusal);
+        assert!(matches!(&ev[0], Event::Model(m) if m == "claude-fable-5-1"));
+        assert!(
+            matches!(&ev[1], Event::Flagged(r) if r == "claude-fable-5-1 refused under its safeguards (cyber): This request triggered restrictions.")
+        );
+        let no_fallback = r#"{"type":"system","subtype":"model_refusal_no_fallback","original_model":"claude-opus-5-5","api_refusal_category":"cyber"}"#;
+        assert!(
+            matches!(&parse_line("claude", no_fallback)[0], Event::Flagged(r) if r == "claude-opus-5-5 refused under its safeguards (cyber)")
+        );
+        let fallback = r#"{"type":"system","subtype":"model_fallback","originalModel":"claude-opus-5-5","fallbackModel":"claude-opus-4-8","trigger":"overloaded"}"#;
+        assert!(
+            matches!(&parse_line("claude", fallback)[0], Event::Flagged(r) if r == "Claude Code switched from claude-opus-5-5 to claude-opus-4-8")
+        );
+        let limit = r#"{"type":"assistant","error":"rate_limit","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit · resets 3:30pm"}]}}"#;
+        let ev = parse_line("claude", limit);
+        assert!(
+            matches!(&ev[0], Event::LimitHit(t) if t.starts_with("You've hit your session limit"))
+        );
+        let flagged_result = r#"{"type":"result","is_error":true,"result":"API Error: Opus 5.5's safeguards flagged this session","usage":{}}"#;
+        assert!(
+            parse_line("claude", flagged_result)
+                .iter()
+                .any(|e| matches!(e, Event::Flagged(_)))
+        );
+        let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":99}}"#;
+        assert!(matches!(
+            &parse_line("claude", rejected)[0],
+            Event::Usage { used_pct, resets_at: Some(99), .. } if *used_pct == 100.0
+        ));
+    }
+
+    #[test]
+    fn claude_turns_off_model_fallback() {
+        let flags = vec![];
+        let launch = Launch {
+            harness: "claude",
+            model: "claude-opus-5-5",
+            effort: "low",
+            session: Some("s"),
+            resume: false,
+            prompt: "hi",
+            context_limit: 0,
+            flags: &flags,
+            acom: Path::new("/tmp/acom"),
+        };
+        let (c, _) = command(&launch);
+        let env: Vec<(String, String)> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into(),
+                    v.unwrap().to_string_lossy().into(),
+                )
+            })
+            .collect();
+        for var in [
+            "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
+            "CLAUDE_CODE_NO_MODEL_FALLBACK",
+        ] {
+            assert!(env.contains(&(var.to_string(), "1".to_string())), "{var}");
+        }
     }
 
     #[test]

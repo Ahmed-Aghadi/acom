@@ -283,7 +283,7 @@ CREATE TABLE IF NOT EXISTS agents (
   fresh_in INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
   cache_read INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
   turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER, wake_why TEXT,
-  session_started INTEGER NOT NULL DEFAULT 0);
+  session_started INTEGER NOT NULL DEFAULT 0, seen_model TEXT, problem TEXT);
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, project INTEGER NOT NULL, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
@@ -672,6 +672,17 @@ impl St {
 }
 
 /// "agent 2, agent 5, user", cut in the middle when long.
+/// Whether the model that answered is the one asked for. A dated ID such as
+/// claude-haiku-4-5-20251001 is the same model as claude-haiku-4-5.
+pub fn same_model(asked: &str, answered: &str) -> bool {
+    let dated = |long: &str, short: &str| {
+        long.strip_prefix(short)
+            .and_then(|r| r.strip_prefix('-'))
+            .is_some_and(|r| r.len() == 8 && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    asked == answered || dated(answered, asked) || dated(asked, answered)
+}
+
 pub fn sender_list(ids: &[i64]) -> String {
     let names: Vec<String> = ids.iter().map(|&i| who(i)).collect();
     if names.len() <= 6 {
@@ -1118,7 +1129,10 @@ impl App {
             p.stopping = true;
             run::stop(p.pid);
         }
-        st.log_for(id, by, &format!("paused agent {id}"))?;
+        // Limits and flags log their own, more specific line.
+        if matches!(reason, "user" | "all") {
+            st.log_for(id, by, &format!("paused agent {id}"))?;
+        }
         self.cv.notify_all();
         Ok(())
     }
@@ -1166,7 +1180,7 @@ impl App {
         }
         st.unfreeze_locks(id)?;
         st.db.execute(
-            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL WHERE id=?1",
+            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL WHERE id=?1",
             [id],
         )?;
         st.log_for(id, by, &format!("resumed agent {id}"))?;
@@ -1249,6 +1263,8 @@ impl App {
             return Err(conflict(format!("agent {id} isn't closed")));
         }
         st.set_state(id, "idle")?;
+        st.db
+            .execute("UPDATE agents SET problem=NULL WHERE id=?1", [id])?;
         st.log_for(id, by, &format!("reopened agent {id}"))?;
         self.maybe_wake(&mut st, id)
     }
@@ -1735,6 +1751,72 @@ impl App {
         Ok(())
     }
 
+    /// The model refused or was flagged, or the harness switched models. Pause the agent
+    /// (releasing its locks) and keep the reason for the user; it stays paused until they act.
+    pub fn flag(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
+        self.stop_for(id, "flagged", reason, "was flagged and paused")
+    }
+
+    /// The subscription's usage limit was hit mid-turn: pause until the window resets.
+    pub fn limit_hit(self: &Arc<Self>, id: i64, text: &str) -> R<()> {
+        self.stop_for(id, "limit", text, "hit its usage limit and was paused")
+    }
+
+    fn stop_for(self: &Arc<Self>, id: i64, why: &str, problem: &str, what: &str) -> R<()> {
+        let mut st = self.lock();
+        let a = st.agent(id)?;
+        let reason: Option<String> =
+            st.db
+                .query_row("SELECT pause_reason FROM agents WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+        if a.state == "paused" && reason.as_deref() == Some(why) {
+            return Ok(()); // one refusal often arrives as several events
+        }
+        st.db.execute(
+            "UPDATE agents SET problem=?2 WHERE id=?1",
+            params![id, problem],
+        )?;
+        if matches!(a.state.as_str(), "working" | "idle" | "done") {
+            self.pause_locked(&mut st, id, LockMode::Release, why, "acom")?;
+        }
+        st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"))
+    }
+
+    /// Flag the agent if a model other than the one it was launched with answered,
+    /// or if the model changed during its session.
+    pub fn check_model(self: &Arc<Self>, id: i64, answered: &str) -> R<()> {
+        let reason = {
+            let st = self.lock();
+            let (asked, seen): (String, Option<String>) = st.db.query_row(
+                "SELECT model, seen_model FROM agents WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if seen.is_none() {
+                st.db.execute(
+                    "UPDATE agents SET seen_model=?2 WHERE id=?1",
+                    params![id, answered],
+                )?;
+            }
+            // A short alias (e.g. "opus") can't be compared with what answers.
+            let full_id = asked.contains('-');
+            match seen {
+                Some(seen) if !same_model(&seen, answered) => Some(format!(
+                    "the model changed from {seen} to {answered} during the session"
+                )),
+                _ if full_id && !same_model(&asked, answered) => {
+                    Some(format!("{answered} answered instead of {asked}"))
+                }
+                _ => None,
+            }
+        };
+        match reason {
+            Some(r) => self.flag(id, &r),
+            None => Ok(()),
+        }
+    }
+
     pub fn set_session(&self, id: i64, session: &str) -> R<()> {
         let st = self.lock();
         st.db.execute(
@@ -1754,7 +1836,14 @@ impl App {
                 st.over_soft.remove(p);
                 st.over_hard.remove(p);
                 if s.auto_resume {
-                    changed |= self.resume_limited(&mut st, p)?;
+                    // The window reset: resume. Never had any usage: give it a few minutes.
+                    let known: i64 = st.db.query_row(
+                        "SELECT count(*) FROM usage WHERE provider=?1",
+                        [p],
+                        |r| r.get(0),
+                    )?;
+                    let wait = if known > 0 { 0 } else { 300 };
+                    changed |= self.resume_limited(&mut st, p, wait)?;
                 }
                 continue;
             };
@@ -1799,8 +1888,9 @@ impl App {
                 }
             } else {
                 st.over_hard.remove(p);
-                if s.auto_resume {
-                    changed |= self.resume_limited(&mut st, p)?;
+                // A window that's used up blocks the agents whatever the limits say.
+                if s.auto_resume && used < 100.0 {
+                    changed |= self.resume_limited(&mut st, p, 0)?;
                 }
             }
         }
@@ -1811,11 +1901,13 @@ impl App {
         Ok(())
     }
 
-    fn resume_limited(self: &Arc<Self>, st: &mut St, provider: &str) -> R<bool> {
+    /// Resume agents a limit paused at least `min_paused` seconds ago.
+    fn resume_limited(self: &Arc<Self>, st: &mut St, provider: &str, min_paused: i64) -> R<bool> {
         let ids: Vec<i64> = rows(
             &st.db,
-            "SELECT id FROM agents WHERE harness=?1 AND state='paused' AND pause_reason='limit'",
-            [provider],
+            "SELECT id FROM agents WHERE harness=?1 AND state='paused' AND pause_reason='limit'
+             AND paused_at <= ?2",
+            params![provider, now() - min_paused],
         )?
         .iter()
         .map(|r| r["id"].as_i64().unwrap())
@@ -1950,7 +2042,7 @@ impl App {
             "SELECT id, project, name, grp \"group\", task, harness, model, effort, state, status_text status,
                     session_id session, launched_by, launched_at, pause_reason, paused_at, context,
                     fresh_in, cache_write, cache_read, output, turns, ended_at, wake_queued_at,
-                    wake_why wake_reason
+                    wake_why wake_reason, problem
              FROM agents WHERE (?1 IS NULL OR project=?1) AND (?2 IS NULL OR grp=?2) ORDER BY id",
             params![project, group],
         )?;
@@ -2187,6 +2279,14 @@ mod tests {
         assert_eq!(st.take_updates(1).unwrap(), "");
         // A closed agent is only woken by the user.
         assert_eq!(st.pending(3, true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dated_ids_are_the_same_model_but_versions_differ() {
+        assert!(same_model("claude-haiku-4-5", "claude-haiku-4-5-20251001"));
+        assert!(same_model("gpt-6-luna", "gpt-6-luna"));
+        assert!(!same_model("claude-opus-5", "claude-opus-5-5"));
+        assert!(!same_model("claude-fable-5-1", "claude-opus-4-8"));
     }
 
     #[test]

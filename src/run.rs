@@ -188,6 +188,9 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, ev: Event) {
             used_pct,
             resets_at,
         } => app.record_usage(harness, &win, used_pct, resets_at),
+        Event::Flagged(reason) => app.flag(id, &reason),
+        Event::LimitHit(text) => app.limit_hit(id, &text),
+        Event::Model(m) => app.check_model(id, &m),
         Event::Text(t) => {
             append(&log_path(app, id, "txt"), &t);
             Ok(())
