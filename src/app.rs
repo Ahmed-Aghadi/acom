@@ -1881,7 +1881,13 @@ impl App {
                     st.log(
                         None,
                         "acom",
-                        &format!("hard limit reached: {line}; paused {} agent(s)", ids.len()),
+                        &match ids.len() {
+                            0 => format!("hard limit reached: {line}"),
+                            n => format!(
+                                "hard limit reached: {line}; paused {n} agent{}",
+                                if n == 1 { "" } else { "s" }
+                            ),
+                        },
                     )?;
                     changed = true;
                 }
