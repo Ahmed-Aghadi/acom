@@ -58,7 +58,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         )));
     }
     let a = st.agent(id)?;
-    let s = st.settings();
+    let s = st.settings_for(Some(a.project));
     let (turns, started): (i64, bool) = st.db.query_row(
         "SELECT turns, session_started FROM agents WHERE id=?1",
         [id],

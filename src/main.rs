@@ -486,7 +486,12 @@ fn main() {
         Cmd::Hook => hook(),
         Cmd::Guide => print!("{GUIDE}"),
         Cmd::Me => print_agent(&get(&format!("/agents/{}", me()))),
-        Cmd::Limits => println!("{}", get("/limits")["text"].as_str().unwrap_or("")),
+        Cmd::Limits => println!(
+            "{}",
+            get(&format!("/limits?{}", scope()))["text"]
+                .as_str()
+                .unwrap_or("")
+        ),
         Cmd::Status { text } => {
             post(
                 &format!("/agents/{}/status", me()),

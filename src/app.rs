@@ -258,8 +258,9 @@ pub struct St {
     /// Lock queues by (project, lock name).
     pub queues: HashMap<(i64, String), Vec<i64>>,
     pub procs: HashMap<i64, Proc>,
-    pub over_hard: HashSet<String>,
-    pub over_soft: HashSet<String>,
+    /// (project, provider) pairs over their usage limits, so each crossing acts once.
+    pub over_hard: HashSet<(i64, String)>,
+    pub over_soft: HashSet<(i64, String)>,
 }
 
 pub struct App {
@@ -272,7 +273,9 @@ pub struct App {
 }
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS configs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, settings TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL,
+  config INTEGER DEFAULT 1, custom TEXT);
 CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY, project INTEGER NOT NULL, name TEXT NOT NULL, grp TEXT, task TEXT NOT NULL,
   harness TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL,
@@ -294,7 +297,6 @@ CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 /// Development schemas changed before release; don't serve a half-working old
@@ -317,8 +319,9 @@ fn check_stored_schema(db: &Connection) -> R<()> {
         .optional()?;
     if db
         .prepare(
-            "SELECT a.project, a.seen_model, a.problem, t.project, l.project, x.project
-                   FROM agents a, threads t, locks l, activity x LIMIT 0",
+            "SELECT a.project, a.seen_model, a.problem, t.project, l.project, x.project,
+                    p.config, p.custom, c.settings
+                   FROM agents a, threads t, locks l, activity x, projects p, configs c LIMIT 0",
         )
         .is_err()
         || !project_sql.is_some_and(|s| s.to_ascii_uppercase().contains("AUTOINCREMENT"))
@@ -397,13 +400,26 @@ pub fn rows(db: &Connection, sql: &str, p: impl rusqlite::Params) -> R<Vec<Value
 }
 
 impl St {
-    pub fn settings(&self) -> Settings {
-        self.db
-            .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+    /// A project's settings: its custom ones, or the saved config it uses.
+    /// No project means the Default config.
+    pub fn settings_for(&self, project: Option<i64>) -> Settings {
+        let json: Option<String> = match project {
+            Some(p) => self
+                .db
+                .query_row(
+                    "SELECT coalesce(p.custom, c.settings) FROM projects p
+                     LEFT JOIN configs c ON c.id=p.config WHERE p.id=?1",
+                    [p],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten(),
+            None => self
+                .db
+                .query_row("SELECT settings FROM configs WHERE id=1", [], |r| r.get(0))
+                .ok(),
+        };
+        json.and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
@@ -478,13 +494,15 @@ impl St {
         Ok(())
     }
 
-    fn active_counts(&self) -> R<(i64, BTreeMap<String, i64>)> {
+    /// Active agents in a project (or everywhere), in total and per harness.
+    fn active_counts(&self, project: Option<i64>) -> R<(i64, BTreeMap<String, i64>)> {
         let mut per = BTreeMap::new();
         let mut total = 0;
         for r in rows(
             &self.db,
-            "SELECT harness h, count(*) n FROM agents WHERE state IN ('working','idle') AND done_req=0 GROUP BY harness",
-            [],
+            "SELECT harness h, count(*) n FROM agents WHERE state IN ('working','idle') AND done_req=0
+             AND (?1 IS NULL OR project=?1) GROUP BY harness",
+            [project],
         )? {
             let n = r["n"].as_i64().unwrap_or(0);
             total += n;
@@ -502,10 +520,11 @@ impl St {
         )?)
     }
 
-    pub fn limits_text(&self) -> R<String> {
-        let s = self.settings();
+    /// A project's limits and rules, with current usage, as agents are told them.
+    pub fn limits_text(&self, project: Option<i64>) -> R<String> {
+        let s = self.settings_for(project);
         let l = &s.limits;
-        let (total, per) = self.active_counts()?;
+        let (total, per) = self.active_counts(project)?;
         let mut out = format!("Active agents: {total} ({})", l.active.text(""));
         for (h, lim) in &l.active_per_harness {
             out += &format!("; {h}: {} ({})", per.get(h).unwrap_or(&0), lim.text(""));
@@ -534,10 +553,10 @@ impl St {
         Ok(out)
     }
 
-    /// The limits a new active agent of this harness would be checked against.
-    fn limit_checks(&self, harness: &str) -> R<Vec<Check>> {
-        let l = self.settings().limits;
-        let (total, per) = self.active_counts()?;
+    /// The limits a new active agent of this harness in this project would be checked against.
+    fn limit_checks(&self, project: i64, harness: &str) -> R<Vec<Check>> {
+        let l = self.settings_for(Some(project)).limits;
+        let (total, per) = self.active_counts(Some(project))?;
         let mut checks = vec![Check {
             what: "active agents".into(),
             value: (total + 1) as f64,
@@ -563,9 +582,9 @@ impl St {
         Ok(checks)
     }
 
-    /// Why an agent of this harness can't become active right now, if it can't.
-    fn no_room(&self, harness: &str) -> R<Option<String>> {
-        let checks = self.limit_checks(harness)?;
+    /// Why an agent of this harness in this project can't become active right now, if it can't.
+    fn no_room(&self, project: i64, harness: &str) -> R<Option<String>> {
+        let checks = self.limit_checks(project, harness)?;
         Ok(checks
             .iter()
             .find(|c| c.over(c.lim.hard))
@@ -761,7 +780,7 @@ impl App {
         check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
         db.execute(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
+            "INSERT OR IGNORE INTO configs(id,name,settings) VALUES(1,'Default',?1)",
             [serde_json::to_string(&Settings::default()).unwrap()],
         )?;
         let mut st = St {
@@ -840,7 +859,6 @@ impl App {
         project: Option<i64>,
         req: LaunchReq,
     ) -> R<(i64, Vec<String>)> {
-        let s = st.settings();
         // An agent's helpers join its project; the user picks one.
         let project = if by > 0 {
             let a = st.agent(by)?;
@@ -856,6 +874,7 @@ impl App {
             st.project(p)?;
             p
         };
+        let s = st.settings_for(Some(project));
         let harness = req.harness.unwrap_or_else(|| {
             s.harnesses
                 .iter()
@@ -917,7 +936,7 @@ impl App {
                 .execute("UPDATE agents SET done_req=1 WHERE id=?1", [by])?;
         }
         let mut warnings = Vec::new();
-        for c in st.limit_checks(&harness)? {
+        for c in st.limit_checks(project, &harness)? {
             if c.over(c.lim.hard) {
                 let msg = c.line("Hard");
                 if by > 0 {
@@ -976,7 +995,7 @@ impl App {
             a.harness,
             a.model,
             a.effort,
-            st.limits_text()?,
+            st.limits_text(Some(a.project))?,
             a.task
         ))
     }
@@ -1043,7 +1062,7 @@ impl App {
                 )?;
                 continue;
             }
-            match st.no_room(&a.harness)? {
+            match st.no_room(a.project, &a.harness)? {
                 Some(why) => {
                     if r["wake_why"].is_null() {
                         st.db.execute(
@@ -1092,7 +1111,7 @@ impl App {
             self.cv.notify_all();
             return Ok(());
         }
-        let s = st.settings();
+        let s = st.settings_for(Some(a.project));
         let next = if !ok && !stopping {
             "crashed"
         } else if a.done_req {
@@ -1742,7 +1761,7 @@ impl App {
 
     pub fn record_context(&self, id: i64, tokens: u64) -> R<()> {
         let st = self.lock();
-        let lim = st.settings().limits.context;
+        let lim = st.settings_for(Some(st.agent(id)?.project)).limits.context;
         let warned: i64 =
             st.db
                 .query_row("SELECT context_warned FROM agents WHERE id=?1", [id], |r| {
@@ -1886,75 +1905,13 @@ impl App {
     pub fn tick(self: &Arc<Self>) -> R<()> {
         let mut st = self.lock();
         let mut changed = st.expire_locks()?;
-        let s = st.settings();
-        for (p, lim) in &s.limits.usage {
-            let Some(used) = st.used_pct(p)? else {
-                st.over_soft.remove(p);
-                st.over_hard.remove(p);
-                if s.auto_resume {
-                    // The window reset: resume. Never had any usage: give it a few minutes.
-                    let known: i64 = st.db.query_row(
-                        "SELECT count(*) FROM usage WHERE provider=?1",
-                        [p],
-                        |r| r.get(0),
-                    )?;
-                    let wait = if known > 0 { 0 } else { 300 };
-                    changed |= self.resume_limited(&mut st, p, wait)?;
-                }
-                continue;
-            };
-            let line = format!("{p} subscription usage {used:.0}% ({})", lim.text("%"));
-            let (over_soft, over_hard) = (
-                lim.soft.is_some_and(|v| used >= v),
-                lim.hard.is_some_and(|v| used >= v),
-            );
-            if over_soft && st.over_soft.insert(p.clone()) {
-                for r in rows(
-                    &st.db,
-                    "SELECT id FROM agents WHERE harness=?1 AND state NOT IN ('closed','crashed')",
-                    [p],
-                )? {
-                    st.notice(
-                        r["id"].as_i64().unwrap(),
-                        &format!("Soft limit reached: {line}."),
-                    )?;
-                }
-            } else if !over_soft {
-                st.over_soft.remove(p);
-            }
-            if over_hard {
-                if st.over_hard.insert(p.clone()) {
-                    let ids: Vec<i64> = rows(
-                        &st.db,
-                        "SELECT id FROM agents WHERE harness=?1 AND state IN ('working','idle')",
-                        [p],
-                    )?
-                    .iter()
-                    .map(|r| r["id"].as_i64().unwrap())
-                    .collect();
-                    for id in &ids {
-                        self.pause_locked(&mut st, *id, LockMode::Release, "limit", "acom")?;
-                    }
-                    st.log(
-                        None,
-                        "acom",
-                        &match ids.len() {
-                            0 => format!("hard limit reached: {line}"),
-                            n => format!(
-                                "hard limit reached: {line}; paused {n} agent{}",
-                                if n == 1 { "" } else { "s" }
-                            ),
-                        },
-                    )?;
-                    changed = true;
-                }
-            } else {
-                st.over_hard.remove(p);
-                // A window that's used up blocks the agents whatever the limits say.
-                if s.auto_resume && used < 100.0 {
-                    changed |= self.resume_limited(&mut st, p, 0)?;
-                }
-            }
+        // Usage is per account, but each project has its own thresholds for its own agents.
+        let projects: Vec<i64> = rows(&st.db, "SELECT id FROM projects", [])?
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        for project in projects {
+            changed |= self.check_usage(&mut st, project)?;
         }
         changed |= self.drain_wakes(&mut st)?;
         if changed {
@@ -1963,13 +1920,96 @@ impl App {
         Ok(())
     }
 
-    /// Resume agents a limit paused at least `min_paused` seconds ago.
-    fn resume_limited(self: &Arc<Self>, st: &mut St, provider: &str, min_paused: i64) -> R<bool> {
+    /// Act on one project's usage limits: warn at soft, pause at hard, resume once clear.
+    fn check_usage(self: &Arc<Self>, st: &mut St, project: i64) -> R<bool> {
+        let s = st.settings_for(Some(project));
+        let mut changed = false;
+        for (p, lim) in &s.limits.usage {
+            let key = (project, p.clone());
+            let Some(used) = st.used_pct(p)? else {
+                st.over_soft.remove(&key);
+                st.over_hard.remove(&key);
+                if s.auto_resume {
+                    // The window reset: resume. Never had any usage: give it a few minutes.
+                    let known: i64 = st.db.query_row(
+                        "SELECT count(*) FROM usage WHERE provider=?1",
+                        [p],
+                        |r| r.get(0),
+                    )?;
+                    let wait = if known > 0 { 0 } else { 300 };
+                    changed |= self.resume_limited(st, project, p, wait)?;
+                }
+                continue;
+            };
+            let line = format!("{p} subscription usage {used:.0}% ({})", lim.text("%"));
+            let (over_soft, over_hard) = (
+                lim.soft.is_some_and(|v| used >= v),
+                lim.hard.is_some_and(|v| used >= v),
+            );
+            if over_soft && st.over_soft.insert(key.clone()) {
+                for r in rows(
+                    &st.db,
+                    "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state NOT IN ('closed','crashed')",
+                    params![project, p],
+                )? {
+                    st.notice(
+                        r["id"].as_i64().unwrap(),
+                        &format!("Soft limit reached: {line}."),
+                    )?;
+                }
+            } else if !over_soft {
+                st.over_soft.remove(&key);
+            }
+            if over_hard {
+                if st.over_hard.insert(key) {
+                    let ids: Vec<i64> = rows(
+                        &st.db,
+                        "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state IN ('working','idle')",
+                        params![project, p],
+                    )?
+                    .iter()
+                    .map(|r| r["id"].as_i64().unwrap())
+                    .collect();
+                    for id in &ids {
+                        self.pause_locked(st, *id, LockMode::Release, "limit", "acom")?;
+                    }
+                    if !ids.is_empty() {
+                        let n = ids.len();
+                        st.log(
+                            Some(project),
+                            "acom",
+                            &format!(
+                                "hard limit reached: {line}; paused {n} agent{}",
+                                if n == 1 { "" } else { "s" }
+                            ),
+                        )?;
+                        changed = true;
+                    }
+                }
+            } else {
+                st.over_hard.remove(&key);
+                // A window that's used up blocks the agents whatever the limits say.
+                if s.auto_resume && used < 100.0 {
+                    changed |= self.resume_limited(st, project, p, 0)?;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Resume a project's agents that a limit paused at least `min_paused` seconds ago.
+    fn resume_limited(
+        self: &Arc<Self>,
+        st: &mut St,
+        project: i64,
+        provider: &str,
+        min_paused: i64,
+    ) -> R<bool> {
         let ids: Vec<i64> = rows(
             &st.db,
-            "SELECT id FROM agents WHERE harness=?1 AND state='paused' AND pause_reason='limit'
-             AND paused_at <= ?2",
-            params![provider, now() - min_paused],
+            "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state='paused'
+             AND pause_reason='limit' AND paused_at <= ?3",
+            params![project, provider, now() - min_paused],
         )?
         .iter()
         .map(|r| r["id"].as_i64().unwrap())
@@ -1982,29 +2022,172 @@ impl App {
         Ok(!ids.is_empty())
     }
 
-    pub fn put_settings(&self, new: Settings, by: &str) -> R<()> {
-        new.check()?;
-        let st = self.lock();
-        let old = st.settings();
-        st.db.execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES('settings',?1)",
-            [serde_json::to_string(&new).unwrap()],
-        )?;
-        st.log(None, by, "changed settings")?;
-        if old.limits != new.limits || old.done_closes != new.done_closes {
-            let text = format!(
-                "The user changed the limits or rules. Now:\n{}",
-                st.limits_text()?
-            );
-            for r in rows(
-                &st.db,
-                "SELECT id FROM agents WHERE state NOT IN ('closed','crashed')",
-                [],
-            )? {
-                st.notice(r["id"].as_i64().unwrap(), &text)?;
-            }
+    // ---------- configs ----------
+
+    /// Tell a project's agents its limits or rules changed, if they did.
+    fn rules_changed(st: &St, project: i64, old: &Settings) -> R<()> {
+        let new = st.settings_for(Some(project));
+        if old.limits == new.limits && old.done_closes == new.done_closes {
+            return Ok(());
+        }
+        let text = format!(
+            "The user changed the limits or rules. Now:\n{}",
+            st.limits_text(Some(project))?
+        );
+        for r in rows(
+            &st.db,
+            "SELECT id FROM agents WHERE project=?1 AND state NOT IN ('closed','crashed')",
+            [project],
+        )? {
+            st.notice(r["id"].as_i64().unwrap(), &text)?;
         }
         Ok(())
+    }
+
+    pub fn configs(&self) -> R<Vec<Value>> {
+        let st = self.lock();
+        let mut v = rows(
+            &st.db,
+            "SELECT id, name, settings FROM configs ORDER BY id",
+            [],
+        )?;
+        for c in &mut v {
+            c["settings"] =
+                serde_json::from_str(c["settings"].as_str().unwrap_or("{}")).unwrap_or_default();
+            let used = rows(
+                &st.db,
+                "SELECT id FROM projects WHERE config=?1 AND custom IS NULL ORDER BY id",
+                [c["id"].as_i64()],
+            )?;
+            c["projects"] = json!(used.iter().map(|r| r["id"].clone()).collect::<Vec<_>>());
+        }
+        Ok(v)
+    }
+
+    /// Save settings as a new named config.
+    pub fn add_config(&self, name: &str, settings: Settings, by: &str) -> R<i64> {
+        settings.check()?;
+        let st = self.lock();
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(bad("give the config a name"));
+        }
+        let added = st.db.execute(
+            "INSERT OR IGNORE INTO configs(name,settings) VALUES(?1,?2)",
+            params![name, serde_json::to_string(&settings).unwrap()],
+        )?;
+        if added == 0 {
+            return Err(conflict(format!("there's already a config called {name}")));
+        }
+        let id = st.db.last_insert_rowid();
+        st.log(None, by, &format!("saved config {name}"))?;
+        Ok(id)
+    }
+
+    /// Change a saved config (and every project using it).
+    pub fn put_config(&self, id: i64, name: Option<&str>, settings: Settings, by: &str) -> R<()> {
+        settings.check()?;
+        let st = self.lock();
+        let old_name: String = st
+            .db
+            .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| not_found(format!("no config {id}")))?;
+        let users: Vec<i64> = rows(
+            &st.db,
+            "SELECT id FROM projects WHERE config=?1 AND custom IS NULL",
+            [id],
+        )?
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+        let before: Vec<Settings> = users.iter().map(|p| st.settings_for(Some(*p))).collect();
+        let name = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&old_name);
+        st.db
+            .execute(
+                "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
+                params![id, name, serde_json::to_string(&settings).unwrap()],
+            )
+            .map_err(|_| conflict(format!("there's already a config called {name}")))?;
+        st.log(None, by, &format!("changed config {name}"))?;
+        for (p, old) in users.iter().zip(&before) {
+            Self::rules_changed(&st, *p, old)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a saved config no project uses. Default always stays.
+    pub fn remove_config(&self, id: i64, by: &str) -> R<()> {
+        let st = self.lock();
+        if id == 1 {
+            return Err(conflict("the Default config can't be removed"));
+        }
+        let name: String = st
+            .db
+            .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| not_found(format!("no config {id}")))?;
+        let used: i64 = st.db.query_row(
+            "SELECT count(*) FROM projects WHERE config=?1 AND custom IS NULL",
+            [id],
+            |r| r.get(0),
+        )?;
+        if used > 0 {
+            return Err(conflict(format!(
+                "{name} is used by {used} project(s); switch them first"
+            )));
+        }
+        st.db.execute("DELETE FROM configs WHERE id=?1", [id])?;
+        st.log(None, by, &format!("removed config {name}"))?;
+        Ok(())
+    }
+
+    /// Make a project use a saved config, or its own custom settings.
+    pub fn set_project_config(
+        &self,
+        project: i64,
+        config: Option<i64>,
+        custom: Option<Settings>,
+        by: &str,
+    ) -> R<()> {
+        let st = self.lock();
+        st.project(project)?;
+        let old = st.settings_for(Some(project));
+        match (config, custom) {
+            (Some(id), None) => {
+                let name: String = st
+                    .db
+                    .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+                    .optional()?
+                    .ok_or_else(|| not_found(format!("no config {id}")))?;
+                st.db.execute(
+                    "UPDATE projects SET config=?2, custom=NULL WHERE id=?1",
+                    params![project, id],
+                )?;
+                st.log(
+                    Some(project),
+                    by,
+                    &format!("project now uses config {name}"),
+                )?;
+            }
+            (None, Some(settings)) => {
+                settings.check()?;
+                st.db.execute(
+                    "UPDATE projects SET config=NULL, custom=?2 WHERE id=?1",
+                    params![project, serde_json::to_string(&settings).unwrap()],
+                )?;
+                st.log(Some(project), by, "changed the project's own settings")?;
+            }
+            _ => {
+                return Err(bad(
+                    "give either config (a saved config's id) or custom (settings)",
+                ));
+            }
+        }
+        Self::rules_changed(&st, project, &old)
     }
 
     // ---------- projects ----------
@@ -2064,9 +2247,11 @@ impl App {
         rows(
             &st.db,
             "SELECT p.id, p.name, p.path,
+                    CASE WHEN p.custom IS NULL THEN p.config END config,
+                    CASE WHEN p.custom IS NULL THEN c.name ELSE 'Custom' END config_name,
                     (SELECT count(*) FROM agents a WHERE a.project=p.id) agents,
                     (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active
-             FROM projects p ORDER BY p.name, p.id",
+             FROM projects p LEFT JOIN configs c ON c.id=p.config ORDER BY p.name, p.id",
             [],
         )
     }
@@ -2125,7 +2310,7 @@ impl App {
         let (name, path) = st.project(project)?;
         a["project_name"] = json!(name);
         a["project_path"] = json!(path);
-        a["limits"] = json!(st.limits_text()?);
+        a["limits"] = json!(st.limits_text(Some(project))?);
         a["lost_locks"] = json!(rows(
             &st.db,
             "SELECT at, text FROM notices WHERE agent_id=?1 AND text LIKE 'You no longer hold lock %' ORDER BY id DESC LIMIT 20",
@@ -2192,18 +2377,22 @@ impl App {
         .ok_or_else(|| not_found(format!("no message {id}")))
     }
 
-    pub fn limits(&self) -> R<Value> {
+    /// A project's limits (the Default config's without one), active counts and usage.
+    pub fn limits(&self, project: Option<i64>) -> R<Value> {
         let st = self.lock();
-        let s = st.settings();
-        let (total, per) = st.active_counts()?;
+        let s = st.settings_for(project);
+        let (total, per) = st.active_counts(project)?;
         let usage = rows(
             &st.db,
             "SELECT provider, win, used_pct, resets_at, at FROM usage ORDER BY provider, win",
             [],
         )?;
-        Ok(
-            json!({ "limits": s.limits, "active": { "total": total, "per_harness": per }, "usage": usage, "text": st.limits_text()? }),
-        )
+        Ok(json!({
+            "limits": s.limits,
+            "active": { "total": total, "per_harness": per },
+            "usage": usage,
+            "text": st.limits_text(project)?,
+        }))
     }
 
     /// Recent activity for a project (with the lines about all projects), or for everything.
@@ -2217,8 +2406,8 @@ impl App {
         )
     }
 
-    pub fn settings(&self) -> Settings {
-        self.lock().settings()
+    pub fn settings(&self, project: Option<i64>) -> Settings {
+        self.lock().settings_for(project)
     }
 }
 
@@ -2255,6 +2444,11 @@ mod tests {
         db.execute_batch(SCHEMA).unwrap();
         db.execute_batch(
             "INSERT INTO projects(id,path,name,created_at) VALUES(1,'/p1','p1',0),(2,'/p2','p2',0)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO configs(id,name,settings) VALUES(1,'Default',?1)",
+            [serde_json::to_string(&Settings::default()).unwrap()],
         )
         .unwrap();
         for (id, project) in [(1, 1), (2, 1), (3, 1), (4, 2)] {
@@ -2383,46 +2577,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn room_follows_the_hard_limits_and_unset_means_no_limit() {
-        let st = st(); // four working claude agents, across two projects
+    fn save_config(st: &St, id: i64, s: &Settings) {
+        st.db
+            .execute(
+                "INSERT OR REPLACE INTO configs(id,name,settings) VALUES(?1,?2,?3)",
+                params![
+                    id,
+                    format!("config {id}"),
+                    serde_json::to_string(s).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn active_hard(n: Option<f64>) -> Settings {
         let mut s = Settings::default();
         s.limits.active = Limit {
             soft: None,
-            hard: Some(4.0),
+            hard: n,
         };
         s.limits.active_per_harness.clear();
-        let save = |st: &St, s: &Settings| {
-            st.db
-                .execute(
-                    "INSERT OR REPLACE INTO settings(key,value) VALUES('settings',?1)",
-                    [serde_json::to_string(s).unwrap()],
-                )
-                .unwrap();
-        };
-        save(&st, &s);
-        let why = st.no_room("claude").unwrap().unwrap();
+        s
+    }
+
+    #[test]
+    fn each_project_has_its_own_limits() {
+        // Project 1 has three working agents, project 2 has one.
+        let st = st();
+        save_config(&st, 1, &active_hard(Some(3.0)));
         assert_eq!(
-            why,
-            "Hard limit reached: 4 active agents (soft none, hard 4)"
+            st.no_room(1, "claude").unwrap().unwrap(),
+            "Hard limit reached: 3 active agents (soft none, hard 3)"
         );
+        assert_eq!(st.no_room(2, "claude").unwrap(), None);
+        assert!(
+            st.limits_text(Some(1))
+                .unwrap()
+                .starts_with("Active agents: 3 (soft none, hard 3)")
+        );
+        assert!(
+            st.limits_text(Some(2))
+                .unwrap()
+                .starts_with("Active agents: 1 (soft none, hard 3)")
+        );
+
         // An agent that marked itself done no longer takes a slot.
         st.db
             .execute("UPDATE agents SET done_req=1 WHERE id=1", [])
             .unwrap();
-        assert_eq!(st.no_room("claude").unwrap(), None);
-        s.limits.active = Limit {
-            soft: None,
-            hard: None,
-        };
-        save(&st, &s);
+        assert_eq!(st.no_room(1, "claude").unwrap(), None);
         st.db.execute("UPDATE agents SET done_req=0", []).unwrap();
-        assert_eq!(st.no_room("claude").unwrap(), None);
+
+        // Project 1 switches to a saved config with no limit; project 2 gets its own.
+        save_config(&st, 2, &active_hard(None));
+        st.db
+            .execute("UPDATE projects SET config=2 WHERE id=1", [])
+            .unwrap();
+        assert_eq!(st.no_room(1, "claude").unwrap(), None);
         assert!(
-            st.limits_text()
+            st.limits_text(Some(1))
                 .unwrap()
-                .starts_with("Active agents: 4 (no limit)")
+                .starts_with("Active agents: 3 (no limit)")
         );
+        let custom = serde_json::to_string(&active_hard(Some(1.0))).unwrap();
+        st.db
+            .execute(
+                "UPDATE projects SET config=NULL, custom=?1 WHERE id=2",
+                [custom],
+            )
+            .unwrap();
+        assert!(st.no_room(2, "claude").unwrap().is_some());
+        // The Default config is unchanged for everyone else.
+        assert_eq!(st.settings_for(None).limits.active.hard, Some(3.0));
     }
 
     #[test]
@@ -2468,7 +2694,7 @@ mod tests {
         assert!(claude.models.contains(&"claude-mythos-5-1".to_string()));
         assert!(s.check().is_ok());
         let st = st();
-        assert!(st.limits_text().unwrap().ends_with(
+        assert!(st.limits_text(Some(1)).unwrap().ends_with(
             "When an agent runs `acom done` it's closed: only the user's messages wake it again."
         ));
     }

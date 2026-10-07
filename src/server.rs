@@ -205,6 +205,9 @@ fn list(b: &Value, key: &str) -> Vec<String> {
         _ => vec![],
     }
 }
+fn settings(b: &Value, key: &str) -> R<Settings> {
+    serde_json::from_value(b[key].clone()).map_err(|e| bad(format!("bad settings: {e}")))
+}
 fn id(seg: &str) -> R<i64> {
     seg.parse()
         .map_err(|_| bad(format!("{seg} isn't a number")))
@@ -244,9 +247,10 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 "agents": agents,
                 "threads": threads,
                 "locks": locks,
-                "limits": app.limits()?,
+                "limits": app.limits(pid)?,
                 "activity": app.activity(pid, 100)?,
-                "settings": app.settings(),
+                "settings": app.settings(pid),
+                "configs": app.configs()?,
                 "model_catalog": { "claude": catalog("claude"), "codex": catalog("codex") },
             }))
         }
@@ -395,15 +399,33 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // limits, activity, settings
-        ("GET", ["limits"]) => J(app.limits()?),
+        ("GET", ["limits"]) => J(app.limits(q.int("project")?)?),
         ("GET", ["activity"]) => J(json!(
             app.activity(q.int("project")?, q.int("limit")?.unwrap_or(100))?
         )),
-        ("GET", ["settings"]) => J(json!(app.settings())),
-        ("PUT", ["settings"]) => {
-            let s: Settings = serde_json::from_value(b["settings"].clone())
-                .map_err(|e| bad(format!("bad settings: {e}")))?;
-            app.put_settings(s, &user(b))?;
+
+        // configs: Default (id 1), saved ones, and each project's choice
+        ("GET", ["configs"]) => J(json!(app.configs()?)),
+        ("POST", ["configs"]) => {
+            let id = app.add_config(&text(b, "name")?, settings(b, "settings")?, &user(b))?;
+            J(json!({ "id": id }))
+        }
+        ("PUT", ["configs", c]) => {
+            let name = opt_text(b, "name");
+            app.put_config(id(c)?, name.as_deref(), settings(b, "settings")?, &user(b))?;
+            J(json!({}))
+        }
+        ("POST", ["configs", c, "remove"]) => {
+            app.remove_config(id(c)?, &user(b))?;
+            J(json!({}))
+        }
+        ("PUT", ["projects", p, "config"]) => {
+            let custom = if b["custom"].is_null() {
+                None
+            } else {
+                Some(settings(b, "custom")?)
+            };
+            app.set_project_config(id(p)?, opt_int(b, "config"), custom, &user(b))?;
             J(json!({}))
         }
         _ => return Err(not_found(format!("no route {method} /{}", p.join("/")))),
