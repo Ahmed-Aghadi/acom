@@ -19,6 +19,16 @@ pub fn kill_group(pid: u32, sig: i32) {
     }
 }
 
+/// Whether a PID still belongs to this agent of this server, not a process that reused the number.
+pub fn is_our_agent(pid: u32, id: i64, url: &str) -> bool {
+    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
+    vars.contains(&format!("ACOM_ID={id}").as_bytes())
+        && vars.contains(&format!("ACOM_URL={url}").as_bytes())
+}
+
 /// SIGTERM the agent's process group, then SIGKILL whatever is left a few seconds later.
 pub fn stop(pid: u32) {
     kill_group(pid, libc::SIGTERM);

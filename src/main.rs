@@ -283,6 +283,17 @@ fn duration(s: &str) -> u64 {
         .unwrap_or_else(|_| die(&format!("bad duration {s:?}: use e.g. 30s, 5m, 1h")))
 }
 
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 fn ids(s: &str) -> Vec<i64> {
     s.split(',')
         .map(str::trim)
@@ -441,12 +452,7 @@ fn main() {
         }
         Cmd::Agents { group } => {
             let path = match group {
-                Some(g) => format!(
-                    "/agents?group={}",
-                    g.replace('%', "%25")
-                        .replace('&', "%26")
-                        .replace(' ', "%20")
-                ),
+                Some(g) => format!("/agents?group={}", encode(&g)),
                 None => "/agents".into(),
             };
             for a in get(&path).as_array().into_iter().flatten() {

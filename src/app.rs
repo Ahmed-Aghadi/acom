@@ -670,7 +670,9 @@ impl App {
             [],
         )? {
             let id = r["id"].as_i64().unwrap();
-            if let Some(pid) = r["pid"].as_i64() {
+            if let Some(pid) = r["pid"].as_i64()
+                && run::is_our_agent(pid as u32, id, &url)
+            {
                 run::kill_group(pid as u32, libc::SIGKILL);
             }
             st.freeze_locks(id)?;
@@ -1352,13 +1354,14 @@ impl App {
         st.agent(agent)?;
         let mark = parse_mark(mark)?;
         for id in ids {
-            let n: i64 =
-                st.db
-                    .query_row("SELECT count(*) FROM messages WHERE id=?1", [id], |r| {
-                        r.get(0)
-                    })?;
+            let n: i64 = st.db.query_row(
+                "SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?2
+                 WHERE m.id=?1",
+                params![id, agent],
+                |r| r.get(0),
+            )?;
             if n == 0 {
-                return Err(not_found(format!("no message {id}")));
+                return Err(not_found(format!("no message {id} in your threads")));
             }
         }
         for id in ids {

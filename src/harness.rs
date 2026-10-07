@@ -113,11 +113,13 @@ fn claude_command(l: &Launch) -> (Command, Option<String>) {
     if let Some(s) = l.session {
         c.args([if l.resume { "--resume" } else { "--session-id" }, s]);
     }
-    // --autocompact takes 100k to 1M.
-    c.args([
-        "--autocompact",
-        &l.context_limit.clamp(100_000, 1_000_000).to_string(),
-    ]);
+    // --autocompact takes 100k to 1M. 0 means no hard context limit.
+    if l.context_limit > 0 {
+        c.args([
+            "--autocompact",
+            &l.context_limit.clamp(100_000, 1_000_000).to_string(),
+        ]);
+    }
     let hook = json!({"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [
         {"type": "command", "command": format!("{} hook", quote(l.acom))}]}]}});
     c.args(["--settings", &hook.to_string()]);
@@ -266,10 +268,12 @@ fn codex_command(l: &Launch) -> (Command, Option<String>) {
         &format!("model_reasoning_effort={}", toml_string(l.effort)),
     ]);
     c.args(["--disable", "multi_agent"]);
-    c.args([
-        "-c",
-        &format!("model_auto_compact_token_limit={}", l.context_limit),
-    ]);
+    if l.context_limit > 0 {
+        c.args([
+            "-c",
+            &format!("model_auto_compact_token_limit={}", l.context_limit),
+        ]);
+    }
     // Workspace-write blocks even localhost by default. Agents need localhost
     // to reach acom, regardless of whether they need other network access.
     c.args(["-c", "sandbox_workspace_write.network_access=true"]);
