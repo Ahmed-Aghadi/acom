@@ -44,8 +44,14 @@ fn append(path: &PathBuf, line: &str) {
 pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
     let a = st.agent(id)?;
     let s = st.settings();
-    let turns: i64 = st.db.query_row("SELECT turns FROM agents WHERE id=?1", [id], |r| r.get(0))?;
-    let flags = s.harnesses.get(&a.harness).map(|h| h.flags.clone()).unwrap_or_default();
+    let turns: i64 = st
+        .db
+        .query_row("SELECT turns FROM agents WHERE id=?1", [id], |r| r.get(0))?;
+    let flags = s
+        .harnesses
+        .get(&a.harness)
+        .map(|h| h.flags.clone())
+        .unwrap_or_default();
     let launch = Launch {
         harness: &a.harness,
         model: &a.model,
@@ -58,7 +64,11 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         acom: &app.exe,
     };
     let (mut cmd, input) = harness::command(&launch);
-    let bin_dir = app.exe.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let bin_dir = app
+        .exe
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let path = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
     let err = OpenOptions::new()
         .create(true)
@@ -75,19 +85,34 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
     if input.is_none() {
         cmd.stdin(Stdio::null());
     }
-    let mut child = cmd.spawn().map_err(|e| Fail(500, format!("can't start {}: {e}", a.harness)))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Fail(500, format!("can't start {}: {e}", a.harness)))?;
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
         thread::spawn(move || {
             let _ = stdin.write_all(text.as_bytes());
         });
     }
     let pid = child.id();
-    st.procs.insert(id, Proc { pid, stopping: false });
+    st.procs.insert(
+        id,
+        Proc {
+            pid,
+            stopping: false,
+        },
+    );
     st.db.execute(
         "UPDATE agents SET state='working', pid=?2, turns=turns+1, ended_at=NULL WHERE id=?1",
         params![id, pid],
     )?;
-    append(&log_path(app, id, "txt"), &format!("--- turn {} started at {}", turns + 1, crate::app::hhmm(now())));
+    append(
+        &log_path(app, id, "txt"),
+        &format!(
+            "--- turn {} started at {}",
+            turns + 1,
+            crate::app::hhmm(now())
+        ),
+    );
 
     let app = app.clone();
     let harness = a.harness.clone();
@@ -109,7 +134,14 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         let ok = child.wait().map(|s| s.success()).unwrap_or(false);
         done.store(true, Ordering::SeqCst);
         let _ = side.join();
-        append(&log_path(&app, id, "txt"), &format!("--- turn ended at {}{}", crate::app::hhmm(now()), if ok { "" } else { " (exit with error)" }));
+        append(
+            &log_path(&app, id, "txt"),
+            &format!(
+                "--- turn ended at {}{}",
+                crate::app::hhmm(now()),
+                if ok { "" } else { " (exit with error)" }
+            ),
+        );
         if let Err(e) = app.turn_ended(id, ok) {
             eprintln!("agent {id}: {}", e.1);
         }
@@ -122,7 +154,11 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, ev: Event) {
         Event::Session(s) => app.set_session(id, &s),
         Event::Tokens { t, add } => app.record_tokens(id, t, add),
         Event::Context(n) => app.record_context(id, n),
-        Event::Usage { win, used_pct, resets_at } => app.record_usage(harness, &win, used_pct, resets_at),
+        Event::Usage {
+            win,
+            used_pct,
+            resets_at,
+        } => app.record_usage(harness, &win, used_pct, resets_at),
         Event::Text(t) => {
             append(&log_path(app, id, "txt"), &t);
             Ok(())

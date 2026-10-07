@@ -15,7 +15,10 @@ pub const STATES: [&str; 6] = ["working", "idle", "paused", "done", "closed", "c
 pub const MARKS: [&str; 3] = ["new", "in-progress", "handled"];
 
 pub fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 #[derive(Debug)]
@@ -93,9 +96,9 @@ impl Default for Settings {
             "codex".into(),
             HarnessCfg {
                 enabled: true,
-                models: strs(&["gpt-5.5"]),
-                efforts: strs(&["low", "medium", "high", "xhigh"]),
-                model: "gpt-5.5".into(),
+                models: strs(&["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]),
+                efforts: strs(&["low", "medium", "high", "xhigh", "max", "ultra"]),
+                model: "gpt-6.1-sol".into(),
                 effort: "medium".into(),
                 flags: strs(&["--sandbox", "workspace-write"]),
             },
@@ -128,15 +131,28 @@ impl Settings {
                 return Err(bad(format!("unknown harness {name}")));
             }
             if !h.models.contains(&h.model) {
-                return Err(bad(format!("{name}: default model {} isn't in its allowed models", h.model)));
+                return Err(bad(format!(
+                    "{name}: default model {} isn't in its allowed models",
+                    h.model
+                )));
             }
             if !h.efforts.contains(&h.effort) {
-                return Err(bad(format!("{name}: default effort {} isn't in its allowed efforts", h.effort)));
+                return Err(bad(format!(
+                    "{name}: default effort {} isn't in its allowed efforts",
+                    h.effort
+                )));
             }
         }
         let l = &self.limits;
-        let mut all = vec![("active agents".to_string(), &l.active), ("context".to_string(), &l.context)];
-        all.extend(l.active_per_harness.iter().map(|(k, v)| (format!("{k} active agents"), v)));
+        let mut all = vec![
+            ("active agents".to_string(), &l.active),
+            ("context".to_string(), &l.context),
+        ];
+        all.extend(
+            l.active_per_harness
+                .iter()
+                .map(|(k, v)| (format!("{k} active agents"), v)),
+        );
         all.extend(l.usage.iter().map(|(k, v)| (format!("{k} usage"), v)));
         for (name, lim) in all {
             if lim.soft < 0.0 || lim.hard < lim.soft {
@@ -211,7 +227,11 @@ pub struct Agent {
 }
 
 pub fn who(id: i64) -> String {
-    if id == 0 { "user".into() } else { format!("agent {id}") }
+    if id == 0 {
+        "user".into()
+    } else {
+        format!("agent {id}")
+    }
 }
 
 /// "user", "agent 3", or "user (via agent 7)" for a user command an agent ran.
@@ -257,7 +277,9 @@ pub fn rows(db: &Connection, sql: &str, p: impl rusqlite::Params) -> R<Vec<Value
 impl St {
     pub fn settings(&self) -> Settings {
         self.db
-            .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| r.get::<_, String>(0))
+            .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| {
+                r.get::<_, String>(0)
+            })
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
@@ -301,19 +323,29 @@ impl St {
     }
 
     pub fn log(&self, actor: &str, what: &str) -> R<()> {
-        self.db.execute("INSERT INTO activity(at,actor,what) VALUES(?1,?2,?3)", params![now(), actor, what])?;
+        self.db.execute(
+            "INSERT INTO activity(at,actor,what) VALUES(?1,?2,?3)",
+            params![now(), actor, what],
+        )?;
         Ok(())
     }
 
     pub fn notice(&self, agent: i64, text: &str) -> R<()> {
-        self.db.execute("INSERT INTO notices(agent_id,text,at) VALUES(?1,?2,?3)", params![agent, text, now()])?;
+        self.db.execute(
+            "INSERT INTO notices(agent_id,text,at) VALUES(?1,?2,?3)",
+            params![agent, text, now()],
+        )?;
         Ok(())
     }
 
     fn active_counts(&self) -> R<(i64, BTreeMap<String, i64>)> {
         let mut per = BTreeMap::new();
         let mut total = 0;
-        for r in rows(&self.db, "SELECT harness h, count(*) n FROM agents WHERE state IN ('working','idle') GROUP BY harness", [])? {
+        for r in rows(
+            &self.db,
+            "SELECT harness h, count(*) n FROM agents WHERE state IN ('working','idle') GROUP BY harness",
+            [],
+        )? {
             let n = r["n"].as_i64().unwrap_or(0);
             total += n;
             per.insert(r["h"].as_str().unwrap_or("").to_string(), n);
@@ -334,9 +366,17 @@ impl St {
         let s = self.settings();
         let l = &s.limits;
         let (total, per) = self.active_counts()?;
-        let mut out = format!("Active agents: {total} (soft {}, hard {})", l.active.soft, l.active.hard);
+        let mut out = format!(
+            "Active agents: {total} (soft {}, hard {})",
+            l.active.soft, l.active.hard
+        );
         for (h, lim) in &l.active_per_harness {
-            out += &format!("; {h}: {} (soft {}, hard {})", per.get(h).unwrap_or(&0), lim.soft, lim.hard);
+            out += &format!(
+                "; {h}: {} (soft {}, hard {})",
+                per.get(h).unwrap_or(&0),
+                lim.soft,
+                lim.hard
+            );
         }
         out += "\nSubscription usage:";
         for (i, (h, lim)) in l.usage.iter().enumerate() {
@@ -344,7 +384,12 @@ impl St {
                 Some(p) => format!("{p:.0}%"),
                 None => "unknown".into(),
             };
-            out += &format!("{} {h} {used} (soft {}%, hard {}%)", if i > 0 { ";" } else { "" }, lim.soft, lim.hard);
+            out += &format!(
+                "{} {h} {used} (soft {}%, hard {}%)",
+                if i > 0 { ";" } else { "" },
+                lim.soft,
+                lim.hard
+            );
         }
         out += &format!(
             "\nContext per agent: soft {} tokens, hard {} (the harness compacts at the hard value)",
@@ -356,7 +401,11 @@ impl St {
     // ---------- locks ----------
 
     fn release_lock(&mut self, name: &str, why: Option<&str>) -> R<()> {
-        let holder: Option<i64> = self.db.query_row("SELECT holder FROM locks WHERE name=?1", [name], |r| r.get(0))?;
+        let holder: Option<i64> =
+            self.db
+                .query_row("SELECT holder FROM locks WHERE name=?1", [name], |r| {
+                    r.get(0)
+                })?;
         self.db.execute(
             "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL, frozen=0, frozen_left=NULL WHERE name=?1",
             [name],
@@ -368,8 +417,12 @@ impl St {
     }
 
     fn held_by(&self, agent: i64) -> R<Vec<String>> {
-        let mut s = self.db.prepare("SELECT name FROM locks WHERE holder=?1 ORDER BY name")?;
-        let v = s.query_map([agent], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let mut s = self
+            .db
+            .prepare("SELECT name FROM locks WHERE holder=?1 ORDER BY name")?;
+        let v = s
+            .query_map([agent], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
         Ok(v)
     }
 
@@ -382,10 +435,12 @@ impl St {
 
     /// Expired TTLs free their locks. Frozen locks never expire.
     pub fn expire_locks(&mut self) -> R<bool> {
-        let mut s = self
-            .db
-            .prepare("SELECT name FROM locks WHERE holder IS NOT NULL AND frozen=0 AND expires_at <= ?1")?;
-        let names: Vec<String> = s.query_map([now()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let mut s = self.db.prepare(
+            "SELECT name FROM locks WHERE holder IS NOT NULL AND frozen=0 AND expires_at <= ?1",
+        )?;
+        let names: Vec<String> = s
+            .query_map([now()], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
         drop(s);
         for n in &names {
             self.release_lock(n, Some("its TTL ran out"))?;
@@ -422,7 +477,9 @@ impl St {
             "SELECT m.id, m.sender FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?1
              WHERE m.id > b.last_notified AND m.sender != ?1 AND (?2=0 OR m.sender=0) ORDER BY m.id",
         )?;
-        let v = s.query_map(params![agent, only_user], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        let v = s
+            .query_map(params![agent, only_user], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
         Ok(v)
     }
 
@@ -439,12 +496,17 @@ impl St {
     /// Never includes message content: only counts and senders.
     pub fn take_updates(&mut self, agent: i64) -> R<String> {
         let mut lines = Vec::new();
-        let mut s = self.db.prepare("SELECT id, text FROM notices WHERE agent_id=?1 AND shown=0 ORDER BY id")?;
-        let notes: Vec<(i64, String)> = s.query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        let mut s = self
+            .db
+            .prepare("SELECT id, text FROM notices WHERE agent_id=?1 AND shown=0 ORDER BY id")?;
+        let notes: Vec<(i64, String)> = s
+            .query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
         drop(s);
         for (id, text) in notes {
             lines.push(format!("[acom] {text}"));
-            self.db.execute("UPDATE notices SET shown=1 WHERE id=?1", [id])?;
+            self.db
+                .execute("UPDATE notices SET shown=1 WHERE id=?1", [id])?;
         }
         let msgs = self.pending(agent, false)?;
         if !msgs.is_empty() {
@@ -472,11 +534,19 @@ pub fn sender_list(ids: &[i64]) -> String {
     if names.len() <= 6 {
         return names.join(", ");
     }
-    format!("{}, … {}", names[..3].join(", "), names[names.len() - 2..].join(", "))
+    format!(
+        "{}, … {}",
+        names[..3].join(", "),
+        names[names.len() - 2..].join(", ")
+    )
 }
 
 fn parse_mark(m: &str) -> R<&str> {
-    MARKS.iter().find(|x| **x == m).copied().ok_or_else(|| bad(format!("mark must be one of {}", MARKS.join(", "))))
+    MARKS
+        .iter()
+        .find(|x| **x == m)
+        .copied()
+        .ok_or_else(|| bad(format!("mark must be one of {}", MARKS.join(", "))))
 }
 
 pub struct LaunchReq {
@@ -505,10 +575,20 @@ impl App {
             "INSERT OR IGNORE INTO settings(key,value) VALUES('settings',?1)",
             [serde_json::to_string(&Settings::default()).unwrap()],
         )?;
-        let mut st = St { db, queues: HashMap::new(), procs: HashMap::new(), over_hard: HashSet::new(), over_soft: HashSet::new() };
+        let mut st = St {
+            db,
+            queues: HashMap::new(),
+            procs: HashMap::new(),
+            over_hard: HashSet::new(),
+            over_soft: HashSet::new(),
+        };
         // Agents that were mid-turn when the server stopped can't be followed any more.
         // Treat it like pause all: stop leftovers, keep their locks frozen.
-        for r in rows(&st.db, "SELECT id, pid FROM agents WHERE state='working'", [])? {
+        for r in rows(
+            &st.db,
+            "SELECT id, pid FROM agents WHERE state='working'",
+            [],
+        )? {
             let id = r["id"].as_i64().unwrap();
             if let Some(pid) = r["pid"].as_i64() {
                 run::kill_group(pid as u32, libc::SIGKILL);
@@ -518,10 +598,19 @@ impl App {
                 "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2, pid=NULL WHERE id=?1",
                 params![id, now()],
             )?;
-            st.log("acom", &format!("paused agent {id}: the server restarted during its turn"))?;
+            st.log(
+                "acom",
+                &format!("paused agent {id}: the server restarted during its turn"),
+            )?;
         }
         let exe = std::env::current_exe().map_err(|e| Fail(500, e.to_string()))?;
-        Ok(Arc::new(App { st: Mutex::new(st), cv: Condvar::new(), dir, url, exe }))
+        Ok(Arc::new(App {
+            st: Mutex::new(st),
+            cv: Condvar::new(),
+            dir,
+            url,
+            exe,
+        }))
     }
 
     pub fn lock(&self) -> MutexGuard<'_, St> {
@@ -530,26 +619,52 @@ impl App {
 
     // ---------- launching and turns ----------
 
-    pub fn launch(self: &Arc<Self>, by: i64, via: Option<i64>, req: LaunchReq) -> R<(i64, Vec<String>)> {
+    pub fn launch(
+        self: &Arc<Self>,
+        by: i64,
+        via: Option<i64>,
+        req: LaunchReq,
+    ) -> R<(i64, Vec<String>)> {
         let mut st = self.lock();
         let s = st.settings();
         if by > 0 && st.agent(by)?.state != "working" {
             return Err(conflict("only a working agent can launch others"));
         }
         let harness = req.harness.unwrap_or_else(|| {
-            s.harnesses.iter().find(|(_, h)| h.enabled).map(|(k, _)| k.clone()).unwrap_or_default()
+            s.harnesses
+                .iter()
+                .find(|(_, h)| h.enabled)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default()
         });
-        let h = s.harnesses.get(&harness).filter(|h| h.enabled).ok_or_else(|| {
-            let ok: Vec<&String> = s.harnesses.iter().filter(|(_, h)| h.enabled).map(|(k, _)| k).collect();
-            bad(format!("harness {harness:?} isn't enabled (enabled: {ok:?})"))
-        })?;
+        let h = s
+            .harnesses
+            .get(&harness)
+            .filter(|h| h.enabled)
+            .ok_or_else(|| {
+                let ok: Vec<&String> = s
+                    .harnesses
+                    .iter()
+                    .filter(|(_, h)| h.enabled)
+                    .map(|(k, _)| k)
+                    .collect();
+                bad(format!(
+                    "harness {harness:?} isn't enabled (enabled: {ok:?})"
+                ))
+            })?;
         let model = req.model.unwrap_or_else(|| h.model.clone());
         if !h.models.contains(&model) {
-            return Err(bad(format!("model {model} isn't allowed for {harness} (allowed: {})", h.models.join(", "))));
+            return Err(bad(format!(
+                "model {model} isn't allowed for {harness} (allowed: {})",
+                h.models.join(", ")
+            )));
         }
         let effort = req.effort.unwrap_or_else(|| h.effort.clone());
         if !h.efforts.contains(&effort) {
-            return Err(bad(format!("effort {effort} isn't allowed for {harness} (allowed: {})", h.efforts.join(", "))));
+            return Err(bad(format!(
+                "effort {effort} isn't allowed for {harness} (allowed: {})",
+                h.efforts.join(", ")
+            )));
         }
         if req.task.trim().is_empty() {
             return Err(bad("the task is empty"));
@@ -558,34 +673,73 @@ impl App {
         // Limits: soft warns, hard refuses agents and needs confirming for the user.
         let (total, per) = st.active_counts()?;
         let l = &s.limits;
-        let mut checks = vec![("Active agents".to_string(), (total + 1) as f64, l.active.clone(), "")];
+        let mut checks = vec![(
+            "Active agents".to_string(),
+            (total + 1) as f64,
+            l.active.clone(),
+            "",
+        )];
         if let Some(lim) = l.active_per_harness.get(&harness) {
-            checks.push((format!("Active {harness} agents"), (per.get(&harness).unwrap_or(&0) + 1) as f64, lim.clone(), ""));
+            checks.push((
+                format!("Active {harness} agents"),
+                (per.get(&harness).unwrap_or(&0) + 1) as f64,
+                lim.clone(),
+                "",
+            ));
         }
         if let (Some(lim), Some(used)) = (l.usage.get(&harness), st.used_pct(&harness)?) {
-            checks.push((format!("{harness} subscription usage"), used, lim.clone(), "%"));
+            checks.push((
+                format!("{harness} subscription usage"),
+                used,
+                lim.clone(),
+                "%",
+            ));
         }
         let mut warnings = Vec::new();
         for (what, value, lim, unit) in checks {
             let is_count = unit.is_empty();
-            let over_hard = if is_count { value > lim.hard } else { value >= lim.hard };
-            let over_soft = if is_count { value > lim.soft } else { value >= lim.soft };
-            let shown = if is_count { format!("{}", value - 1.0) } else { format!("{value:.0}{unit}") };
+            let over_hard = if is_count {
+                value > lim.hard
+            } else {
+                value >= lim.hard
+            };
+            let over_soft = if is_count {
+                value > lim.soft
+            } else {
+                value >= lim.soft
+            };
+            let shown = if is_count {
+                format!("{}", value - 1.0)
+            } else {
+                format!("{value:.0}{unit}")
+            };
             if over_hard {
-                let msg = format!("Hard limit reached: {what} {shown} (soft {}{unit}, hard {}{unit})", lim.soft, lim.hard);
+                let msg = format!(
+                    "Hard limit reached: {what} {shown} (soft {}{unit}, hard {}{unit})",
+                    lim.soft, lim.hard
+                );
                 if by > 0 {
                     return Err(conflict(format!("{msg}. Launch refused.")));
                 }
                 if !req.force {
-                    return Err(conflict(format!("{msg}. Confirm to launch anyway (--force).")));
+                    return Err(conflict(format!(
+                        "{msg}. Confirm to launch anyway (--force)."
+                    )));
                 }
                 warnings.push(format!("{msg}; launched anyway."));
             } else if over_soft {
-                warnings.push(format!("Soft limit reached: {what} {shown} (soft {}{unit}, hard {}{unit})", lim.soft, lim.hard));
+                warnings.push(format!(
+                    "Soft limit reached: {what} {shown} (soft {}{unit}, hard {}{unit})",
+                    lim.soft, lim.hard
+                ));
             }
         }
 
-        let session = if harness == "claude" { Some(crate::harness::new_uuid()) } else { None };
+        let session = if harness == "claude" {
+            Some(crate::harness::new_uuid())
+        } else {
+            None
+        };
         st.db.execute(
             "INSERT INTO agents(name,grp,task,harness,model,effort,state,session_id,launched_by,launched_at)
              VALUES(?1,?2,?3,?4,?5,?6,'idle',?7,?8,?9)",
@@ -593,9 +747,15 @@ impl App {
         )?;
         let id = st.db.last_insert_rowid();
         if req.name.as_deref().unwrap_or("").is_empty() {
-            st.db.execute("UPDATE agents SET name=?2 WHERE id=?1", params![id, format!("agent {id}")])?;
+            st.db.execute(
+                "UPDATE agents SET name=?2 WHERE id=?1",
+                params![id, format!("agent {id}")],
+            )?;
         }
-        st.log(&actor(by, via), &format!("launched agent {id} ({harness} / {model} / {effort})"))?;
+        st.log(
+            &actor(by, via),
+            &format!("launched agent {id} ({harness} / {model} / {effort})"),
+        )?;
         let prompt = self.briefing(&st, id)?;
         run::start_turn(self, &mut st, id, &prompt)?;
         Ok((id, warnings))
@@ -603,7 +763,11 @@ impl App {
 
     fn briefing(&self, st: &St, id: i64) -> R<String> {
         let a = st.agent(id)?;
-        let group = a.grp.as_ref().map(|g| format!(", group \"{g}\"")).unwrap_or_default();
+        let group = a
+            .grp
+            .as_ref()
+            .map(|g| format!(", group \"{g}\""))
+            .unwrap_or_default();
         Ok(format!(
             "You are agent {id} (\"{}\"{group}), launched by {} through acom, running {} / {} / effort {}.\n\n{GUIDE}\n## Limits right now\n\n{}\n\n## Your task\n\n{}\n",
             a.name,
@@ -627,7 +791,10 @@ impl App {
         if st.pending(id, only_user)?.is_empty() {
             return Ok(());
         }
-        st.db.execute("UPDATE agents SET rest=?2 WHERE id=?1", params![id, a.state])?;
+        st.db.execute(
+            "UPDATE agents SET rest=?2 WHERE id=?1",
+            params![id, a.state],
+        )?;
         let updates = st.take_updates(id)?;
         let prompt = format!("{updates}\n\nYou were woken up because of the above. Carry on.");
         run::start_turn(self, st, id, &prompt)
@@ -637,7 +804,8 @@ impl App {
     pub fn turn_ended(self: &Arc<Self>, id: i64, ok: bool) -> R<()> {
         let mut st = self.lock();
         let stopping = st.procs.remove(&id).map(|p| p.stopping).unwrap_or(false);
-        st.db.execute("UPDATE agents SET pid=NULL WHERE id=?1", [id])?;
+        st.db
+            .execute("UPDATE agents SET pid=NULL WHERE id=?1", [id])?;
         let a = st.agent(id)?;
         if a.state != "working" {
             // Paused or closed by someone: they already set the state.
@@ -652,14 +820,20 @@ impl App {
         } else {
             a.rest.as_str()
         };
-        st.db.execute("UPDATE agents SET done_req=0, rest='idle' WHERE id=?1", [id])?;
+        st.db.execute(
+            "UPDATE agents SET done_req=0, rest='idle' WHERE id=?1",
+            [id],
+        )?;
         st.set_state(id, next)?;
         if next != "idle" {
             let why = format!("you became {next}");
             st.release_all(id, &why)?;
         }
         if next == "crashed" {
-            st.log("acom", &format!("agent {id} crashed (its process exited with an error)"))?;
+            st.log(
+                "acom",
+                &format!("agent {id} crashed (its process exited with an error)"),
+            )?;
         } else if a.done_req {
             st.log(&who(id), &format!("finished: {next}"))?;
         }
@@ -675,7 +849,14 @@ impl App {
         self.pause_locked(&mut st, id, locks, "user", by)
     }
 
-    fn pause_locked(self: &Arc<Self>, st: &mut St, id: i64, locks: LockMode, reason: &str, by: &str) -> R<()> {
+    fn pause_locked(
+        self: &Arc<Self>,
+        st: &mut St,
+        id: i64,
+        locks: LockMode,
+        reason: &str,
+        by: &str,
+    ) -> R<()> {
         let a = st.agent(id)?;
         if !matches!(a.state.as_str(), "working" | "idle" | "done") {
             return Err(conflict(format!("agent {id} is {}", a.state)));
@@ -688,7 +869,9 @@ impl App {
                     held.join(", ")
                 )));
             }
-            LockMode::Release => st.release_all(id, &format!("you were paused at {}", hhmm(now())))?,
+            LockMode::Release => {
+                st.release_all(id, &format!("you were paused at {}", hhmm(now())))?
+            }
             _ => st.freeze_locks(id)?,
         }
         st.db.execute(
@@ -726,11 +909,16 @@ impl App {
             return Err(conflict(format!("agent {id} is {}, not paused", a.state)));
         }
         st.unfreeze_locks(id)?;
-        st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL WHERE id=?1", [id])?;
+        st.db.execute(
+            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL WHERE id=?1",
+            [id],
+        )?;
         st.log(by, &format!("resumed agent {id}"))?;
         if a.state == "crashed" {
             let updates = st.take_updates(id)?;
-            let prompt = format!("Your last turn ended with an error and you've been resumed.\n{updates}\n\nCarry on.");
+            let prompt = format!(
+                "Your last turn ended with an error and you've been resumed.\n{updates}\n\nCarry on."
+            );
             return run::start_turn(self, st, id, &prompt);
         }
         let from = a.pause_from.unwrap_or_else(|| "idle".into());
@@ -750,10 +938,14 @@ impl App {
 
     pub fn pause_all(self: &Arc<Self>, by: &str) -> R<Vec<i64>> {
         let mut st = self.lock();
-        let ids: Vec<i64> = rows(&st.db, "SELECT id FROM agents WHERE state IN ('working','idle','done')", [])?
-            .iter()
-            .map(|r| r["id"].as_i64().unwrap())
-            .collect();
+        let ids: Vec<i64> = rows(
+            &st.db,
+            "SELECT id FROM agents WHERE state IN ('working','idle','done')",
+            [],
+        )?
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
         for &id in &ids {
             self.pause_locked(&mut st, id, LockMode::Keep, "all", by)?;
         }
@@ -805,15 +997,23 @@ impl App {
     pub fn set_status(&self, id: i64, text: &str) -> R<()> {
         let st = self.lock();
         st.agent(id)?;
-        st.db.execute("UPDATE agents SET status_text=?2 WHERE id=?1", params![id, text])?;
+        st.db.execute(
+            "UPDATE agents SET status_text=?2 WHERE id=?1",
+            params![id, text],
+        )?;
         Ok(())
     }
 
     pub fn set_group(&self, id: i64, group: &str) -> R<()> {
         let st = self.lock();
         st.agent(id)?;
-        let g = if group.trim().is_empty() { None } else { Some(group.trim()) };
-        st.db.execute("UPDATE agents SET grp=?2 WHERE id=?1", params![id, g])?;
+        let g = if group.trim().is_empty() {
+            None
+        } else {
+            Some(group.trim())
+        };
+        st.db
+            .execute("UPDATE agents SET grp=?2 WHERE id=?1", params![id, g])?;
         Ok(())
     }
 
@@ -822,7 +1022,8 @@ impl App {
         if st.agent(id)?.state != "working" {
             return Err(conflict("only a working agent can mark itself done"));
         }
-        st.db.execute("UPDATE agents SET done_req=1 WHERE id=?1", [id])?;
+        st.db
+            .execute("UPDATE agents SET done_req=1 WHERE id=?1", [id])?;
         Ok(())
     }
 
@@ -838,7 +1039,12 @@ impl App {
 
     fn resolve(st: &St, sel: &[String]) -> R<Vec<i64>> {
         let mut ids = Vec::new();
-        for s in sel.iter().flat_map(|s| s.split(',')).map(str::trim).filter(|s| !s.is_empty()) {
+        for s in sel
+            .iter()
+            .flat_map(|s| s.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let found: Vec<i64> = if let Ok(id) = s.parse::<i64>() {
                 st.agent(id)?;
                 vec![id]
@@ -846,7 +1052,10 @@ impl App {
                 let (sql, arg) = if let Some(g) = s.strip_prefix("group:") {
                     ("SELECT id FROM agents WHERE grp=?1", g.to_string())
                 } else if s == "active" {
-                    ("SELECT id FROM agents WHERE state IN ('working','idle') AND ?1=?1", String::new())
+                    (
+                        "SELECT id FROM agents WHERE state IN ('working','idle') AND ?1=?1",
+                        String::new(),
+                    )
                 } else if STATES.contains(&s) {
                     ("SELECT id FROM agents WHERE state=?1", s.to_string())
                 } else {
@@ -855,7 +1064,10 @@ impl App {
                         STATES.join(", ")
                     )));
                 };
-                rows(&st.db, sql, [arg])?.iter().map(|r| r["id"].as_i64().unwrap()).collect()
+                rows(&st.db, sql, [arg])?
+                    .iter()
+                    .map(|r| r["id"].as_i64().unwrap())
+                    .collect()
             };
             for id in found {
                 if !ids.contains(&id) {
@@ -866,7 +1078,12 @@ impl App {
         Ok(ids)
     }
 
-    pub fn new_thread(self: &Arc<Self>, by: i64, title: &str, members: &[String]) -> R<(i64, Vec<i64>)> {
+    pub fn new_thread(
+        self: &Arc<Self>,
+        by: i64,
+        title: &str,
+        members: &[String],
+    ) -> R<(i64, Vec<i64>)> {
         let st = self.lock();
         if title.trim().is_empty() {
             return Err(bad("the thread needs a title"));
@@ -881,10 +1098,16 @@ impl App {
         if ids.is_empty() {
             return Err(bad("the thread has no members"));
         }
-        st.db.execute("INSERT INTO threads(title,created_by,created_at) VALUES(?1,?2,?3)", params![title.trim(), by, now()])?;
+        st.db.execute(
+            "INSERT INTO threads(title,created_by,created_at) VALUES(?1,?2,?3)",
+            params![title.trim(), by, now()],
+        )?;
         let tid = st.db.last_insert_rowid();
         for id in &ids {
-            st.db.execute("INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)", params![tid, id])?;
+            st.db.execute(
+                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
+                params![tid, id],
+            )?;
         }
         Ok((tid, ids))
     }
@@ -894,7 +1117,10 @@ impl App {
         Self::thread_exists(&st, tid)?;
         let ids = Self::resolve(&st, members)?;
         for id in &ids {
-            st.db.execute("INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)", params![tid, id])?;
+            st.db.execute(
+                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
+                params![tid, id],
+            )?;
         }
         // Earlier messages count as new for them, so resting members may need waking.
         for id in &ids {
@@ -904,8 +1130,16 @@ impl App {
     }
 
     fn thread_exists(st: &St, tid: i64) -> R<()> {
-        let n: i64 = st.db.query_row("SELECT count(*) FROM threads WHERE id=?1", [tid], |r| r.get(0))?;
-        if n == 0 { Err(not_found(format!("no thread {tid}"))) } else { Ok(()) }
+        let n: i64 = st
+            .db
+            .query_row("SELECT count(*) FROM threads WHERE id=?1", [tid], |r| {
+                r.get(0)
+            })?;
+        if n == 0 {
+            Err(not_found(format!("no thread {tid}")))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn post(self: &Arc<Self>, sender: i64, tid: i64, text: &str) -> R<i64> {
@@ -916,7 +1150,10 @@ impl App {
         }
         if sender > 0 {
             st.agent(sender)?;
-            st.db.execute("INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)", params![tid, sender])?;
+            st.db.execute(
+                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
+                params![tid, sender],
+            )?;
         }
         st.db.execute(
             "INSERT INTO messages(thread_id,sender,text,at) VALUES(?1,?2,?3,?4)",
@@ -925,12 +1162,19 @@ impl App {
         let mid = st.db.last_insert_rowid();
         if sender > 0 {
             // You've seen your own message.
-            st.db.execute("INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,'handled')", params![sender, mid])?;
+            st.db.execute(
+                "INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,'handled')",
+                params![sender, mid],
+            )?;
         }
-        let members: Vec<i64> = rows(&st.db, "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2", params![tid, sender])?
-            .iter()
-            .map(|r| r["a"].as_i64().unwrap())
-            .collect();
+        let members: Vec<i64> = rows(
+            &st.db,
+            "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2",
+            params![tid, sender],
+        )?
+        .iter()
+        .map(|r| r["a"].as_i64().unwrap())
+        .collect();
         for m in members {
             self.maybe_wake(&mut st, m)?;
         }
@@ -962,13 +1206,20 @@ impl App {
         st.agent(agent)?;
         let mark = parse_mark(mark)?;
         for id in ids {
-            let n: i64 = st.db.query_row("SELECT count(*) FROM messages WHERE id=?1", [id], |r| r.get(0))?;
+            let n: i64 =
+                st.db
+                    .query_row("SELECT count(*) FROM messages WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })?;
             if n == 0 {
                 return Err(not_found(format!("no message {id}")));
             }
         }
         for id in ids {
-            st.db.execute("INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,?3)", params![agent, id, mark])?;
+            st.db.execute(
+                "INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,?3)",
+                params![agent, id, mark],
+            )?;
         }
         Ok(())
     }
@@ -992,9 +1243,17 @@ impl App {
 
     fn lock_row(st: &St, name: &str) -> R<(Option<i64>, i64)> {
         st.db
-            .query_row("SELECT holder, coalesce(acquired_at,0) FROM locks WHERE name=?1", [name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT holder, coalesce(acquired_at,0) FROM locks WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?
-            .ok_or_else(|| not_found(format!("no lock {name}; create it first with `acom lock new`")))
+            .ok_or_else(|| {
+                not_found(format!(
+                    "no lock {name}; create it first with `acom lock new`"
+                ))
+            })
     }
 
     /// Take a lock, waiting in a first-come-first-served queue for up to `wait` seconds.
@@ -1011,14 +1270,24 @@ impl App {
             if st.agent(agent)?.state != "working" {
                 leave(&mut st);
                 self.cv.notify_all();
-                return Err(conflict("you're not working (paused or stopped), so you left the queue"));
+                return Err(conflict(
+                    "you're not working (paused or stopped), so you left the queue",
+                ));
             }
             let (holder, since) = Self::lock_row(&st, name)?;
             let expires = ttl.map(|t| now() + t as i64);
             if holder == Some(agent) {
-                st.db.execute("UPDATE locks SET expires_at=?2 WHERE name=?1", params![name, expires])?;
+                st.db.execute(
+                    "UPDATE locks SET expires_at=?2 WHERE name=?1",
+                    params![name, expires],
+                )?;
                 leave(&mut st);
-                return Ok(format!("renewed {name}{}", expires.map(|e| format!(", expires {}", hhmm(e))).unwrap_or_default()));
+                return Ok(format!(
+                    "renewed {name}{}",
+                    expires
+                        .map(|e| format!(", expires {}", hhmm(e)))
+                        .unwrap_or_default()
+                ));
             }
             let first = st.queues.get(name).and_then(|q| q.first().copied());
             if holder.is_none() && (first.is_none() || first == Some(agent)) {
@@ -1028,7 +1297,12 @@ impl App {
                 )?;
                 leave(&mut st);
                 self.cv.notify_all();
-                return Ok(format!("acquired {name}{}", expires.map(|e| format!(", expires {}", hhmm(e))).unwrap_or_default()));
+                return Ok(format!(
+                    "acquired {name}{}",
+                    expires
+                        .map(|e| format!(", expires {}", hhmm(e)))
+                        .unwrap_or_default()
+                ));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -1039,7 +1313,10 @@ impl App {
                         let n = st.agent(h).map(|a| a.name).unwrap_or_default();
                         format!("held by agent {h} \"{n}\" since {}", hhmm(since))
                     }
-                    None => format!("free, but agent {} is ahead of you in the queue", first.unwrap_or(0)),
+                    None => format!(
+                        "free, but agent {} is ahead of you in the queue",
+                        first.unwrap_or(0)
+                    ),
                 };
                 return Err(conflict(format!("{name} is {by}")));
             }
@@ -1047,7 +1324,11 @@ impl App {
             if !q.contains(&agent) {
                 q.push(agent);
             }
-            st = self.cv.wait_timeout(st, left.min(Duration::from_secs(1))).unwrap_or_else(|e| e.into_inner()).0;
+            st = self
+                .cv
+                .wait_timeout(st, left.min(Duration::from_secs(1)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -1070,7 +1351,10 @@ impl App {
             return Err(conflict(format!("{name} isn't held")));
         }
         st.release_lock(name, Some("the user freed it"))?;
-        st.log(by, &format!("freed lock {name} (held by agent {})", holder.unwrap()))?;
+        st.log(
+            by,
+            &format!("freed lock {name} (held by agent {})", holder.unwrap()),
+        )?;
         self.cv.notify_all();
         Ok(())
     }
@@ -1084,7 +1368,11 @@ impl App {
             [],
         )?;
         for l in &mut v {
-            let q = st.queues.get(l["name"].as_str().unwrap()).cloned().unwrap_or_default();
+            let q = st
+                .queues
+                .get(l["name"].as_str().unwrap())
+                .cloned()
+                .unwrap_or_default();
             l["queue"] = json!(q);
         }
         Ok(v)
@@ -1099,14 +1387,21 @@ impl App {
         } else {
             "UPDATE agents SET fresh_in=?2, cache_write=?3, cache_read=?4, output=?5 WHERE id=?1"
         };
-        st.db.execute(sql, params![id, t[0] as i64, t[1] as i64, t[2] as i64, t[3] as i64])?;
+        st.db.execute(
+            sql,
+            params![id, t[0] as i64, t[1] as i64, t[2] as i64, t[3] as i64],
+        )?;
         Ok(())
     }
 
     pub fn record_context(&self, id: i64, tokens: u64) -> R<()> {
         let st = self.lock();
         let soft = st.settings().limits.context;
-        let warned: i64 = st.db.query_row("SELECT context_warned FROM agents WHERE id=?1", [id], |r| r.get(0))?;
+        let warned: i64 =
+            st.db
+                .query_row("SELECT context_warned FROM agents WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
         let over = tokens as f64 >= soft.soft;
         if over && warned == 0 {
             st.notice(
@@ -1117,11 +1412,20 @@ impl App {
                 ),
             )?;
         }
-        st.db.execute("UPDATE agents SET context=?2, context_warned=?3 WHERE id=?1", params![id, tokens as i64, over])?;
+        st.db.execute(
+            "UPDATE agents SET context=?2, context_warned=?3 WHERE id=?1",
+            params![id, tokens as i64, over],
+        )?;
         Ok(())
     }
 
-    pub fn record_usage(&self, provider: &str, win: &str, used_pct: f64, resets_at: Option<i64>) -> R<()> {
+    pub fn record_usage(
+        &self,
+        provider: &str,
+        win: &str,
+        used_pct: f64,
+        resets_at: Option<i64>,
+    ) -> R<()> {
         let st = self.lock();
         st.db.execute(
             "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,?2,?3,?4,?5)",
@@ -1132,7 +1436,10 @@ impl App {
 
     pub fn set_session(&self, id: i64, session: &str) -> R<()> {
         let st = self.lock();
-        st.db.execute("UPDATE agents SET session_id=?2 WHERE id=?1 AND session_id IS NULL", params![id, session])?;
+        st.db.execute(
+            "UPDATE agents SET session_id=?2 WHERE id=?1 AND session_id IS NULL",
+            params![id, session],
+        )?;
         Ok(())
     }
 
@@ -1150,24 +1457,41 @@ impl App {
                 }
                 continue;
             };
-            let line = format!("{p} subscription usage {used:.0}% (soft {}%, hard {}%)", lim.soft, lim.hard);
+            let line = format!(
+                "{p} subscription usage {used:.0}% (soft {}%, hard {}%)",
+                lim.soft, lim.hard
+            );
             if used >= lim.soft && st.over_soft.insert(p.clone()) {
-                for r in rows(&st.db, "SELECT id FROM agents WHERE harness=?1 AND state NOT IN ('closed','crashed')", [p])? {
-                    st.notice(r["id"].as_i64().unwrap(), &format!("Soft limit reached: {line}."))?;
+                for r in rows(
+                    &st.db,
+                    "SELECT id FROM agents WHERE harness=?1 AND state NOT IN ('closed','crashed')",
+                    [p],
+                )? {
+                    st.notice(
+                        r["id"].as_i64().unwrap(),
+                        &format!("Soft limit reached: {line}."),
+                    )?;
                 }
             } else if used < lim.soft {
                 st.over_soft.remove(p);
             }
             if used >= lim.hard {
                 if st.over_hard.insert(p.clone()) {
-                    let ids: Vec<i64> = rows(&st.db, "SELECT id FROM agents WHERE harness=?1 AND state IN ('working','idle')", [p])?
-                        .iter()
-                        .map(|r| r["id"].as_i64().unwrap())
-                        .collect();
+                    let ids: Vec<i64> = rows(
+                        &st.db,
+                        "SELECT id FROM agents WHERE harness=?1 AND state IN ('working','idle')",
+                        [p],
+                    )?
+                    .iter()
+                    .map(|r| r["id"].as_i64().unwrap())
+                    .collect();
                     for id in &ids {
                         self.pause_locked(&mut st, *id, LockMode::Release, "limit", "acom")?;
                     }
-                    st.log("acom", &format!("hard limit reached: {line}; paused {} agent(s)", ids.len()))?;
+                    st.log(
+                        "acom",
+                        &format!("hard limit reached: {line}; paused {} agent(s)", ids.len()),
+                    )?;
                     changed = true;
                 }
             } else {
@@ -1184,10 +1508,14 @@ impl App {
     }
 
     fn resume_limited(self: &Arc<Self>, st: &mut St, provider: &str) -> R<bool> {
-        let ids: Vec<i64> = rows(&st.db, "SELECT id FROM agents WHERE harness=?1 AND state='paused' AND pause_reason='limit'", [provider])?
-            .iter()
-            .map(|r| r["id"].as_i64().unwrap())
-            .collect();
+        let ids: Vec<i64> = rows(
+            &st.db,
+            "SELECT id FROM agents WHERE harness=?1 AND state='paused' AND pause_reason='limit'",
+            [provider],
+        )?
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
         for id in &ids {
             self.resume_locked(st, *id, "acom")?;
         }
@@ -1205,7 +1533,11 @@ impl App {
         st.log(by, "changed settings")?;
         if old.limits != new.limits {
             let text = format!("The user changed the limits. Now:\n{}", st.limits_text()?);
-            for r in rows(&st.db, "SELECT id FROM agents WHERE state NOT IN ('closed','crashed')", [])? {
+            for r in rows(
+                &st.db,
+                "SELECT id FROM agents WHERE state NOT IN ('closed','crashed')",
+                [],
+            )? {
                 st.notice(r["id"].as_i64().unwrap(), &text)?;
             }
         }
@@ -1238,7 +1570,10 @@ impl App {
     pub fn agent_view(&self, id: i64) -> R<Value> {
         let st = self.lock();
         st.agent(id)?;
-        let mut a = Self::agents_locked(&st, None)?.into_iter().find(|a| a["id"] == id).unwrap();
+        let mut a = Self::agents_locked(&st, None)?
+            .into_iter()
+            .find(|a| a["id"] == id)
+            .unwrap();
         a["limits"] = json!(st.limits_text()?);
         Ok(a)
     }
@@ -1255,7 +1590,11 @@ impl App {
             [agent],
         )?;
         for t in &mut v {
-            let ids = rows(&st.db, "SELECT agent_id a FROM members WHERE thread_id=?1 ORDER BY agent_id", [t["id"].as_i64()])?;
+            let ids = rows(
+                &st.db,
+                "SELECT agent_id a FROM members WHERE thread_id=?1 ORDER BY agent_id",
+                [t["id"].as_i64()],
+            )?;
             t["members"] = json!(ids.iter().map(|r| r["a"].clone()).collect::<Vec<_>>());
         }
         Ok(v)
@@ -1264,10 +1603,23 @@ impl App {
     pub fn thread(&self, tid: i64) -> R<Value> {
         let st = self.lock();
         Self::thread_exists(&st, tid)?;
-        let mut t = rows(&st.db, "SELECT id, title, created_by, created_at FROM threads WHERE id=?1", [tid])?.remove(0);
-        let ids = rows(&st.db, "SELECT agent_id a FROM members WHERE thread_id=?1 ORDER BY agent_id", [tid])?;
+        let mut t = rows(
+            &st.db,
+            "SELECT id, title, created_by, created_at FROM threads WHERE id=?1",
+            [tid],
+        )?
+        .remove(0);
+        let ids = rows(
+            &st.db,
+            "SELECT agent_id a FROM members WHERE thread_id=?1 ORDER BY agent_id",
+            [tid],
+        )?;
         t["members"] = json!(ids.iter().map(|r| r["a"].clone()).collect::<Vec<_>>());
-        t["messages"] = json!(rows(&st.db, "SELECT id, sender, text, at FROM messages WHERE thread_id=?1 ORDER BY id", [tid])?);
+        t["messages"] = json!(rows(
+            &st.db,
+            "SELECT id, sender, text, at FROM messages WHERE thread_id=?1 ORDER BY id",
+            [tid]
+        )?);
         Ok(t)
     }
 
@@ -1286,13 +1638,23 @@ impl App {
         let st = self.lock();
         let s = st.settings();
         let (total, per) = st.active_counts()?;
-        let usage = rows(&st.db, "SELECT provider, win, used_pct, resets_at, at FROM usage ORDER BY provider, win", [])?;
-        Ok(json!({ "limits": s.limits, "active": { "total": total, "per_harness": per }, "usage": usage, "text": st.limits_text()? }))
+        let usage = rows(
+            &st.db,
+            "SELECT provider, win, used_pct, resets_at, at FROM usage ORDER BY provider, win",
+            [],
+        )?;
+        Ok(
+            json!({ "limits": s.limits, "active": { "total": total, "per_harness": per }, "usage": usage, "text": st.limits_text()? }),
+        )
     }
 
     pub fn activity(&self, limit: i64) -> R<Vec<Value>> {
         let st = self.lock();
-        rows(&st.db, "SELECT id, at, actor, what FROM activity ORDER BY id DESC LIMIT ?1", [limit])
+        rows(
+            &st.db,
+            "SELECT id, at, actor, what FROM activity ORDER BY id DESC LIMIT ?1",
+            [limit],
+        )
     }
 
     pub fn settings(&self) -> Settings {

@@ -50,22 +50,59 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
-    let res = if body.trim().is_empty() {
+    let res = if !same_origin(app, &req, &method) {
+        Err(Fail(
+            403,
+            "requests must come from this server's own page or the acom command".into(),
+        ))
+    } else if body.trim().is_empty() {
         Ok(Value::Null)
     } else {
         serde_json::from_str(&body).map_err(|e| bad(format!("bad JSON: {e}")))
     }
     .and_then(|b| {
-        let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        let segs: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
         route(app, &method, &segs, &Query(query), &b)
     });
     let (code, body, ctype) = match res {
         Ok(Reply::Html(h)) => (200, h.to_string(), "text/html; charset=utf-8"),
         Ok(Reply::Json(v)) => (200, v.to_string(), "application/json"),
-        Err(Fail(code, msg)) => (code, json!({ "error": msg }).to_string(), "application/json"),
+        Err(Fail(code, msg)) => (
+            code,
+            json!({ "error": msg }).to_string(),
+            "application/json",
+        ),
     };
     let header = tiny_http::Header::from_bytes("Content-Type", ctype).unwrap();
-    let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(code).with_header(header));
+    let _ = req.respond(
+        tiny_http::Response::from_string(body)
+            .with_status_code(code)
+            .with_header(header),
+    );
+}
+
+/// No auth, but a web page elsewhere mustn't be able to drive the server: the Host and
+/// Origin must be this server, and writes must be JSON, which browsers won't send
+/// cross-origin without a preflight we never answer.
+fn same_origin(app: &App, req: &tiny_http::Request, method: &str) -> bool {
+    let header = |name: &'static str| {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    let local = app.url.replace("127.0.0.1", "localhost");
+    let host_ok = header("Host").is_some_and(|h| {
+        app.url.ends_with(&format!("//{h}")) || local.ends_with(&format!("//{h}"))
+    });
+    let origin_ok = header("Origin").is_none_or(|o| o == app.url || o == local);
+    let json_ok = method == "GET"
+        || header("Content-Type").is_some_and(|c| c.starts_with("application/json"));
+    host_ok && origin_ok && json_ok
 }
 
 enum Reply {
@@ -77,10 +114,19 @@ struct Query<'a>(&'a str);
 
 impl Query<'_> {
     fn get(&self, key: &str) -> Option<String> {
-        self.0.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| decode(v))
+        self.0
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| decode(v))
     }
     fn int(&self, key: &str) -> R<Option<i64>> {
-        self.get(key).map(|v| v.parse().map_err(|_| bad(format!("{key} must be a number")))).transpose()
+        self.get(key)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| bad(format!("{key} must be a number")))
+            })
+            .transpose()
     }
 }
 
@@ -109,26 +155,42 @@ fn decode(s: &str) -> String {
 }
 
 fn int(b: &Value, key: &str) -> R<i64> {
-    b[key].as_i64().ok_or_else(|| bad(format!("{key} is required and must be a number")))
+    b[key]
+        .as_i64()
+        .ok_or_else(|| bad(format!("{key} is required and must be a number")))
 }
 fn opt_int(b: &Value, key: &str) -> Option<i64> {
     b[key].as_i64()
 }
 fn text(b: &Value, key: &str) -> R<String> {
-    b[key].as_str().map(str::to_string).ok_or_else(|| bad(format!("{key} is required")))
+    b[key]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| bad(format!("{key} is required")))
 }
 fn opt_text(b: &Value, key: &str) -> Option<String> {
-    b[key].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+    b[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 fn list(b: &Value, key: &str) -> Vec<String> {
     match &b[key] {
-        Value::Array(a) => a.iter().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).collect(),
+        Value::Array(a) => a
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .collect(),
         Value::String(s) => vec![s.clone()],
         _ => vec![],
     }
 }
 fn id(seg: &str) -> R<i64> {
-    seg.parse().map_err(|_| bad(format!("{seg} isn't a number")))
+    seg.parse()
+        .map_err(|_| bad(format!("{seg} isn't a number")))
 }
 
 /// Who a user command came from: "user", or "user (via agent 7)".
@@ -154,7 +216,8 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["agents", a]) => J(app.agent_view(id(a)?)?),
         ("GET", ["agents", a, "log"]) => {
             let n = q.int("lines")?.unwrap_or(200).max(1) as usize;
-            let txt = std::fs::read_to_string(crate::run::log_path(app, id(a)?, "txt")).unwrap_or_default();
+            let txt = std::fs::read_to_string(crate::run::log_path(app, id(a)?, "txt"))
+                .unwrap_or_default();
             let lines: Vec<&str> = txt.lines().collect();
             J(json!({ "lines": lines[lines.len().saturating_sub(n)..] }))
         }
@@ -194,7 +257,9 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             app.pause(id(a)?, mode, &user(b))?;
             J(json!({}))
         }
-        ("POST", ["agents", a, "resume"]) => J(json!({ "warnings": app.resume(id(a)?, &user(b))? })),
+        ("POST", ["agents", a, "resume"]) => {
+            J(json!({ "warnings": app.resume(id(a)?, &user(b))? }))
+        }
         ("POST", ["agents", a, "close"]) => {
             app.close(id(a)?, &user(b))?;
             J(json!({}))
@@ -210,19 +275,34 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         // threads and messages
         ("GET", ["threads"]) => J(json!(app.threads(q.int("agent")?)?)),
         ("POST", ["threads"]) => {
-            let (tid, members) = app.new_thread(opt_int(b, "agent").unwrap_or(0), &text(b, "title")?, &list(b, "members"))?;
+            let (tid, members) = app.new_thread(
+                opt_int(b, "agent").unwrap_or(0),
+                &text(b, "title")?,
+                &list(b, "members"),
+            )?;
             J(json!({ "id": tid, "members": members }))
         }
         ("GET", ["threads", t]) => J(app.thread(id(t)?)?),
-        ("POST", ["threads", t, "members"]) => J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? })),
+        ("POST", ["threads", t, "members"]) => {
+            J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? }))
+        }
         ("POST", ["messages"]) => {
-            let mid = app.post(opt_int(b, "agent").unwrap_or(0), int(b, "thread")?, &text(b, "text")?)?;
+            let mid = app.post(
+                opt_int(b, "agent").unwrap_or(0),
+                int(b, "thread")?,
+                &text(b, "text")?,
+            )?;
             J(json!({ "id": mid }))
         }
         ("GET", ["messages", m]) => J(app.message(id(m)?)?),
-        ("GET", ["inbox", a]) => J(json!(app.inbox(id(a)?, q.get("mark").as_deref().unwrap_or("new"))?)),
+        ("GET", ["inbox", a]) => J(json!(
+            app.inbox(id(a)?, q.get("mark").as_deref().unwrap_or("new"))?
+        )),
         ("POST", ["marks"]) => {
-            let ids: Vec<i64> = b["ids"].as_array().map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+            let ids: Vec<i64> = b["ids"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default();
             if ids.is_empty() {
                 return Err(bad("ids is required"));
             }
@@ -255,7 +335,8 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["activity"]) => J(json!(app.activity(q.int("limit")?.unwrap_or(100))?)),
         ("GET", ["settings"]) => J(json!(app.settings())),
         ("PUT", ["settings"]) => {
-            let s: Settings = serde_json::from_value(b["settings"].clone()).map_err(|e| bad(format!("bad settings: {e}")))?;
+            let s: Settings = serde_json::from_value(b["settings"].clone())
+                .map_err(|e| bad(format!("bad settings: {e}")))?;
             app.put_settings(s, &user(b))?;
             J(json!({}))
         }

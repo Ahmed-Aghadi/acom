@@ -65,14 +65,20 @@ enum Cmd {
     Guide,
     Me,
     Limits,
-    Status { text: Vec<String> },
-    Group { name: String },
+    Status {
+        text: Vec<String>,
+    },
+    Group {
+        name: String,
+    },
     Done,
     Agents {
         #[arg(long)]
         group: Option<String>,
     },
-    Agent { id: i64 },
+    Agent {
+        id: i64,
+    },
     Launch {
         #[arg(long)]
         task: Option<String>,
@@ -103,8 +109,13 @@ enum Cmd {
         #[arg(long, default_value = "new")]
         mark: String,
     },
-    Read { id: i64 },
-    Mark { ids: String, mark: String },
+    Read {
+        id: i64,
+    },
+    Mark {
+        ids: String,
+        mark: String,
+    },
     Locks,
     Lock {
         #[command(subcommand)]
@@ -123,9 +134,15 @@ enum Cmd {
     },
     PauseAll,
     ResumeAll,
-    Resume { ids: String },
-    Close { id: i64 },
-    Reopen { id: i64 },
+    Resume {
+        ids: String,
+    },
+    Close {
+        id: i64,
+    },
+    Reopen {
+        id: i64,
+    },
     #[command(hide = true)]
     Hook,
 }
@@ -138,8 +155,13 @@ enum ThreadCmd {
         #[arg(long)]
         members: Option<String>,
     },
-    Read { id: i64 },
-    Add { id: i64, members: String },
+    Read {
+        id: i64,
+    },
+    Add {
+        id: i64,
+        members: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,8 +178,12 @@ enum LockCmd {
         #[arg(long)]
         ttl: Option<String>,
     },
-    Release { name: String },
-    Free { name: String },
+    Release {
+        name: String,
+    },
+    Free {
+        name: String,
+    },
 }
 
 fn die(msg: &str) -> ! {
@@ -177,7 +203,9 @@ fn base_url() -> String {
         }
         dir = d.parent().map(|p| p.to_path_buf());
     }
-    die("can't find the acom server: no .acom/port here or in a parent folder, and ACOM_URL isn't set. Start it with `acom serve`.")
+    die(
+        "can't find the acom server: no .acom/port here or in a parent folder, and ACOM_URL isn't set. Start it with `acom serve`.",
+    )
 }
 
 fn my_id() -> Option<i64> {
@@ -191,17 +219,30 @@ fn me() -> i64 {
 fn call(method: &str, path: &str, body: Option<Value>) -> Value {
     let url = format!("{}{path}", base_url());
     let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder().http_status_as_error(false).timeout_global(None).build(),
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(None)
+            .build(),
     );
     let res = match (method, body) {
         ("GET", _) => agent.get(&url).call(),
         (m, b) => {
             let b = b.unwrap_or(json!({})).to_string();
-            let req = if m == "PUT" { agent.put(&url) } else { agent.post(&url) };
-            req.header("Content-Type", "application/json").send(b.as_bytes())
+            let req = if m == "PUT" {
+                agent.put(&url)
+            } else {
+                agent.post(&url)
+            };
+            req.header("Content-Type", "application/json")
+                .send(b.as_bytes())
         }
     };
-    let mut res = res.unwrap_or_else(|e| die(&format!("can't reach the acom server at {}: {e}", base_url())));
+    let mut res = res.unwrap_or_else(|e| {
+        die(&format!(
+            "can't reach the acom server at {}: {e}",
+            base_url()
+        ))
+    });
     let status = res.status().as_u16();
     let text = res.body_mut().read_to_string().unwrap_or_default();
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -233,14 +274,20 @@ fn duration(s: &str) -> u64 {
         Some('h') => (&s[..s.len() - 1], 3600),
         _ => (s, 1),
     };
-    num.trim().parse::<u64>().map(|n| n * mult).unwrap_or_else(|_| die(&format!("bad duration {s:?}: use e.g. 30s, 5m, 1h")))
+    num.trim()
+        .parse::<u64>()
+        .map(|n| n * mult)
+        .unwrap_or_else(|_| die(&format!("bad duration {s:?}: use e.g. 30s, 5m, 1h")))
 }
 
 fn ids(s: &str) -> Vec<i64> {
     s.split(',')
         .map(str::trim)
         .filter(|x| !x.is_empty())
-        .map(|x| x.parse().unwrap_or_else(|_| die(&format!("{x} isn't an ID"))))
+        .map(|x| {
+            x.parse()
+                .unwrap_or_else(|_| die(&format!("{x} isn't an ID")))
+        })
         .collect()
 }
 
@@ -262,18 +309,39 @@ fn sender(v: &Value) -> String {
 }
 
 fn print_message(m: &Value) {
-    let mark = m["mark"].as_str().map(|k| format!(" · {k}")).unwrap_or_default();
-    println!("#{} · thread {} \"{}\" · {} · {}{mark}", m["id"], m["thread"], m["title"].as_str().unwrap_or(""), sender(&m["sender"]), t(&m["at"]));
+    let mark = m["mark"]
+        .as_str()
+        .map(|k| format!(" · {k}"))
+        .unwrap_or_default();
+    println!(
+        "#{} · thread {} \"{}\" · {} · {}{mark}",
+        m["id"],
+        m["thread"],
+        m["title"].as_str().unwrap_or(""),
+        sender(&m["sender"]),
+        t(&m["at"])
+    );
     println!("{}\n", m["text"].as_str().unwrap_or(""));
 }
 
 fn print_agent_line(a: &Value) {
-    let group = a["group"].as_str().map(|g| format!(" [{g}]")).unwrap_or_default();
-    let status = a["status"].as_str().map(|s| format!(" · {s}")).unwrap_or_default();
+    let group = a["group"]
+        .as_str()
+        .map(|g| format!(" [{g}]"))
+        .unwrap_or_default();
+    let status = a["status"]
+        .as_str()
+        .map(|s| format!(" · {s}"))
+        .unwrap_or_default();
     println!(
         "{:>3}  {}{group} · {} · {}/{}/{} · context {}{status}",
-        a["id"], a["name"].as_str().unwrap_or(""), a["state"].as_str().unwrap_or(""),
-        a["harness"].as_str().unwrap_or(""), a["model"].as_str().unwrap_or(""), a["effort"].as_str().unwrap_or(""), a["context"]
+        a["id"],
+        a["name"].as_str().unwrap_or(""),
+        a["state"].as_str().unwrap_or(""),
+        a["harness"].as_str().unwrap_or(""),
+        a["model"].as_str().unwrap_or(""),
+        a["effort"].as_str().unwrap_or(""),
+        a["context"]
     );
 }
 
@@ -282,27 +350,64 @@ fn print_agent(a: &Value) {
     if let Some(g) = a["group"].as_str() {
         println!("Group: {g}");
     }
-    println!("State: {}{}", a["state"].as_str().unwrap_or(""), a["status"].as_str().map(|s| format!(" ({s})")).unwrap_or_default());
-    println!("Running: {} / {} / effort {}", a["harness"].as_str().unwrap_or(""), a["model"].as_str().unwrap_or(""), a["effort"].as_str().unwrap_or(""));
-    println!("Launched by {} at {}", sender(&a["launched_by"]), t(&a["launched_at"]));
+    println!(
+        "State: {}{}",
+        a["state"].as_str().unwrap_or(""),
+        a["status"]
+            .as_str()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default()
+    );
+    println!(
+        "Running: {} / {} / effort {}",
+        a["harness"].as_str().unwrap_or(""),
+        a["model"].as_str().unwrap_or(""),
+        a["effort"].as_str().unwrap_or("")
+    );
+    println!(
+        "Launched by {} at {}",
+        sender(&a["launched_by"]),
+        t(&a["launched_at"])
+    );
     println!(
         "Context: {} tokens. Tokens so far: fresh input {}, cache writes {}, cache reads {}, output {}",
         a["context"], a["fresh_in"], a["cache_write"], a["cache_read"], a["output"]
     );
-    let locks: Vec<&str> = a["locks"].as_array().map(|l| l.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-    println!("Locks held: {}", if locks.is_empty() { "none".into() } else { locks.join(", ") });
+    let locks: Vec<&str> = a["locks"]
+        .as_array()
+        .map(|l| l.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    println!(
+        "Locks held: {}",
+        if locks.is_empty() {
+            "none".into()
+        } else {
+            locks.join(", ")
+        }
+    );
     println!("Task:\n{}", a["task"].as_str().unwrap_or(""));
 }
 
 fn hook() {
     let mut stdin = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin);
-    let (Some(id), Ok(url)) = (my_id(), std::env::var("ACOM_URL")) else { return };
+    let (Some(id), Ok(url)) = (my_id(), std::env::var("ACOM_URL")) else {
+        return;
+    };
     let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(5))).build(),
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build(),
     );
-    let Ok(mut res) = agent.post(&format!("{url}/hook/{id}")).send(&b"{}"[..]) else { return };
-    let v: Value = serde_json::from_str(&res.body_mut().read_to_string().unwrap_or_default()).unwrap_or(Value::Null);
+    let Ok(mut res) = agent
+        .post(&format!("{url}/hook/{id}"))
+        .header("Content-Type", "application/json")
+        .send(&b"{}"[..])
+    else {
+        return;
+    };
+    let v: Value = serde_json::from_str(&res.body_mut().read_to_string().unwrap_or_default())
+        .unwrap_or(Value::Null);
     if let Some(text) = v["text"].as_str().filter(|s| !s.is_empty()) {
         println!("{}", harness::hook_output(text));
     }
@@ -317,7 +422,10 @@ fn main() {
         Cmd::Me => print_agent(&get(&format!("/agents/{}", me()))),
         Cmd::Limits => println!("{}", get("/limits")["text"].as_str().unwrap_or("")),
         Cmd::Status { text } => {
-            post(&format!("/agents/{}/status", me()), json!({ "text": text.join(" ") }));
+            post(
+                &format!("/agents/{}/status", me()),
+                json!({ "text": text.join(" ") }),
+            );
             println!("status set");
         }
         Cmd::Group { name } => {
@@ -330,7 +438,12 @@ fn main() {
         }
         Cmd::Agents { group } => {
             let path = match group {
-                Some(g) => format!("/agents?group={}", g.replace('%', "%25").replace('&', "%26").replace(' ', "%20")),
+                Some(g) => format!(
+                    "/agents?group={}",
+                    g.replace('%', "%25")
+                        .replace('&', "%26")
+                        .replace(' ', "%20")
+                ),
                 None => "/agents".into(),
             };
             for a in get(&path).as_array().into_iter().flatten() {
@@ -338,7 +451,15 @@ fn main() {
             }
         }
         Cmd::Agent { id } => print_agent(&get(&format!("/agents/{id}"))),
-        Cmd::Launch { task, harness, model, effort, name, group, force } => {
+        Cmd::Launch {
+            task,
+            harness,
+            model,
+            effort,
+            name,
+            group,
+            force,
+        } => {
             let task = task.unwrap_or_else(|| text_or_stdin(vec![]));
             let mut b = json!({ "task": task, "harness": harness, "model": model, "effort": effort, "name": name, "group": group, "force": force });
             match my_id() {
@@ -353,36 +474,77 @@ fn main() {
         }
         Cmd::Threads => {
             for th in get("/threads").as_array().into_iter().flatten() {
-                let members: Vec<String> = th["members"].as_array().into_iter().flatten().map(|m| m.to_string()).collect();
+                let members: Vec<String> = th["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|m| m.to_string())
+                    .collect();
                 println!(
                     "{:>3}  \"{}\" · members {} · {} messages · last {}",
-                    th["id"], th["title"].as_str().unwrap_or(""), members.join(","), th["messages"], t(&th["last_at"])
+                    th["id"],
+                    th["title"].as_str().unwrap_or(""),
+                    members.join(","),
+                    th["messages"],
+                    t(&th["last_at"])
                 );
             }
         }
         Cmd::Thread { cmd } => match cmd {
             ThreadCmd::New { title, members } => {
-                let members: Vec<String> = members.map(|m| m.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default();
+                let members: Vec<String> = members
+                    .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default();
                 let mut b = json!({ "title": title, "members": members });
                 if let Some(id) = my_id() {
                     b["agent"] = json!(id);
                 }
                 let v = post("/threads", b);
-                let m: Vec<String> = v["members"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
+                let m: Vec<String> = v["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|x| x.to_string())
+                    .collect();
                 println!("thread {} (members {})", v["id"], m.join(", "));
             }
             ThreadCmd::Read { id } => {
                 let th = get(&format!("/threads/{id}"));
-                let m: Vec<String> = th["members"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
-                println!("Thread {} \"{}\" · members {}\n", th["id"], th["title"].as_str().unwrap_or(""), m.join(", "));
+                let m: Vec<String> = th["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|x| x.to_string())
+                    .collect();
+                println!(
+                    "Thread {} \"{}\" · members {}\n",
+                    th["id"],
+                    th["title"].as_str().unwrap_or(""),
+                    m.join(", ")
+                );
                 for msg in th["messages"].as_array().into_iter().flatten() {
-                    println!("#{} · {} · {}\n{}\n", msg["id"], sender(&msg["sender"]), t(&msg["at"]), msg["text"].as_str().unwrap_or(""));
+                    println!(
+                        "#{} · {} · {}\n{}\n",
+                        msg["id"],
+                        sender(&msg["sender"]),
+                        t(&msg["at"]),
+                        msg["text"].as_str().unwrap_or("")
+                    );
                 }
             }
             ThreadCmd::Add { id, members } => {
-                let members: Vec<String> = members.split(',').map(|s| s.trim().to_string()).collect();
-                let v = post(&format!("/threads/{id}/members"), json!({ "members": members }));
-                let m: Vec<String> = v["members"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
+                let members: Vec<String> =
+                    members.split(',').map(|s| s.trim().to_string()).collect();
+                let v = post(
+                    &format!("/threads/{id}/members"),
+                    json!({ "members": members }),
+                );
+                let m: Vec<String> = v["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|x| x.to_string())
+                    .collect();
                 println!("added {} to thread {id}", m.join(", "));
             }
         },
@@ -406,21 +568,34 @@ fn main() {
                 print_message(m);
             }
             if !msgs.is_empty() && mark == "new" {
-                println!("Mark them with `acom mark <IDs> in-progress` or `handled` once you've dealt with them.");
+                println!(
+                    "Mark them with `acom mark <IDs> in-progress` or `handled` once you've dealt with them."
+                );
             }
         }
         Cmd::Read { id } => print_message(&get(&format!("/messages/{id}"))),
         Cmd::Mark { ids: list, mark } => {
-            post("/marks", json!({ "agent": me(), "ids": ids(&list), "mark": mark }));
+            post(
+                "/marks",
+                json!({ "agent": me(), "ids": ids(&list), "mark": mark }),
+            );
             println!("marked {list} {mark}");
         }
         Cmd::Locks => {
             for l in get("/locks").as_array().into_iter().flatten() {
-                println!("{} · {}", l["name"].as_str().unwrap_or(""), l["about"].as_str().unwrap_or(""));
+                println!(
+                    "{} · {}",
+                    l["name"].as_str().unwrap_or(""),
+                    l["about"].as_str().unwrap_or("")
+                );
                 match l["holder"].as_i64() {
                     None => println!("    free"),
                     Some(h) => {
-                        let mut s = format!("    held by agent {h} \"{}\" since {}", l["holder_name"].as_str().unwrap_or(""), t(&l["acquired_at"]));
+                        let mut s = format!(
+                            "    held by agent {h} \"{}\" since {}",
+                            l["holder_name"].as_str().unwrap_or(""),
+                            t(&l["acquired_at"])
+                        );
                         if l["frozen"] == 1 {
                             s += &match l["frozen_left"].as_i64() {
                                 Some(left) => format!(", frozen with {}s left", left),
@@ -432,7 +607,12 @@ fn main() {
                         println!("{s}");
                     }
                 }
-                let q: Vec<String> = l["queue"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
+                let q: Vec<String> = l["queue"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|x| x.to_string())
+                    .collect();
                 if !q.is_empty() {
                     println!("    queue: {}", q.join(", "));
                 }
@@ -449,7 +629,10 @@ fn main() {
                     "wait": wait.as_deref().map(duration).unwrap_or(0),
                     "ttl": ttl.as_deref().map(duration),
                 });
-                println!("{}", post("/locks/acquire", b)["result"].as_str().unwrap_or(""));
+                println!(
+                    "{}",
+                    post("/locks/acquire", b)["result"].as_str().unwrap_or("")
+                );
             }
             LockCmd::Release { name } => {
                 post("/locks/release", json!({ "agent": me(), "name": name }));
@@ -460,18 +643,37 @@ fn main() {
                 println!("freed {name}");
             }
         },
-        Cmd::Pause { id, release_locks, keep_locks } => {
-            let locks = if release_locks { json!("release") } else if keep_locks { json!("keep") } else { Value::Null };
-            post(&format!("/agents/{id}/pause"), user_body(json!({ "locks": locks })));
+        Cmd::Pause {
+            id,
+            release_locks,
+            keep_locks,
+        } => {
+            let locks = if release_locks {
+                json!("release")
+            } else if keep_locks {
+                json!("keep")
+            } else {
+                Value::Null
+            };
+            post(
+                &format!("/agents/{id}/pause"),
+                user_body(json!({ "locks": locks })),
+            );
             println!("paused agent {id}");
         }
         Cmd::PauseAll => {
             let v = post("/pause-all", user_body(json!({})));
-            println!("paused {} agent(s); their locks are frozen", v["ids"].as_array().map(|a| a.len()).unwrap_or(0));
+            println!(
+                "paused {} agent(s); their locks are frozen",
+                v["ids"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
         }
         Cmd::ResumeAll => {
             let v = post("/resume-all", user_body(json!({})));
-            println!("resumed {} agent(s)", v["ids"].as_array().map(|a| a.len()).unwrap_or(0));
+            println!(
+                "resumed {} agent(s)",
+                v["ids"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
         }
         Cmd::Resume { ids: list } => {
             for id in ids(&list) {
