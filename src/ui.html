@@ -377,7 +377,7 @@
         <label class="wide">Allowed efforts <input name="efforts" value="${esc((h.efforts || []).join(', '))}"></label>
         <label class="wide">Extra launch flags <input name="flags" value="${esc((h.flags || []).join(' '))}"></label>
       </div></div>`).join('');
-      const limit = (label, path, value) => `<div class="limit-row" data-limit="${path}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" placeholder="no limit"></label></div>`;
+      const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" placeholder="no limit"></label></div>`;
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${n} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${n} subscription %`, `usage.${n}`, v)).join('');
       $('#settings-form').innerHTML = `<h3>Harnesses</h3>${harnesses}<h3>Limits</h3>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
