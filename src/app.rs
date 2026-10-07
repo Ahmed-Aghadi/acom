@@ -129,7 +129,7 @@ impl Default for Settings {
                 efforts: strs(&["low", "medium", "high", "xhigh", "max"]),
                 model: "sonnet".into(),
                 effort: "medium".into(),
-                flags: strs(&["--permission-mode", "auto"]),
+                flags: strs(&["--permission-mode", "acceptEdits"]),
             },
         );
         harnesses.insert(

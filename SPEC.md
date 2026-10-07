@@ -201,7 +201,7 @@ Confirmations: launching past a hard limit; pausing an agent that holds locks (r
 
 Edited on the UI's settings page and stored in the database.
 
-- **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags (e.g. permission mode: `--permission-mode auto` for Claude, `--sandbox workspace-write` for Codex). acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
+- **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags (defaults: `--permission-mode acceptEdits` for Claude, `--sandbox workspace-write` for Codex). Agents run unattended, so anything their harness would ask permission for is denied; widen it here if they need more. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
 - **Limits:** soft and hard values for active agents (total and per harness), subscription usage (per provider) and context size. Any value can be empty.
 - **Auto-resume** after a limit clears: on (default) or off.
 - **`done` becomes `closed`:** off (default) or on.

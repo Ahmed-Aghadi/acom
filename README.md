@@ -21,6 +21,10 @@ An agent can use `acom launch --task "..." --done` to finish its own work and la
 
 Every soft and hard limit is optional. Leave its field empty in Settings to disable that threshold.
 
+## Permissions
+
+Agents run unattended, so nobody can answer a permission prompt: whatever the harness would ask about is denied. By default Claude agents run with `--permission-mode acceptEdits` (they can edit files in the project) and Codex agents with `--sandbox workspace-write`. If your agents need to run more, change the extra launch flags in Settings, e.g. add `--allowedTools "Bash(cargo *)"` for Claude, or use `--dangerously-skip-permissions` only on a machine where that's acceptable. (`--permission-mode auto` isn't available to headless Claude agents on every account; it silently falls back to asking, i.e. denying.)
+
 ## Test
 
 ```sh
