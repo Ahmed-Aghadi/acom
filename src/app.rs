@@ -2106,6 +2106,9 @@ impl App {
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .unwrap_or(&old_name);
+        if id == 1 && name != old_name {
+            return Err(bad("the Default config keeps its name"));
+        }
         st.db
             .execute(
                 "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
