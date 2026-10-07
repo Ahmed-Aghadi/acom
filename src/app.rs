@@ -1337,7 +1337,7 @@ impl App {
         }
         let members: Vec<i64> = rows(
             &st.db,
-            "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2",
+            "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2 ORDER BY agent_id",
             params![tid, sender],
         )?
         .iter()
