@@ -98,6 +98,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let path = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
+    let err_from = std::fs::metadata(log_path(app, id, "err")).map_or(0, |m| m.len());
     let err = OpenOptions::new()
         .create(true)
         .append(true)
@@ -151,16 +152,26 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
             let (app, harness, done) = (app.clone(), harness.clone(), done.clone());
             thread::spawn(move || follow_side_file(&app, id, &harness, resume, &done))
         };
+        // The last error the harness reported, to explain a crash.
+        let mut last_error = None;
         if let Some(out) = child.stdout.take() {
             let raw = log_path(&app, id, "jsonl");
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 append(&raw, &line);
                 for ev in harness::parse_line(&harness, &line) {
+                    if let Event::Text(t) = &ev
+                        && let Some(e) = t.strip_prefix("error: ")
+                    {
+                        last_error = Some(e.to_string());
+                    }
                     apply(&app, id, &harness, ev);
                 }
             }
         }
         let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if !ok && last_error.is_none() {
+            last_error = last_line(&log_path(&app, id, "err"), err_from);
+        }
         done.store(true, Ordering::SeqCst);
         let _ = side.join();
         append(
@@ -171,11 +182,22 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
                 if ok { "" } else { " (exit with error)" }
             ),
         );
-        if let Err(e) = app.turn_ended(id, pid, ok) {
+        if let Err(e) = app.turn_ended(id, pid, ok, last_error.as_deref()) {
             eprintln!("agent {id}: {}", e.1);
         }
     });
     Ok(())
+}
+
+/// The last non-empty line written to a file after `from` bytes.
+fn last_line(path: &PathBuf, from: u64) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    Some(line.chars().take(300).collect())
 }
 
 fn apply(app: &Arc<App>, id: i64, harness: &str, ev: Event) {

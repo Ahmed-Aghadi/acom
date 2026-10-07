@@ -1039,8 +1039,8 @@ impl App {
         Ok(woke)
     }
 
-    /// Called when an agent's process exits.
-    pub fn turn_ended(self: &Arc<Self>, id: i64, pid: u32, ok: bool) -> R<()> {
+    /// Called when an agent's process exits. `error` explains a failed exit, if known.
+    pub fn turn_ended(self: &Arc<Self>, id: i64, pid: u32, ok: bool, error: Option<&str>) -> R<()> {
         let mut st = self.lock();
         if st.procs.get(&id).is_some_and(|p| p.pid != pid) {
             return Ok(()); // not this process's entry; never happens since turns don't overlap
@@ -1076,11 +1076,10 @@ impl App {
             st.release_all(id, &why)?;
         }
         if next == "crashed" {
-            st.log_for(
-                id,
-                "acom",
-                &format!("agent {id} crashed (its process exited with an error)"),
-            )?;
+            let why = error.unwrap_or("its process exited with an error");
+            st.db
+                .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, why])?;
+            st.log_for(id, "acom", &format!("agent {id} crashed: {why}"))?;
         } else if a.done_req {
             st.log_for(id, &who(id), &format!("finished: {next}"))?;
         }
