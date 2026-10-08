@@ -27,11 +27,12 @@ function settings() {
 }
 
 async function fixture(run) {
-  const data = { settings: settings(), agents: [], threads: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 1 }, { id: 2, name: 'other', path: '/projects/other', config: 1 }], requests: [], hardLimit: false };
+  const data = { settings: settings(), agents: [], threads: [], reads: {}, agentLogs: {}, detailRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 1 }, { id: 2, name: 'other', path: '/projects/other', config: 1 }], requests: [], hardLimit: false };
   data.configs = [{ id: 1, name: 'Default', settings: data.settings }];
   data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
   const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
+  const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && m.id > (data.reads[t.id] || 0)).length : 0;
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -47,7 +48,7 @@ async function fixture(run) {
       const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
       const project = data.projects.find(p => p.id === id) || data.projects[0] || null;
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
-      return send({ ...data, configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: data.usage || [], checks:data.checks || [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
+      return send({ ...data, projects: data.projects.map(p => ({ ...p, unread: data.threads.filter(t => t.project === p.id).reduce((n, t) => n + unread(t), 0) })), configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length, unread: unread(t) })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: data.usage || [], checks:data.checks || [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
     }
     if(req.url.startsWith('/folders')) {
       if(req.method==='GET') {
@@ -96,6 +97,14 @@ async function fixture(run) {
       if (data.hardLimit && !body.force) { res.statusCode = 409; return send({ error: 'hard limit reached: confirm to continue' }); }
       return send({ id: 1, warnings: [] });
     }
+    if (/^\/agents\/\d+(\/log\?lines=100)?$/.test(req.url)) {
+      const id = Number(req.url.split('/')[2]);
+      data.detailRequests.push(req.url);
+      const value = req.url.includes('/log') ? { lines: [...(data.agentLogs[id] || [])] } : { ...data.agents.find(a => a.id === id) };
+      if (data.detailDelay) await new Promise(resolve => setTimeout(resolve, data.detailDelay));
+      if (data.detailFailure) { res.statusCode = 503; return send({ error: 'Offline' }); }
+      return send(value);
+    }
     if (req.url === '/threads') {
       const t = { id: data.threads.length + 1, ...body, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
       data.threads.push(t);
@@ -103,9 +112,15 @@ async function fixture(run) {
     }
     if (req.url.startsWith('/threads/')) {
       const t=data.threads.find(t=>t.id===Number(req.url.split('/')[2]));
+      if(req.url.endsWith('/read')) {
+        if(data.readDelay) await new Promise(resolve => setTimeout(resolve, data.readDelay));
+        if(data.readFailure) {res.statusCode=503;return send({error:'Offline'});}
+        data.reads[t.id]=Math.max(data.reads[t.id] || 0,body.message);
+        return send({last_read:data.reads[t.id],unread:unread(t)});
+      }
       if(req.url.endsWith('/user')) t.members=body.joined ? [...new Set([0,...t.members])] : t.members.filter(id=>id!==0);
       if(req.url.endsWith('/members')) t.members=[...new Set([...t.members,...body.members])];
-      return send(t);
+      return send({...t,last_read:data.reads[t.id] || 0,unread:unread(t)});
     }
     if (req.url === '/messages') {
       const t = data.threads.find(t => t.id === body.thread);
@@ -638,4 +653,173 @@ test('cancelling member selection preserves a draft only within its project',asy
   await page.locator('[data-open=thread-dialog]').click();
   assert.equal(await page.locator('[name=member][value="2"]').isChecked(),false);
   assert.equal(await page.locator('[name=include_user]').isChecked(),true);
+}));
+
+const incoming = (id, text = `Message ${id}`) => ({ id, sender: 1, text, at: 1 });
+const conversation = (messages, extra = {}) => ({ id: 1, project: 1, title: 'Review', members: [0, 1], messages, ...extra });
+
+test('unread badges span projects, exclude own and agent-only messages, and persist across reloads', async () => fixture(async (page, data) => {
+  data.threads = [
+    conversation([incoming(1), { ...incoming(2), sender: 0 }]),
+    conversation([incoming(3)], { id: 2, project: 2 }),
+    conversation([incoming(4)], { id: 3, members: [1] }),
+  ];
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '2 unread');
+  await page.setViewportSize({width:375,height:800});
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  assert.match(await page.title(), /^\(2\)/);
+  assert.match(await page.locator('#project-select option[value="2"]').textContent(), /1 unread/);
+  await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread-filter=unread]').click();
+  assert.equal(await page.locator('.thread-row').count(), 1);
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '1 unread');
+  assert.equal(data.reads[1], 2);
+  assert.equal(await page.locator('.thread-row').count(), 0);
+  await page.reload();
+  await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('.thread-row').count(), 0);
+  assert.equal(data.reads[2], undefined);
+  await page.locator('#project-select').selectOption('2');
+  await page.locator('[data-thread="2"]').waitFor();
+  await page.locator('[data-thread="2"]').click();
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  assert.doesNotMatch(await page.title(), /^\(/);
+}));
+
+test('background, other pages and dialogs do not clear unread messages', async () => fixture(async (page, data) => {
+  data.threads = [conversation([])];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep my draft');
+  await page.evaluate(() => { document.hasFocus = () => false; });
+  data.threads[0].messages.push(incoming(1));
+  await page.evaluate(() => refresh());
+  assert.equal(data.reads[1], undefined);
+  assert.match(await page.locator('#thread-unread').textContent(), /1 unread/);
+  await page.evaluate(() => {
+    delete document.hasFocus;
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    window.dispatchEvent(new Event('focus'));
+  });
+  await page.evaluate(() => refresh());
+  assert.equal(data.reads[1], undefined);
+  await page.locator('[data-page=overview]').click();
+  await page.evaluate(() => { delete document.visibilityState; document.dispatchEvent(new Event('visibilitychange')); });
+  await page.evaluate(() => refresh());
+  assert.equal(data.reads[1], undefined);
+  await page.evaluate(() => document.querySelector('#thread-dialog').showModal());
+  await page.evaluate(async () => {
+    document.querySelector('#page-overview').classList.remove('active');
+    document.querySelector('#page-threads').classList.add('active');
+    await refresh();
+  });
+  assert.equal(data.reads[1], undefined);
+  await page.locator('[data-close=thread-dialog]').click();
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  assert.equal(data.reads[1], 1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
+}));
+
+test('scrolling history leaves new messages unread until jumping to latest', async () => fixture(async (page, data) => {
+  data.threads = [conversation(Array.from({ length: 30 }, (_, i) => incoming(i + 1, 'History\n'.repeat(4))))];
+  data.reads[1] = 30;
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Unsent reply');
+  await page.locator('#messages').evaluate(el => { el.scrollTop = 100; });
+  await page.waitForTimeout(100);
+  data.threads[0].messages.push(incoming(31, '<script>unsafe()</script>'));
+  // Let the normal live poll deliver the new message.
+  await page.locator('[data-message="31"]').waitFor();
+  assert.equal(data.reads[1], 30);
+  assert.equal(await page.locator('#messages').evaluate(el => el.scrollTop), 100);
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Unsent reply');
+  assert.equal(await page.locator('[data-message="31"] script').count(), 0);
+  await page.locator('#thread-unread').click();
+  await page.waitForFunction(() => document.querySelector('#thread-unread').hidden);
+  assert.equal(data.reads[1], 31);
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Unsent reply');
+}));
+
+test('a failed read acknowledgement keeps badges and retries without losing the draft', async () => fixture(async (page, data) => {
+  data.threads = [conversation([incoming(1)])]; data.readFailure = true;
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#thread-read-error').waitFor();
+  assert.equal(data.reads[1], undefined);
+  assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
+  await page.locator('#message-form textarea').fill('Still here');
+  data.readFailure = false;
+  await page.waitForFunction(() => document.querySelector('#thread-read-error').hidden);
+  assert.equal(data.reads[1], 1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Still here');
+}));
+
+test('a delayed read acknowledgement cannot clear a reply absent from its snapshot', async () => fixture(async (page, data) => {
+  data.threads = [conversation([incoming(1)])]; data.readDelay = 800;
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  const ack = page.waitForRequest(r => r.url().endsWith('/read'));
+  await page.locator('[data-thread="1"]').click(); await ack;
+  await page.evaluate(() => { document.hasFocus = () => false; });
+  data.threads[0].messages.push(incoming(2, 'Reply after the snapshot'));
+  await page.evaluate(() => refresh());
+  await page.waitForFunction(() => document.querySelector('#thread-unread').textContent.startsWith('1 unread'));
+  assert.equal(data.reads[1], 1);
+  assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
+  assert.equal(data.requests.filter(r => r.url.endsWith('/read')).at(-1).body.message, 1);
+  data.readDelay = 0;
+  await page.evaluate(() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); });
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  assert.equal(data.reads[1], 2);
+}));
+
+test('open details update status and logs, preserve history scroll and recover from errors', async () => fixture(async (page, data) => {
+  data.agents = [{ id: 1, project: 1, name: 'Worker', state: 'working', status: 'Starting', locks: [], lost_locks: [] }];
+  data.agentLogs[1] = Array.from({ length: 80 }, (_, i) => `Line ${i}`);
+  await page.reload(); await page.locator('[data-action=details]').click();
+  await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
+  assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight < 20), true);
+  await page.locator('#agent-log').evaluate(el => { el.scrollTop = 35; });
+  data.delays = {1:3000}; // Details must not wait for a slow overview response.
+  data.agents[0].status = 'Running tests'; data.agents[0].state = 'idle';
+  data.agentLogs[1].push('<img src=x onerror=unsafe()>');
+  await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('<img'));
+  assert.match(await page.locator('#agent-details').textContent(), /Running tests/);
+  assert.match(await page.locator('#agent-details').textContent(), /idle/);
+  assert.equal(await page.locator('#agent-log img').count(), 0);
+  assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollTop), 35);
+  data.delays = {};
+  data.detailFailure = true;
+  await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.includes('Updates unavailable'));
+  assert.match(await page.locator('#agent-log').textContent(), /<img/);
+  data.detailFailure = false; data.agentLogs[1].push('Recovered');
+  await page.waitForFunction(() => document.querySelector('#agent-log').textContent.endsWith('Recovered'));
+  await page.locator('#agent-dialog button').click();
+  await page.waitForTimeout(100);
+  const requests = data.detailRequests.length;
+  await page.waitForTimeout(2200);
+  assert.equal(data.detailRequests.length, requests, 'closed details stop fetching');
+}));
+
+test('closing pending details and opening another agent ignores old responses', async () => fixture(async (page, data) => {
+  data.agents = [1, 2].map(id => ({ id, project: 1, name: `Worker ${id}`, state: 'working' }));
+  data.agentLogs = { 1: ['Old log'], 2: ['New log'] };
+  await page.reload(); data.detailDelay = 1000;
+  await page.locator('[data-action=details][data-id="1"]').click();
+  await page.locator('#agent-dialog button').click();
+  data.detailDelay = 0;
+  await page.locator('[data-action=details][data-id="2"]').click();
+  await page.waitForFunction(() => document.querySelector('#agent-title').textContent === 'Worker 2 · #2');
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('#agent-title').textContent(), 'Worker 2 · #2');
+  assert.equal(await page.locator('#agent-log').textContent(), 'New log');
+  assert.equal(await page.locator('#agent-dialog').isVisible(), true);
+  await page.locator('#agent-dialog button').click();
+  data.detailDelay = 800;
+  await page.locator('[data-action=details][data-id="1"]').click();
+  await page.locator('#agent-dialog button').click();
+  await page.waitForTimeout(1000);
+  assert.equal(await page.locator('#agent-dialog').isVisible(), false);
 }));

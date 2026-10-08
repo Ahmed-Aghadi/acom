@@ -162,6 +162,25 @@ process.stdin.on('end', async () => {
     await api('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 400);
     await api('POST', `/projects/${a.id}/remove`, {}, 409);
     await finished(one.id); await finished(two.id);
+    const firstMessage = await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread for the user' });
+    const snapshot = await api('GET', `/threads/${thread.id}`);
+    assert.equal(snapshot.unread, 1);
+    assert.equal((await api('GET', `/threads?project=${a.id}`)).find(t => t.id === thread.id).unread, 1);
+    assert.equal((await api('GET', `/overview?project=${a.id}`)).projects.find(p => p.id === a.id).unread, 1);
+    // Agent reads and notification cursors must not clear the user's unread state.
+    assert.match(cli(root, ['thread', 'read', String(thread.id)], { ACOM_ID: String(one.id), ACOM_URL: url }), /Unread for the user/);
+    assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, 0);
+    await api('POST', `/threads/${thread.id}/read`, { agent: one.id, message: firstMessage.id }, 400);
+    assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, 0);
+    const secondMessage = await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Arrived after the snapshot' });
+    assert.equal((await api('POST', `/threads/${thread.id}/read`, { message: snapshot.messages.at(-1).id })).unread, 1);
+    assert.equal((await api('POST', `/threads/${thread.id}/read`, { message: 0 })).last_read, firstMessage.id);
+    for (const message of [null, '1', 1.5, -1, 99999]) await api('POST', `/threads/${thread.id}/read`, { message }, 400);
+    await api('POST', '/threads/99999/read', { message: 0 }, 404);
+    assert.match(cli(first, ['thread', 'read', String(thread.id)]), /Arrived after the snapshot/);
+    assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, secondMessage.id);
+    assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 0);
+    if (process.env.ACOM_BROWSER_TEST) await browserMessageChecks(url, api, a.id, one.id, thread.id, home);
     await api('POST', '/messages', { thread: thread.id, text: 'User wake' });
     await until(() => runs().filter(r => r.id === one.id).length === 2, 'resumed turn');
     assert.equal(runs().filter(r => r.id === one.id)[1].resume, true);
@@ -283,7 +302,11 @@ process.stdin.on('end', async () => {
     await until(() => runs().filter(r => r.id === scopedA.id).length === 3, 'rule change delivered on wake');
     assert.match(runs().filter(r => r.id === scopedA.id)[2].prompt, /user changed the limits or rules/);
     await finished(scopedA.id, 'done');
+    const savedRead = (await api('GET', `/threads/${thread.id}`)).last_read;
+    await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread survives restart' });
     await stop(); await start();
+    assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, savedRead);
+    assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 1);
     assert.equal((await api('GET', `/overview?project=${a.id}`)).settings.auto_resume, false);
     assert.equal((await api('GET', `/overview?project=${b.id}`)).project.config, null);
     assert.equal((await api('GET', '/configs')).find(c => c.id === saved.id).name, 'Small renamed');
@@ -300,6 +323,37 @@ process.stdin.on('end', async () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function browserMessageChecks(url, api, project, agent, thread, home) {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+  const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
+  const page = await browser.newPage();
+  const errors = []; page.on('pageerror', e => errors.push(e.message));
+  try {
+    await page.goto(`${url}/?project=${project}`);
+    await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
+    await api('POST', '/messages', { agent, thread, text: 'Live unread badge' });
+    await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '1 unread');
+    await page.locator('[data-page=threads]').click(); await page.locator(`[data-thread="${thread}"]`).click();
+    await until(async () => (await api('GET', `/threads/${thread}`)).unread === 0, 'browser persists read acknowledgement');
+    await page.locator('#message-form textarea').fill('Preserve this draft');
+    const message = await api('POST', '/messages', { agent, thread, text: 'Live reply in open thread' });
+    await page.locator(`[data-message="${message.id}"]`).waitFor();
+    await until(async () => (await api('GET', `/threads/${thread}`)).unread === 0, 'open thread clears new reply');
+    assert.equal(await page.locator('#message-form textarea').inputValue(), 'Preserve this draft');
+    await page.locator('[data-page=overview]').click();
+    await page.locator(`[data-action=details][data-id="${agent}"]`).click();
+    await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
+    await api('POST', `/agents/${agent}/status`, { text: 'Live status from the test harness' });
+    fs.appendFileSync(path.join(home, 'logs', `${agent}.txt`), '\nLive log line from the test harness\n');
+    await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Live log line from the test harness'));
+    assert.match(await page.locator('#agent-details').textContent(), /Live status from the test harness/);
+    await page.locator('#agent-dialog button').click();
+    await page.reload();
+    assert.equal((await api('GET', `/threads/${thread}`)).unread, 0);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+}
 
 async function browserChecks(url, api, first, second, defaults) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');

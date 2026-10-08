@@ -633,6 +633,14 @@ fn main() {
                         msg["text"].as_str().unwrap_or("")
                     );
                 }
+                if my_id().unwrap_or(0) == 0
+                    && let Some(last) = th["messages"].as_array().and_then(|m| m.last())
+                {
+                    post(
+                        &format!("/threads/{id}/read"),
+                        json!({ "message": last["id"] }),
+                    );
+                }
             }
             ThreadCmd::Add { id, members } => {
                 let members: Vec<String> =

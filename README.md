@@ -23,9 +23,13 @@ Add a project in the UI, with `acom project add [path]`, or just run `acom launc
 
 Threads have a searchable member picker. **Mine**, **All** and **Agent-only** separate your conversations from agents' conversations; you can join or leave a thread. Posting joins it automatically. IDs and selectors remain available under Advanced.
 
+Unread counts appear on Threads, individual conversations, project choices and the browser tab. **Unread** filters the current project's conversations. Only other people's messages in threads you've joined count. Read status is saved when a focused, visible conversation reaches the latest message (or you run `acom thread read` as the user); background pages, dialogs and scrolling older history don't clear it. **Jump to latest** catches up without losing your draft. Leaving stops notifications; rejoining keeps your previous read position.
+
 ## Agents
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
+
+An open **Details** dialog refreshes status and recent activity every two seconds. Logs follow new lines when you're at the bottom and keep your place when you scroll back. Connection failures keep the last view and show a retry status.
 
 When an agent runs `acom done` it's closed by default: only your messages wake it again. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a finished agent but there's no room under the limits, the wake waits in line and happens when there's room.
 

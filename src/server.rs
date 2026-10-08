@@ -346,6 +346,17 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({ "id": tid, "members": members }))
         }
         ("GET", ["threads", t]) => J(app.thread(id(t)?)?),
+        ("POST", ["threads", t, "read"]) => {
+            if b.get("agent").is_some_and(|a| a.as_i64() != Some(0)) {
+                return Err(bad("only the user can mark a thread read"));
+            }
+            J(app.read_thread(
+                id(t)?,
+                b["message"]
+                    .as_i64()
+                    .ok_or_else(|| bad("message must be an integer"))?,
+            )?)
+        }
         ("POST", ["threads", t, "members"]) => {
             J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? }))
         }

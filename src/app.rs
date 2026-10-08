@@ -332,6 +332,8 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, project INTEGER NOT NULL, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_id, id);
+CREATE TABLE IF NOT EXISTS user_reads (thread_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS marks (agent_id INTEGER NOT NULL, message_id INTEGER NOT NULL, mark TEXT NOT NULL, PRIMARY KEY (agent_id, message_id));
 CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, about TEXT NOT NULL, created_at INTEGER NOT NULL,
   holder INTEGER, acquired_at INTEGER, expires_at INTEGER, frozen INTEGER NOT NULL DEFAULT 0, frozen_left INTEGER,
@@ -2331,7 +2333,10 @@ impl App {
                     CASE WHEN p.custom IS NULL THEN p.config END config,
                     CASE WHEN p.custom IS NULL THEN c.name ELSE 'Custom' END config_name,
                     (SELECT count(*) FROM agents a WHERE a.project=p.id) agents,
-                    (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active
+                    (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active,
+                    (SELECT count(*) FROM threads t JOIN members b ON b.thread_id=t.id AND b.agent_id=0
+                     JOIN messages m ON m.thread_id=t.id LEFT JOIN user_reads r ON r.thread_id=t.id
+                     WHERE t.project=p.id AND m.sender<>0 AND m.id>coalesce(r.message_id,0)) unread
              FROM projects p LEFT JOIN configs c ON c.id=p.config ORDER BY p.name, p.id",
             [],
         )
@@ -2414,6 +2419,7 @@ impl App {
             params![project, agent],
         )?;
         for t in &mut v {
+            t["unread"] = json!(Self::user_unread(&st, t["id"].as_i64().unwrap())?);
             let ids = rows(
                 &st.db,
                 "SELECT agent_id a FROM members WHERE thread_id=?1 ORDER BY agent_id",
@@ -2444,7 +2450,49 @@ impl App {
             "SELECT id, sender, text, at FROM messages WHERE thread_id=?1 ORDER BY id",
             [tid]
         )?);
+        t["last_read"] = json!(Self::user_read_cursor(&st, tid)?);
+        t["unread"] = json!(Self::user_unread(&st, tid)?);
         Ok(t)
+    }
+
+    fn user_read_cursor(st: &St, tid: i64) -> R<i64> {
+        Ok(st.db.query_row(
+            "SELECT coalesce((SELECT message_id FROM user_reads WHERE thread_id=?1),0)",
+            [tid],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn user_unread(st: &St, tid: i64) -> R<i64> {
+        Ok(st.db.query_row(
+            "SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0
+             LEFT JOIN user_reads r ON r.thread_id=m.thread_id
+             WHERE m.thread_id=?1 AND m.sender<>0 AND m.id>coalesce(r.message_id,0)",
+            [tid],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Acknowledge only the messages actually shown, never a later arrival.
+    pub fn read_thread(&self, tid: i64, through: i64) -> R<Value> {
+        let st = self.lock();
+        Self::thread_project(&st, tid)?;
+        let valid: bool = st.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id=?1 AND id=?2)",
+            params![tid, through],
+            |r| r.get(0),
+        )?;
+        if through < 0 || (through != 0 && !valid) {
+            return Err(bad("message must be 0 or a message in this thread"));
+        }
+        st.db.execute(
+            "INSERT INTO user_reads(thread_id,message_id) VALUES(?1,?2)
+             ON CONFLICT(thread_id) DO UPDATE SET message_id=max(message_id,excluded.message_id)",
+            params![tid, through],
+        )?;
+        Ok(
+            json!({ "last_read": Self::user_read_cursor(&st, tid)?, "unread": Self::user_unread(&st, tid)? }),
+        )
     }
 
     pub fn message(&self, id: i64) -> R<Value> {
@@ -2761,6 +2809,63 @@ mod tests {
                 params![project, serde_json::to_string(&s).unwrap()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn user_reads_are_scoped_monotonic_and_persistent() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db.execute_batch(
+                "INSERT INTO threads(id,project,title,created_by,created_at) VALUES
+                   (1,1,'mine',0,0),(2,1,'agents',1,0),(3,2,'other project',0,0);
+                 INSERT INTO members(thread_id,agent_id) VALUES (1,0),(1,1),(2,1),(3,0),(3,2);
+                 INSERT INTO messages(id,thread_id,sender,text,at) VALUES
+                   (1,1,1,'first',0),(2,1,0,'own message',0),(3,2,1,'agent only',0),(4,3,2,'other project',0);",
+            ).unwrap();
+        }
+        assert_eq!(app.thread(1).unwrap()["unread"], 1);
+        assert_eq!(app.thread(1).unwrap()["last_read"], 0);
+        assert_eq!(
+            app.threads(Some(1), None)
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == 2)
+                .unwrap()["unread"],
+            0
+        );
+        assert_eq!(
+            app.projects()
+                .unwrap()
+                .iter()
+                .map(|p| p["unread"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        // A later message is not cleared by an acknowledgement of the old snapshot.
+        app.lock()
+            .db
+            .execute("INSERT INTO messages VALUES(5,1,1,'arrived later',0)", [])
+            .unwrap();
+        assert_eq!(app.read_thread(1, 2).unwrap()["unread"], 1);
+        assert_eq!(app.read_thread(1, 1).unwrap()["last_read"], 2);
+        assert_eq!(app.read_thread(1, 0).unwrap()["last_read"], 2);
+        for invalid in [-1, 3, 4, 999] {
+            assert_eq!(app.read_thread(1, invalid).unwrap_err().0, 400);
+        }
+        assert_eq!(app.read_thread(999, 0).unwrap_err().0, 404);
+        assert_eq!(app.thread(3).unwrap()["unread"], 1);
+        app.user_membership(1, false).unwrap();
+        assert_eq!(app.thread(1).unwrap()["unread"], 0);
+        app.user_membership(1, true).unwrap();
+        assert_eq!(app.thread(1).unwrap()["last_read"], 2);
+        assert_eq!(app.thread(1).unwrap()["unread"], 1);
+        let home = app.home.clone();
+        drop(app);
+        let reopened = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        assert_eq!(reopened.thread(1).unwrap()["last_read"], 2);
+        assert_eq!(reopened.read_thread(1, 5).unwrap()["unread"], 0);
+        assert_eq!(reopened.thread(3).unwrap()["unread"], 1);
     }
 
     fn state(app: &App, id: i64) -> (String, Option<String>) {
