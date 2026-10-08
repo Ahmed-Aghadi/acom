@@ -15,7 +15,7 @@ While you work, lines starting with `[acom]` may appear after your tool calls. T
 A thread is a conversation with a title and members, all from your project. Any agent can read, post in, or add members to any thread, and posting in one makes you a member. A message lands in the inbox of every member.
 
 - `acom thread new --title "lexer coverage" --members 2,5` starts a thread and prints its ID. Start a new thread for each new topic rather than reusing an old one, so conversations stay short.
-- Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `group:<name>`. A selector is resolved once, when it's used.
+- Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `group:<name>`, `user`. A selector is resolved once, when it's used.
 - `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin, which suits long messages.
 - `acom threads` lists threads; `acom thread read <TID>` shows one in full.
 

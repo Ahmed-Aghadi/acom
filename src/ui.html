@@ -30,6 +30,16 @@
     .dot.off { background: var(--danger); box-shadow: 0 0 0 3px #f4dfdd; }
     .usage { display: flex; gap: 14px; margin-left: auto; }
     .meter { width: 132px; }
+    button.meter { text-align: left; background: transparent; border: 0; padding: 0; }
+    .folder-list, .member-list { max-height: 280px; overflow: auto; margin: 12px 0; border: 1px solid var(--line); border-radius: 7px; }
+    .folder-row { display: flex; width: 100%; gap: 9px; padding: 8px 10px; border: 0; border-radius: 0; text-align: left; overflow-wrap: anywhere; }
+    .folder-row span:last-child { margin-left: auto; color: var(--muted); }
+    .member-list label { display: flex; align-items: center; gap: 9px; padding: 9px; border-bottom: 1px solid var(--line); }
+    .member-list input, .inline-check input { width: auto; }
+    .inline-check { display: flex; align-items: center; gap: 7px; }
+    .filter-actions { display: flex; gap: 5px; padding: 10px; flex-wrap: wrap; }
+    .filter-actions .active { background: var(--accent-soft); color: var(--accent); }
+    .inline-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; }
     .meter-label { display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
     .track { position: relative; height: 6px; overflow: hidden; border-radius: 9px; background: #e6e2d9; }
     .fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s; }
@@ -190,6 +200,7 @@
       <section class="panel thread-layout">
         <div class="thread-list">
           <div class="panel-head"><h2>Threads</h2><span class="count" id="thread-count"></span><button class="small" data-open="thread-dialog">New</button></div>
+          <div class="filter-actions"><button class="small" data-thread-filter="mine">Mine</button><button class="small" data-thread-filter="all">All</button><button class="small" data-thread-filter="agents">Agent-only</button></div>
           <div id="thread-list"></div>
         </div>
         <div class="thread-main" id="thread-main"><div class="empty">Select a thread</div></div>
@@ -208,6 +219,8 @@
     <form method="dialog" id="launch-form">
       <h2>Launch agent</h2>
       <p class="meta launch-project" id="launch-project"></p>
+      <p class="meta launch-project">Model catalogs are not access checks. If your account rejects a model, choose another explicitly; acom never silently substitutes it.</p>
+      <p class="inline-error" id="launch-model-warning" hidden></p>
       <div class="form-grid">
         <label class="wide">Project <select name="project" id="launch-project-select" required></select></label>
         <label>Name <input name="name" placeholder="optional"></label>
@@ -226,6 +239,7 @@
     <form method="dialog" id="project-form">
       <h2>Add project</h2>
       <label>Folder path <input name="path" placeholder="/path/to/project" required><span>An existing folder on the machine running acom. Agents will work in this folder.</span></label>
+      <p><button type="button" id="browse-project">Browse folders…</button></p>
       <div class="dialog-actions"><button type="button" data-close="project-dialog">Cancel</button><button class="primary">Add</button></div>
     </form>
   </dialog>
@@ -235,11 +249,28 @@
       <h2>New thread</h2>
       <div class="form-grid">
         <label class="wide">Title <input name="title" required></label>
-        <label class="wide">Members <input name="members" placeholder="1, 2, active, group:review"></label>
+        <div class="wide" id="thread-member-picker"></div>
+        <details class="wide"><summary>Advanced member selectors</summary><label>IDs, states or groups <input name="members" placeholder="1, active, group:review"></label></details>
       </div>
       <div class="dialog-actions"><button type="button" data-close="thread-dialog">Cancel</button><button class="primary" value="default">Create</button></div>
     </form>
   </dialog>
+
+  <dialog id="folder-dialog"><form id="folder-form">
+    <h2>Choose a project folder</h2>
+    <div class="actions"><button type="button" id="folder-home">Home</button><button type="button" id="folder-up">Up</button></div>
+    <p class="launch-project"><code id="folder-path"></code></p>
+    <label class="inline-check"><input type="checkbox" id="folder-hidden"> Show hidden files</label>
+    <div class="folder-list" id="folder-list"></div><p class="inline-error" id="folder-error" role="alert"></p>
+    <div class="custom-model-row"><label>New folder name <input name="name" placeholder="optional"></label><button type="submit">Create folder</button></div>
+    <div class="dialog-actions"><button type="button" data-close="folder-dialog">Cancel</button><button type="button" class="primary" id="folder-use">Use this folder</button></div>
+  </form></dialog>
+
+  <dialog id="members-dialog"><form id="members-form"><h2>Add thread members</h2><div id="add-member-picker"></div>
+    <div class="dialog-actions"><button type="button" data-close="members-dialog">Cancel</button><button class="primary">Add members</button></div>
+  </form></dialog>
+
+  <dialog id="usage-dialog"><form method="dialog"><h2>Subscription usage</h2><div id="usage-details"></div><div class="dialog-actions"><button>Close</button></div></form></dialog>
 
   <dialog id="config-dialog">
     <form method="dialog" id="config-form">
@@ -269,7 +300,7 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: localStorage.getItem('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -349,17 +380,24 @@
       const root = $('#usage');
       const usages = state.limits?.usage || [];
       const limits = state.limits?.limits?.usage || {};
-      const providers = Object.keys(limits);
+      const providers = [...new Set([...Object.keys(state.catalog),...Object.keys(limits),...usages.map(u=>u.provider)])];
       root.innerHTML = providers.map(provider => {
         const now = Date.now() / 1000;
-        const readings = usages.filter(u => u.provider === provider && (!u.resets_at || u.resets_at > now));
+        const readings = usages.filter(u => u.provider === provider);
         const known = readings.length > 0;
         const value = known ? Math.max(...readings.map(u => Number(u.used_pct))) : 0;
         const lim = limits[provider] || { soft: null, hard: null };
-        const kind = lim.hard != null && value >= lim.hard ? 'hard' : lim.soft != null && value >= lim.soft ? 'warn' : '';
+        const kind = value >= 100 || lim.hard != null && value >= lim.hard ? 'hard' : lim.soft != null && value >= lim.soft ? 'warn' : '';
         const marks = [['soft', lim.soft], ['hard', lim.hard]].filter(([,n]) => n != null).map(([kind,n]) => `<span class="mark ${kind}" title="${kind} ${esc(n)}%" style="left:${Math.max(0, Math.min(Number(n), 100))}%"></span>`).join('');
-        return `<div class="meter"><div class="meter-label"><span>${esc(provider)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div></div>`;
+        const reset = readings.filter(u => u.used_pct >= 100 && u.resets_at).map(u => u.resets_at).sort((a,b)=>a-b).at(-1);
+        return `<button class="meter" data-usage="${esc(provider)}" title="Usage windows, reset times and check status"><div class="meter-label"><span>${esc(provider)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div><div class="meta">${reset ? reset > now ? `resets ${esc(new Date(reset*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}))}` : 'reset due · checking' : 'View usage details'}</div></button>`;
       }).join('');
+      if (state.usageProvider) {
+        const check = state.limits?.checks?.find(c => c.provider === state.usageProvider);
+        $('#usage-details').innerHTML = `<p>${esc(state.usageProvider)} · Last checked: ${esc(when(check?.checked_at))}<br>Next check: ${esc(when(check?.next_check))}</p>
+          ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
+          ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}">Check now</button>`;
+      }
     }
 
     function renderAgents() {
@@ -373,17 +411,19 @@
 
     function agentRow(a) {
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
+      const unavailable = /model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
         ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
-        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.pause_reason === 'flagged' ? 'Resume same model' : 'Resume'}</button>`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${unavailable ? 'Retry same model' : a.pause_reason === 'flagged' ? 'Resume same model' : 'Resume'}</button>${unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
       const close = a.state !== 'closed' ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
       const waiting = a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
-      const problem = a.problem ? `<div class="problem">${a.pause_reason === 'flagged' ? 'Flagged' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(a.problem)}</div>${a.pause_reason === 'flagged' ? '<div class="meta">Choose another model by launching a new agent.</div>' : ''}` : '';
+      const problem = a.problem ? `<div class="problem">${unavailable ? 'Model unavailable' : a.pause_reason === 'flagged' ? 'Flagged' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(a.problem)}</div>${a.pause_reason === 'flagged' ? '<div class="meta">Choose another model by launching a new agent.</div>' : ''}` : '';
+      const recovery = a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div>${problem}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div>${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -404,8 +444,11 @@
 
     function renderThreads() {
       $('#thread-count').textContent = `${state.threads.length}`;
-      $('#thread-list').innerHTML = state.threads.length ? state.threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong><span class="meta">${fmt(t.messages)} messages · ${t.members?.map(x => `#${x}`).join(', ') || 'no members'}</span></button>`).join('') : '<div class="empty">No threads yet</div>';
+      document.querySelectorAll('[data-thread-filter]').forEach(b=>b.classList.toggle('active',b.dataset.threadFilter===state.threadFilter));
+      const threads = state.threads.filter(t=>state.threadFilter === 'all' || (t.members?.includes(0) ? state.threadFilter === 'mine' : state.threadFilter === 'agents'));
+      $('#thread-list').innerHTML = threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong><span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`;
     }
+    function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
     function messageHtml(m) {
       return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''}" data-message="${m.id}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}</span><span>${when(m.at)}</span></div><div class="message-text">${esc(m.text)}</div></div>`;
@@ -419,7 +462,7 @@
         if (request !== state.threadRequest || selected !== state.selectedThread) return;
         const sameThread = state.thread?.id === t.id && $('#messages');
         if (!sameThread) {
-          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta">Members: ${t.members?.map(x => `#${x}`).join(', ') || 'none'}</div></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta"></div><div class="actions"><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button></div></div>
             <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
             <form class="composer" id="message-form"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
           const messages = $('#messages');
@@ -435,8 +478,9 @@
             if (atBottom) messages.scrollTop = messages.scrollHeight;
           }
           $('.thread-header h2', $('#thread-main')).textContent = t.title;
-          $('.thread-header .meta', $('#thread-main')).textContent = `Members: ${t.members?.map(x => `#${x}`).join(', ') || 'none'}`;
         }
+        $('.thread-header .meta', $('#thread-main')).innerHTML = `Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`;
+        $('#thread-membership').textContent = t.members?.includes(0) ? 'Leave thread' : 'Join thread';
         state.thread = t;
       } catch (error) { if (showError) toast(error.message, true); }
     }
@@ -479,7 +523,10 @@
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${capital(n)} subscription %`, `usage.${n}`, v)).join('');
       $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
-        <h3>Behavior</h3><div class="form-grid"><label><span><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''} style="width:auto"> Auto-resume after limits clear</span></label><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents wake only for user messages or explicit reopen. Turn this off to allow peer messages to wake done agents.</span></label></div>
+        <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
+        <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
+        <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents wake only for user messages or explicit reopen. Turn this off to allow peer messages to wake done agents.</span></label>
+        <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
     }
@@ -562,6 +609,41 @@
       });
     }
 
+    async function browseFolder(path) {
+      const request = ++state.folderRequest;
+      state.folder = null;
+      $('#folder-use').disabled = true; $('#folder-error').textContent = '';
+      try {
+        const folder = await api(`/folders?hidden=${$('#folder-hidden').checked ? 1 : 0}${path ? `&path=${encodeURIComponent(path)}` : ''}`);
+        if (request !== state.folderRequest) return;
+        state.folder = folder; $('#folder-path').textContent = folder.path;
+        $('#folder-up').disabled = !folder.parent;
+        $('#folder-list').innerHTML = folder.entries.map(e=>e.directory
+          ? `<button type="button" class="folder-row" data-folder="${esc(e.path)}"><strong>▸</strong>${esc(e.name)}<span>Folder</span></button>`
+          : `<div class="folder-row">${esc(e.name)}<span>File</span></div>`).join('') || '<div class="empty">Empty folder</div>';
+        if (folder.truncated) $('#folder-error').textContent = 'Showing the first 1000 entries. Use the exact-path field for other folders.';
+        $('#folder-use').disabled = false;
+      } catch (error) { if (request === state.folderRequest) $('#folder-error').textContent = error.message; }
+    }
+    function memberPicker(root, existing = [], includeUser = false) {
+      const agents = state.agents.filter(a=>!existing.includes(a.id));
+      const sameProject = root.dataset.project===String(state.selectedProject);
+      const previous = sameProject ? checked(root,'member') : [];
+      const userSelected = sameProject ? ($('[name=include_user]',root)?.checked ?? true) : true;
+      root.dataset.project=state.selectedProject;
+      root.innerHTML = `<label>Find members <input type="search" data-member-search placeholder="Name, ID or group"></label>
+        ${includeUser ? '<label class="inline-check" style="margin:12px 0"><input type="checkbox" name="include_user" checked> Include me in this thread</label>' : ''}
+        <div class="filter-actions"><button type="button" class="small" data-member-pick="active">Active agents</button><button type="button" class="small" data-member-pick="all">All agents</button><button type="button" class="small" data-member-pick="none">Clear</button></div>
+        <div class="member-list">${agents.map(a=>`<label data-member-row data-search="${esc(`${a.name} ${a.id} ${a.group || ''}`.toLowerCase())}"><input type="checkbox" name="member" value="${a.id}" data-state="${esc(a.state)}"><span><strong>${esc(a.name)}</strong><br><span class="meta">#${a.id} · ${esc(a.state)} · ${esc(a.harness)} / ${esc(a.model)}${a.group ? ` · ${esc(a.group)}` : ''}</span></span></label>`).join('') || '<div class="empty">No agents to add yet</div>'}</div>`;
+      root.querySelectorAll('[name=member]').forEach(input=>input.checked=previous.includes(input.value));
+      if (includeUser) $('[name=include_user]',root).checked=userSelected;
+    }
+    document.addEventListener('input', event=> {
+      if (!event.target.matches('[data-member-search]')) return;
+      const root = event.target.closest('#thread-member-picker, #add-member-picker');
+      root.querySelectorAll('[data-member-row]').forEach(row=>row.hidden=!row.dataset.search.includes(event.target.value.toLowerCase()));
+    });
+
     async function pauseChoice(agent) {
       if (!agent?.locks?.length) return 'release';
       $('#pause-copy').textContent = `Agent ${agent.id} holds: ${agent.locks.join(', ')}`;
@@ -583,6 +665,29 @@
     document.addEventListener('click', async event => {
       const close = event.target.closest('[data-close]');
       if (close) { document.getElementById(close.dataset.close).close('cancel'); return; }
+      const pick = event.target.closest('[data-member-pick]');
+      if (pick) {
+        pick.closest('#thread-member-picker, #add-member-picker').querySelectorAll('[name=member]').forEach(input=>input.checked=pick.dataset.memberPick==='all' || (pick.dataset.memberPick==='active' && ['working','idle'].includes(input.dataset.state)));
+        return;
+      }
+      const folder = event.target.closest('[data-folder]');
+      if (folder) { await browseFolder(folder.dataset.folder); return; }
+      if (event.target.closest('#browse-project')) { $('#folder-dialog').showModal(); await browseFolder($('#project-form [name=path]').value.trim() || undefined); return; }
+      if (event.target.closest('#folder-home')) { await browseFolder(state.folder?.home); return; }
+      if (event.target.closest('#folder-up')) { if(state.folder?.parent) await browseFolder(state.folder.parent); return; }
+      if (event.target.closest('#folder-use')) { if(state.folder) { $('#project-form [name=path]').value=state.folder.path; $('#folder-dialog').close(); } return; }
+      const usage = event.target.closest('[data-usage]');
+      if (usage) { state.usageProvider=usage.dataset.usage; renderUsage(); $('#usage-dialog').showModal(); return; }
+      const checkUsage = event.target.closest('[data-check-usage]');
+      if (checkUsage) {
+        try { await mutate('/usage/check', {provider:checkUsage.dataset.checkUsage}); toast('Usage check scheduled'); } catch(error) {toast(error.message,true);} return;
+      }
+      const threadFilter = event.target.closest('[data-thread-filter]');
+      if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; localStorage.setItem('thread-filter',state.threadFilter); renderThreads(); return; }
+      if(event.target.closest('#thread-membership')) {
+        try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); await refreshThread(); } catch(error) {toast(error.message,true);} return;
+      }
+      if(event.target.closest('#add-thread-members')) { memberPicker($('#add-member-picker'),state.thread?.members); $('#members-dialog').showModal(); return; }
       if (event.target.closest('#save-config-as')) {
         if ($('#settings-form').reportValidity()) {
           try {
@@ -628,6 +733,7 @@
           setLaunchProject();
         }
         if (open.dataset.open === 'thread-dialog' && !state.project) { toast('Add a project first.', true); return; }
+        if (open.dataset.open === 'thread-dialog') memberPicker($('#thread-member-picker'),[],true);
         document.getElementById(open.dataset.open).showModal();
         return;
       }
@@ -643,7 +749,13 @@
       if (!action) return;
       try {
         const id = Number(action.dataset.id);
-        if (action.dataset.action === 'details') {
+        if (action.dataset.action === 'another-model') {
+          const agent=state.agents.find(a=>a.id===id);
+          $('#launch-project-select').innerHTML=projectOptions(agent.project);
+          $('#launch-dialog').showModal(); await setLaunchProject();
+          if([...$('#launch-harness').options].some(o=>o.value===agent.harness)) {$('#launch-harness').value=agent.harness;setLaunchChoices();}
+          $('#launch-form [name=task]').value=agent.task || '';
+        } else if (action.dataset.action === 'details') {
           const [a, log] = await Promise.all([api(`/agents/${id}`), api(`/agents/${id}/log?lines=100`)]);
           $('#agent-title').textContent = `${a.name} · #${a.id}`;
           const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
@@ -678,7 +790,7 @@
     $('#resume-all').addEventListener('click', async () => { try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); } });
 
     $('#launch-harness').addEventListener('change', setLaunchChoices);
-    $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); });
+    $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); showModelWarning(); });
     $('#launch-project-select').addEventListener('change', setLaunchProject);
     async function setLaunchProject() {
       const p = state.projects.find(x => x.id === Number($('#launch-project-select').value));
@@ -734,6 +846,13 @@
       $('#launch-model').innerHTML = modelOptions(name, [...new Set([...(state.catalog[name] || []).map(x => x.id), ...(h?.models || [])])], h?.model);
       setLaunchEfforts(true);
       showCustom($('#launch-model'), $('#launch-custom-row'));
+      showModelWarning();
+    }
+    function showModelWarning() {
+      const model=$('#launch-model').value;
+      const rejected=state.agents.find(a=>a.harness===$('#launch-harness').value && a.model===model && /not supported|not available|model.*not found/i.test(a.problem || ''));
+      $('#launch-model-warning').hidden=!rejected;
+      $('#launch-model-warning').textContent=rejected ? `This account previously rejected ${model}: ${rejected.problem}. Choose an accessible model explicitly.` : '';
     }
     function setLaunchEfforts(useDefault = false) {
       const name = $('#launch-harness').value;
@@ -778,11 +897,29 @@
       const data = new FormData(form);
       if (button) button.disabled = true;
       try {
-        const result = await mutate('/threads', { project: state.selectedProject, title: data.get('title'), members: splitList(data.get('members')) });
+        const result = await mutate('/threads', { project: state.selectedProject, title: data.get('title'), members: [...data.getAll('member'),...splitList(data.get('members') || '')], include_user: data.has('include_user') });
         $('#thread-dialog').close(); form.reset();
+        if(!data.has('include_user')) {state.threadFilter='all';localStorage.setItem('thread-filter','all');renderThreads();}
         state.selectedThread = Number(result.id ?? result.thread_id); await refreshThread();
       } catch (error) { toast(error.message, true); }
       finally { if (button) button.disabled = false; }
+    });
+
+    $('#folder-hidden').addEventListener('change',()=>browseFolder(state.folder?.path));
+    $('#folder-form').addEventListener('submit', async event=> {
+      event.preventDefault(); const form=event.currentTarget, button=event.submitter;
+      if (!state.folder) return;
+      if (button) button.disabled=true;
+      try {
+        const result=await api('/folders',{method:'POST',body:JSON.stringify({parent:state.folder.path,name:new FormData(form).get('name')})});
+        $('[name=name]',form).value=''; await browseFolder(result.path);
+      } catch(error) { $('#folder-error').textContent=error.message; }
+      finally {if(button) button.disabled=false;}
+    });
+    $('#members-form').addEventListener('submit',async event=> {
+      event.preventDefault(); const members=new FormData(event.currentTarget).getAll('member');
+      if(!members.length) {toast('Choose at least one member.',true);return;}
+      try {await mutate(`/threads/${state.selectedThread}/members`,{members}); $('#members-dialog').close(); await refreshThread();} catch(error) {toast(error.message,true);}
     });
 
     $('#project-form').addEventListener('submit', async event => {
@@ -832,6 +969,8 @@
       });
       next.auto_resume = $('[name=auto_resume]', form).checked;
       next.done_closes = $('[name=done_closes]', form).checked;
+      next.usage_poll_secs = Number($('[name=usage_poll_secs]', form).value);
+      next.prompts = Object.fromEntries(['launch','wake','resume'].map(name=>[name,$(`[name=prompt_${name}]`,form).value]));
       return next;
     }
     function setSettingsBusy(busy) {

@@ -120,6 +120,31 @@ pub struct Settings {
     pub limits: Limits,
     pub auto_resume: bool,
     pub done_closes: bool,
+    #[serde(default = "poll_interval")]
+    pub usage_poll_secs: u64,
+    #[serde(default)]
+    pub prompts: Prompts,
+}
+
+fn poll_interval() -> u64 {
+    120
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Prompts {
+    pub launch: String,
+    pub wake: String,
+    pub resume: String,
+}
+impl Default for Prompts {
+    fn default() -> Self {
+        Self {
+            launch: "Work on your task and use acom to coordinate when useful.".into(),
+            wake: "You were woken because of the updates above. Carry on.".into(),
+            resume: "Check what finished before the interruption and redo only what is needed. Carry on.".into(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -155,7 +180,7 @@ impl Default for Settings {
             "codex".into(),
             cfg(
                 "codex",
-                "gpt-6.1-sol",
+                "gpt-6-sol",
                 "--dangerously-bypass-approvals-and-sandbox",
             ),
         );
@@ -179,12 +204,29 @@ impl Default for Settings {
             },
             auto_resume: true,
             done_closes: true,
+            usage_poll_secs: poll_interval(),
+            prompts: Prompts::default(),
         }
     }
 }
 
 impl Settings {
     fn check(&self) -> R<()> {
+        if !(15..=3600).contains(&self.usage_poll_secs) {
+            return Err(bad("usage check interval must be 15–3600 seconds"));
+        }
+        if [
+            &self.prompts.launch,
+            &self.prompts.wake,
+            &self.prompts.resume,
+        ]
+        .iter()
+        .any(|s| s.len() > 20_000)
+        {
+            return Err(bad(
+                "prompt guidance must be at most 20000 bytes per scenario",
+            ));
+        }
         for (name, h) in &self.harnesses {
             if !crate::harness::KNOWN.contains(&name.as_str()) {
                 return Err(bad(format!("unknown harness {name}")));
@@ -296,6 +338,7 @@ CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, 
   PRIMARY KEY (project, name));
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
+CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
 ";
 
@@ -349,6 +392,7 @@ pub struct Agent {
     pub pause_from: Option<String>,
     pub paused_at: Option<i64>,
     pub done_req: bool,
+    pub problem: Option<String>,
 }
 
 pub fn who(id: i64) -> String {
@@ -427,7 +471,7 @@ impl St {
         self.db
             .query_row(
                 "SELECT name,grp,task,harness,model,effort,state,rest,session_id,launched_by,
-                        pause_from,paused_at,done_req,project FROM agents WHERE id=?1",
+                        pause_from,paused_at,done_req,project,problem FROM agents WHERE id=?1",
                 [id],
                 |r| {
                     Ok(Agent {
@@ -445,6 +489,7 @@ impl St {
                         paused_at: r.get(11)?,
                         done_req: r.get::<_, i64>(12)? != 0,
                         project: r.get(13)?,
+                        problem: r.get(14)?,
                     })
                 },
             )
@@ -511,11 +556,11 @@ impl St {
         Ok((total, per))
     }
 
-    /// Highest usage % across a provider's windows that haven't reset yet, if known.
+    /// Last observed usage, including expired windows until a fresh check confirms a reset.
     pub fn used_pct(&self, provider: &str) -> R<Option<f64>> {
         Ok(self.db.query_row(
-            "SELECT max(used_pct) FROM usage WHERE provider=?1 AND (resets_at IS NULL OR resets_at > ?2)",
-            params![provider, now()],
+            "SELECT max(used_pct) FROM usage WHERE provider=?1",
+            [provider],
             |r| r.get::<_, Option<f64>>(0),
         )?)
     }
@@ -779,6 +824,7 @@ impl App {
         let db = Connection::open(home.join("acom.db"))?;
         check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
+        db.execute("UPDATE usage_checks SET in_flight=0", [])?;
         db.execute(
             "INSERT OR IGNORE INTO configs(id,name,settings) VALUES(1,'Default',?1)",
             [serde_json::to_string(&Settings::default()).unwrap()],
@@ -989,14 +1035,15 @@ impl App {
             .unwrap_or_default();
         let (project, path) = st.project(a.project)?;
         Ok(format!(
-            "You are agent {id} (\"{}\"{group}) in project \"{project}\" ({path}), launched by {} through acom, running {} / {} / effort {}.\n\n{GUIDE}\n## Limits and rules right now\n\n{}\n\n## Your task\n\n{}\n",
+            "You are agent {id} (\"{}\"{group}) in project \"{project}\" ({path}), launched by {} through acom, running {} / {} / effort {}.\n\n{GUIDE}\n## Limits and rules right now\n\n{}\n\n## Your task\n\n{}\n\n## Guidance\n\n{}\n",
             a.name,
             who(a.launched_by),
             a.harness,
             a.model,
             a.effort,
             st.limits_text(Some(a.project))?,
-            a.task
+            a.task,
+            st.settings_for(Some(a.project)).prompts.launch
         ))
     }
 
@@ -1033,7 +1080,8 @@ impl App {
             params![id, rest],
         )?;
         let updates = st.take_updates(id)?;
-        let prompt = format!("{updates}\n\nYou were woken up because of the above. Carry on.");
+        let guidance = st.settings_for(Some(st.agent(id)?.project)).prompts.wake;
+        let prompt = format!("{updates}\n\n## Guidance\n\n{guidance}");
         run::start_turn(self, st, id, &prompt)
     }
 
@@ -1236,10 +1284,19 @@ impl App {
             [id],
         )?;
         st.log_for(id, by, &format!("resumed agent {id}"))?;
+        let guidance = st.settings_for(Some(a.project)).prompts.resume;
+        let interruption = format!(
+            "[acom] Previous turn interrupted{}: {}. Commands may have only partially executed and unsaved work may be lost. Previous commands, background tasks and monitors are gone: don't wait for them.",
+            a.paused_at
+                .map(|t| format!(" at {}", hhmm(t)))
+                .unwrap_or_default(),
+            a.problem.as_deref().unwrap_or("the process was stopped")
+        );
         if a.state == "crashed" {
             let updates = st.take_updates(id)?;
             let prompt = format!(
-                "Your last turn ended with an error and you've been resumed. Background tasks and monitors from before are gone: don't wait for them.\n{updates}\n\nCarry on."
+                "{interruption}\n[acom] Resumed at {} after an error.\n{updates}\n\n## Guidance\n\n{guidance}",
+                hhmm(now())
             );
             return run::start_turn(self, st, id, &prompt);
         }
@@ -1247,8 +1304,7 @@ impl App {
         if from == "working" {
             let updates = st.take_updates(id)?;
             let prompt = format!(
-                "[acom] You were paused at {} and resumed at {}. Your process was stopped, so every command, background task and monitor from before the pause is gone: don't wait for any of them. Check what finished and redo the rest.\n{updates}\n\nCarry on.",
-                hhmm(a.paused_at.unwrap_or(now())),
+                "{interruption}\n[acom] Resumed at {}.\n{updates}\n\n## Guidance\n\n{guidance}",
                 hhmm(now())
             );
             run::start_turn(self, st, id, &prompt)
@@ -1379,7 +1435,9 @@ impl App {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let found: Vec<i64> = if let Ok(id) = s.parse::<i64>() {
+            let found: Vec<i64> = if s == "user" || s == "0" {
+                vec![0]
+            } else if let Ok(id) = s.parse::<i64>() {
                 if st.agent(id)?.project != project {
                     return Err(bad(format!("agent {id} is in another project")));
                 }
@@ -1418,6 +1476,7 @@ impl App {
         project: Option<i64>,
         title: &str,
         members: &[String],
+        include_user: bool,
     ) -> R<(i64, Vec<i64>)> {
         let st = self.lock();
         if title.trim().is_empty() {
@@ -1431,7 +1490,7 @@ impl App {
             p
         };
         let mut ids = Self::resolve(&st, project, members)?;
-        if by > 0 && !ids.contains(&by) {
+        if (by > 0 || include_user) && !ids.contains(&by) {
             ids.insert(0, by);
         }
         if ids.is_empty() {
@@ -1463,9 +1522,28 @@ impl App {
         }
         // Earlier messages count as new for them, so resting members may need waking.
         for id in &ids {
-            self.maybe_wake(&mut st, *id)?;
+            if *id > 0 {
+                self.maybe_wake(&mut st, *id)?;
+            }
         }
         Ok(ids)
+    }
+
+    pub fn user_membership(&self, tid: i64, joined: bool) -> R<()> {
+        let st = self.lock();
+        Self::thread_project(&st, tid)?;
+        if joined {
+            st.db.execute(
+                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,0)",
+                [tid],
+            )?;
+        } else {
+            st.db.execute(
+                "DELETE FROM members WHERE thread_id=?1 AND agent_id=0",
+                [tid],
+            )?;
+        }
+        Ok(())
     }
 
     fn thread_project(st: &St, tid: i64) -> R<i64> {
@@ -1489,15 +1567,13 @@ impl App {
         if text.trim().is_empty() {
             return Err(bad("the message is empty"));
         }
-        if sender > 0 {
-            if st.agent(sender)?.project != project {
-                return Err(bad(format!("thread {tid} is in another project")));
-            }
-            st.db.execute(
-                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
-                params![tid, sender],
-            )?;
+        if sender > 0 && st.agent(sender)?.project != project {
+            return Err(bad(format!("thread {tid} is in another project")));
         }
+        st.db.execute(
+            "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
+            params![tid, sender],
+        )?;
         st.db.execute(
             "INSERT INTO messages(thread_id,sender,text,at) VALUES(?1,?2,?3,?4)",
             params![tid, sender, text, now()],
@@ -1512,7 +1588,7 @@ impl App {
         }
         let members: Vec<i64> = rows(
             &st.db,
-            "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2 ORDER BY agent_id",
+            "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2 AND agent_id>0 ORDER BY agent_id",
             params![tid, sender],
         )?
         .iter()
@@ -1843,11 +1919,14 @@ impl App {
             params![id, problem],
         )?;
         if why == "limit" {
-            // Until the harness reports the window's real reset time, assume a few minutes,
-            // so an older reading below 100% can't resume the agent straight away.
+            // Only a fresh provider check can clear this marker; don't invent a reset time.
             st.db.execute(
-                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,'limit',100,?2,?3)",
-                params![a.harness, now() + 300, now()],
+                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,'limit',100,NULL,?2)",
+                params![a.harness, now()],
+            )?;
+            st.db.execute(
+                "UPDATE usage_checks SET next_check=?2 WHERE provider=?1",
+                params![a.harness, now()],
             )?;
         }
         if matches!(a.state.as_str(), "working" | "idle" | "done") {
@@ -1924,21 +2003,17 @@ impl App {
     fn check_usage(self: &Arc<Self>, st: &mut St, project: i64) -> R<bool> {
         let s = st.settings_for(Some(project));
         let mut changed = false;
-        for (p, lim) in &s.limits.usage {
+        for p in crate::harness::KNOWN {
+            let lim = s.limits.usage.get(p).cloned().unwrap_or(Limit {
+                soft: None,
+                hard: None,
+            });
+            let p = &p.to_string();
             let key = (project, p.clone());
             let Some(used) = st.used_pct(p)? else {
                 st.over_soft.remove(&key);
                 st.over_hard.remove(&key);
-                if s.auto_resume {
-                    // The window reset: resume. Never had any usage: give it a few minutes.
-                    let known: i64 = st.db.query_row(
-                        "SELECT count(*) FROM usage WHERE provider=?1",
-                        [p],
-                        |r| r.get(0),
-                    )?;
-                    let wait = if known > 0 { 0 } else { 300 };
-                    changed |= self.resume_limited(st, project, p, wait)?;
-                }
+                // Unknown is not evidence that an exhausted subscription recovered.
                 continue;
             };
             let line = format!("{p} subscription usage {used:.0}% ({})", lim.text("%"));
@@ -2008,18 +2083,20 @@ impl App {
         let ids: Vec<i64> = rows(
             &st.db,
             "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state='paused'
-             AND pause_reason='limit' AND paused_at <= ?3",
+             AND pause_reason='limit' AND paused_at <= ?3 ORDER BY paused_at,id",
             params![project, provider, now() - min_paused],
         )?
         .iter()
         .map(|r| r["id"].as_i64().unwrap())
         .collect();
+        let mut changed = false;
         for id in &ids {
-            if !st.procs.contains_key(id) {
+            if !st.procs.contains_key(id) && st.no_room(project, provider)?.is_none() {
                 self.resume_locked(st, *id, "acom")?;
+                changed = true;
             }
         }
-        Ok(!ids.is_empty())
+        Ok(changed)
     }
 
     // ---------- configs ----------
@@ -2052,8 +2129,9 @@ impl App {
             [],
         )?;
         for c in &mut v {
-            c["settings"] =
+            let settings: Settings =
                 serde_json::from_str(c["settings"].as_str().unwrap_or("{}")).unwrap_or_default();
+            c["settings"] = serde_json::to_value(settings).unwrap();
             let used = rows(
                 &st.db,
                 "SELECT id FROM projects WHERE config=?1 AND custom IS NULL ORDER BY id",
@@ -2394,6 +2472,7 @@ impl App {
             "limits": s.limits,
             "active": { "total": total, "per_harness": per },
             "usage": usage,
+            "checks": rows(&st.db, "SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider", [])?,
             "text": st.limits_text(project)?,
         }))
     }
@@ -2741,6 +2820,115 @@ mod tests {
         app.tick().unwrap();
         assert_eq!(state(&app, 1), ("paused".into(), Some("limit".into())));
         assert_eq!(state(&app, 2), ("idle".into(), None));
+    }
+
+    #[test]
+    fn subscription_stops_without_hard_limits_need_fresh_confirmed_usage() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.limit_hit(1, "subscription exhausted").unwrap();
+        {
+            let st = app.lock();
+            st.db
+                .execute("UPDATE usage SET resets_at=?1", [now() - 10])
+                .unwrap();
+        }
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        crate::usage::finish(&app, "claude", 120, Err("status unavailable".into())).unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        app.lock()
+            .db
+            .execute(
+                "INSERT INTO usage_checks(provider,attempted_at) VALUES('claude',?1)",
+                [now() - 1],
+            )
+            .unwrap();
+        // A check that started before the interruption must not clear its marker.
+        crate::usage::finish(
+            &app,
+            "claude",
+            120,
+            Ok(vec![crate::usage::Window {
+                name: "five_hour".into(),
+                used: 0.0,
+                reset: Some(now() + 60),
+            }]),
+        )
+        .unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        {
+            let st = app.lock();
+            st.db
+                .execute("UPDATE usage SET at=?1 WHERE win='limit'", [now() - 1])
+                .unwrap();
+            st.db
+                .execute(
+                    "UPDATE usage_checks SET attempted_at=?1 WHERE provider='claude'",
+                    [now()],
+                )
+                .unwrap();
+        }
+        crate::usage::finish(
+            &app,
+            "claude",
+            120,
+            Ok(vec![crate::usage::Window {
+                name: "five_hour".into(),
+                used: 0.0,
+                reset: Some(now() + 60),
+            }]),
+        )
+        .unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+    }
+
+    #[test]
+    fn automatic_recovery_waits_for_an_active_slot() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.active.hard = Some(1.0));
+        {
+            let st = app.lock();
+            st.db.execute("UPDATE agents SET project=1,state='paused',pause_reason='limit',pause_from='idle',paused_at=?1", [now()-60]).unwrap();
+        }
+        set_usage(&app, 0.0);
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+        assert_eq!(state(&app, 2).0, "paused");
+        app.tick().unwrap();
+        assert_eq!(state(&app, 2).0, "paused");
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='closed' WHERE id=1", [])
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 2).0, "idle");
+    }
+
+    #[test]
+    fn guidance_is_literal_and_cannot_remove_the_generated_briefing() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            s.prompts.launch = "Literal {task} {updates} <tag>".into()
+        });
+        let text = app.briefing(&app.lock(), 1).unwrap();
+        assert!(text.contains("Literal {task} {updates} <tag>"));
+        assert!(
+            text.contains("## Your task")
+                && text.contains("## Limits and rules right now")
+                && text.contains(GUIDE)
+        );
+        assert!(
+            Settings {
+                usage_poll_secs: 0,
+                ..Settings::default()
+            }
+            .check()
+            .is_err()
+        );
     }
 
     #[test]

@@ -21,9 +21,9 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 - launch details: when, and by whom (you, or agent N)
 - usage: context size now, and tokens so far, split into fresh input, cache writes, cache reads and output
 
-**Thread.** A conversation in one project: a title, member agents from that project, and messages. Threads are open: any agent in the project can read, post in, or add members to any of its threads. Membership decides whose inbox a message lands in. Posting in a thread makes you a member.
+**Thread.** A conversation in one project: a title, member agents from that project (and optionally the user, ID `0`), and messages. Threads are open: any agent in the project can read, post in, or add members to any of its threads. Membership decides whose inbox a message lands in. Posting in a thread makes you a member. User-created threads include the user by default; the UI lets the user join or leave without posting.
 
-- There's no built-in thread for everyone. When starting a thread you pick members by ID, or by selector (selectors only match agents in the thread's project): `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, or `group:<name>`. For example, `--members active` messages every active agent, and `--members active,done` adds the finished ones too.
+- There's no built-in thread for everyone. When starting a thread you pick members by ID, or by selector (selectors only match agents in the thread's project): `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `group:<name>`, or `user`. For example, `--members active` messages every active agent, and `--members active,done` adds the finished ones too.
 - A selector is resolved when it's used: agents that later enter that state or group aren't added automatically. Add them with `thread add`.
 - To message one agent or a group, start a thread with them and post in it. Any number of threads can have the same members, so a new topic gets a new thread.
 - When an agent joins a thread, the earlier messages count as new for it, so it can catch up.
@@ -100,7 +100,7 @@ Limits are part of each project's settings (see Settings) and apply to that proj
 
 A subscription limit only affects that provider's agents: Claude hitting its limit doesn't pause Codex agents. The hard usage action happens when usage crosses the limit, so an agent you launch or resume past it afterwards keeps running: you've seen the warning and chosen to.
 
-Agents paused by a limit resume by themselves when it clears, e.g. when the usage window resets or you raise the limit. A setting turns that off, so they wait for you.
+Agents paused by a limit resume by themselves when usage is confirmed below the project's hard threshold and below 100%, and an active-agent slot is free. A setting turns that off, so they wait for you. An unknown reading or a passed reset timestamp is not confirmation. Quota checks run even when agents are paused: every 120 seconds by default (configurable 15–3600), and at reported reset times. Periodic checks find early/free resets; the reported time avoids an extra interval after a scheduled reset. Shared accounts use the shortest project's interval. Failed checks preserve the last reading and show an error; they don't wake agents blindly.
 
 **The wake line.** Waking a done or closed agent makes it active again, so it needs room under the hard limits. If there isn't any, the agent waits in line, the sender is told (`agent 5 wasn't woken: Hard limit reached: 1 active agents (soft none, hard 1). It will be woken when there's room.`), and the UI shows it waiting. Waiting agents are woken oldest first as soon as there's room; a new message never jumps the line. Idle agents already count as active, so they're always woken at once.
 
@@ -112,7 +112,7 @@ A model can refuse a request under its safeguards (e.g. a false cyber flag on se
 - Codex has no switch for its safety reroute (it can move a turn to another model, e.g. for "high risk cyber activity"). acom watches for the reroute event and pauses the agent, but it can't rule out a substitution Codex doesn't report.
 - When an agent is refused or flagged, acom pauses it (its locks are released), shows the reason on the agent (e.g. "claude-fable-5-1 refused under its safeguards (cyber): ..."), and logs it. It isn't resumed automatically: you resume it with the same model, or launch an agent with another model.
 - As a safety net, acom checks the model that actually answers. If it isn't the one the agent was launched with (a dated ID like `claude-haiku-4-5-20251001` counts as `claude-haiku-4-5`), or it changes during the session, the agent is paused the same way.
-- When an agent hits its subscription's usage limit mid-turn ("You've hit your session limit"), acom pauses it with reason `limit` and resumes it automatically once the usage window resets, even if no hard limit is set.
+- When an agent hits its subscription's usage limit mid-turn ("You've hit your session limit"), acom pauses it with reason `limit`, even if no hard limit is set. With auto-resume enabled, it resumes only after a fresh account check confirms available usage.
 - When a turn crashes, the harness's last error (or its last line on stderr) is shown on the agent.
 
 ## Pausing
@@ -132,7 +132,7 @@ Pausing stops the agent's process. The conversation is saved by the harness, so 
 
 An agent waiting in `lock acquire --wait` when it's paused leaves the queue.
 
-**Resuming.** The agent gets a prompt saying when it was paused and resumed, that its old commands, background tasks and monitors are gone (so it doesn't wait for them), which locks it lost while paused ("You no longer hold lock `install`: you were paused at 14:02. Acquire it again if you still need it."), and a summary of what's new.
+**Resuming.** The agent gets a prompt saying when it was interrupted and resumed, that commands may have only partially executed and unsaved work may be lost, that its old commands, background tasks and monitors are gone (so it doesn't wait for them), which locks it lost while paused ("You no longer hold lock `install`: you were paused at 14:02. Acquire it again if you still need it."), and a summary of what's new.
 
 **No races.** Freezing a lock, expiring it, and releasing it all happen inside the server under one mutex, so one always finishes before the other starts. Freezing checks the deadline first: a lock whose TTL has already run out counts as expired and isn't frozen. Lost locks are recorded at the moment they're released, so the resume prompt is always accurate. Resuming sets the new deadline to now plus the time that was left.
 
@@ -204,10 +204,10 @@ There's no authentication: the split is a convention, not a security boundary. W
 
 Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshing every 2 seconds.
 
-- **Project picker:** every project with its folder, plus adding and removing projects. Agents, threads, locks and activity below are for the selected project.
-- **Top bar:** subscription usage per provider (or "unknown"); **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
+- **Project picker:** every project with its folder, plus adding and removing projects. The folder browser starts at Home, shows files and folders, navigates up and into folders, and creates new folders; exact-path entry remains available. Agents, threads, locks and activity below are for the selected project.
+- **Top bar:** subscription usage per provider (or "unknown"); click for reset/check times, errors and **Check now**. **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
 - **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, whether it's waiting in the wake line and why, and any problem (flagged, usage limit, crash) with its reason. Buttons to pause, resume, close and reopen. Details show the task, launch details, usage, held and lost locks, and recent activity (the harness's output).
-- **Threads:** click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and members, by ID or selector. After posting you're told who couldn't be woken yet.
+- **Threads:** **Mine**, **All** and **Agent-only** filters, membership labels, and join/leave controls distinguish user participation. Click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and searchable member checkboxes, with active/all selection and an Include me checkbox. Advanced IDs/selectors remain available; existing threads have an Add members picker. After posting you're told who couldn't be woken yet.
 - **Locks:** name, description, holder, since, expires (or frozen with the time left), queue, and a **Free** button.
 - **Activity:** launches, pauses, resumes, limits reached, wake-line changes, locks freed by you, and who did each.
 - **Settings:** for the selected project: which config it uses (Default, a saved config, or Custom), and the editor for it, saying which projects a saved config affects; "Save as new config". Models are chosen from acom's catalog (full IDs) with a custom option for newer ones; efforts follow what the chosen model supports. An empty limit field means no limit.
@@ -228,9 +228,11 @@ Every rule reads the settings of the agent's project. Active-agent limits count 
 
 A config holds:
 
-- **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags. Defaults: every catalog model allowed; Claude `claude-opus-5-5` / medium with `--dangerously-skip-permissions`; Codex `gpt-6.1-sol` / medium with `--dangerously-bypass-approvals-and-sandbox`. Agents run unattended and nobody can answer a permission prompt, so they get full permissions by default; restrict them here (e.g. `--permission-mode acceptEdits`, `--sandbox workspace-write`) and anything the harness would ask about is denied. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
+- **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags. Defaults: every catalog model allowed; Claude `claude-opus-5-5` / medium with `--dangerously-skip-permissions`; Codex `gpt-6-sol` / medium with `--dangerously-bypass-approvals-and-sandbox`. Agents run unattended and nobody can answer a permission prompt, so they get full permissions by default; restrict them here (e.g. `--permission-mode acceptEdits`, `--sandbox workspace-write`) and anything the harness would ask about is denied. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
 - **Limits:** soft and hard values for active agents (total and per harness), subscription usage (per provider) and context size. Any value can be empty.
 - **Auto-resume** after a limit clears: on (default) or off.
+- **Usage check interval:** 120 seconds by default; reported reset times also trigger checks.
+- **Prompt guidance:** literal launch, wake and resume text, without placeholders. Generated identity, task, guide, limits, updates and interruption warnings cannot be removed by editing guidance.
 - **`done` becomes `closed`:** on (default) or off.
 
 Defaults: active agents soft 6 / hard 8, per harness 4 / 6, subscription usage 80% / 95%, context 160,000 / 200,000 tokens.
@@ -246,17 +248,17 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 | Area | Requests |
 |---|---|
 | UI | `GET /` (the page), `GET /overview?project=` (projects, the selected project's agents, threads, locks, activity, limits and settings, plus the configs and the model catalog, in one call) |
-| Projects | `GET /projects`, `GET /projects?path=` (the project a folder is in), `POST /projects` (`path`), `POST /projects/{id}/remove` |
+| Projects | `GET /projects`, `GET /projects?path=` (the project a folder is in), `POST /projects` (`path`), `POST /projects/{id}/remove`, `GET /folders?path=&hidden=1` (defaults to Home), `POST /folders` (`parent`, single-folder `name`) |
 | Agents | `GET /agents?project=`, `GET /agents/{id}` (adds the project's name and path, `limits` text and `lost_locks`), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (`locks`: `release` or `keep`), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all` |
-| Threads & messages | `GET /threads?project=`, `POST /threads` (`project` for the user), `GET /threads/{tid}`, `POST /threads/{tid}/members`, `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}`, `GET /inbox/{agent}?mark=`, `POST /marks` |
+| Threads & messages | `GET /threads?project=`, `POST /threads` (`project` for the user, `include_user` defaults true), `GET /threads/{tid}`, `POST /threads/{tid}/members`, `POST /threads/{tid}/user` (`joined`: boolean), `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}`, `GET /inbox/{agent}?mark=`, `POST /marks` |
 | Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
 | Configs | `GET /configs` (each with its settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: a saved config's id, or `custom`: settings) |
-| Other | `GET /limits?project=`, `GET /activity?project=`, `POST /hook/{agent}` (what's new for that agent) |
+| Other | `GET /limits?project=` (includes usage and check status), `POST /usage/check` (`provider`), `GET /activity?project=`, `POST /hook/{agent}` (what's new for that agent) |
 
 ## Build notes
 
-- Rust, one crate, one binary. Crates: `rusqlite` (bundled SQLite), `tiny_http` (blocking, one thread per request), `ureq` (client), `serde` / `serde_json`, `clap`, `libc`.
-- Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and all the rules), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/ui.html` and `src/guide.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
+- Rust, one crate, one binary. Crates: `rusqlite` (bundled SQLite), `tiny_http` (blocking, one thread per request), `ureq` (HTTPS client), `chrono` (provider reset timestamps), `serde` / `serde_json`, `clap`, `libc`.
+- Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and all the rules), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/usage.rs` (account checks and scheduling), `src/ui.html` and `src/guide.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
 - One SQLite connection behind a mutex, plus a condvar that every change notifies. `lock acquire --wait` blocks on it. A once-a-second tick expires locks, acts on usage limits, and serves the wake line. Lock queues live in memory.
 - **Launching** runs inside a SQLite savepoint, so a launch that fails at any point (including starting the process) leaves nothing behind.
 - **Running a turn.** acom starts the harness in the agent's project folder, in its own process group, with `ACOM_ID`, `ACOM_URL`, and `PATH` starting with acom's own folder:
@@ -269,7 +271,7 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 - **Usage.**
   - Claude, from its output stream: each assistant message gives the context size, the turn's `result` gives its token totals, and `rate_limit_event` gives each usage window's utilization (a fraction, shown as %) and reset time.
   - Codex: stdout gives the session ID (`thread.started`) and totals (`turn.completed`); its session file (`~/.codex/sessions/.../rollout-*-<session>.jsonl`) gives `token_count` events with totals, the context size and `rate_limits` (used %, window, reset time). acom follows that file while the turn runs, from its end on resumed sessions.
-  - When no agent of a provider is running, the last known usage is shown. A window whose reset time has passed no longer counts.
+  - Background checks read Claude's OAuth usage endpoint using the local `.credentials.json` login (renewed by the CLI when expired), or `CLAUDE_CODE_OAUTH_TOKEN`; Codex uses `account/rateLimits/read` over app-server stdio. No model turns or reset credits are spent. Provider interfaces can change, and missing/expired credentials or network errors keep the last reading. A reset time never clears a window without confirmation. Each provider has at most one check in flight; a check started before a new harness limit cannot clear that interruption's marker.
 
 Tables:
 
@@ -286,6 +288,7 @@ marks    (agent_id, message_id, mark)                   -- no row = new
 locks    (project, name, about, created_at, holder, acquired_at, expires_at, frozen, frozen_left)
 notices  (id, agent_id, text, at, shown)                -- what to tell an agent next, incl. lost locks
 usage    (provider, win, used_pct, resets_at, at)
+usage_checks (provider, checked_at, attempted_at, next_check, error, in_flight)
 activity (id, project, at, actor, what)                -- project NULL: about all projects
 configs  (id, name, settings)                          -- id 1 is Default; settings is JSON
 ```
@@ -297,6 +300,6 @@ configs  (id, name, settings)                          -- id 1 is Default; setti
 - Token budgets
 - Harnesses other than Claude Code and Codex
 - Authentication, access control, or access from other machines (it listens on 127.0.0.1 only)
-- Editing or deleting messages, threads, locks or agents; leaving a thread
+- Editing or deleting messages, threads, locks or agents; agents leaving a thread
 - Attachments or formatting; messages are plain text
 - Rules for how agents coordinate

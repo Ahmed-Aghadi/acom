@@ -51,6 +51,9 @@ pub fn serve(port: u16) {
                 if let Err(e) = app.tick() {
                     eprintln!("tick: {}", e.1);
                 }
+                if let Err(e) = crate::usage::schedule(&app) {
+                    eprintln!("usage checks: {}", e.1);
+                }
             }
         });
     }
@@ -338,12 +341,53 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 opt_int(b, "project"),
                 &text(b, "title")?,
                 &list(b, "members"),
+                b["include_user"].as_bool().unwrap_or(true),
             )?;
             J(json!({ "id": tid, "members": members }))
         }
         ("GET", ["threads", t]) => J(app.thread(id(t)?)?),
         ("POST", ["threads", t, "members"]) => {
             J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? }))
+        }
+        ("POST", ["threads", t, "user"]) => {
+            app.user_membership(
+                id(t)?,
+                b["joined"]
+                    .as_bool()
+                    .ok_or_else(|| bad("joined must be true or false"))?,
+            )?;
+            J(json!({}))
+        }
+        ("GET", ["folders"]) => J(folders(
+            q.get("path").as_deref(),
+            q.get("hidden").as_deref() == Some("1"),
+        )?),
+        ("POST", ["folders"]) => {
+            let parent =
+                std::fs::canonicalize(text(b, "parent")?).map_err(|e| bad(e.to_string()))?;
+            if parent.to_str().is_none() {
+                return Err(bad("folder path is not valid UTF-8"));
+            }
+            let name = text(b, "name")?;
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains(['/', '\\'])
+                || name.contains('\0')
+            {
+                return Err(bad("give a folder name, not a path"));
+            }
+            let path = parent.join(name);
+            std::fs::create_dir(&path).map_err(|e| bad(format!("cannot create folder: {e}")))?;
+            J(json!({"path":path}))
+        }
+        ("POST", ["usage", "check"]) => {
+            let provider = text(b, "provider")?;
+            if !crate::harness::KNOWN.contains(&provider.as_str()) {
+                return Err(bad("unknown provider"));
+            }
+            app.lock().db.execute("INSERT INTO usage_checks(provider,next_check) VALUES(?1,?2) ON CONFLICT(provider) DO UPDATE SET next_check=?2", rusqlite::params![provider,crate::app::now()])?;
+            J(json!({}))
         }
         ("POST", ["messages"]) => {
             let (mid, not_woken) = app.post(
@@ -430,6 +474,44 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
         _ => return Err(not_found(format!("no route {method} /{}", p.join("/")))),
     })
+}
+
+fn folders(path: Option<&str>, hidden: bool) -> R<Value> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| bad("home folder unavailable"))?;
+    let path = path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.clone());
+    let path = std::fs::canonicalize(path).map_err(|e| bad(format!("cannot open folder: {e}")))?;
+    if path.to_str().is_none() || home.to_str().is_none() {
+        return Err(bad(
+            "folder path is not valid UTF-8; use a UTF-8 folder name",
+        ));
+    }
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&path).map_err(|e| bad(format!("cannot list folder: {e}")))? {
+        let entry = entry.map_err(|e| bad(e.to_string()))?;
+        if entry.path().to_str().is_none() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !hidden && name.starts_with('.') {
+            continue;
+        }
+        entries.push(json!({"name":name,"path":entry.path(),"directory":entry.path().is_dir()}));
+    }
+    entries.sort_by(|a, b| {
+        b["directory"]
+            .as_bool()
+            .cmp(&a["directory"].as_bool())
+            .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+    });
+    let truncated = entries.len() > 1000;
+    entries.truncate(1000);
+    Ok(
+        json!({"path":path,"parent":path.parent(),"home":home,"entries":entries,"truncated":truncated}),
+    )
 }
 
 #[cfg(test)]

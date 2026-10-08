@@ -2,6 +2,7 @@ mod app;
 mod harness;
 mod run;
 mod server;
+mod usage;
 
 use app::{GUIDE, hhmm, who};
 use clap::{Parser, Subcommand};
@@ -560,7 +561,13 @@ fn main() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|m| m.to_string())
+                    .map(|m| {
+                        if m.as_i64() == Some(0) {
+                            "user".into()
+                        } else {
+                            m.to_string()
+                        }
+                    })
                     .collect();
                 println!(
                     "{:>3}  \"{}\" · members {} · {} messages · last {}",
@@ -587,7 +594,13 @@ fn main() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|x| x.to_string())
+                    .map(|x| {
+                        if x.as_i64() == Some(0) {
+                            "user".into()
+                        } else {
+                            x.to_string()
+                        }
+                    })
                     .collect();
                 println!("thread {} (members {})", v["id"], m.join(", "));
             }
@@ -597,7 +610,13 @@ fn main() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|x| x.to_string())
+                    .map(|x| {
+                        if x.as_i64() == Some(0) {
+                            "user".into()
+                        } else {
+                            x.to_string()
+                        }
+                    })
                     .collect();
                 println!(
                     "Thread {} \"{}\" · members {}\n",
@@ -626,7 +645,13 @@ fn main() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|x| x.to_string())
+                    .map(|x| {
+                        if x.as_i64() == Some(0) {
+                            "user".into()
+                        } else {
+                            x.to_string()
+                        }
+                    })
                     .collect();
                 println!("added {} to thread {id}", m.join(", "));
             }

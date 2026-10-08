@@ -10,8 +10,8 @@ const net = require('node:net');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
 
-async function until(check, label) {
-  const deadline = Date.now() + 10000;
+async function until(check, label, timeout = 10000) {
+  const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const result = await check();
     if (result) return result;
@@ -27,6 +27,26 @@ test('single server scopes projects, preserves settings and supervises first/res
   for (const dir of [home, bin, first, second, path.join(first, 'child')]) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(bin, 'codex'), `#!${process.execPath}
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+if (process.argv[2] === 'app-server') {
+  let buffer=''; process.stdin.setEncoding('utf8');
+  process.stdin.on('data',chunk=>{
+    buffer+=chunk; let i;
+    while((i=buffer.indexOf('\\n'))>=0) {
+      const line=buffer.slice(0,i); buffer=buffer.slice(i+1); const request=JSON.parse(line);
+      if(request.method==='initialize') console.log(JSON.stringify({id:request.id,result:{}}));
+      if(request.method==='account/rateLimits/read') {
+        fs.appendFileSync(path.join(process.env.ACOM_HOME,'checks.jsonl'),JSON.stringify({at:Date.now()})+'\\n');
+        const file=path.join(process.env.ACOM_HOME,'subscription.json');
+        const value=fs.existsSync(file) ? JSON.parse(fs.readFileSync(file)) : {rateLimits:{primary:{usedPercent:0,resetsAt:Math.floor(Date.now()/1000)+3600}}};
+        if(value.hang) {
+          const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore','inherit','inherit']});
+          fs.writeFileSync(path.join(process.env.ACOM_HOME,'usage-child-pid'),String(child.pid)); return;
+        }
+        console.log(JSON.stringify({id:request.id,result:value}));
+      }
+    }
+  });
+} else {
 let prompt = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => prompt += chunk);
@@ -37,18 +57,21 @@ process.stdin.on('end', async () => {
   console.log(JSON.stringify({ type: 'thread.started', thread_id: resume ? args.at(-2) : crypto.randomUUID() }));
   if (prompt.includes('REROUTE_TEST') && !resume) console.log(JSON.stringify({ type: 'model_reroute', from_model: 'gpt-6.1-sol', to_model: 'gpt-other', reason: 'high_risk_cyber_activity' }));
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
+  if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
+  if (prompt.includes('UNSUPPORTED_TEST')) { console.log(JSON.stringify({type:'turn.failed',error:{message:JSON.stringify({error:{message:"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}})}})); process.exitCode=1;return; }
   await fetch(process.env.ACOM_URL + '/hook/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   await new Promise(resolve => setTimeout(resolve, 2000));
   await fetch(process.env.ACOM_URL + '/agents/' + id + '/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }));
 });
+}
 `, { mode: 0o755 });
   const probe = net.createServer();
   await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   const port = probe.address().port;
   await new Promise(resolve => probe.close(resolve));
   const url = `http://127.0.0.1:${port}`;
-  const env = { ...process.env, ACOM_HOME: home, PATH: `${bin}:${process.env.PATH}` };
+  const env = { ...process.env, ACOM_HOME: home, CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: `${bin}:${process.env.PATH}` };
   delete env.ACOM_ID; delete env.ACOM_URL;
   let server, stderr = '';
   const start = async () => {
@@ -83,6 +106,24 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', '/overview')).project, null);
     await api('POST', '/agents', { harness: 'codex', task: 'Missing project' }, 400);
     const defaults = (await api('GET', '/configs'))[0].settings;
+    assert.equal(defaults.harnesses.codex.model,'gpt-6-sol');
+    defaults.prompts={launch:'Literal {task} launch',wake:'Literal {updates} wake',resume:'Literal {updates} resume'};
+    await api('PUT','/configs/1',{settings:defaults});
+    const folder = await api('GET', '/folders');
+    assert.equal(folder.path, fs.realpathSync(os.homedir()));
+    fs.writeFileSync(path.join(first,'visible.txt'),'file listing, not file contents');
+    fs.writeFileSync(path.join(first,'.hidden'),'hidden');
+    const listing=await api('GET',`/folders?path=${encodeURIComponent(first)}`);
+    assert.equal(listing.entries[0].directory,true);
+    assert.ok(listing.entries.some(e=>e.name==='visible.txt' && !e.directory));
+    assert.ok(!listing.entries.some(e=>e.name==='.hidden'));
+    assert.ok((await api('GET',`/folders?path=${encodeURIComponent(first)}&hidden=1`)).entries.some(e=>e.name==='.hidden'));
+    for(const name of ['', '.', '..', '../escape','x/y','x\\y']) await api('POST','/folders',{parent:first,name},400);
+    const made=await api('POST','/folders',{parent:first,name:'new folder'});
+    assert.equal(made.path,path.join(first,'new folder'));
+    await api('POST','/folders',{parent:first,name:'new folder'},400);
+    await api('GET',`/folders?path=${encodeURIComponent(path.join(first,'visible.txt'))}`,null,400);
+    await api('POST','/usage/check',{provider:'unknown'},400);
     assert.equal(defaults.done_closes, true);
     assert.deepEqual(defaults.harnesses.codex.flags, ['--dangerously-bypass-approvals-and-sandbox']);
     assert.deepEqual(defaults.harnesses.claude.flags, ['--dangerously-skip-permissions']);
@@ -105,6 +146,7 @@ process.stdin.on('end', async () => {
       assert.ok(run.args.includes('--dangerously-bypass-approvals-and-sandbox'));
       assert.ok(run.args.includes('--skip-git-repo-check'));
       assert.match(run.prompt, /only the user's messages wake/);
+      assert.match(run.prompt,/Literal \{task\} launch/);
     }
     assert.deepEqual((await api('GET', `/overview?project=${a.id}`)).agents.map(x => x.id), [one.id]);
     assert.deepEqual((await api('GET', `/overview?project=${b.id}`)).agents.map(x => x.id), [two.id]);
@@ -123,6 +165,7 @@ process.stdin.on('end', async () => {
     await api('POST', '/messages', { thread: thread.id, text: 'User wake' });
     await until(() => runs().filter(r => r.id === one.id).length === 2, 'resumed turn');
     assert.equal(runs().filter(r => r.id === one.id)[1].resume, true);
+    assert.match(runs().filter(r=>r.id===one.id)[1].prompt,/Literal \{updates\} wake/);
     assert.ok(runs().filter(r => r.id === one.id)[1].args.includes('--dangerously-bypass-approvals-and-sandbox'));
     await finished(one.id);
     assert.equal((await api('GET', `/locks?project=${a.id}`))[0].holder, null);
@@ -141,6 +184,49 @@ process.stdin.on('end', async () => {
       await finished(flagged.id);
       assert.equal((await api('GET', `/agents/${flagged.id}`)).problem, null);
     }
+    const rejected=await api('POST','/agents',{project:a.id,harness:'codex',model:'gpt-6.1-sol',task:'UNSUPPORTED_TEST'});
+    await until(async()=>(await api('GET',`/agents/${rejected.id}`)).state==='crashed','unsupported model error');
+    assert.match((await api('GET',`/agents/${rejected.id}`)).problem,/^The 'gpt-6.1-sol' model is not supported/);
+    const noCap=structuredClone(defaults); noCap.limits.usage.codex={soft:null,hard:null}; noCap.auto_resume=false; noCap.usage_poll_secs=15;
+    await api('PUT','/configs/1',{settings:noCap});
+    const quota=(used,reset)=>({rateLimits:{primary:{usedPercent:used,resetsAt:reset}}});
+    const subscription=path.join(home,'subscription.json');
+    const resetAt=Math.floor(Date.now()/1000)+2;
+    fs.writeFileSync(subscription,JSON.stringify(quota(100,resetAt)));
+    const exhausted=await api('POST','/agents',{project:a.id,harness:'codex',task:'LIMIT_TEST'});
+    await until(async()=>(await api('GET',`/agents/${exhausted.id}`)).pause_reason==='limit','harness subscription pause with no hard cap');
+    await new Promise(resolve=>setTimeout(resolve,3200));
+    assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
+    const checks=fs.readFileSync(path.join(home,'checks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+    assert.ok(checks.some(c=>c.at>=resetAt*1000 && c.at<=(resetAt+2)*1000),'provider-reported reset gets an immediate check, not the periodic delay');
+    noCap.usage_poll_secs=3600; await api('PUT','/configs/1',{settings:noCap});
+    fs.writeFileSync(subscription,JSON.stringify({hang:true})); await api('POST','/usage/check',{provider:'codex'});
+    await until(async()=>(await api('GET',`/limits?project=${a.id}`)).checks.some(c=>c.provider==='codex'&&c.error?.includes('timed out')),'a stalled usage probe times out',20000);
+    assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
+    if(os.platform()==='linux') {
+      const child=Number(fs.readFileSync(path.join(home,'usage-child-pid'),'utf8'));
+      await until(()=> !fs.existsSync(`/proc/${child}/stat`) || fs.readFileSync(`/proc/${child}/stat`,'utf8').includes(') Z '),'usage probe descendants stop too');
+    }
+    fs.writeFileSync(subscription,'{}'); await api('POST','/usage/check',{provider:'codex'});
+    await until(async()=>(await api('GET',`/limits?project=${a.id}`)).checks.some(c=>c.provider==='codex'&&c.error),'unknown status does not clear quota');
+    assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
+    noCap.usage_poll_secs=15; await api('PUT','/configs/1',{settings:noCap});
+    fs.writeFileSync(subscription,JSON.stringify(quota(0,Math.floor(Date.now()/1000)+3600)));
+    await until(async()=>(await api('GET',`/limits?project=${a.id}`)).usage.filter(u=>u.provider==='codex').every(u=>u.used_pct===0),'periodic checks discover an early reset',20000);
+    assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused','auto-resume is off');
+    noCap.auto_resume=true; await api('PUT','/configs/1',{settings:noCap});
+    await until(()=>runs().filter(r=>r.id===exhausted.id).length===2,'automatic same-session recovery');
+    const recovery=runs().filter(r=>r.id===exhausted.id)[1];
+    assert.ok(recovery.resume); assert.match(recovery.prompt,/Commands may have only partially executed/);
+    assert.match(recovery.prompt,/Literal \{updates\} resume/);
+    await finished(exhausted.id); await api('PUT','/configs/1',{settings:defaults});
+    const solo=await api('POST','/threads',{project:a.id,title:'User notes',members:[]});
+    assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[0]);
+    assert.match(cli(first,['thread','read',String(solo.id)]),/user/);
+    await api('POST',`/threads/${solo.id}/user`,{joined:false});
+    assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[]);
+    await api('POST','/messages',{thread:solo.id,text:'Posting joins me again'});
+    assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[0]);
     await api('GET', '/settings', null, 404);
     await api('POST', '/configs/1/remove', {}, 409);
     await api('POST', '/configs', { name: '  ', settings: defaults }, 400);
@@ -238,11 +324,47 @@ async function browserChecks(url, api, first, second, defaults) {
     await page.waitForFunction(() => document.querySelector('#toast').classList.contains('error'));
     assert.match(await page.locator('#toast').textContent(), /missing/);
     await page.locator('[data-close="project-dialog"]').click();
-    await add(first); await add(second);
+    await page.locator('[data-open="project-dialog"]').click();
+    await page.locator('#project-form [name=path]').fill('');
+    await page.locator('#browse-project').click();
+    await page.waitForFunction(p=>document.querySelector('#folder-path').textContent===p,fs.realpathSync(os.homedir()));
+    await page.locator('[data-close=folder-dialog]').click();
+    await page.locator('#project-form [name=path]').fill(first);
+    await page.locator('#browse-project').click();
+    await page.waitForFunction(p=>document.querySelector('#folder-path').textContent===p,first);
+    assert.match(await page.locator('#folder-list').textContent(),/visible.txt/);
+    await page.locator('#folder-form [name=name]').fill('browser folder');
+    await page.locator('#folder-form [type=submit]').click();
+    await page.waitForFunction(p=>document.querySelector('#folder-path').textContent===p,path.join(first,'browser folder'));
+    assert.ok(fs.statSync(path.join(first,'browser folder')).isDirectory());
+    await page.locator('#folder-up').click();
+    await page.waitForFunction(p=>document.querySelector('#folder-path').textContent===p,first);
+    await page.locator('#folder-use').click();
+    await page.locator('#project-form button.primary').click();
+    await page.waitForFunction(()=>!document.querySelector('#project-dialog').open);
+    await add(second);
     const projects = await api('GET', '/projects');
     const firstId = projects.find(p => p.path === first).id;
     const secondId = projects.find(p => p.path === second).id;
     assert.equal(await page.locator('#project-path').textContent(), second);
+    await page.locator('[data-page=threads]').click();
+    await page.locator('[data-open=thread-dialog]').click();
+    await page.locator('#thread-form [name=title]').fill('Browser notes');
+    await page.locator('#thread-form button.primary').click();
+    await page.locator('#thread-membership').waitFor();
+    assert.equal(await page.locator('#thread-membership').textContent(),'Leave thread');
+    await page.locator('#thread-membership').click();
+    await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread');
+    assert.equal(await page.locator('[data-thread]').count(),0);
+    await page.locator('[data-thread-filter=all]').click();
+    assert.equal(await page.locator('[data-thread]').count(),1);
+    await page.locator('#thread-membership').click();
+    await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Leave thread');
+    await page.locator('[data-usage=codex]').click();
+    await page.locator('[data-check-usage=codex]').click();
+    await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Usage check scheduled');
+    await page.locator('#usage-dialog button').filter({hasText:'Close'}).click();
+    await page.locator('[data-page=overview]').click();
     await api('POST', '/locks', { project: firstId, name: 'only-first', about: 'Project scope' });
     await page.locator('#project-select').selectOption(String(firstId));
     await page.locator('#locks code').waitFor();
@@ -264,9 +386,15 @@ async function browserChecks(url, api, first, second, defaults) {
     await cfg.locator('[name=model]').selectOption('custom-next');
     const active = page.locator('[data-limit=active]');
     await active.locator('[name=soft]').fill('');
+    await page.locator('[data-prompt-editor] summary').click();
+    const guidance='Literal {task} {updates} <tag> $HOME';
+    await page.locator('[name=prompt_resume]').fill(guidance);
+    await page.locator('[name=usage_poll_secs]').fill('45');
     await page.locator('[form=settings-form]').click();
     await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
     assert.equal((await api('GET', '/configs'))[0].settings.limits.active.soft, null);
+    assert.equal((await api('GET', '/configs'))[0].settings.prompts.resume,guidance);
+    assert.equal((await api('GET', '/configs'))[0].settings.usage_poll_secs,45);
     await page.reload();
     await page.locator('[data-page=settings]').click();
     await cfg.locator('[name=model] option[value=custom-next]').waitFor({ state: 'attached' });

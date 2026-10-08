@@ -317,14 +317,15 @@ fn claude_events(v: &Value) -> Vec<Event> {
             }
             // Rejected means that window is used up until it resets.
             if info["status"] == "rejected" {
+                let window = info["rateLimitType"].as_str().unwrap_or("limit");
                 out.push(Event::Usage {
-                    win: info["rateLimitType"]
-                        .as_str()
-                        .unwrap_or("limit")
-                        .to_string(),
+                    win: window.to_string(),
                     used_pct: 100.0,
                     resets_at: info["resetsAt"].as_i64(),
                 });
+                out.push(Event::LimitHit(format!(
+                    "Claude subscription window {window} exhausted"
+                )));
             }
         }
         _ => {}
@@ -483,9 +484,21 @@ fn codex_events(v: &Value) -> Vec<Event> {
             .as_str()
             .or(event["error"].as_str())
             .unwrap_or("Codex error");
+        // exec sometimes embeds the API error as a JSON string inside message.
+        let nested = serde_json::from_str::<Value>(message).ok();
+        let message = nested
+            .as_ref()
+            .and_then(|v| v.pointer("/error/message").or(v.get("message")))
+            .and_then(Value::as_str)
+            .unwrap_or(message);
         let code = error["code"]
             .as_str()
             .or(event["codex_error_info"].as_str())
+            .or(error["codexErrorInfo"].as_str())
+            .or(nested
+                .as_ref()
+                .and_then(|v| v.pointer("/error/code"))
+                .and_then(Value::as_str))
             .unwrap_or("");
         let mut out = vec![Event::Text(format!("error: {}", short(message, 300)))];
         // Match error frames only, never user/tool text or an assistant merely
@@ -502,7 +515,10 @@ fn codex_events(v: &Value) -> Vec<Event> {
             out.push(Event::Flagged(short(message, 300)));
         } else if matches!(
             code,
-            "usage_limit_reached" | "rate_limit_exceeded" | "insufficient_quota"
+            "usage_limit_reached"
+                | "rate_limit_exceeded"
+                | "insufficient_quota"
+                | "UsageLimitExceeded"
         ) || lower.contains("usage limit")
             || lower.contains("rate limit")
             || lower.contains("quota exceeded")
@@ -680,6 +696,11 @@ mod tests {
             &parse_line("claude", rejected)[0],
             Event::Usage { used_pct, resets_at: Some(99), .. } if *used_pct == 100.0
         ));
+        assert!(
+            parse_line("claude", rejected)
+                .iter()
+                .any(|e| matches!(e, Event::LimitHit(_)))
+        );
     }
 
     #[test]
@@ -967,5 +988,21 @@ mod tests {
             r#"{"type":"response.completed","response":{"model":"gpt-6-sol"}}"#,
         );
         assert!(matches!(&events[0], Event::Model(m) if m == "gpt-6-sol"));
+    }
+
+    #[test]
+    fn codex_unwraps_account_model_errors_without_treating_them_as_limits_or_flags() {
+        let events = parse_line("codex", &serde_json::json!({"type":"turn.failed","error":{"message":serde_json::json!({"error":{"message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}).to_string()}}).to_string());
+        assert!(matches!(&events[0],Event::Text(t) if t.starts_with("error: The 'gpt-6.1-sol'")));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::LimitHit(_) | Event::Flagged(_)))
+        );
+        let events = parse_line(
+            "codex",
+            r#"{"type":"turn.failed","error":{"codexErrorInfo":"UsageLimitExceeded","message":"Account blocked"}}"#,
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::LimitHit(_))));
     }
 }

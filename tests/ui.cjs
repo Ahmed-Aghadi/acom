@@ -21,12 +21,15 @@ function settings() {
     }])),
     limits: { active: { soft: 6, hard: 8 }, active_per_harness: {}, usage: {}, context: { soft: null, hard: 200000 } },
     auto_resume: true, done_closes: true,
+    usage_poll_secs: 120,
+    prompts: { launch:'Launch guidance', wake:'Wake guidance', resume:'Resume guidance' },
   };
 }
 
 async function fixture(run) {
   const data = { settings: settings(), agents: [], threads: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 1 }, { id: 2, name: 'other', path: '/projects/other', config: 1 }], requests: [], hardLimit: false };
   data.configs = [{ id: 1, name: 'Default', settings: data.settings }];
+  data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
   const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
   const server = http.createServer(async (req, res) => {
@@ -44,8 +47,21 @@ async function fixture(run) {
       const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
       const project = data.projects.find(p => p.id === id) || data.projects[0] || null;
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
-      return send({ ...data, configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
+      return send({ ...data, configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: data.usage || [], checks:data.checks || [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
     }
+    if(req.url.startsWith('/folders')) {
+      if(req.method==='GET') {
+        const p=new URL(req.url,'http://localhost').searchParams.get('path') || '/home/example';
+        if(!data.folders[p]) {res.statusCode=400;return send({error:'Cannot open folder'});}
+        return send(data.folders[p]);
+      }
+      if(!body.name || body.name.includes('/') || body.name==='..') {res.statusCode=400;return send({error:'Give a folder name, not a path'});}
+      const p=body.parent+'/'+body.name;
+      data.folders[p]={path:p,parent:body.parent,home:'/home/example',entries:[]};
+      data.folders[body.parent].entries.push({name:body.name,path:p,directory:true});
+      return send({path:p});
+    }
+    if(req.url==='/usage/check') return send({});
     if (req.url === '/projects') {
       const p = { id: Math.max(0, ...data.projects.map(p => p.id)) + 1, path: body.path, name: body.path.split('/').at(-1), config: 1 };
       data.projects.push(p);
@@ -81,13 +97,19 @@ async function fixture(run) {
       return send({ id: 1, warnings: [] });
     }
     if (req.url === '/threads') {
-      const t = { id: data.threads.length + 1, ...body, messages: [] };
+      const t = { id: data.threads.length + 1, ...body, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
       data.threads.push(t);
       return send({ id: t.id });
     }
-    if (req.url.startsWith('/threads/')) return send(data.threads.find(t => t.id === Number(req.url.split('/')[2])));
+    if (req.url.startsWith('/threads/')) {
+      const t=data.threads.find(t=>t.id===Number(req.url.split('/')[2]));
+      if(req.url.endsWith('/user')) t.members=body.joined ? [...new Set([0,...t.members])] : t.members.filter(id=>id!==0);
+      if(req.url.endsWith('/members')) t.members=[...new Set([...t.members,...body.members])];
+      return send(t);
+    }
     if (req.url === '/messages') {
       const t = data.threads.find(t => t.id === body.thread);
+      t.members=[...new Set([0,...t.members])];
       t.messages.push({ id: t.messages.length + 1, sender: 0, at: Date.now() / 1000, text: body.text });
       return send({});
     }
@@ -149,11 +171,12 @@ test('thread creation resets the form and opens a working composer', async () =>
   await page.locator('[data-page="threads"]').click();
   await page.locator('[data-open="thread-dialog"]').click();
   await page.locator('#thread-form [name=title]').fill('Review');
+  await page.locator('#thread-form details summary').click();
   await page.locator('#thread-form [name=members]').fill('1, group:review');
   await page.locator('#thread-form button.primary').click();
   await page.locator('#message-form').waitFor();
   assert.equal(await page.locator('#thread-form [name=title]').inputValue(), '');
-  assert.deepEqual(data.threads[0].members, ['1', 'group:review']);
+  assert.deepEqual(data.threads[0].members, [0, '1', 'group:review']);
   await page.locator('#message-form textarea').fill('Check the fix');
   await page.locator('#message-form button').click();
   await page.locator('.message-text').waitFor();
@@ -209,6 +232,7 @@ test('project switching isolates threads; launch can target a different project'
   data.threads.push({ id: 1, project: 1, title: 'First project', members: [], messages: [] });
   await page.reload();
   await page.locator('[data-page="threads"]').click();
+  await page.locator('[data-thread-filter=all]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form').waitFor();
   await page.locator('#project-select').selectOption('2');
@@ -483,4 +507,135 @@ test('polling cannot unlock project controls during a settings save', async () =
   assert.equal(await page.locator('#project-select').isEnabled(), true);
   assert.equal(data.projects[0].config, 1);
   assert.equal(data.settings.limits.active.hard, 9);
+}));
+
+test('folder browsing starts at home, navigates, creates and chooses a new folder', async () => fixture(async (page,data)=> {
+  await page.locator('[data-open=project-dialog]').click();
+  await page.locator('#browse-project').click();
+  await page.waitForFunction(()=>document.querySelector('#folder-path').textContent==='/home/example');
+  assert.match(await page.locator('#folder-list').textContent(),/note.txt.*File/);
+  await page.locator('[data-folder="/home/example/work"]').click();
+  await page.waitForFunction(()=>document.querySelector('#folder-path').textContent==='/home/example/work');
+  await page.locator('#folder-form [name=name]').fill('../unsafe');
+  await page.locator('#folder-form [type=submit]').click();
+  await page.waitForFunction(()=>document.querySelector('#folder-error').textContent.includes('not a path'));
+  await page.locator('#folder-form [name=name]').fill('new project');
+  await page.locator('#folder-form [type=submit]').click();
+  await page.waitForFunction(()=>document.querySelector('#folder-path').textContent.endsWith('/new project'));
+  await page.locator('#folder-use').click();
+  assert.equal(await page.locator('#project-form [name=path]').inputValue(),'/home/example/work/new project');
+  await page.locator('#project-form button.primary').click();
+  await page.waitForFunction(()=>!document.querySelector('#project-dialog').open);
+  assert.equal(data.projects.at(-1).path,'/home/example/work/new project');
+}));
+
+test('thread member picker is searchable and supports active/all selections without typing IDs',async()=>fixture(async(page,data)=> {
+  data.agents=[{id:1,project:1,name:'Reviewer',state:'working',harness:'codex',model:'gpt-6-luna'}, {id:2,project:1,name:'Writer',state:'paused',harness:'claude',model:'claude-sonnet-5-5'}];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('#thread-form [name=title]').fill('Easy members');
+  await page.locator('[data-member-pick=active]').click();
+  assert.equal(await page.locator('[name=member][value="1"]').isChecked(),true);
+  assert.equal(await page.locator('[name=member][value="2"]').isChecked(),false);
+  await page.locator('[data-member-search]').fill('Writer');
+  assert.equal(await page.locator('[data-member-row]').filter({hasText:'Reviewer'}).isVisible(),false);
+  await page.locator('[name=member][value="2"]').check();
+  await page.locator('#thread-form button.primary').click();
+  await page.locator('#message-form').waitFor();
+  assert.deepEqual(data.requests.find(r=>r.url==='/threads').body.members,['1','2']);
+  assert.equal(data.requests.find(r=>r.url==='/threads').body.include_user,true);
+}));
+
+test('thread filters distinguish participation; joining, leaving and adding members work',async()=>fixture(async(page,data)=> {
+  data.agents=[{id:1,project:1,name:'One',state:'idle'},{id:2,project:1,name:'Two',state:'paused'}];
+  data.threads=[{id:1,project:1,title:'Mine',members:[0,1],messages:[]},{id:2,project:1,title:'Agents talking',members:[1],messages:[]}];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('[data-thread]').count(),1);
+  await page.locator('[data-thread-filter=all]').click();
+  assert.equal(await page.locator('[data-thread]').count(),2);
+  await page.locator('[data-thread="2"]').click();
+  await page.locator('#thread-membership').waitFor();
+  assert.equal(await page.locator('#thread-membership').textContent(),'Join thread');
+  await page.locator('#thread-membership').click();
+  await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Leave thread');
+  assert.ok(data.threads[1].members.includes(0));
+  await page.locator('#add-thread-members').click();
+  assert.equal(await page.locator('#add-member-picker [name=member]').count(),1);
+  await page.locator('#add-member-picker [name=member]').check();
+  await page.locator('#members-form button.primary').click();
+  await page.waitForFunction(()=>!document.querySelector('#members-dialog').open);
+  assert.ok(data.threads[1].members.includes('2'));
+  await page.locator('#thread-membership').click();
+  await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread');
+  await page.locator('[data-thread-filter=agents]').click();
+  assert.equal(await page.locator('[data-thread]').count(),1);
+}));
+
+test('prompt guidance is literal and polling/recovery settings persist in configs',async()=>fixture(async(page,data)=> {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('[data-prompt-editor] summary').click();
+  const text='Keep {task}, {updates}, $HOME and <tag> literal.';
+  await page.locator('[name=prompt_resume]').fill(text);
+  await page.locator('[name=usage_poll_secs]').fill('45');
+  await page.locator('[name=auto_resume]').uncheck();
+  await saveSettings(page); await page.reload(); await page.locator('[data-page=settings]').click();
+  await page.locator('[data-prompt-editor] summary').click();
+  assert.equal(await page.locator('[name=prompt_resume]').inputValue(),text);
+  assert.equal(data.settings.prompts.resume,text);
+  assert.equal(await page.locator('[name=usage_poll_secs]').inputValue(),'45');
+  assert.equal(await page.locator('[name=auto_resume]').isChecked(),false);
+}));
+
+test('usage details show expired readings as unconfirmed and offer a status check',async()=>fixture(async(page,data)=> {
+  data.settings.limits.usage={codex:{soft:null,hard:null}};
+  data.usage=[{provider:'codex',win:'primary',used_pct:100,resets_at:Math.floor(Date.now()/1000)-60}];
+  data.checks=[{provider:'codex',checked_at:1,next_check:Math.floor(Date.now()/1000)+30,error:'Provider unavailable'}];
+  await page.reload(); await page.locator('[data-usage=codex]').click();
+  assert.match(await page.locator('#usage-details').textContent(),/100%.*awaiting confirmation/s);
+  assert.match(await page.locator('#usage-details').textContent(),/Provider unavailable/);
+  await page.locator('[data-check-usage=codex]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Usage check scheduled');
+  assert.equal(data.requests.at(-1).url,'/usage/check');
+}));
+
+test('a previously rejected model has an explicit warning and no silent replacement',async()=>fixture(async(page,data)=> {
+  data.agents=[{id:1,project:1,state:'crashed',harness:'codex',model:'gpt-6.1-sol',problem:'Model not supported with this account'}];
+  await page.reload(); await openLaunch(page); await page.locator('#launch-harness').selectOption('codex');
+  assert.equal(await page.locator('#launch-model').inputValue(),'gpt-6.1-sol');
+  assert.match(await page.locator('#launch-model-warning').textContent(),/previously rejected/);
+  await page.locator('#launch-model').selectOption('gpt-6-luna');
+  assert.equal(await page.locator('#launch-model-warning').isHidden(),true);
+  assert.equal(data.requests.length,0);
+}));
+
+test('model errors offer an explicit alternative launch while retaining the original agent',async()=>fixture(async(page,data)=> {
+  data.agents=[{id:1,project:1,name:'Unavailable',state:'crashed',harness:'codex',model:'gpt-6.1-sol',task:'Original task',problem:'Model not supported with this account'}];
+  await page.reload();
+  assert.equal(await page.locator('[data-action=resume]').textContent(),'Retry same model');
+  await page.locator('[data-action=another-model]').click();
+  assert.equal(await page.locator('#launch-form [name=task]').inputValue(),'Original task');
+  assert.equal(await page.locator('#launch-harness').inputValue(),'codex');
+  await page.locator('#launch-model').selectOption('gpt-6-luna');
+  await page.locator('#launch-form button.primary').click();
+  await page.waitForFunction(()=>!document.querySelector('#launch-dialog').open);
+  assert.equal(data.requests.at(-1).body.model,'gpt-6-luna');
+  assert.equal(data.agents[0].model,'gpt-6.1-sol');
+}));
+
+test('cancelling member selection preserves a draft only within its project',async()=>fixture(async(page,data)=> {
+  data.agents=[{id:1,project:1,name:'First',state:'working'},{id:2,project:2,name:'Second',state:'idle'}];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('[name=member][value="1"]').check();
+  await page.locator('[name=include_user]').uncheck();
+  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('[data-open=thread-dialog]').click();
+  assert.equal(await page.locator('[name=member][value="1"]').isChecked(),true);
+  assert.equal(await page.locator('[name=include_user]').isChecked(),false);
+  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
+  await page.locator('[data-open=thread-dialog]').click();
+  assert.equal(await page.locator('[name=member][value="2"]').isChecked(),false);
+  assert.equal(await page.locator('[name=include_user]').isChecked(),true);
 }));
