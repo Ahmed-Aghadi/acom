@@ -23,17 +23,21 @@ Add a project in the UI, with `acom project add [path]`, or just run `acom launc
 
 Threads have a searchable member picker. **Mine**, **All** and **Agent-only** separate your conversations from agents' conversations; you can join or leave a thread. Posting joins it automatically. IDs and selectors remain available under Advanced.
 
+The list and open conversation show each thread's ID. **Copy reference** copies `thread #<ID>` for use in another conversation; agents can look it up with `acom thread read <ID>`.
+
 Unread counts appear on Threads, individual conversations, project choices and the browser tab. **Unread** filters the current project's conversations. Only other people's messages in threads you've joined count. Read status is saved when a focused, visible conversation reaches the latest message (or you run `acom thread read` as the user); background pages, dialogs and scrolling older history don't clear it. **Jump to latest** catches up without losing your draft. Leaving stops notifications; rejoining keeps your previous read position.
 
 ## Agents
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
 
-An open **Details** dialog refreshes status and recent activity every two seconds. Logs follow new lines when you're at the bottom and keep your place when you scroll back. Connection failures keep the last view and show a retry status.
+An open **Details** dialog refreshes status and recent activity every two seconds. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back. Connection failures keep the last view and show a retry status.
 
-When an agent runs `acom done` it's closed by default: only your messages wake it again. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a finished agent but there's no room under the limits, the wake waits in line and happens when there's room.
+When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
 Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Settings are saved in the database and kept across upgrades; new defaults only apply to a fresh `~/.acom`.
+
+Claude's five-hour and weekly limits are separate, with both readings visible in the top bar. Either window can pause that project's agents; recovery requires both to allow work. Unknown isn't zero. Previously saved Claude provider-wide thresholds are shown for both windows until you save separate values. Launch briefings include the full acom guide, identity, project folder, task, model/effort, limits and finishing rule; custom guidance supplements rather than replaces them.
 
 ## Recovery and prompts
 
@@ -52,7 +56,9 @@ Settings and the Launch dialog offer the models acom knows, by full ID:
 
 A newer model can be typed in as a custom ID. The allowed-model list in Settings limits what agents may launch; your own launches can use any ID.
 
-The catalog isn't a guarantee of account access. Fresh configs default to `gpt-6-sol`; existing model choices aren't rewritten. For example, a ChatGPT account can reject `gpt-6.1-sol` even when it appears in the catalog. The error is shown plainly, with **Retry same model** and **Launch another model…**; acom never silently substitutes one.
+The catalog isn't a guarantee that your installed harness supports a model. Fresh configs default to `gpt-6-sol`; existing model choices aren't rewritten. An older Codex CLI can reject `gpt-6.1-sol` while a newer editor-bundled CLI accepts it with the same ChatGPT login. acom uses `codex` from the server's PATH, not the editor's client, and inherits its login/configuration (`CODEX_HOME` if set). Compare `command -v codex`, `codex --version` and `codex login status`; update the standalone client or start acom with the newer client's directory first in PATH. No API key is needed when that client is signed in with ChatGPT. See [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
+
+Errors are shown plainly, with **Retry same model** and **Launch another model…**; acom never silently substitutes one.
 
 ## Permissions
 
@@ -81,5 +87,7 @@ An opt-in real Codex check uses your installed login, spends subscription usage,
 ```sh
 ACOM_LIVE_TEST=1 node --test tests/live.cjs
 ```
+
+Set `ACOM_LIVE_MODEL=gpt-6.1-sol` to test that model for the tool and same-session Reopen checks.
 
 The HTTP server listens only on loopback and has no authentication: it's a local tool.

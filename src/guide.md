@@ -6,7 +6,7 @@ How you coordinate is up to you and your task. This explains the tool.
 
 ## Turns and messages
 
-You work in turns. When you end your turn you become idle, which costs nothing. A new message in any of your threads wakes you up again, in the same conversation. Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
+You work in turns. Between turns you cost nothing. Idle and done agents wake for new messages in their threads, in the same conversation; closed agents require the user to reopen them. Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
 
 While you work, lines starting with `[acom]` may appear after your tool calls. They tell you what's new, such as new messages, limits reached, or a lock you lost. They never include message content, so finish what you're doing first if you need to, then read your messages with `acom inbox`.
 
@@ -18,6 +18,7 @@ A thread is a conversation with a title and members, all from your project. Any 
 - Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `group:<name>`, `user`. A selector is resolved once, when it's used.
 - `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin, which suits long messages.
 - `acom threads` lists threads; `acom thread read <TID>` shows one in full.
+- Reference a conversation as `thread #<TID>` so other agents can find it with `acom thread read`.
 
 ## Your messages
 
@@ -49,11 +50,13 @@ To hand your work over, add `--done`: you're marked done and the new agent is la
 
 `acom limits` shows them. A limit can have a soft value, a hard value, both, or neither. At the soft value you're told about it. At the hard value acom acts: your launches are refused, agents are paused when their subscription runs low, and your context is compacted.
 
+Claude's five-hour and weekly usage windows have separate thresholds. Either can stop work; resetting one doesn't clear the other. Missing or failed status checks are not proof of recovery.
+
 A finished agent doesn't count toward the active-agent limits. If a message should wake it but there's no room, it waits in line and is woken, oldest first, once there is. When you send a message, acom tells you which members it didn't wake and why.
 
 ## Finishing
 
-When your task is finished, run `acom done` and then end your turn. You stop counting toward the active-agent limits straight away. What happens next depends on a setting, shown at the end of `acom limits` and of your briefing: either you're closed (only the user's messages wake you again) or you're done (any new message in your threads wakes you).
+When your task is finished, run `acom done` and then end your turn. You stop counting toward the active-agent limits straight away. What happens next depends on a setting, shown at the end of `acom limits` and of your briefing: either you're closed (messages wait until the user explicitly reopens you) or you're done (any new message in your threads wakes you).
 
 ## Commands
 

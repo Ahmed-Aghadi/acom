@@ -23,12 +23,12 @@
     body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
     button, input, select, textarea { font: inherit; }
     button { cursor: pointer; }
-    .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 18px; padding: 14px 24px; border-bottom: 1px solid var(--line); background: rgba(255,254,250,.94); backdrop-filter: blur(12px); }
+    .top { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 18px; padding: 14px 24px; border-bottom: 1px solid var(--line); background: rgba(255,254,250,.94); backdrop-filter: blur(12px); }
     .brand { font: 700 21px/1 ui-monospace, monospace; letter-spacing: -.5px; }
     .live { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #419176; box-shadow: 0 0 0 3px #dfeee9; }
     .dot.off { background: var(--danger); box-shadow: 0 0 0 3px #f4dfdd; }
-    .usage { display: flex; gap: 14px; margin-left: auto; }
+    .usage { display: flex; flex-wrap: wrap; gap: 14px; margin-left: auto; }
     .meter { width: 132px; }
     button.meter { text-align: left; background: transparent; border: 0; padding: 0; }
     .folder-list, .member-list { max-height: 280px; overflow: auto; margin: 12px 0; border: 1px solid var(--line); border-radius: 7px; }
@@ -391,24 +391,33 @@
       const root = $('#usage');
       const usages = state.limits?.usage || [];
       const limits = state.limits?.limits?.usage || {};
-      const providers = [...new Set([...Object.keys(state.catalog),...Object.keys(limits),...usages.map(u=>u.provider)])];
-      root.innerHTML = providers.map(provider => {
+      const windows = [
+        {provider:'claude',win:'five_hour',label:'Claude · 5-hour'},
+        {provider:'claude',win:'seven_day',label:'Claude · Weekly'},
+        {provider:'codex',win:null,label:'Codex'},
+      ];
+      root.innerHTML = windows.map(({provider,win,label}) => {
         const now = Date.now() / 1000;
-        const readings = usages.filter(u => u.provider === provider);
+        const readings = usages.filter(u => u.provider === provider && (!win || u.win === win));
         const known = readings.length > 0;
         const value = known ? Math.max(...readings.map(u => Number(u.used_pct))) : 0;
-        const lim = limits[provider] || { soft: null, hard: null };
+        const lim = usageLimit(limits, provider, win);
         const kind = value >= 100 || lim.hard != null && value >= lim.hard ? 'hard' : lim.soft != null && value >= lim.soft ? 'warn' : '';
         const marks = [['soft', lim.soft], ['hard', lim.hard]].filter(([,n]) => n != null).map(([kind,n]) => `<span class="mark ${kind}" title="${kind} ${esc(n)}%" style="left:${Math.max(0, Math.min(Number(n), 100))}%"></span>`).join('');
-        const reset = readings.filter(u => u.used_pct >= 100 && u.resets_at).map(u => u.resets_at).sort((a,b)=>a-b).at(-1);
-        return `<button class="meter" data-usage="${esc(provider)}" title="Usage windows, reset times and check status"><div class="meter-label"><span>${esc(provider)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div><div class="meta">${reset ? reset > now ? `resets ${esc(new Date(reset*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}))}` : 'reset due · checking' : 'View usage details'}</div></button>`;
+        const reset = readings.filter(u => u.resets_at && (win || u.used_pct >= 100)).map(u => u.resets_at).sort((a,b)=>a-b).at(-1);
+        const resetLabel = reset ? new Date(reset*1000).toLocaleString([], { ...(win === 'seven_day' ? {weekday:'short'} : {}), hour:'2-digit',minute:'2-digit' }) : '';
+        return `<button class="meter" data-usage="${esc(provider)}" data-window="${win || ''}" title="Usage windows, reset times and check status${reset ? ` · ${esc(when(reset))}` : ''}"><div class="meter-label"><span>${esc(label)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div><div class="meta">${reset ? reset > now ? `resets ${esc(resetLabel)}` : 'reset due · checking' : 'View usage details'}</div></button>`;
       }).join('');
       if (state.usageProvider) {
         const check = state.limits?.checks?.find(c => c.provider === state.usageProvider);
         $('#usage-details').innerHTML = `<p>${esc(state.usageProvider)} · Last checked: ${esc(when(check?.checked_at))}<br>Next check: ${esc(when(check?.next_check))}</p>
-          ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
+          ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win === 'five_hour' ? '5-hour' : u.win === 'seven_day' ? 'Weekly' : u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
           ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}">Check now</button>`;
       }
+    }
+
+    function usageLimit(limits, provider, win) {
+      return (provider === 'claude' ? limits[`claude_${win}`] || limits.claude : limits[provider]) || {soft:null,hard:null};
     }
 
     function renderAgents() {
@@ -457,7 +466,7 @@
       $('#thread-count').textContent = `${state.threads.length}`;
       document.querySelectorAll('[data-thread-filter]').forEach(b=>b.classList.toggle('active',b.dataset.threadFilter===state.threadFilter));
       const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread > 0 : t.members?.includes(0) ? state.threadFilter === 'mine' : state.threadFilter === 'agents'));
-      $('#thread-list').innerHTML = threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`;
+      $('#thread-list').innerHTML = threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`;
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
@@ -473,7 +482,7 @@
         if (request !== state.threadRequest || selected !== state.selectedThread) return;
         const sameThread = state.thread?.id === t.id && $('#messages');
         if (!sameThread) {
-          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta"></div><div class="actions"><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button></div><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta"></div><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button></div><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
             <form class="composer" id="message-form"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
           const messages = $('#messages');
@@ -491,7 +500,7 @@
           }
           $('.thread-header h2', $('#thread-main')).textContent = t.title;
         }
-        $('.thread-header .meta', $('#thread-main')).innerHTML = `Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`;
+        $('.thread-header .meta', $('#thread-main')).innerHTML = `Thread #${t.id} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`;
         $('#thread-membership').textContent = t.members?.includes(0) ? 'Leave thread' : 'Join thread';
         if (state.thread?.id === t.id) t.last_read = Math.max(t.last_read || 0, state.thread.last_read || 0);
         t.unread = t.members?.includes(0) ? t.messages.filter(m => m.sender !== 0 && m.id > t.last_read).length : 0;
@@ -602,14 +611,14 @@
         <div class="wide"><label>Allowed efforts</label><div class="effort-options">${[...new Set([...(name === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']), ...h.efforts])].map(x => `<label><input type="checkbox" name="allowed_effort" value="${esc(x)}" ${h.efforts.includes(x) ? 'checked' : ''}>${esc(x)}</label>`).join('')}</div></div>
         <label class="wide">Extra launch flags <input name="flags" value="${esc(flagsText(h.flags || []))}"><span>Separate arguments with spaces; double-quote values containing spaces.</span></label>
       </div></div>`).join('');
-      const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" placeholder="no limit"></label></div>`;
+      const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label></div>`;
       const capital = name => name.charAt(0).toUpperCase() + name.slice(1);
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
-      const usage = Object.entries(s.limits?.usage || {}).map(([n, v]) => limit(`${capital(n)} subscription %`, `usage.${n}`, v)).join('');
+      const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
       $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
         <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
         <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
-        <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents wake only for user messages or explicit reopen. Turn this off to allow peer messages to wake done agents.</span></label>
+        <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents require explicit Reopen; messages wait in their inbox. Turn this off to let finished agents wake for new messages.</span></label>
         <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
@@ -772,6 +781,12 @@
         try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); await refreshThread(); } catch(error) {toast(error.message,true);} return;
       }
       if(event.target.closest('#add-thread-members')) { memberPicker($('#add-member-picker'),state.thread?.members); $('#members-dialog').showModal(); return; }
+      if(event.target.closest('#copy-thread')) {
+        const reference = `thread #${state.selectedThread}`;
+        try { await navigator.clipboard.writeText(reference); toast(`Copied ${reference}`); }
+        catch (_) { toast(`Reference: ${reference}`); }
+        return;
+      }
       if(event.target.closest('#thread-unread')) { $('#messages').scrollTop = $('#messages').scrollHeight; await markThreadRead(); return; }
       if (event.target.closest('#save-config-as')) {
         if ($('#settings-form').reportValidity()) {
@@ -936,7 +951,7 @@
       const model=$('#launch-model').value;
       const rejected=state.agents.find(a=>a.harness===$('#launch-harness').value && a.model===model && /not supported|not available|model.*not found/i.test(a.problem || ''));
       $('#launch-model-warning').hidden=!rejected;
-      $('#launch-model-warning').textContent=rejected ? `This account previously rejected ${model}: ${rejected.problem}. Choose an accessible model explicitly.` : '';
+      $('#launch-model-warning').textContent=rejected ? `A previous launch rejected ${model}: ${rejected.problem}. Check the harness version and account access, or choose another model explicitly.` : '';
     }
     function setLaunchEfforts(useDefault = false) {
       const name = $('#launch-harness').value;
@@ -1047,10 +1062,11 @@
       });
       form.querySelectorAll('[data-limit]').forEach(root => {
         const [kind, name] = root.dataset.limit.split('.');
-        const target = name ? next.limits[kind][name] : next.limits[kind];
+        const target = name ? (next.limits[kind][name] ??= {soft:null,hard:null}) : next.limits[kind];
         const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
         target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
       });
+      delete next.limits.usage.claude;
       next.auto_resume = $('[name=auto_resume]', form).checked;
       next.done_closes = $('[name=done_closes]', form).checked;
       next.usage_poll_secs = Number($('[name=usage_poll_secs]', form).value);

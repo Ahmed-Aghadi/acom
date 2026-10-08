@@ -85,6 +85,17 @@ pub fn side_file(harness: &str, session: &str) -> Option<PathBuf> {
     }
 }
 
+/// The native transcript, if the harness has created it. Never invent a path.
+pub fn history_file(harness: &str, session: &str) -> Option<PathBuf> {
+    if harness != "claude" {
+        return codex_side_file(session);
+    }
+    let home = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))?;
+    find_session(&home.join("projects"), session, 2)
+}
+
 /// What `acom hook` prints so the text lands in the agent's context.
 pub fn hook_output(text: &str) -> String {
     json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}})
@@ -654,6 +665,30 @@ fn toml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_history_lookup_handles_both_layouts_and_missing_files() {
+        let root = std::env::temp_dir().join(format!("acom-history-{}", new_uuid()));
+        let session = new_uuid();
+        let codex = root.join("sessions/2026/10/08");
+        let claude = root.join("projects/-project");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::create_dir_all(&claude).unwrap();
+        let rollout = codex.join(format!("rollout-{session}.jsonl"));
+        let transcript = claude.join(format!("{session}.jsonl"));
+        std::fs::write(&rollout, "{}").unwrap();
+        std::fs::write(&transcript, "{}").unwrap();
+        assert_eq!(
+            find_session(&root.join("sessions"), &session, 4),
+            Some(rollout)
+        );
+        assert_eq!(
+            find_session(&root.join("projects"), &session, 2),
+            Some(transcript)
+        );
+        assert_eq!(find_session(&root, &new_uuid(), 4), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn claude_rate_limit_is_percent() {

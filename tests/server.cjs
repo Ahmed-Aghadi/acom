@@ -54,7 +54,10 @@ process.stdin.on('end', async () => {
   const args = process.argv.slice(2), id = Number(process.env.ACOM_ID);
   const resume = args[1] === 'resume';
   fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, cwd: process.cwd(), resume }) + '\\n');
-  console.log(JSON.stringify({ type: 'thread.started', thread_id: resume ? args.at(-2) : crypto.randomUUID() }));
+  const session = resume ? args.at(-2) : crypto.randomUUID();
+  console.log(JSON.stringify({ type: 'thread.started', thread_id: session }));
+  const sessions=path.join(process.env.CODEX_HOME,'sessions','2026','10','08'); fs.mkdirSync(sessions,{recursive:true});
+  fs.appendFileSync(path.join(sessions,'rollout-'+session+'.jsonl'),JSON.stringify({type:'session_meta',payload:{id:session}})+'\\n');
   if (prompt.includes('REROUTE_TEST') && !resume) console.log(JSON.stringify({ type: 'model_reroute', from_model: 'gpt-6.1-sol', to_model: 'gpt-other', reason: 'high_risk_cyber_activity' }));
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
   if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
@@ -71,7 +74,7 @@ process.stdin.on('end', async () => {
   const port = probe.address().port;
   await new Promise(resolve => probe.close(resolve));
   const url = `http://127.0.0.1:${port}`;
-  const env = { ...process.env, ACOM_HOME: home, CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: `${bin}:${process.env.PATH}` };
+  const env = { ...process.env, ACOM_HOME: home, CODEX_HOME:path.join(root,'codex'), CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: `${bin}:${process.env.PATH}` };
   delete env.ACOM_ID; delete env.ACOM_URL;
   let server, stderr = '';
   const start = async () => {
@@ -130,6 +133,18 @@ process.stdin.on('end', async () => {
     if (process.env.ACOM_BROWSER_TEST) await browserChecks(url, api, first, second, defaults);
     const a = await api('POST', '/projects', { path: first });
     const b = await api('POST', '/projects', { path: second });
+    const windowConfig = structuredClone(defaults);
+    windowConfig.limits.usage.claude_five_hour = {soft:25,hard:75};
+    windowConfig.limits.usage.claude_seven_day = {soft:60,hard:90};
+    await api('PUT','/configs/1',{settings:windowConfig});
+    const windowView = await api('GET',`/overview?project=${a.id}`);
+    assert.deepEqual(windowView.settings.limits.usage.claude_five_hour,{soft:25,hard:75});
+    assert.deepEqual(windowView.settings.limits.usage.claude_seven_day,{soft:60,hard:90});
+    assert.match(cli(first,['limits']),/claude five-hour unknown \(soft 25%, hard 75%\)/);
+    assert.match(cli(first,['limits']),/claude weekly unknown \(soft 60%, hard 90%\)/);
+    const invalid = structuredClone(windowConfig); invalid.limits.usage.claude_seven_day.hard = 101;
+    await api('PUT','/configs/1',{settings:invalid},400);
+    await api('PUT','/configs/1',{settings:defaults});
     assert.equal((await api('POST', '/projects', { path: first })).id, a.id);
     assert.equal((await api('GET', `/projects?path=${encodeURIComponent(path.join(first, 'child'))}`)).id, a.id);
     await api('POST', '/projects', { path: path.join(root, 'missing') }, 400);
@@ -145,7 +160,12 @@ process.stdin.on('end', async () => {
       assert.equal(run.cwd, project);
       assert.ok(run.args.includes('--dangerously-bypass-approvals-and-sandbox'));
       assert.ok(run.args.includes('--skip-git-repo-check'));
-      assert.match(run.prompt, /only the user's messages wake/);
+      assert.match(run.prompt, /messages wait until the user explicitly reopens/);
+      assert.match(run.prompt, /# acom guide/);
+      assert.match(run.prompt, /Your agent ID is in `ACOM_ID`/);
+      assert.match(run.prompt, /acom inbox/);
+      assert.match(run.prompt, /acom lock acquire/);
+      assert.ok(run.prompt.includes(project));
       assert.match(run.prompt,/Literal \{task\} launch/);
     }
     assert.deepEqual((await api('GET', `/overview?project=${a.id}`)).agents.map(x => x.id), [one.id]);
@@ -181,7 +201,16 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, secondMessage.id);
     assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 0);
     if (process.env.ACOM_BROWSER_TEST) await browserMessageChecks(url, api, a.id, one.id, thread.id, home);
-    await api('POST', '/messages', { thread: thread.id, text: 'User wake' });
+    const waiting = await api('POST', '/messages', { thread: thread.id, text: 'User wake' });
+    assert.match(waiting.not_woken.find(a=>a.agent===one.id).reason,/user reopens/);
+    await new Promise(resolve=>setTimeout(resolve,1100));
+    assert.equal((await api('GET',`/agents/${one.id}`)).state,'closed');
+    assert.equal(runs().filter(r=>r.id===one.id).length,1);
+    const beforeReopen=await api('GET',`/agents/${one.id}`);
+    assert.ok(fs.existsSync(beforeReopen.conversation_history));
+    assert.ok(beforeReopen.conversation_history.includes(beforeReopen.session));
+    assert.ok(fs.existsSync(beforeReopen.output_log));
+    await api('POST',`/agents/${one.id}/reopen`,{});
     await until(() => runs().filter(r => r.id === one.id).length === 2, 'resumed turn');
     assert.equal(runs().filter(r => r.id === one.id)[1].resume, true);
     assert.match(runs().filter(r=>r.id===one.id)[1].prompt,/Literal \{updates\} wake/);
@@ -261,7 +290,7 @@ process.stdin.on('end', async () => {
     await api('PUT', `/projects/${a.id}/config`, { config: saved.id });
     const custom = structuredClone(defaults);
     custom.limits.active = { soft: null, hard: 1 };
-    custom.auto_resume = false;
+    custom.auto_resume = false; custom.done_closes = false;
     await api('PUT', `/projects/${b.id}/config`, { custom });
     await api('PUT', `/projects/${a.id}/config`, { config: saved.id, custom }, 400);
     await api('PUT', `/projects/${a.id}/config`, { config: 99999 }, 404);
@@ -279,7 +308,7 @@ process.stdin.on('end', async () => {
     assert.ok(scopedRun.args.includes('acom_test=true'));
     assert.ok(scopedRun.args.includes('model_auto_compact_token_limit=123456'));
     assert.match(scopedRun.prompt, /any new message in its threads wakes/);
-    await finished(scopedA.id, 'done'); await finished(scopedB.id);
+    await finished(scopedA.id, 'done'); await finished(scopedB.id, 'done');
     // A queued wake in a full project must not hold up a different project's wake.
     const blocker = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'Hold project A slot' });
     const configThread = await api('POST', '/threads', { project: a.id, title: 'Changed rules', members: [String(scopedA.id)] });
@@ -291,7 +320,7 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', `/agents/${scopedA.id}`)).state, 'done');
     await finished(blocker.id, 'done');
     await until(() => runs().filter(r => r.id === scopedA.id).length === 2, 'project A wakes when its slot clears');
-    await finished(scopedA.id, 'done'); await finished(scopedB.id);
+    await finished(scopedA.id, 'done'); await finished(scopedB.id, 'done');
     // Shared config edits propagate, while a project's custom config is unchanged.
     small.limits.active.hard = 2;
     await api('PUT', `/configs/${saved.id}`, { name: 'Small renamed', settings: small });
@@ -344,6 +373,8 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     await page.locator('[data-page=overview]').click();
     await page.locator(`[data-action=details][data-id="${agent}"]`).click();
     await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
+    const details = await api('GET', `/agents/${agent}`);
+    assert.ok((await page.locator('#agent-details').textContent()).includes(details.conversation_history));
     await api('POST', `/agents/${agent}/status`, { text: 'Live status from the test harness' });
     fs.appendFileSync(path.join(home, 'logs', `${agent}.txt`), '\nLive log line from the test harness\n');
     await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Live log line from the test harness'));
@@ -406,6 +437,7 @@ async function browserChecks(url, api, first, second, defaults) {
     await page.locator('#thread-form [name=title]').fill('Browser notes');
     await page.locator('#thread-form button.primary').click();
     await page.locator('#thread-membership').waitFor();
+    assert.match(await page.locator('.thread-header .meta').textContent(),/Thread #\d+/);
     assert.equal(await page.locator('#thread-membership').textContent(),'Leave thread');
     await page.locator('#thread-membership').click();
     await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread');

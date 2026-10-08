@@ -617,7 +617,7 @@ test('a previously rejected model has an explicit warning and no silent replacem
   data.agents=[{id:1,project:1,state:'crashed',harness:'codex',model:'gpt-6.1-sol',problem:'Model not supported with this account'}];
   await page.reload(); await openLaunch(page); await page.locator('#launch-harness').selectOption('codex');
   assert.equal(await page.locator('#launch-model').inputValue(),'gpt-6.1-sol');
-  assert.match(await page.locator('#launch-model-warning').textContent(),/previously rejected/);
+  assert.match(await page.locator('#launch-model-warning').textContent(),/previous launch rejected/);
   await page.locator('#launch-model').selectOption('gpt-6-luna');
   assert.equal(await page.locator('#launch-model-warning').isHidden(),true);
   assert.equal(data.requests.length,0);
@@ -822,4 +822,61 @@ test('closing pending details and opening another agent ignores old responses', 
   await page.locator('#agent-dialog button').click();
   await page.waitForTimeout(1000);
   assert.equal(await page.locator('#agent-dialog').isVisible(), false);
+}));
+
+test('Claude windows display and save independent thresholds, including older saved configs', async () => fixture(async (page, data) => {
+  data.settings.limits.usage.claude = {soft:50,hard:90};
+  data.usage = [{provider:'claude',win:'five_hour',used_pct:60,resets_at:Date.now()/1000+3600},{provider:'claude',win:'seven_day',used_pct:95,resets_at:Date.now()/1000+86400}];
+  await page.reload();
+  assert.match(await page.locator('[data-window=five_hour] .meter-label').textContent(), /5-hour.*60%/);
+  assert.match(await page.locator('[data-window=seven_day] .meter-label').textContent(), /Weekly.*95%/);
+  assert.equal(await page.locator('[data-window=five_hour] .fill.warn').count(), 1);
+  assert.equal(await page.locator('[data-window=seven_day] .fill.hard').count(), 1);
+  assert.match(await page.locator('[data-window=five_hour] .meta').textContent(), /resets/);
+  await page.locator('[data-page=settings]').click();
+  const five = page.locator('[data-limit="usage.claude_five_hour"]');
+  const weekly = page.locator('[data-limit="usage.claude_seven_day"]');
+  assert.equal(await five.locator('[name=hard]').inputValue(), '90');
+  assert.equal(await weekly.locator('[name=hard]').inputValue(), '90');
+  await five.locator('[name=soft]').fill('20'); await five.locator('[name=hard]').fill('80');
+  await weekly.locator('[name=soft]').fill('75'); await weekly.locator('[name=hard]').fill('85');
+  await saveSettings(page);
+  assert.deepEqual(data.settings.limits.usage.claude_five_hour, {soft:20,hard:80});
+  assert.deepEqual(data.settings.limits.usage.claude_seven_day, {soft:75,hard:85});
+  assert.equal(data.settings.limits.usage.claude, undefined);
+  await page.reload(); await page.locator('[data-page=settings]').click();
+  assert.equal(await weekly.locator('[name=hard]').inputValue(), '85');
+  data.usage = [data.usage[0]];
+  await page.evaluate(() => refresh());
+  assert.match(await page.locator('[data-window=seven_day] .meter-label').textContent(), /unknown/);
+  await page.setViewportSize({width:375,height:800});
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+}));
+
+test('thread identifiers are visible and copyable for references in another conversation', async () => fixture(async (page, data) => {
+  data.threads = [conversation([]),conversation([], {id:2,title:'Follow-up'})];
+  await page.reload(); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('[data-page=threads]').click();
+  assert.match(await page.locator('[data-thread="1"] .meta').textContent(), /Thread #1/);
+  await page.locator('[data-thread="1"]').click();
+  assert.match(await page.locator('.thread-header .meta').textContent(), /Thread #1/);
+  await page.locator('#copy-thread').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Copied thread #1');
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'thread #1');
+  await page.locator('[data-thread="2"]').click();
+  await page.locator('#message-form textarea').fill('See thread #1');
+  await page.locator('#message-form button').click();
+  await page.locator('.message-text').waitFor();
+  assert.equal(data.threads[1].messages[0].text, 'See thread #1');
+}));
+
+test('agent details expose native history and output paths; closed behavior is explained', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'closed',harness:'claude',conversation_history:'/home/example/.claude/projects/-work/session.jsonl',output_log:'/home/example/.acom/logs/1.jsonl'}];
+  await page.reload(); await page.locator('[data-action=details]').click();
+  await page.waitForFunction(() => document.querySelector('#agent-details').textContent.includes('conversation history'));
+  assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.claude\/projects\/-work\/session.jsonl/);
+  assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.acom\/logs\/1.jsonl/);
+  await page.locator('#agent-dialog button').click();
+  await page.locator('[data-page=settings]').click();
+  assert.match(await page.locator('[name=done_closes]').locator('..').locator('..').textContent(), /require explicit Reopen/);
 }));

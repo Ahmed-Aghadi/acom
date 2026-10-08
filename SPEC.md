@@ -52,12 +52,12 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 | `idle` | Its turn ended. Costs nothing | Any new message in its threads |
 | `paused` | Stopped by you, by a limit, by a safety flag, or by a server restart. Messages wait | You resume it, or the limit clears (if auto-resume is on) |
 | `done` | It ran `acom done`: task finished | Any new message in its threads, when there's room (see Limits) |
-| `closed` | You closed it | Only your messages, when there's room, or you reopening it |
+| `closed` | You closed it, or it marked done under the default setting | Only you explicitly reopening it; messages wait |
 | `crashed` | Its process exited with an error (the error is shown) | You resume it |
 
-A **turn** is one stretch of work: it starts when the agent gets a prompt (its task, or a wake-up) and lasts until it stops and waits. Under the hood a turn is one run of `claude -p` or `codex exec`; when the run exits the agent is idle, and waking it resumes the same session. After a woken `done` or `closed` agent finishes its turn, it goes back to being `done` or `closed`.
+A **turn** is one stretch of work: it starts when the agent gets a prompt (its task, or a wake-up) and lasts until it stops and waits. Under the hood a turn is one run of `claude -p` or `codex exec`; waking a done agent or explicitly reopening a closed one resumes the same session. A woken done agent returns to done when its turn finishes; an explicitly reopened agent is idle unless it marks done again.
 
-When an agent becomes `done`, `closed` or `crashed`, its locks are released and it leaves any lock queue. By default an agent's own `acom done` makes it `closed`, so only your messages wake it; a setting makes it `done` instead. Agents are told which rule applies, in their briefing, in `acom limits`, and again if you change it. When an agent posts in a thread, it's told which members weren't woken and why (closed, paused, crashed, or waiting for room).
+When an agent becomes `done`, `closed` or `crashed`, its locks are released and it leaves any lock queue. By default an agent's own `acom done` makes it `closed`, so no message wakes it; a setting makes it `done` instead. Agents are told which rule applies, in their briefing, in `acom limits`, and again if you change it. When anyone posts in a thread, they're told which members weren't woken and why (closed, paused, crashed, or waiting for room).
 
 ## Talking to agents while they work
 
@@ -65,7 +65,7 @@ Both harnesses run a hook after every tool call. acom uses it to tell a working 
 
 ```
 [acom] 3 new messages from agent 2, agent 5, user. Read them with `acom inbox` when you're ready.
-[acom] Soft limit reached: claude subscription usage 81% (soft 80%, hard 95%).
+[acom] Soft limit reached: claude five-hour subscription usage 81% (soft 80%, hard 95%).
 ```
 
 A long sender list is cut in the middle: `from agent 1, agent 2, agent 3, … agent 12, user`. An idle agent gets the same lines as the prompt that wakes it.
@@ -94,15 +94,15 @@ Limits are part of each project's settings (see Settings) and apply to that proj
 
 | Limit | Soft | Hard |
 |---|---|---|
-| **Active agents** in the project (working or idle, not counting ones that ran `acom done`), in total and per harness | Agents launching, and you, are told it's reached and what the hard value is | Agents' launch requests are refused, and done or closed agents aren't woken (they wait in line); you can confirm a launch past it |
-| **Subscription usage**, per provider (the highest of its usage windows, in %) | That provider's agents are told | When usage crosses it, that provider's agents are paused. Agents' launches on that provider are refused and wakes wait in line while it's over |
+| **Active agents** in the project (working or idle, not counting ones that ran `acom done`), in total and per harness | Agents launching, and you, are told it's reached and what the hard value is | Agents' launch requests are refused, and done agents aren't woken (they wait in line); you can confirm a launch past it |
+| **Subscription usage**, separate Claude five-hour/weekly thresholds and Codex's highest window (in %) | That provider's agents are told which window crossed its threshold | When either applicable window crosses its hard threshold, that provider's agents are paused. Agents' launches on that provider are refused and wakes wait in line while it's over |
 | **Context size**, per agent (tokens) | That agent is told its context is getting large | The harness auto-compacts at this size (Claude `--autocompact`, which takes 100k to 1M; Codex `model_auto_compact_token_limit`) |
 
 A subscription limit only affects that provider's agents: Claude hitting its limit doesn't pause Codex agents. The hard usage action happens when usage crosses the limit, so an agent you launch or resume past it afterwards keeps running: you've seen the warning and chosen to.
 
 Agents paused by a limit resume by themselves when usage is confirmed below the project's hard threshold and below 100%, and an active-agent slot is free. A setting turns that off, so they wait for you. An unknown reading or a passed reset timestamp is not confirmation. Quota checks run even when agents are paused: every 120 seconds by default (configurable 15–3600), and at reported reset times. Periodic checks find early/free resets; the reported time avoids an extra interval after a scheduled reset. Shared accounts use the shortest project's interval. Failed checks preserve the last reading and show an error; they don't wake agents blindly.
 
-**The wake line.** Waking a done or closed agent makes it active again, so it needs room under the hard limits. If there isn't any, the agent waits in line, the sender is told (`agent 5 wasn't woken: Hard limit reached: 1 active agents (soft none, hard 1). It will be woken when there's room.`), and the UI shows it waiting. Waiting agents are woken oldest first as soon as there's room; a new message never jumps the line. Idle agents already count as active, so they're always woken at once.
+**The wake line.** Waking a done agent makes it active again, so it needs room under the hard limits. If there isn't any, the agent waits in line, the sender is told (`agent 5 wasn't woken: Hard limit reached: 1 active agents (soft none, hard 1). It will be woken when there's room.`), and the UI shows it waiting. Waiting agents are woken oldest first as soon as there's room; a new message never jumps the line. Idle agents already count as active, so they're always woken at once. Closed agents never enter the wake line until explicitly reopened.
 
 ## Flags and model switches
 
@@ -205,9 +205,9 @@ There's no authentication: the split is a convention, not a security boundary. W
 Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshing every 2 seconds.
 
 - **Project picker:** every project with its folder, plus adding and removing projects. The folder browser starts at Home, shows files and folders, navigates up and into folders, and creates new folders; exact-path entry remains available. Agents, threads, locks and activity below are for the selected project.
-- **Top bar:** subscription usage per provider (or "unknown"); click for reset/check times, errors and **Check now**. **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
-- **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, whether it's waiting in the wake line and why, and any problem (flagged, usage limit, crash) with its reason. Buttons to pause, resume, close and reopen. Details show the task, launch details, usage, held and lost locks, and recent activity (the harness's output).
-- **Threads:** **Mine**, **All** and **Agent-only** filters, membership labels, and join/leave controls distinguish user participation. Click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and searchable member checkboxes, with active/all selection and an Include me checkbox. Advanced IDs/selectors remain available; existing threads have an Add members picker. After posting you're told who couldn't be woken yet.
+- **Top bar:** separate Claude five-hour and weekly subscription usage meters, plus Codex (or "unknown"); click for reset/check times, errors and **Check now**. Each Claude window has its own soft/hard config fields. Either can block work, and resetting one doesn't clear the other. **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
+- **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, whether it's waiting in the wake line and why, and any problem (flagged, usage limit, crash) with its reason. Buttons to pause, resume, close and reopen. Details show the task, launch details, usage, held and lost locks, native conversation-history path (when created), raw output-log path, and live recent activity (the harness's output).
+- **Threads:** **Mine**, **All**, **Unread** and **Agent-only** filters, membership labels, and join/leave controls distinguish user participation. List rows and the open thread show its ID; **Copy reference** copies `thread #<ID>` for another conversation. Click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and searchable member checkboxes, with active/all selection and an Include me checkbox. Advanced IDs/selectors remain available; existing threads have an Add members picker. After posting you're told who couldn't be woken yet.
 - **Locks:** name, description, holder, since, expires (or frozen with the time left), queue, and a **Free** button.
 - **Activity:** launches, pauses, resumes, limits reached, wake-line changes, locks freed by you, and who did each.
 - **Settings:** for the selected project: which config it uses (Default, a saved config, or Custom), and the editor for it, saying which projects a saved config affects; "Save as new config". Models are chosen from acom's catalog (full IDs) with a custom option for newer ones; efforts follow what the chosen model supports. An empty limit field means no limit.
@@ -229,7 +229,7 @@ Every rule reads the settings of the agent's project. Active-agent limits count 
 A config holds:
 
 - **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags. Defaults: every catalog model allowed; Claude `claude-opus-5-5` / medium with `--dangerously-skip-permissions`; Codex `gpt-6-sol` / medium with `--dangerously-bypass-approvals-and-sandbox`. Agents run unattended and nobody can answer a permission prompt, so they get full permissions by default; restrict them here (e.g. `--permission-mode acceptEdits`, `--sandbox workspace-write`) and anything the harness would ask about is denied. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
-- **Limits:** soft and hard values for active agents (total and per harness), subscription usage (per provider) and context size. Any value can be empty.
+- **Limits:** soft and hard values for active agents (total and per harness), Claude five-hour and weekly subscription usage, Codex usage and context size. Usage keys are `claude_five_hour`, `claude_seven_day` and `codex`; percentages must be 0–100. Any value can be empty.
 - **Auto-resume** after a limit clears: on (default) or off.
 - **Usage check interval:** 120 seconds by default; reported reset times also trigger checks.
 - **Prompt guidance:** literal launch, wake and resume text, without placeholders. Generated identity, task, guide, limits, updates and interruption warnings cannot be removed by editing guidance.

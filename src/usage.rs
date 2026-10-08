@@ -63,6 +63,13 @@ pub fn parse(provider: &str, v: &Value) -> Result<Vec<Window>, String> {
             });
         }
     }
+    if provider == "claude"
+        && ["five_hour", "seven_day"]
+            .iter()
+            .any(|name| !out.iter().any(|w| w.name == *name))
+    {
+        return Err("Claude usage response omitted the five-hour or weekly window; keeping the last reading.".into());
+    }
     if out.is_empty()
         || out
             .iter()
@@ -354,7 +361,7 @@ mod tests {
     fn provider_responses_and_unknowns() {
         let a = parse(
             "claude",
-            &json!({"five_hour":{"utilization":100,"resets_at":"2026-10-08T11:30:00Z"}}),
+            &json!({"five_hour":{"utilization":100,"resets_at":"2026-10-08T11:30:00Z"},"seven_day":{"utilization":0}}),
         )
         .unwrap();
         assert_eq!(a[0].used, 100.0);
@@ -362,6 +369,7 @@ mod tests {
         let b = parse("codex", &json!({"rateLimits":{"primary":{"usedPercent":12,"resetsAt":99}},"ordinaryUsageAllowed":false})).unwrap();
         assert_eq!(b[1].used, 100.0);
         assert!(parse("claude", &json!({})).is_err());
+        assert!(parse("claude", &json!({"five_hour":{"utilization":0}})).is_err());
     }
 
     #[test]
@@ -404,7 +412,7 @@ mod tests {
         assert_eq!(
             parse(
                 "claude",
-                &json!({"five_hour":{"utilization":100,"resets_at":"2026-10-08T11:30:00.254Z"}})
+                &json!({"five_hour":{"utilization":100,"resets_at":"2026-10-08T11:30:00.254Z"},"seven_day":{"utilization":0}})
             )
             .unwrap()[0]
                 .reset,

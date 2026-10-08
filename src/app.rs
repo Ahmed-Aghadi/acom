@@ -114,6 +114,30 @@ pub struct Limits {
     pub context: Limit,
 }
 
+impl Limits {
+    fn usage_limit(&self, provider: &str, window: &str) -> Option<&Limit> {
+        if provider == "claude" {
+            let key = match window {
+                "five_hour" => "claude_five_hour",
+                "seven_day" => "claude_seven_day",
+                _ => return None,
+            };
+            // Previously saved provider-wide thresholds supply both windows until edited.
+            self.usage.get(key).or_else(|| self.usage.get("claude"))
+        } else {
+            self.usage.get(provider)
+        }
+    }
+}
+
+fn window_label(window: &str) -> &str {
+    match window {
+        "five_hour" => "five-hour",
+        "seven_day" => "weekly",
+        _ => window,
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Settings {
     pub harnesses: BTreeMap<String, HarnessCfg>,
@@ -192,7 +216,9 @@ impl Default for Settings {
         let mut usage = BTreeMap::new();
         for h in ["claude", "codex"] {
             active_per_harness.insert(h.to_string(), per(4.0, 6.0));
-            usage.insert(h.to_string(), per(80.0, 95.0));
+        }
+        for k in ["claude_five_hour", "claude_seven_day", "codex"] {
+            usage.insert(k.to_string(), per(80.0, 95.0));
         }
         Settings {
             harnesses,
@@ -260,9 +286,17 @@ impl Settings {
             }
         }
         let l = &self.limits;
-        for k in l.active_per_harness.keys().chain(l.usage.keys()) {
+        for k in l.active_per_harness.keys() {
             if !crate::harness::KNOWN.contains(&k.as_str()) {
                 return Err(bad(format!("unknown harness {k} in limits")));
+            }
+        }
+        for (k, lim) in &l.usage {
+            if !["claude", "claude_five_hour", "claude_seven_day", "codex"].contains(&k.as_str()) {
+                return Err(bad(format!("unknown subscription window {k}")));
+            }
+            if [lim.soft, lim.hard].iter().flatten().any(|v| *v > 100.0) {
+                return Err(bad(format!("{k}: usage limits must be between 0 and 100%")));
             }
         }
         let mut all = vec![
@@ -567,6 +601,63 @@ impl St {
         )?)
     }
 
+    fn window_pct(&self, provider: &str, window: &str) -> R<Option<f64>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT used_pct FROM usage WHERE provider=?1 AND win=?2",
+                params![provider, window],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn usage_checks(&self, limits: &Limits, provider: &str) -> R<Vec<Check>> {
+        let mut checks = Vec::new();
+        if provider != "claude" {
+            // Codex keeps one provider-wide threshold; stream and status window names can differ.
+            if let (Some(lim), Some(value)) = (limits.usage.get(provider), self.used_pct(provider)?)
+            {
+                checks.push(Check {
+                    what: format!("{provider} subscription usage"),
+                    value,
+                    lim: lim.clone(),
+                    unit: "%",
+                });
+            }
+        } else {
+            for r in rows(
+                &self.db,
+                "SELECT win,used_pct FROM usage WHERE provider=?1",
+                [provider],
+            )? {
+                let window = r["win"].as_str().unwrap();
+                if let Some(lim) = limits.usage_limit(provider, window) {
+                    checks.push(Check {
+                        what: format!("{provider} {} subscription usage", window_label(window)),
+                        value: r["used_pct"].as_f64().unwrap(),
+                        lim: lim.clone(),
+                        unit: "%",
+                    });
+                }
+            }
+        }
+        if self.used_pct(provider)?.is_some_and(|used| used >= 100.0)
+            && !checks.iter().any(|c| c.over(c.lim.hard))
+        {
+            checks.push(Check {
+                what: format!("{provider} subscription exhausted"),
+                value: 100.0,
+                lim: Limit {
+                    soft: None,
+                    hard: Some(100.0),
+                },
+                unit: "%",
+            });
+        }
+        Ok(checks)
+    }
+
     /// A project's limits and rules, with current usage, as agents are told them.
     pub fn limits_text(&self, project: Option<i64>) -> R<String> {
         let s = self.settings_for(project);
@@ -577,23 +668,37 @@ impl St {
             out += &format!("; {h}: {} ({})", per.get(h).unwrap_or(&0), lim.text(""));
         }
         out += "\nSubscription usage:";
-        for (i, (h, lim)) in l.usage.iter().enumerate() {
-            let used = match self.used_pct(h)? {
+        for (h, window) in [
+            ("claude", "five_hour"),
+            ("claude", "seven_day"),
+            ("codex", ""),
+        ] {
+            let lim = l.usage_limit(h, window).cloned().unwrap_or(Limit {
+                soft: None,
+                hard: None,
+            });
+            let value = if window.is_empty() {
+                self.used_pct(h)?
+            } else {
+                self.window_pct(h, window)?
+            };
+            let used = match value {
                 Some(p) => format!("{p:.0}%"),
                 None => "unknown".into(),
             };
-            out += &format!(
-                "{} {h} {used} ({})",
-                if i > 0 { ";" } else { "" },
-                lim.text("%")
-            );
+            let label = if window.is_empty() {
+                h.to_string()
+            } else {
+                format!("{h} {}", window_label(window))
+            };
+            out += &format!("\n  {label} {used} ({})", lim.text("%"));
         }
         out += &format!("\nContext per agent: {}", l.context.text(" tokens"));
         if l.context.hard.is_some() {
             out += " (the harness compacts at the hard value)";
         }
         out += if s.done_closes {
-            "\nWhen an agent runs `acom done` it's closed: only the user's messages wake it again."
+            "\nWhen an agent runs `acom done` it's closed: messages wait until the user explicitly reopens it."
         } else {
             "\nWhen an agent runs `acom done` it's done: any new message in its threads wakes it again."
         };
@@ -618,14 +723,7 @@ impl St {
                 unit: "",
             });
         }
-        if let (Some(lim), Some(used)) = (l.usage.get(harness), self.used_pct(harness)?) {
-            checks.push(Check {
-                what: format!("{harness} subscription usage"),
-                value: used,
-                lim: lim.clone(),
-                unit: "%",
-            });
-        }
+        checks.extend(self.usage_checks(&l, harness)?);
         Ok(checks)
     }
 
@@ -714,13 +812,13 @@ impl St {
     // ---------- messages ----------
 
     /// Messages in the agent's threads it hasn't been told about yet.
-    fn pending(&self, agent: i64, only_user: bool) -> R<Vec<(i64, i64)>> {
+    fn pending(&self, agent: i64) -> R<Vec<(i64, i64)>> {
         let mut s = self.db.prepare(
             "SELECT m.id, m.sender FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?1
-             WHERE m.id > b.last_notified AND m.sender != ?1 AND (?2=0 OR m.sender=0) ORDER BY m.id",
+             WHERE m.id > b.last_notified AND m.sender != ?1 ORDER BY m.id",
         )?;
         let v = s
-            .query_map(params![agent, only_user], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         Ok(v)
     }
@@ -750,7 +848,7 @@ impl St {
             self.db
                 .execute("UPDATE notices SET shown=1 WHERE id=?1", [id])?;
         }
-        let msgs = self.pending(agent, false)?;
+        let msgs = self.pending(agent)?;
         if !msgs.is_empty() {
             let mut senders: Vec<i64> = Vec::new();
             for (_, s) in &msgs {
@@ -1049,7 +1147,7 @@ impl App {
         ))
     }
 
-    /// Something arrived for an agent. An idle agent is woken at once. A done or closed agent
+    /// Something arrived for an agent. An idle agent is woken at once. A done agent
     /// isn't counted as active, so it joins the wake line instead, which `drain_wakes` serves
     /// oldest first whenever there's room under the hard limits.
     pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
@@ -1057,12 +1155,7 @@ impl App {
             return Ok(()); // still stopping; turn_ended wakes it if needed
         }
         let a = st.agent(id)?;
-        let only_user = match a.state.as_str() {
-            "idle" | "done" => false,
-            "closed" => true,
-            _ => return Ok(()),
-        };
-        if st.pending(id, only_user)?.is_empty() {
+        if !matches!(a.state.as_str(), "idle" | "done") || st.pending(id)?.is_empty() {
             return Ok(());
         }
         if a.state == "idle" {
@@ -1101,10 +1194,7 @@ impl App {
                 continue;
             }
             let a = st.agent(id)?;
-            let only_user = a.state == "closed";
-            if !matches!(a.state.as_str(), "done" | "closed")
-                || st.pending(id, only_user)?.is_empty()
-            {
+            if a.state != "done" || st.pending(id)?.is_empty() {
                 // Reopened, paused, or nothing left to hear about: it leaves the line.
                 st.db.execute(
                     "UPDATE agents SET wake_queued_at=NULL, wake_why=NULL WHERE id=?1",
@@ -1155,8 +1245,7 @@ impl App {
         )?;
         let a = st.agent(id)?;
         if a.state != "working" {
-            // Paused or closed by someone: they already set the state. A closed agent may
-            // have a message from the user waiting that couldn't wake it while it stopped.
+            // Paused or closed by someone: they already set the state.
             self.maybe_wake(&mut st, id)?;
             self.cv.notify_all();
             return Ok(());
@@ -1607,8 +1696,8 @@ impl App {
                 st.db
                     .query_row("SELECT wake_why FROM agents WHERE id=?1", [m], |r| r.get(0))?;
             let reason = match state.as_str() {
-                "closed" if sender != 0 => {
-                    Some("it's closed, so only the user's messages wake it".to_string())
+                "closed" => {
+                    Some("it's closed; messages wait until the user reopens it".to_string())
                 }
                 "paused" => Some("it's paused; it will see this when it's resumed".into()),
                 "crashed" => Some("it crashed; it will see this if the user resumes it".into()),
@@ -2006,38 +2095,32 @@ impl App {
         let s = st.settings_for(Some(project));
         let mut changed = false;
         for p in crate::harness::KNOWN {
-            let lim = s.limits.usage.get(p).cloned().unwrap_or(Limit {
-                soft: None,
-                hard: None,
-            });
             let p = &p.to_string();
             let key = (project, p.clone());
             let Some(used) = st.used_pct(p)? else {
-                st.over_soft.remove(&key);
                 st.over_hard.remove(&key);
                 // Unknown is not evidence that an exhausted subscription recovered.
                 continue;
             };
-            let line = format!("{p} subscription usage {used:.0}% ({})", lim.text("%"));
-            let (over_soft, over_hard) = (
-                lim.soft.is_some_and(|v| used >= v),
-                lim.hard.is_some_and(|v| used >= v),
-            );
-            if over_soft && st.over_soft.insert(key.clone()) {
-                for r in rows(
-                    &st.db,
-                    "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state NOT IN ('closed','crashed')",
-                    params![project, p],
-                )? {
-                    st.notice(
-                        r["id"].as_i64().unwrap(),
-                        &format!("Soft limit reached: {line}."),
-                    )?;
+            let checks = st.usage_checks(&s.limits, p)?;
+            for check in &checks {
+                let key = (project, check.what.clone());
+                if check.over(check.lim.soft) {
+                    if st.over_soft.insert(key) {
+                        for r in rows(
+                            &st.db,
+                            "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state NOT IN ('closed','crashed')",
+                            params![project, p],
+                        )? {
+                            st.notice(r["id"].as_i64().unwrap(), &check.line("Soft"))?;
+                        }
+                    }
+                } else {
+                    st.over_soft.remove(&key);
                 }
-            } else if !over_soft {
-                st.over_soft.remove(&key);
             }
-            if over_hard {
+            let hard: Vec<_> = checks.iter().filter(|c| c.over(c.lim.hard)).collect();
+            if !hard.is_empty() {
                 if st.over_hard.insert(key) {
                     let ids: Vec<i64> = rows(
                         &st.db,
@@ -2056,7 +2139,11 @@ impl App {
                             Some(project),
                             "acom",
                             &format!(
-                                "hard limit reached: {line}; paused {n} agent{}",
+                                "{}; paused {n} agent{}",
+                                hard.iter()
+                                    .map(|c| c.line("Hard"))
+                                    .collect::<Vec<_>>()
+                                    .join("; "),
                                 if n == 1 { "" } else { "s" }
                             ),
                         )?;
@@ -2396,6 +2483,16 @@ impl App {
         let (name, path) = st.project(project)?;
         a["project_name"] = json!(name);
         a["project_path"] = json!(path);
+        a["conversation_history"] =
+            json!(
+                a["session"]
+                    .as_str()
+                    .and_then(|session| crate::harness::history_file(
+                        a["harness"].as_str().unwrap(),
+                        session
+                    ))
+            );
+        a["output_log"] = json!(crate::run::log_path(self, id, "jsonl"));
         a["limits"] = json!(st.limits_text(Some(project))?);
         a["lost_locks"] = json!(rows(
             &st.db,
@@ -2686,8 +2783,7 @@ mod tests {
             "[acom] 3 new messages from agent 2, user. Read them with `acom inbox` when you're ready."
         );
         assert_eq!(st.take_updates(1).unwrap(), "");
-        // A closed agent is only woken by the user.
-        assert_eq!(st.pending(3, true).unwrap().len(), 1);
+        assert_eq!(st.pending(3).unwrap().len(), 4);
     }
 
     #[test]
@@ -2895,7 +2991,7 @@ mod tests {
         // Project 2 stops at 50%; project 1 keeps the Default 95%.
         custom(&app, 2, |s| {
             s.limits.usage.insert(
-                "claude".into(),
+                "claude_five_hour".into(),
                 Limit {
                     soft: None,
                     hard: Some(50.0),
@@ -2906,6 +3002,166 @@ mod tests {
         app.tick().unwrap();
         assert_eq!(state(&app, 1), ("idle".into(), None));
         assert_eq!(state(&app, 2), ("paused".into(), Some("limit".into())));
+    }
+
+    #[test]
+    fn claude_windows_have_independent_limits_and_both_must_clear() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "claude_five_hour".into(),
+                Limit {
+                    soft: Some(30.0),
+                    hard: Some(90.0),
+                },
+            );
+            s.limits.usage.insert(
+                "claude_seven_day".into(),
+                Limit {
+                    soft: Some(40.0),
+                    hard: Some(70.0),
+                },
+            );
+        });
+        app.record_usage("claude", "five_hour", 40.0, Some(now() + 60))
+            .unwrap();
+        app.record_usage("claude", "seven_day", 80.0, Some(now() + 600))
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        assert_eq!(state(&app, 2).0, "idle");
+        let notices = rows(
+            &app.lock().db,
+            "SELECT text FROM notices WHERE agent_id=1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n["text"].as_str().unwrap().contains("five-hour"))
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n["text"].as_str().unwrap().contains("weekly"))
+        );
+        app.record_usage("claude", "five_hour", 0.0, Some(now() + 60))
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "paused",
+            "five-hour reset cannot clear the weekly limit"
+        );
+        let incomplete = crate::usage::parse("claude", &json!({"five_hour":{"utilization":0}}));
+        crate::usage::finish(&app, "claude", 120, incomplete).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "paused",
+            "incomplete status cannot clear a weekly limit"
+        );
+        app.record_usage("claude", "seven_day", 0.0, Some(now() + 600))
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+        app.record_usage("claude", "five_hour", 92.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "paused",
+            "five-hour threshold acts independently"
+        );
+        assert_eq!(state(&app, 2).0, "idle");
+        assert!(app.lock().limits_text(Some(1)).unwrap().contains("weekly"));
+    }
+
+    #[test]
+    fn closed_agents_keep_user_and_peer_messages_without_waking() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db.execute_batch("UPDATE agents SET state='closed' WHERE id=1;
+                INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at)
+                VALUES(3,1,'peer','task','claude','m','e','closed',0,0);").unwrap();
+        }
+        let (tid, _) = app
+            .new_thread(0, Some(1), "waiting", &["1".into()], true)
+            .unwrap();
+        let (_, user) = app.post(0, tid, "user message").unwrap();
+        let (_, peer) = app.post(3, tid, "peer message").unwrap();
+        assert!(
+            user.iter()
+                .any(|(id, why)| *id == 1 && why.contains("user reopens"))
+        );
+        assert!(
+            peer.iter()
+                .any(|(id, why)| *id == 1 && why.contains("user reopens"))
+        );
+        app.add_members(tid, &["1".into()]).unwrap();
+        // A queue saved by an older server must not restart a closed agent either.
+        app.lock()
+            .db
+            .execute("UPDATE agents SET wake_queued_at=1 WHERE id=1", [])
+            .unwrap();
+        app.tick().unwrap();
+        app.turn_ended(1, 0, true, None).unwrap();
+        assert_eq!(state(&app, 1).0, "closed");
+        assert!(app.lock().procs.is_empty());
+        assert_eq!(app.inbox(1, "new").unwrap().len(), 2);
+        assert!(app.agent_view(1).unwrap()["wake_queued_at"].is_null());
+    }
+
+    #[test]
+    fn usage_settings_validate_windows_and_preserve_saved_provider_thresholds() {
+        let mut s = Settings::default();
+        s.limits.usage.clear();
+        s.limits.usage.insert(
+            "claude".into(),
+            Limit {
+                soft: Some(80.0),
+                hard: Some(95.0),
+            },
+        );
+        assert!(s.check().is_ok());
+        assert_eq!(
+            s.limits.usage_limit("claude", "five_hour").unwrap().hard,
+            Some(95.0)
+        );
+        assert_eq!(
+            s.limits.usage_limit("claude", "seven_day").unwrap().hard,
+            Some(95.0)
+        );
+        s.limits.usage.insert(
+            "claude_seven_day".into(),
+            Limit {
+                soft: None,
+                hard: Some(60.0),
+            },
+        );
+        assert_eq!(
+            s.limits.usage_limit("claude", "seven_day").unwrap().hard,
+            Some(60.0)
+        );
+        s.limits.usage.get_mut("claude_seven_day").unwrap().hard = Some(101.0);
+        assert!(s.check().is_err());
+    }
+
+    #[test]
+    fn codex_usage_stays_aggregated_without_duplicate_warnings() {
+        let app = app_with_two_projects();
+        app.record_usage("codex", "primary (10080m)", 85.0, None)
+            .unwrap();
+        app.record_usage("codex", "codex primary", 80.0, None)
+            .unwrap();
+        let st = app.lock();
+        let checks = st
+            .usage_checks(&Settings::default().limits, "codex")
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].value, 85.0);
+        assert!(checks[0].over(checks[0].lim.soft));
     }
 
     #[test]
@@ -3104,7 +3360,7 @@ mod tests {
         assert!(s.check().is_ok());
         let st = st();
         assert!(st.limits_text(Some(1)).unwrap().ends_with(
-            "When an agent runs `acom done` it's closed: only the user's messages wake it again."
+            "When an agent runs `acom done` it's closed: messages wait until the user explicitly reopens it."
         ));
     }
 
