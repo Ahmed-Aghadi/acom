@@ -58,6 +58,7 @@ process.stdin.on('end', async () => {
   console.log(JSON.stringify({ type: 'thread.started', thread_id: session }));
   const sessions=path.join(process.env.CODEX_HOME,'sessions','2026','10','08'); fs.mkdirSync(sessions,{recursive:true});
   fs.appendFileSync(path.join(sessions,'rollout-'+session+'.jsonl'),JSON.stringify({type:'session_meta',payload:{id:session}})+'\\n');
+  if (prompt.includes('CRASH_TEST') && !resume) { process.exitCode=1; return; }
   if (prompt.includes('REROUTE_TEST') && !resume) console.log(JSON.stringify({ type: 'model_reroute', from_model: 'gpt-6.1-sol', to_model: 'gpt-other', reason: 'high_risk_cyber_activity' }));
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
   if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
@@ -201,6 +202,12 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, secondMessage.id);
     assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 0);
     if (process.env.ACOM_BROWSER_TEST) await browserMessageChecks(url, api, a.id, one.id, thread.id, home);
+    // Closed agents miss rule-change notices, so their next turn needs a fresh snapshot.
+    const changedWhileClosed = structuredClone(defaults);
+    changedWhileClosed.done_closes = false;
+    changedWhileClosed.limits.usage.claude_five_hour = {soft:25,hard:75};
+    changedWhileClosed.limits.usage.claude_seven_day = {soft:60,hard:90};
+    await api('PUT', `/projects/${a.id}/config`, {custom:changedWhileClosed});
     const waiting = await api('POST', '/messages', { thread: thread.id, text: 'User wake' });
     assert.match(waiting.not_woken.find(a=>a.agent===one.id).reason,/user reopens/);
     await new Promise(resolve=>setTimeout(resolve,1100));
@@ -213,10 +220,36 @@ process.stdin.on('end', async () => {
     await api('POST',`/agents/${one.id}/reopen`,{});
     await until(() => runs().filter(r => r.id === one.id).length === 2, 'resumed turn');
     assert.equal(runs().filter(r => r.id === one.id)[1].resume, true);
-    assert.match(runs().filter(r=>r.id===one.id)[1].prompt,/Literal \{updates\} wake/);
+    const reopenedPrompt = runs().filter(r=>r.id===one.id)[1].prompt;
+    assert.match(reopenedPrompt,/Literal \{updates\} wake/);
+    assert.doesNotMatch(reopenedPrompt, /# acom guide|user changed the limits or rules/);
+    assert.match(reopenedPrompt, /claude five-hour unknown \(soft 25%, hard 75%\)/);
+    assert.match(reopenedPrompt, /claude weekly unknown \(soft 60%, hard 90%\)/);
+    assert.match(reopenedPrompt, /any new message in its threads wakes it again/);
     assert.ok(runs().filter(r => r.id === one.id)[1].args.includes('--dangerously-bypass-approvals-and-sandbox'));
-    await finished(one.id);
+    await finished(one.id, 'done');
+    await api('POST', `/agents/${one.id}/close`, {});
+    await api('PUT', `/projects/${a.id}/config`, {config:1});
     assert.equal((await api('GET', `/locks?project=${a.id}`))[0].holder, null);
+    const crashed = await api('POST', '/agents', {project:a.id,harness:'codex',task:'CRASH_TEST'});
+    await finished(crashed.id, 'crashed');
+    const crashSession = (await api('GET', `/agents/${crashed.id}`)).session;
+    assert.ok(crashSession);
+    const changedWhileCrashed = structuredClone(defaults);
+    changedWhileCrashed.limits.usage.claude_seven_day = {soft:35,hard:65};
+    await api('PUT', `/projects/${a.id}/config`, {custom:changedWhileCrashed});
+    await api('POST', `/agents/${crashed.id}/resume`, {});
+    await until(() => runs().filter(r=>r.id===crashed.id).length===2, 'crash retry');
+    const crashRetry = runs().filter(r=>r.id===crashed.id)[1];
+    assert.ok(crashRetry.resume);
+    assert.match(crashRetry.prompt, /Resumed at .* after an error/);
+    assert.match(crashRetry.prompt, /Commands may have only partially executed/);
+    assert.match(crashRetry.prompt, /Literal \{updates\} resume/);
+    assert.match(crashRetry.prompt, /claude weekly unknown \(soft 35%, hard 65%\)/);
+    assert.doesNotMatch(crashRetry.prompt, /# acom guide|user changed the limits or rules/);
+    await finished(crashed.id);
+    assert.equal((await api('GET', `/agents/${crashed.id}`)).session, crashSession);
+    await api('PUT', `/projects/${a.id}/config`, {config:1});
     for (const task of ['REROUTE_TEST', 'POLICY_TEST']) {
       const flagged = await api('POST', '/agents', { project: a.id, harness: 'codex', task });
       await until(async () => (await api('GET', `/agents/${flagged.id}`)).state === 'paused', 'flagged pause');
@@ -267,6 +300,8 @@ process.stdin.on('end', async () => {
     const recovery=runs().filter(r=>r.id===exhausted.id)[1];
     assert.ok(recovery.resume); assert.match(recovery.prompt,/Commands may have only partially executed/);
     assert.match(recovery.prompt,/Literal \{updates\} resume/);
+    assert.match(recovery.prompt,/codex 0% \(no limit\)/);
+    assert.ok(recovery.prompt.lastIndexOf('## Limits and rules right now') > recovery.prompt.lastIndexOf('user changed the limits or rules'));
     await finished(exhausted.id); await api('PUT','/configs/1',{settings:defaults});
     const solo=await api('POST','/threads',{project:a.id,title:'User notes',members:[]});
     assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[0]);
@@ -317,6 +352,7 @@ process.stdin.on('end', async () => {
     const otherThread = await api('POST', '/threads', { project: b.id, title: 'Independent wake', members: [String(scopedB.id)] });
     await api('POST', '/messages', { thread: otherThread.id, text: 'Use project B slot' });
     await until(() => runs().filter(r => r.id === scopedB.id).length === 2, 'project B wakes despite blocked project A');
+    assert.match(runs().filter(r=>r.id===scopedB.id)[1].prompt, /## Limits and rules right now/);
     assert.equal((await api('GET', `/agents/${scopedA.id}`)).state, 'done');
     await finished(blocker.id, 'done');
     await until(() => runs().filter(r => r.id === scopedA.id).length === 2, 'project A wakes when its slot clears');
@@ -330,6 +366,9 @@ process.stdin.on('end', async () => {
     await api('POST', '/messages', { thread: configThread.id, text: 'Check changed settings' });
     await until(() => runs().filter(r => r.id === scopedA.id).length === 3, 'rule change delivered on wake');
     assert.match(runs().filter(r => r.id === scopedA.id)[2].prompt, /user changed the limits or rules/);
+    const changedWake = runs().filter(r=>r.id===scopedA.id)[2].prompt;
+    assert.match(changedWake.split('## Limits and rules right now').at(-1), /Active agents: \d+ \(soft none, hard 2\)/);
+    assert.ok(changedWake.lastIndexOf('## Limits and rules right now') > changedWake.indexOf('user changed the limits or rules'));
     await finished(scopedA.id, 'done');
     const savedRead = (await api('GET', `/threads/${thread.id}`)).last_read;
     await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread survives restart' });

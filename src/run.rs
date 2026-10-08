@@ -73,7 +73,15 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
     // session (e.g. the first turn crashed early), which needs the briefing again.
     let resume = started && a.session.is_some();
     let briefed;
-    let prompt = if turns > 0 && !resume {
+    let prompt = if resume {
+        // Closed/crashed agents do not receive rule-change notices. Refresh every
+        // continuation, after queued notices so older rules cannot be the last word.
+        briefed = format!(
+            "{prompt}\n\n## Limits and rules right now\n\n{}",
+            st.limits_text(Some(a.project))?
+        );
+        &briefed
+    } else if turns > 0 {
         briefed = format!("{}\n{prompt}", app.briefing(st, id)?);
         &briefed
     } else {

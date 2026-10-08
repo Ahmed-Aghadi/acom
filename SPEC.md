@@ -73,7 +73,8 @@ A long sender list is cut in the middle: `from agent 1, agent 2, agent 3, … ag
 What agents are told, and when:
 
 - **At launch**, the first prompt is a full briefing: its ID, name, group, project (name and folder), task, who launched it, harness/model/effort, the current limits and usage, what happens when it runs `acom done`, and the guide (below).
-- **Afterwards, only changes**: new messages; a limit or rule you changed; a soft or hard limit reached; a lock it lost; that it was paused and resumed (and that every command, background task and monitor from before the pause is gone).
+- **During a turn**, pending changes: new messages; a limit or rule you changed; a soft or hard limit reached; a lock it lost.
+- **At each continued turn**, pending updates and wake or resume guidance, followed by fresh limits, usage and finishing rules. Interrupted work also gets a warning about partial commands and stopped background tasks. This includes explicit Reopen and crash recovery, even if the agent missed rule-change notices.
 - **Any time**, `acom me` shows its full picture and `acom limits` shows all limits and usage.
 
 If a session never really started (say the first turn crashed at once), the next turn is a fresh session and gets the full briefing again.
