@@ -147,6 +147,10 @@ process.stdin.on('end', async () => {
     assert.equal(defaults.allow_agent_model_change,false);
     assert.equal(defaults.allow_agent_effort_change,false);
     assert.deepEqual(defaults.flagged_retries,{});
+    assert.equal(defaults.max_lock_ttl_secs,900);
+    for (const ttl of [0,-1,1.5,4294967296,null]) {
+      await api('PUT','/configs/1',{settings:{...defaults,max_lock_ttl_secs:ttl}},400);
+    }
     assert.match(cli(root,['models']),/Models and providers/);
     assert.match(cli(root,['models','--catalog']),/claude-haiku-5-5/);
     const reference=await fetch(url+'/models');
@@ -174,6 +178,8 @@ process.stdin.on('end', async () => {
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already running/);
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
+    const boundedLocks=structuredClone(defaults); boundedLocks.max_lock_ttl_secs=60;
+    await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
     const one = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'First project' });
     const two = await api('POST', '/agents', { project: b.id, harness: 'codex', model: 'custom-id', task: 'Second project' });
     await until(() => runs().length >= 2, 'both harnesses started');
@@ -187,6 +193,7 @@ process.stdin.on('end', async () => {
       assert.match(run.prompt, /Your agent ID is in `ACOM_ID`/);
       assert.match(run.prompt, /acom inbox/);
       assert.match(run.prompt, /acom lock acquire/);
+      assert.match(run.prompt, new RegExp(`Lock TTL: maximum ${agent===one.id ? 900 : 60}s`));
       assert.ok(run.prompt.includes(project));
       assert.match(run.prompt,/Literal \{task\} launch/);
     }
@@ -199,6 +206,24 @@ process.stdin.on('end', async () => {
     for (const agent of [one.id, two.id]) await api('POST', '/locks/acquire', { agent, name: 'build', wait: 0 });
     assert.equal((await api('GET', `/locks?project=${a.id}`))[0].holder, one.id);
     assert.equal((await api('GET', `/locks?project=${b.id}`))[0].holder, two.id);
+    const ownLock=(await api('GET',`/locks?project=${b.id}`))[0];
+    assert.ok(ownLock.expires_at>Math.floor(Date.now()/1000) && ownLock.expires_at<=Math.floor(Date.now()/1000)+60);
+    for (const ttl of [0,-1,1.5,'10',true,61,Number.MAX_SAFE_INTEGER]) {
+      await api('POST','/locks/acquire',{agent:two.id,name:'build',wait:0,ttl},400);
+    }
+    assert.equal((await api('GET',`/locks?project=${b.id}`))[0].expires_at,ownLock.expires_at,'invalid renewals preserve the lease');
+    assert.match(cli(second,['lock','acquire','build','--ttl','30s'],{ACOM_ID:String(two.id)}),/renewed build, expires/);
+    const overflow=spawnSync(binary,['lock','acquire','build','--ttl','18446744073709551615h'],{cwd:second,env:{...env,ACOM_ID:String(two.id)},encoding:'utf8'});
+    assert.equal(overflow.status,1); assert.match(overflow.stderr,/bad duration/); assert.doesNotMatch(overflow.stderr,/panicked/);
+    boundedLocks.max_lock_ttl_secs=10;
+    await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
+    const shortened=(await api('GET',`/locks?project=${b.id}`))[0].expires_at;
+    assert.ok(shortened<=Math.floor(Date.now()/1000)+10);
+    boundedLocks.max_lock_ttl_secs=120;
+    await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
+    assert.equal((await api('GET',`/locks?project=${b.id}`))[0].expires_at,shortened,'raising the ceiling never extends a held lock');
+    assert.ok((await api('GET',`/locks?project=${a.id}`))[0].expires_at>shortened,'other project retains its ceiling');
+    await api('PUT',`/projects/${b.id}/config`,{config:1});
     await api('POST', '/threads', { project: a.id, title: 'Wrong project', members: [String(two.id)] }, 400);
     const thread = await api('POST', '/threads', { project: a.id, title: 'Review', members: [String(one.id)] });
     await api('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 400);

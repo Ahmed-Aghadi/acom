@@ -151,6 +151,8 @@ pub struct Settings {
     pub limits: Limits,
     pub auto_resume: bool,
     pub done_closes: bool,
+    #[serde(default = "default_max_lock_ttl_secs")]
+    pub max_lock_ttl_secs: u32,
     #[serde(default = "poll_interval")]
     pub usage_poll_secs: u64,
     #[serde(default)]
@@ -205,6 +207,10 @@ fn check_choice(harness: &str, model: &str, effort: &str) -> R<()> {
 
 fn poll_interval() -> u64 {
     120
+}
+
+fn default_max_lock_ttl_secs() -> u32 {
+    900
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -288,6 +294,7 @@ impl Default for Settings {
             },
             auto_resume: true,
             done_closes: true,
+            max_lock_ttl_secs: default_max_lock_ttl_secs(),
             usage_poll_secs: poll_interval(),
             prompts: Prompts::default(),
             allow_agent_model_change: false,
@@ -299,6 +306,9 @@ impl Default for Settings {
 
 impl Settings {
     fn check(&self) -> R<()> {
+        if self.max_lock_ttl_secs == 0 {
+            return Err(bad("maximum lock TTL must be a positive number of seconds"));
+        }
         if !(15..=3600).contains(&self.usage_poll_secs) {
             return Err(bad("usage check interval must be 15–3600 seconds"));
         }
@@ -852,6 +862,10 @@ impl St {
             out += " (the harness compacts at the hard value)";
         }
         out += &format!(
+            "\nLock TTL: maximum {}s per acquisition or renewal; omitted --ttl uses this maximum. User-frozen pauses stop the TTL clock.",
+            s.max_lock_ttl_secs
+        );
+        out += &format!(
             "\nAgent self-changes (next turn, same provider only): model {}; effort {}.",
             if s.allow_agent_model_change {
                 "allowed"
@@ -984,6 +998,29 @@ impl St {
             self.release_lock(*project, name, Some("its TTL ran out"))?;
         }
         Ok(!expired.is_empty())
+    }
+
+    /// Shorten oversized or legacy untimed leases, including frozen time left.
+    fn cap_lock_ttls(&self, project: i64, max: u32) -> R<bool> {
+        let deadline = now() + i64::from(max);
+        let affected = rows(
+            &self.db,
+            "SELECT name,holder FROM locks WHERE project=?1 AND holder IS NOT NULL AND
+             ((frozen=0 AND (expires_at IS NULL OR expires_at>?2)) OR
+              (frozen=1 AND (frozen_left IS NULL OR frozen_left>?3)))",
+            params![project, deadline, max],
+        )?;
+        for l in &affected {
+            let name = l["name"].as_str().unwrap();
+            self.db.execute(
+                "UPDATE locks SET expires_at=CASE WHEN frozen=0 THEN ?3 ELSE NULL END,
+                 frozen_left=CASE WHEN frozen=1 THEN ?4 ELSE NULL END WHERE project=?1 AND name=?2",
+                params![project, name, deadline, max],
+            )?;
+            self.notice(l["holder"].as_i64().unwrap(),
+                &format!("Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining (frozen clocks stay paused)."))?;
+        }
+        Ok(!affected.is_empty())
     }
 
     /// Keep an agent's locks while it's paused: stop their TTL clocks.
@@ -2101,6 +2138,16 @@ impl App {
             }
         };
         loop {
+            // Recheck after each wait: the user may lower the ceiling while queued.
+            let max = st.settings_for(Some(project)).max_lock_ttl_secs;
+            let ttl = ttl.unwrap_or(u64::from(max));
+            if ttl == 0 || ttl > u64::from(max) {
+                leave(&mut st);
+                self.cv.notify_all();
+                return Err(bad(format!(
+                    "lock TTL must be 1–{max} seconds; use --ttl within the project's maximum"
+                )));
+            }
             st.expire_locks()?;
             if st.agent(agent)?.state != "working" {
                 leave(&mut st);
@@ -2110,7 +2157,7 @@ impl App {
                 ));
             }
             let (holder, since) = Self::lock_row(&st, project, name)?;
-            let expires = ttl.map(|t| now() + t as i64);
+            let expires = Some(now() + ttl as i64);
             let until = |e: Option<i64>| {
                 e.map(|e| format!(", expires {}", hhmm(e)))
                     .unwrap_or_default()
@@ -2624,6 +2671,8 @@ impl App {
             .map(|r| r["id"].as_i64().unwrap())
             .collect();
         for project in projects {
+            changed |=
+                st.cap_lock_ttls(project, st.settings_for(Some(project)).max_lock_ttl_secs)?;
             changed |= self.check_usage(&mut st, project)?;
         }
         changed |= self.drain_wakes(&mut st)?;
@@ -2732,6 +2781,7 @@ impl App {
         if old == &new {
             return Ok(());
         }
+        st.cap_lock_ttls(project, new.max_lock_ttl_secs)?;
         let text = format!(
             "The user changed the limits or rules. Now:\n{}",
             st.limits_text(Some(project))?
@@ -3255,6 +3305,164 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn lock_ttl_settings_have_a_finite_legacy_default_and_reject_invalid_values() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("max_lock_ttl_secs");
+        let mut s: Settings = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(s.max_lock_ttl_secs, 900);
+        s.max_lock_ttl_secs = 0;
+        assert!(s.check().is_err());
+        for ttl in [json!(-1), json!(1.5), json!(4294967296_u64), Value::Null] {
+            value["max_lock_ttl_secs"] = ttl;
+            assert!(serde_json::from_value::<Settings>(value.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn lock_acquisition_and_renewal_enforce_the_project_ceiling() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working'", [])
+            .unwrap();
+        custom(&app, 1, |s| s.max_lock_ttl_secs = 60);
+        app.new_lock(1, "schema", "exclusive schema edits").unwrap();
+        app.new_lock(2, "schema", "another project").unwrap();
+        for ttl in [0, 61, u64::MAX] {
+            assert_eq!(app.acquire(1, "schema", 0, Some(ttl)).unwrap_err().0, 400);
+        }
+        assert!(app.locks(Some(1)).unwrap()[0]["holder"].is_null());
+        assert!(
+            app.acquire(1, "schema", 0, None)
+                .unwrap()
+                .contains("expires")
+        );
+        let expiry = app.locks(Some(1)).unwrap()[0]["expires_at"]
+            .as_i64()
+            .unwrap();
+        assert!((now() + 59..=now() + 60).contains(&expiry));
+        assert!(app.acquire(1, "schema", 0, Some(61)).is_err());
+        assert_eq!(app.locks(Some(1)).unwrap()[0]["expires_at"], expiry);
+        app.acquire(1, "schema", 0, Some(10)).unwrap();
+        app.acquire(1, "schema", 0, None).unwrap();
+        assert!(
+            app.locks(Some(1)).unwrap()[0]["expires_at"]
+                .as_i64()
+                .unwrap()
+                >= now() + 59
+        );
+        app.acquire(2, "schema", 0, Some(61)).unwrap(); // Independent ceiling.
+        app.lock()
+            .db
+            .execute(
+                "UPDATE locks SET expires_at=?1 WHERE project=1",
+                [now() - 1],
+            )
+            .unwrap();
+        app.tick().unwrap();
+        let mut st = app.lock();
+        assert_eq!(st.agent(1).unwrap().state, "working");
+        assert!(st.take_updates(1).unwrap().contains("its TTL ran out"));
+        assert!(st.held_by(1).unwrap().is_empty());
+        assert!(st.held_by(2).unwrap().contains(&"schema".into()));
+    }
+
+    #[test]
+    fn ttl_changes_bound_existing_and_frozen_leases_without_extending_them() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            hold(&st, "long", 1, Some(now() + 800));
+            hold(&st, "untimed", 1, None);
+            hold(&st, "short", 1, Some(now() + 10));
+            st.db.execute("INSERT INTO locks(project,name,about,created_at,holder,expires_at) VALUES(2,'other','x',0,2,?1)", [now()+800]).unwrap();
+        }
+        let mut s = Settings {
+            max_lock_ttl_secs: 60,
+            ..Settings::default()
+        };
+        app.set_project_config(1, None, Some(s.clone()), "user")
+            .unwrap();
+        let deadline = app
+            .lock()
+            .db
+            .query_row("SELECT expires_at FROM locks WHERE name='long'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert!((now() + 59..=now() + 60).contains(&deadline));
+        assert_eq!(lock(&app.lock(), "untimed").1, Some(deadline));
+        assert!(lock(&app.lock(), "short").1.unwrap() < deadline);
+        assert!(lock(&app.lock(), "other").1.unwrap() > deadline);
+        {
+            let mut st = app.lock();
+            st.freeze_locks(1).unwrap();
+            hold(&st, "legacy-frozen", 1, None);
+            st.db
+                .execute("UPDATE locks SET frozen=1 WHERE name='legacy-frozen'", [])
+                .unwrap();
+        }
+        s.max_lock_ttl_secs = 30;
+        app.set_project_config(1, None, Some(s.clone()), "user")
+            .unwrap();
+        assert_eq!(lock(&app.lock(), "long").3, Some(30));
+        assert_eq!(lock(&app.lock(), "legacy-frozen").3, Some(30));
+        s.max_lock_ttl_secs = 90;
+        app.set_project_config(1, None, Some(s), "user").unwrap();
+        assert_eq!(lock(&app.lock(), "long").3, Some(30));
+        // A shared-config edit affects only projects using that config.
+        let default = Settings {
+            max_lock_ttl_secs: 15,
+            ..Settings::default()
+        };
+        app.put_config(1, None, default, "user").unwrap();
+        assert!(lock(&app.lock(), "other").1.unwrap() <= now() + 15);
+        assert_eq!(lock(&app.lock(), "long").3, Some(30));
+        let mut st = app.lock();
+        assert!(st.take_updates(1).unwrap().contains("maximum TTL: 30s"));
+        st.unfreeze_locks(1).unwrap();
+        assert!(lock(&st, "legacy-frozen").1.unwrap() <= now() + 30);
+        hold(&st, "legacy-running", 1, None);
+        drop(st);
+        app.tick().unwrap();
+        assert!(lock(&app.lock(), "legacy-running").1.unwrap() <= now() + 90);
+    }
+
+    #[test]
+    fn queued_acquisition_rechecks_the_ttl_ceiling_and_leaves_the_queue_on_rejection() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working',project=1", [])
+            .unwrap();
+        custom(&app, 1, |s| s.max_lock_ttl_secs = 60);
+        app.new_lock(1, "schema", "x").unwrap();
+        app.acquire(1, "schema", 0, Some(60)).unwrap();
+        let waiter_app = app.clone();
+        let waiter = std::thread::spawn(move || waiter_app.acquire(2, "schema", 5, Some(60)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .lock()
+            .queues
+            .get(&(1, "schema".into()))
+            .is_some_and(|q| q.contains(&2))
+        {
+            assert!(Instant::now() < deadline, "waiter did not queue");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let s = Settings {
+            max_lock_ttl_secs: 30,
+            ..Settings::default()
+        };
+        app.set_project_config(1, None, Some(s), "user").unwrap();
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.0, 400);
+        assert!(error.1.contains("1–30 seconds"));
+        assert!(app.lock().queues[&(1, "schema".into())].is_empty());
+        assert_eq!(lock(&app.lock(), "schema").0, Some(1));
     }
 
     #[test]

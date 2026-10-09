@@ -620,6 +620,7 @@
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['claude','seven_day_fable','Claude Fable weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
       $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
+        <h3>Locks</h3><label style="max-width:300px">Maximum lock TTL (seconds) <input type="number" name="max_lock_ttl_secs" min="1" max="4294967295" step="1" required value="${s.max_lock_ttl_secs ?? 900}"></label><p class="meta launch-project">Every acquisition and renewal has a timed expiry; omitted TTL uses this maximum. Larger TTLs are rejected. Lowering the maximum shortens existing leases, including frozen time left; user-frozen clocks still pause.</p>
         <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
         <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
         <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents require explicit Reopen; messages wait in their inbox. Turn this off to let finished agents wake for new messages.</span></label>
@@ -1153,6 +1154,8 @@
         target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
       });
       delete next.limits.usage.claude;
+      next.max_lock_ttl_secs = Number($('[name=max_lock_ttl_secs]', form).value);
+      if (!Number.isInteger(next.max_lock_ttl_secs) || next.max_lock_ttl_secs < 1 || next.max_lock_ttl_secs > 4294967295) throw new Error('Maximum lock TTL must be a positive whole number of seconds (at most 4294967295).');
       next.auto_resume = $('[name=auto_resume]', form).checked;
       next.done_closes = $('[name=done_closes]', form).checked;
       next.allow_agent_model_change = $('[name=allow_agent_model_change]', form).checked;

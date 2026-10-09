@@ -452,7 +452,13 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({}))
         }
         ("POST", ["locks", "acquire"]) => {
-            let ttl = opt_int(b, "ttl").filter(|t| *t > 0).map(|t| t as u64);
+            let ttl =
+                match b.get("ttl") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(value.as_u64().ok_or_else(|| {
+                        bad("lock TTL must be a positive whole number of seconds")
+                    })?),
+                };
             let wait = opt_int(b, "wait").unwrap_or(0).max(0) as u64;
             J(json!({ "result": app.acquire(int(b, "agent")?, &text(b, "name")?, wait, ttl)? }))
         }

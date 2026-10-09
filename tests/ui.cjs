@@ -21,6 +21,7 @@ function settings() {
     }])),
     limits: { active: { soft: 6, hard: 8 }, active_per_harness: {}, usage: {}, context: { soft: null, hard: 200000 } },
     auto_resume: true, done_closes: true,
+    max_lock_ttl_secs: 900,
     allow_agent_model_change: false, allow_agent_effort_change: false, flagged_retries: {},
     usage_poll_secs: 120,
     prompts: { launch:'Launch guidance', wake:'Wake guidance', resume:'Resume guidance' },
@@ -856,6 +857,28 @@ test('Claude windows display and save independent thresholds, including older sa
   assert.match(await page.locator('[data-window=seven_day] .meter-label').textContent(), /unknown/);
   await page.setViewportSize({width:375,height:800});
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+}));
+
+test('maximum lock TTL is required, positive and persists; older settings get a finite default', async () => fixture(async (page, data) => {
+  delete data.settings.max_lock_ttl_secs;
+  await page.reload();
+  await page.locator('[data-page=settings]').click();
+  const ttl = page.locator('[name=max_lock_ttl_secs]');
+  assert.equal(await ttl.inputValue(), '900');
+  for (const value of ['', '0', '-1', '1.5', '4294967296']) {
+    await ttl.fill(value);
+    assert.equal(await ttl.evaluate(el => el.checkValidity()), false);
+    const writes = data.requests.length;
+    await page.locator('[form=settings-form]').click();
+    assert.equal(data.requests.length, writes);
+  }
+  await ttl.fill('120');
+  await page.evaluate(() => refresh());
+  assert.equal(await ttl.inputValue(), '120');
+  await saveSettings(page);
+  assert.equal(data.settings.max_lock_ttl_secs, 120);
+  await page.reload(); await page.locator('[data-page=settings]').click();
+  assert.equal(await ttl.inputValue(), '120');
 }));
 
 test('agent self-change permissions are independent opt-ins and retry rules are explicit', async () => fixture(async (page, data) => {

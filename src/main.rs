@@ -43,6 +43,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   locks                                   List locks
   lock new <name> --about <text>          Create a lock
   lock acquire <name> [--wait <dur>] [--ttl <dur>]
+                                          TTL defaults to the project's maximum; larger TTLs fail
   lock release <name>
 
 User commands (they act on the project the current folder is in):
@@ -340,8 +341,9 @@ fn duration(s: &str) -> u64 {
     };
     num.trim()
         .parse::<u64>()
-        .map(|n| n * mult)
-        .unwrap_or_else(|_| die(&format!("bad duration {s:?}: use e.g. 30s, 5m, 1h")))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .unwrap_or_else(|| die(&format!("bad duration {s:?}: use e.g. 30s, 5m, 1h")))
 }
 
 fn encode(s: &str) -> String {
