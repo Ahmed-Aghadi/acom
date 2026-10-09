@@ -435,12 +435,12 @@
       const unavailable = /model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
         ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
-        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.state === 'crashed' || unavailable ? 'Retry same model' : a.pause_reason === 'flagged' ? 'Resume same model' : 'Resume'}</button>${a.state === 'crashed' || unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${a.state === 'crashed' || unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
-      const close = a.state !== 'closed' ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
+      const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
       const waiting = a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
-      const problem = a.problem ? `<div class="problem">${unavailable ? 'Model unavailable' : a.pause_reason === 'flagged' ? 'Flagged' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(a.problem)}</div>${a.pause_reason === 'flagged' ? '<div class="meta">Choose another model by launching a new agent.</div>' : ''}` : '';
+      const problem = a.problem ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(a.problem)}</div>` : '';
       const recovery = a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
@@ -563,7 +563,8 @@
         const eligible = a.retry && !a.retry.handled && a.retry.eligible_at ? `<br>Earliest retry: ${esc(when(a.retry.eligible_at))}` : '';
         if (a.retry) fields.push({key:'retry',label:'crash recovery',content:`${esc(a.retry.source)} · Same-model retries: ${esc(a.retry.same_model_attempts ?? 0)}${retryEffort}<br>${a.retry.replacement ? `Replacement agent #${esc(a.retry.replacement)}${retryStatus ? '<br>' : ''}` : ''}${retryStatus}${eligible}`});
         updateAgentDetails(fields);
-        if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
+        if (a.state === 'replaced') $('#agent-config').replaceChildren();
+        else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         const el = $('#agent-log'), text = (log.lines || []).join('\n') || 'No activity yet';
         const selection = getSelection();
         const selectingLog = selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).intersectsNode(el);
@@ -602,13 +603,13 @@
     window.addEventListener('focus', markThreadRead);
 
     function syncSettings(force = false) {
-      if (!state.settings || state.saving || (state.editor?.dirty && !force)) return;
+      if (!state.settings || state.saving || ((state.editor?.dirty || state.editor?.pending) && !force)) return;
       const project = state.project?.id ?? null;
       const config = state.project ? state.project.config : (state.editor?.project == null ? state.editor?.config ?? 1 : 1);
       const s = config == null ? state.settings : state.configs.find(c => c.id === config)?.settings || state.settings;
       const signature = JSON.stringify([project, config, s, state.configs.map(c => [c.id, c.name, c.projects]), state.projects.map(p => [p.id, p.name])]);
       if (!force && signature === state.editor?.signature) return;
-      state.editor = { project, config, settings: structuredClone(s), signature, dirty: false };
+      state.editor = { project, config, settings: structuredClone(s), signature, dirty: false, pending: false };
       renderSettings();
     }
     function renderSettings() {
@@ -622,7 +623,7 @@
       const binding = state.editor.project == null ? 'Configuration' : 'This project uses';
       const configControls = `<div class="form-grid"><label>${binding} <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
         ${config && config.id !== 1 ? `<label>Config name <input name="config_name" value="${esc(config.name)}" required></label>` : '<span></span>'}</div>
-        <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}</p>
+        <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. ${config.id === 1 ? 'Default is read-only. Copy it with Save as new config, or choose Custom for this project.' : `Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.`}` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}${state.editor.pending ? ' Selection is not applied yet; Save applies it to this project.' : ''}</p>
         <div class="actions"><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 1 ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
       const harnesses = Object.entries(s.harnesses || {}).map(([name, h]) => `<div class="harness-settings" data-harness="${esc(name)}"><h4>${esc(name)}</h4><div class="form-grid">
         <label><span><input type="checkbox" name="enabled" ${h.enabled ? 'checked' : ''} style="width:auto"> Enabled</span></label><span></span>
@@ -647,11 +648,12 @@
         <label class="inline-check"><input type="checkbox" name="allow_agent_effort_change" ${s.allow_agent_effort_change ? 'checked' : ''}> Allow agents to change their effort level</label>
         <p class="meta launch-project">Both permissions are off by default. Changes use allowed models and efforts, and apply to the next turn. Provider-native sessions cannot move between providers; a new agent can read the previous agent's history instead. <a href="/models" target="_blank" rel="noopener">Model and provider reference</a></p>
         <h3>Crash recovery</h3><p class="meta launch-project">No retries are configured by default. The same-model count excludes the original turn; zero goes straight to the replacement. Successful responses, including refusals, do not trigger recovery. Manual/usage pauses are separate. Supported effort is preserved; ultra maps to max when supported. Fixed-effort Haiku 4.5 uses a medium placeholder and omits the effort flag. Allowed-effort restrictions still apply. Enable the replacement provider and allow its model in Harnesses above. Cross-provider replacements receive the original conversation history path.</p>
-        <div id="retry-rules">${Object.entries(s.crash_retries || s.flagged_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
+        <div id="retry-rules">${Object.entries(s.crash_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
         <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
       $('#retry-rules').querySelectorAll('[data-retry-rule]').forEach(root => syncRetryChoices(root));
+      setSettingsControls();
     }
 
     function splitList(value) { return value.split(',').map(x => x.trim()).filter(Boolean); }
@@ -1022,8 +1024,8 @@
       if (event.target.id === 'config-select') {
         if (!discardSettings()) { event.target.value = state.editor.config ?? 'custom'; return; }
         const config = event.target.value === 'custom' ? null : Number(event.target.value);
-        const s = state.configs.find(c => c.id === (config ?? 1))?.settings;
-        state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: true };
+        const s = config == null && state.project?.config == null ? state.settings : state.configs.find(c => c.id === (config ?? 1))?.settings;
+        state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: false, pending: !!state.project && config !== state.project.config };
         renderSettings(); return;
       }
       if (state.editor) state.editor.dirty = true;
@@ -1156,6 +1158,7 @@
     function collectSettings() {
       const form = $('#settings-form');
       const next = structuredClone(state.editor.settings);
+      if (state.editor.config === 1) return next;
       form.querySelectorAll('[data-harness]').forEach(root => {
         const h = next.harnesses[root.dataset.harness];
         h.enabled = $('[name=enabled]', root).checked;
@@ -1181,7 +1184,6 @@
       next.allow_agent_model_change = $('[name=allow_agent_model_change]', form).checked;
       next.allow_agent_effort_change = $('[name=allow_agent_effort_change]', form).checked;
       next.crash_retries = Object.create(null);
-      delete next.flagged_retries;
       form.querySelectorAll('[data-retry-rule]').forEach(root => {
         const selected = (name, custom) => $('[name='+name+']',root).value === '__custom__' ? customModel($('[name='+custom+']',root).value) : $('[name='+name+']',root).value;
         const source = selected('retry_source','retry_custom_source');
@@ -1198,19 +1200,21 @@
       next.prompts = Object.fromEntries(['launch','wake','resume'].map(name=>[name,$(`[name=prompt_${name}]`,form).value]));
       return next;
     }
+    function setSettingsControls() {
+      const busy = state.saving, readOnly = state.editor?.config === 1;
+      $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (readOnly && !['config-select','save-config-as'].includes(el.id)));
+      $('[form="settings-form"]').disabled = busy || (readOnly && !state.editor?.pending);
+      const config = state.configs.find(c => c.id === state.editor?.config);
+      if ($('#remove-config')) $('#remove-config').disabled = busy || !!config?.projects.length;
+    }
     function setSettingsBusy(busy) {
       state.saving = busy;
       $('#project-select').disabled = busy || !state.projects.length;
       $('[data-open="project-dialog"]').disabled = busy;
       $('#remove-project').disabled = busy || !state.project || state.agents.length > 0;
       $('#project-form button.primary').disabled = busy;
-      $('#settings-form').querySelectorAll('input, select, button').forEach(el => el.disabled = busy);
-      $('[form="settings-form"]').disabled = busy;
+      setSettingsControls();
       $('#config-form button.primary').disabled = busy;
-      if (!busy) {
-        const config = state.configs.find(c => c.id === state.editor?.config);
-        if ($('#remove-config')) $('#remove-config').disabled = !!config?.projects.length;
-      }
     }
     async function saveConfig(name) {
       const editor = state.editor;
@@ -1222,7 +1226,7 @@
         if (name !== undefined) {
           const result = await api('/configs', { method: 'POST', body: JSON.stringify({ name, settings: next }) });
           config = result.id;
-        } else if (config != null) {
+        } else if (config != null && config !== 1) {
           const rename = $('[name=config_name]', $('#settings-form'))?.value;
           if (JSON.stringify(next) !== JSON.stringify(editor.settings) || (rename != null && rename !== state.configs.find(c => c.id === config)?.name)) {
             await api(`/configs/${config}`, { method: 'PUT', body: JSON.stringify({ settings: next, ...(rename == null ? {} : { name: rename }) }) });
@@ -1231,7 +1235,7 @@
         if (editor.project != null) {
           await api(`/projects/${editor.project}/config`, { method: 'PUT', body: JSON.stringify(config == null ? { custom: next } : { config }) });
         }
-        state.editor = { project: editor.project, config, dirty: false };
+        state.editor = { project: editor.project, config, dirty: false, pending: false };
         await refresh();
       } finally { setSettingsBusy(false); }
       syncSettings(true); toast('Settings saved');

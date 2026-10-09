@@ -51,13 +51,24 @@ fn append(path: &PathBuf, line: &str) {
 }
 
 /// Start one turn of an agent with this prompt. The agent becomes `working`.
-pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
+pub fn start_turn(
+    app: &Arc<App>,
+    st: &mut St,
+    id: i64,
+    prompt: &str,
+    replaces: Option<i64>,
+) -> R<()> {
     if st.procs.contains_key(&id) {
         return Err(crate::app::conflict(format!(
             "agent {id} is still stopping; try again in a moment"
         )));
     }
     let a = st.agent(id)?;
+    if a.state == "replaced" {
+        return Err(crate::app::conflict(
+            "a replaced agent is read-only; use its replacement",
+        ));
+    }
     let s = st.settings_for(Some(a.project));
     let (turns, started): (i64, bool) = st.db.query_row(
         "SELECT turns, session_started FROM agents WHERE id=?1",
@@ -132,12 +143,32 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
     let pid = child.id();
     // Don't feed the task or register a worker until its state is saved. A DB
     // failure after spawn must stop and reap the child, not leave it unattended.
-    if let Err(e) = st.db.execute(
-        "UPDATE agents SET seen_model=NULL,state='working',pid=?2,turns=turns+1,ended_at=NULL WHERE id=?1",
-        params![id, pid]) {
+    let saved = (|| -> R<()> {
+        st.db.execute_batch("SAVEPOINT turn_start")?;
+        st.db.execute(
+            "UPDATE agents SET seen_model=NULL,state='working',pid=?2,turns=turns+1,ended_at=NULL WHERE id=?1",
+            params![id, pid])?;
+        if let Some(old) = replaces {
+            let changed = st.db.execute(
+                "UPDATE agents SET state='replaced' WHERE id=?1 AND state='crashed'",
+                [old],
+            )?;
+            if changed != 1 {
+                return Err(crate::app::conflict(
+                    "replacement predecessor is not crashed",
+                ));
+            }
+        }
+        st.db.execute_batch("RELEASE turn_start")?;
+        Ok(())
+    })();
+    if let Err(e) = saved {
+        let _ = st
+            .db
+            .execute_batch("ROLLBACK TO turn_start; RELEASE turn_start");
         kill_group(pid, libc::SIGKILL);
         let _ = child.wait();
-        return Err(e.into());
+        return Err(e);
     }
     st.procs.insert(
         id,

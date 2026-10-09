@@ -17,7 +17,7 @@ Incompatible development databases are left untouched; startup explains how to u
 
 ## Projects
 
-A project is a folder. Agents run in their project's folder, and only see that project's agents, threads and locks. Each project has its own settings: limits, models, permissions and rules. New projects use the **Default** config. You can save named configs and reuse them across projects, or give a project its own custom settings (starting from Default). In Settings, choose a config for the project and press Save to apply it; editing a shared config shows which projects it affects. There's no cap across projects.
+A project is a folder. Agents run in their project's folder, and only see that project's agents, threads and locks. Each project has its own settings: limits, models, permissions and rules. New projects use the built-in **Default** config, which cannot be edited, renamed or removed. Copy it to a named config or the project's **Custom** settings to make changes. Saved configs can be reused; editing a shared config shows which projects it affects. In Settings, choose a config and press Save to apply it. Selecting a config isn't an edit; discard confirmation is only for changed settings. There's no cap across projects.
 
 Add a project in the UI, with `acom project add [path]`, or just run `acom launch` inside the folder: it's added the first time. The folder browser starts at Home, shows files and folders, and can create a folder; exact-path entry remains available. Your own `acom` commands act on the project the current folder is in; `acom projects` lists them all.
 
@@ -35,7 +35,7 @@ An open **Details** dialog refreshes changed fields and recent activity every tw
 
 When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
-Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Settings are saved in the database and kept across upgrades; new defaults only apply to a fresh `~/.acom`.
+Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Saved and Custom settings are kept across upgrades. Default always uses the built-in preset; copy it before changing settings.
 
 Settings → Locks requires a maximum lock TTL in seconds (default 900 / 15 minutes, including older configs without this setting). Every acquisition or renewal expires: omitted `--ttl` uses the maximum, and larger or nonpositive TTLs are rejected. Lowering it shortens existing oversized leases and notifies their holders; increasing it doesn't extend them. Agents may renew, and user-frozen pauses still stop the clock. Expiry frees the lock but does not stop the agent or its commands.
 
@@ -80,9 +80,9 @@ Recovery uses the failed turn's actual effort, not a queued next-turn change:
 
 These are compatibility conversions, not a separately configured replacement effort. Converted efforts must still be in the project's allowed-effort list. Other unsupported efforts stop with a reason; disallowed targets/efforts or full limits wait. Notices and activity show any conversion.
 
-Same-provider recovery keeps the agent and native session. Cross-provider recovery creates a new agent/session with the original task, failure reason, history/output paths, name/group, thread memberships, notification cursors and message marks. Its prompt tells it to inspect partial work and read predecessor records as context, not replay commands. No locks or background processes transfer; the predecessor stays crashed for inspection.
+Same-provider recovery keeps the same agent ID and native session. Cross-provider recovery creates a new agent/session with the original task, failure reason, history/output paths, name/group, thread memberships, notification cursors and message marks. Its prompt tells it to inspect partial work and read predecessor records as context, not replay commands. No locks or background processes transfer. Once the replacement starts successfully, the predecessor becomes **replaced**: a terminal, read-only agent record, with its details and history still accessible. It cannot be resumed or reopened. A failed replacement spawn leaves the predecessor crashed.
 
-Attempt counts and visited models survive restarts; successful turns and manual **Retry same model** reset the chain. Returning to an already-tried model stops a replacement cycle. Failed setup or spawn stops visibly instead of launching repeatedly. Existing saved `flagged_retries` mappings are accepted as crash-recovery rules with zero same-model retries; upgrading does not automatically retry previously crashed or paused agents.
+Attempt counts and visited models survive restarts; successful turns and manual **Retry same model** reset the chain. Returning to an already-tried model stops a replacement cycle. Failed setup or spawn stops visibly instead of launching repeatedly.
 
 ## Permissions
 

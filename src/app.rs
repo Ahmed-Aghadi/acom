@@ -12,7 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const GUIDE: &str = include_str!("guide.md");
 pub const MODELS: &str = include_str!("models.md");
-pub const STATES: [&str; 6] = ["working", "idle", "paused", "done", "closed", "crashed"];
+pub const STATES: [&str; 7] = [
+    "working", "idle", "paused", "done", "closed", "crashed", "replaced",
+];
 pub const MARKS: [&str; 3] = ["new", "in-progress", "handled"];
 
 /// Where acom keeps its data: `ACOM_HOME`, or `~/.acom`.
@@ -161,7 +163,7 @@ pub struct Settings {
     pub allow_agent_model_change: bool,
     #[serde(default)]
     pub allow_agent_effort_change: bool,
-    #[serde(default, alias = "flagged_retries")]
+    #[serde(default)]
     pub crash_retries: BTreeMap<String, RetryRule>,
 }
 
@@ -506,27 +508,6 @@ CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source T
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
 ";
 
-fn ensure_retry_schema(db: &Connection) -> R<()> {
-    let columns = db
-        .prepare("PRAGMA table_info(agent_retries)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|name| name == "effort") {
-        db.execute("ALTER TABLE agent_retries ADD COLUMN effort TEXT", [])?;
-    }
-    for column in ["same_model_attempts", "eligible_at"] {
-        if !columns.iter().any(|name| name == column) {
-            db.execute(
-                &format!(
-                    "ALTER TABLE agent_retries ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-                ),
-                [],
-            )?;
-        }
-    }
-    Ok(())
-}
-
 /// Development schemas changed before release; don't serve a half-working old
 /// database or alter its records. Starting with a separate ACOM_HOME is safe.
 fn check_stored_schema(db: &Connection) -> R<()> {
@@ -548,8 +529,8 @@ fn check_stored_schema(db: &Connection) -> R<()> {
     if db
         .prepare(
             "SELECT a.project, a.seen_model, a.problem, t.project, l.project, x.project,
-                    p.config, p.custom, c.settings
-                   FROM agents a, threads t, locks l, activity x, projects p, configs c LIMIT 0",
+                    p.config, p.custom, c.settings, r.effort, r.same_model_attempts, r.eligible_at
+                   FROM agents a, threads t, locks l, activity x, projects p, configs c, agent_retries r LIMIT 0",
         )
         .is_err()
         || !project_sql.is_some_and(|s| s.to_ascii_uppercase().contains("AUTOINCREMENT"))
@@ -693,7 +674,7 @@ impl St {
     }
 
     pub fn set_state(&self, id: i64, state: &str) -> R<()> {
-        let ended = matches!(state, "done" | "closed" | "crashed");
+        let ended = matches!(state, "done" | "closed" | "crashed" | "replaced");
         self.db.execute(
             "UPDATE agents SET state=?2, ended_at=CASE WHEN ?3 THEN ?4 ELSE NULL END WHERE id=?1",
             params![id, state, ended, now()],
@@ -1199,10 +1180,10 @@ impl App {
         let db = Connection::open(home.join("acom.db"))?;
         check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
-        ensure_retry_schema(&db)?;
         db.execute("UPDATE usage_checks SET in_flight=0", [])?;
         db.execute(
-            "INSERT OR IGNORE INTO configs(id,name,settings) VALUES(1,'Default',?1)",
+            "INSERT INTO configs(id,name,settings) VALUES(1,'Default',?1)
+             ON CONFLICT(id) DO UPDATE SET name='Default',settings=excluded.settings",
             [serde_json::to_string(&Settings::default()).unwrap()],
         )?;
         let mut st = St {
@@ -1278,7 +1259,7 @@ impl App {
         let (id, warnings) = r?;
         let started = self
             .briefing(&st, id)
-            .and_then(|prompt| run::start_turn(self, &mut st, id, &prompt));
+            .and_then(|prompt| run::start_turn(self, &mut st, id, &prompt, None));
         if let Err(e) = started {
             st.set_state(id, "crashed")?;
             st.db
@@ -1492,7 +1473,7 @@ impl App {
         let updates = st.take_updates(id)?;
         let guidance = st.settings_for(Some(st.agent(id)?.project)).prompts.wake;
         let prompt = format!("{updates}\n\n## Guidance\n\n{guidance}");
-        run::start_turn(self, st, id, &prompt)
+        run::start_turn(self, st, id, &prompt, None)
     }
 
     /// Wake agents in the wake line, oldest first, while there's room. Returns whether any woke.
@@ -1649,7 +1630,7 @@ impl App {
             p.stopping = true;
             run::stop(p.pid);
         }
-        // Limits and flags log their own, more specific line.
+        // Limit pauses log their own, more specific line.
         if matches!(reason, "user" | "all") {
             st.log_for(id, by, &format!("paused agent {id}"))?;
         }
@@ -1690,7 +1671,7 @@ impl App {
 
     fn resume_locked(self: &Arc<Self>, st: &mut St, id: i64, by: &str) -> R<()> {
         match self.prepare_resume(st, id, by)? {
-            Some(prompt) => run::start_turn(self, st, id, &prompt),
+            Some(prompt) => run::start_turn(self, st, id, &prompt, None),
             None => self.maybe_wake(st, id),
         }
     }
@@ -1781,6 +1762,11 @@ impl App {
     pub fn close(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
         let mut st = self.lock();
         let a = st.agent(id)?;
+        if a.state == "replaced" {
+            return Err(conflict(
+                "a replaced agent is read-only; use its replacement",
+            ));
+        }
         if a.state == "closed" {
             return Err(conflict(format!("agent {id} is already closed")));
         }
@@ -1820,6 +1806,11 @@ impl App {
     ) -> R<()> {
         let st = self.lock();
         let a = st.agent(id)?;
+        if a.state == "replaced" {
+            return Err(conflict(
+                "a replaced agent is read-only; use its replacement",
+            ));
+        }
         let s = st.settings_for(Some(a.project));
         if model.is_none() && effort.is_none() {
             return Err(bad("give a model or effort"));
@@ -1868,7 +1859,11 @@ impl App {
 
     pub fn set_status(&self, id: i64, text: &str) -> R<()> {
         let st = self.lock();
-        st.agent(id)?;
+        if st.agent(id)?.state == "replaced" {
+            return Err(conflict(
+                "a replaced agent is read-only; use its replacement",
+            ));
+        }
         st.db.execute(
             "UPDATE agents SET status_text=?2 WHERE id=?1",
             params![id, text],
@@ -1878,7 +1873,11 @@ impl App {
 
     pub fn set_group(&self, id: i64, group: &str) -> R<()> {
         let st = self.lock();
-        st.agent(id)?;
+        if st.agent(id)?.state == "replaced" {
+            return Err(conflict(
+                "a replaced agent is read-only; use its replacement",
+            ));
+        }
         let g = if group.trim().is_empty() {
             None
         } else {
@@ -2093,6 +2092,9 @@ impl App {
                 }
                 "paused" => Some("it's paused; it will see this when it's resumed".into()),
                 "crashed" => Some("it crashed; it will see this if the user resumes it".into()),
+                "replaced" => Some(
+                    "it's replaced and won't resume; its replacement continues the work".into(),
+                ),
                 _ => why.map(|w| format!("{w}; it will be woken when there's room")),
             };
             if let Some(reason) = reason {
@@ -2524,8 +2526,8 @@ impl App {
         } else {
             rule.model.as_str()
         };
-        // Older retry records have no running-effort snapshot. Do not guess
-        // from the agent row: it may contain a queued next-turn change.
+        // Never guess a missing running-effort snapshot from the agent row:
+        // it may contain a queued next-turn change.
         let inherited = effort.unwrap_or_default();
         let effort = recovery_effort(target_harness, target_model, &inherited);
         let mut tried: Vec<String> = serde_json::from_str(&tried)
@@ -2672,7 +2674,7 @@ impl App {
                 "UPDATE agent_retries SET replacement=?2 WHERE agent_id=?1",
                 params![id, new],
             )?;
-            // Keep the predecessor crashed for inspection; its retry is handled.
+            // Mark the predecessor replaced only after the new process spawns.
             st.notice(
                 new,
                 &format!("Agent {id} handed off to you; read inherited messages with acom inbox."),
@@ -2684,7 +2686,7 @@ impl App {
                 st.db.execute_batch("RELEASE crash_retry")?;
                 // All identities and inherited records are committed before any
                 // subprocess can act; failed spawns never orphan rolled-back IDs.
-                if let Err(e) = run::start_turn(self, st, new, &prompt) {
+                if let Err(e) = run::start_turn(self, st, new, &prompt, (new != id).then_some(id)) {
                     st.db.execute(
                         "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
                         params![id, e.1],
@@ -2770,7 +2772,7 @@ impl App {
             for r in rows(
                 &st.db,
                 "SELECT id,model,state FROM agents WHERE project=?1 AND harness=?2
-                AND state NOT IN ('closed','crashed')",
+                AND state NOT IN ('closed','crashed','replaced')",
                 params![project, p],
             )? {
                 let id = r["id"].as_i64().unwrap();
@@ -2860,7 +2862,7 @@ impl App {
         );
         for r in rows(
             &st.db,
-            "SELECT id FROM agents WHERE project=?1 AND state NOT IN ('closed','crashed')",
+            "SELECT id FROM agents WHERE project=?1 AND state NOT IN ('closed','crashed','replaced')",
             [project],
         )? {
             st.notice(r["id"].as_i64().unwrap(), &text)?;
@@ -2911,6 +2913,11 @@ impl App {
 
     /// Change a saved config (and every project using it).
     pub fn put_config(&self, id: i64, name: Option<&str>, settings: Settings, by: &str) -> R<()> {
+        if id == 1 {
+            return Err(conflict(
+                "Default is read-only; save a new config or use Custom",
+            ));
+        }
         settings.check()?;
         let st = self.lock();
         let old_name: String = st
@@ -2931,9 +2938,6 @@ impl App {
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .unwrap_or(&old_name);
-        if id == 1 && name != old_name {
-            return Err(bad("the Default config keeps its name"));
-        }
         st.db
             .execute(
                 "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
@@ -3329,6 +3333,22 @@ mod tests {
         let current = Connection::open_in_memory().unwrap();
         current.execute_batch(SCHEMA).unwrap();
         assert!(check_stored_schema(&current).is_ok());
+        current.execute_batch("DROP TABLE agent_retries;
+            CREATE TABLE agent_retries(agent_id INTEGER PRIMARY KEY,source TEXT,tried TEXT,handled INTEGER,replacement INTEGER,blocked TEXT);
+            INSERT INTO agent_retries VALUES(1,'m','[]',0,NULL,NULL);").unwrap();
+        assert!(
+            check_stored_schema(&current)
+                .unwrap_err()
+                .1
+                .contains("earlier development schema")
+        );
+        assert_eq!(
+            current
+                .query_row("SELECT count(*) FROM agent_retries", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     /// Project 1 with three working claude agents (1, 2, 3); project 2 with agent 4.
@@ -3486,11 +3506,16 @@ mod tests {
         app.set_project_config(1, None, Some(s), "user").unwrap();
         assert_eq!(lock(&app.lock(), "long").3, Some(30));
         // A shared-config edit affects only projects using that config.
-        let default = Settings {
+        let config = app
+            .add_config("shared", Settings::default(), "user")
+            .unwrap();
+        app.set_project_config(2, Some(config), None, "user")
+            .unwrap();
+        let shared = Settings {
             max_lock_ttl_secs: 15,
             ..Settings::default()
         };
-        app.put_config(1, None, default, "user").unwrap();
+        app.put_config(config, None, shared, "user").unwrap();
         assert!(lock(&app.lock(), "other").1.unwrap() <= now() + 15);
         assert_eq!(lock(&app.lock(), "long").3, Some(30));
         let mut st = app.lock();
@@ -3716,6 +3741,100 @@ mod tests {
                 .unwrap();
         }
         app
+    }
+
+    #[test]
+    fn default_is_read_only_and_startup_preserves_named_settings() {
+        let app = app_with_two_projects();
+        let original = serde_json::to_value(Settings::default()).unwrap();
+        let mut mine = Settings {
+            max_lock_ttl_secs: 42,
+            ..Settings::default()
+        };
+        mine.crash_retries.insert(
+            "claude-opus-5-5".into(),
+            RetryRule {
+                harness: "claude".into(),
+                model: "claude-opus-5".into(),
+                same_model_retries: 1,
+            },
+        );
+        let id = app.add_config("Mine", mine.clone(), "user").unwrap();
+        for name in [None, Some("Changed")] {
+            assert_eq!(
+                app.put_config(1, name, mine.clone(), "user").unwrap_err().0,
+                409
+            );
+        }
+        assert_eq!(app.remove_config(1, "user").unwrap_err().0, 409);
+        assert_eq!(app.configs().unwrap()[0]["settings"], original);
+        app.set_project_config(1, Some(id), None, "user").unwrap();
+        let expected = serde_json::to_value(&mine).unwrap();
+        let home = app.home.clone();
+        // A persisted row cannot turn the built-in preset into a mutable config.
+        app.lock()
+            .db
+            .execute(
+                "UPDATE configs SET settings=?1 WHERE id=1",
+                [serde_json::to_string(&mine).unwrap()],
+            )
+            .unwrap();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        assert_eq!(app.configs().unwrap()[0]["settings"], original);
+        assert_eq!(app.configs().unwrap()[1]["settings"], expected);
+        assert_eq!(
+            serde_json::to_value(app.settings(Some(1))).unwrap(),
+            expected
+        );
+        app.set_project_config(1, Some(1), None, "user").unwrap();
+        assert_eq!(
+            serde_json::to_value(app.settings(Some(1))).unwrap(),
+            original
+        );
+        app.set_project_config(1, None, Some(mine.clone()), "user")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(app.settings(Some(1))).unwrap(),
+            expected
+        );
+        app.put_config(id, Some("Mine"), mine, "user").unwrap();
+    }
+
+    #[test]
+    fn replaced_agents_stay_inspectable_and_cannot_be_reactivated_or_configured() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.set_state(1, "replaced").unwrap();
+            st.db
+                .execute(
+                    "UPDATE agents SET problem='original failure' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            st.db.execute("INSERT INTO agent_retries(agent_id,source,effort,tried,handled,replacement) VALUES(1,'m','e','[]',1,2)", []).unwrap();
+        }
+        for result in [
+            app.resume(1, "user").map(|_| ()),
+            app.reopen(1, "user"),
+            app.pause(1, LockMode::Release, "user"),
+            app.close(1, "user"),
+            app.configure_agent(1, 0, None, Some("medium")),
+            app.set_group(1, "new"),
+            app.set_status(1, "new"),
+            app.mark_done(1),
+        ] {
+            assert_eq!(result.unwrap_err().0, 409);
+        }
+        app.turn_ended(1, 0, false, Some("late callback")).unwrap();
+        app.tick().unwrap();
+        assert!(app.resume_all("user").unwrap().is_empty());
+        let view = app.agent_view(1).unwrap();
+        assert_eq!(view["state"], "replaced");
+        assert_eq!(view["problem"], "original failure");
+        assert_eq!(view["retry"]["replacement"], 2);
+        assert!(app.lock().procs.is_empty());
     }
 
     fn custom(app: &App, project: i64, change: impl Fn(&mut Settings)) {
@@ -4300,16 +4419,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retry_settings_migrate_without_changing_the_target() {
-        let mut old = serde_json::to_value(Settings::default()).unwrap();
-        old.as_object_mut().unwrap().remove("crash_retries");
-        old["flagged_retries"] = json!({"gpt-6-sol": {"harness":"codex", "model":"gpt-6-luna"}});
-        let restored: Settings = serde_json::from_value(old).unwrap();
-        assert_eq!(restored.crash_retries["gpt-6-sol"].same_model_retries, 0);
-        restored.check().unwrap();
-        let saved = serde_json::to_value(restored).unwrap();
-        assert!(saved.get("flagged_retries").is_none());
-        assert_eq!(saved["crash_retries"]["gpt-6-sol"]["model"], "gpt-6-luna");
+    fn retry_count_must_be_a_nonnegative_u32() {
         for count in [json!(-1), json!(0.5), json!(4294967296u64)] {
             assert!(
                 serde_json::from_value::<RetryRule>(
@@ -4502,9 +4612,9 @@ mod tests {
     }
 
     #[test]
-    fn retry_rules_ignore_legacy_effort_overrides() {
+    fn retry_rules_default_to_zero_and_require_a_different_valid_target() {
         let rule: RetryRule = serde_json::from_value(json!({
-            "harness": "codex", "model": "gpt-6-luna", "effort": "low"
+            "harness": "codex", "model": "gpt-6-luna"
         }))
         .unwrap();
         assert_eq!(
@@ -4521,26 +4631,6 @@ mod tests {
         s.crash_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-luna".into();
         s.crash_retries.get_mut("gpt-6-sol").unwrap().harness = "claude".into();
         assert!(s.check().unwrap_err().1.contains("belongs to codex"));
-    }
-
-    #[test]
-    fn adding_retry_effort_preserves_legacy_records_and_is_idempotent() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT);
-            INSERT INTO agent_retries(agent_id,source,tried) VALUES(1,'gpt-6-sol','[\"codex:gpt-6-sol\"]');").unwrap();
-        ensure_retry_schema(&db).unwrap();
-        ensure_retry_schema(&db).unwrap();
-        let record: (String, String, Option<String>) = db
-            .query_row(
-                "SELECT source,tried,effort FROM agent_retries WHERE agent_id=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            record,
-            ("gpt-6-sol".into(), "[\"codex:gpt-6-sol\"]".into(), None)
-        );
     }
 
     #[test]
@@ -4704,7 +4794,13 @@ mod tests {
     #[test]
     fn preparing_retry_clears_old_finish_request_without_starting_a_process() {
         let app = app_with_two_projects();
-        app.lock().db.execute("UPDATE agents SET state='paused',pause_reason='flagged',pause_from='working',done_req=1,rest='done' WHERE id=1", []).unwrap();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET state='crashed',done_req=1,rest='done' WHERE id=1",
+                [],
+            )
+            .unwrap();
         let mut st = app.lock();
         let prompt = app.prepare_resume(&mut st, 1, "acom").unwrap().unwrap();
         assert!(prompt.contains("Previous turn interrupted"));
@@ -4781,10 +4877,24 @@ mod tests {
             )
             .unwrap();
         st.db.execute_batch("CREATE TRIGGER fail_worker BEFORE UPDATE OF state ON agents WHEN NEW.state='working' BEGIN SELECT RAISE(ABORT,'injected worker state failure'); END").unwrap();
-        let error = run::start_turn(&app, &mut st, 1, "must not execute").unwrap_err();
+        let error = run::start_turn(&app, &mut st, 1, "must not execute", None).unwrap_err();
         assert!(error.1.contains("injected worker state failure"));
         assert!(st.procs.is_empty());
         assert_eq!(st.agent(1).unwrap().state, "idle");
+        assert_eq!(
+            st.db
+                .query_row("SELECT turns FROM agents WHERE id=1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        st.db.execute_batch("DROP TRIGGER fail_worker; UPDATE agents SET state='crashed' WHERE id=2;
+            CREATE TRIGGER fail_replaced BEFORE UPDATE OF state ON agents WHEN NEW.state='replaced' BEGIN SELECT RAISE(ABORT,'injected predecessor state failure'); END").unwrap();
+        let error = run::start_turn(&app, &mut st, 1, "must not execute", Some(2)).unwrap_err();
+        assert!(error.1.contains("injected predecessor state failure"));
+        assert!(st.procs.is_empty());
+        assert_eq!(st.agent(1).unwrap().state, "idle");
+        assert_eq!(st.agent(2).unwrap().state, "crashed");
         assert_eq!(
             st.db
                 .query_row("SELECT turns FROM agents WHERE id=1", [], |r| r

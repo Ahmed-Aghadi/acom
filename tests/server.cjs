@@ -21,6 +21,10 @@ async function until(check, label, timeout = 10000) {
 }
 
 test('single server scopes projects, preserves settings and supervises first/resumed turns', async () => {
+  // acom prepends its executable directory to child PATH. Reject any client
+  // there before starting the isolated server, even when ACOM_BINARY is overridden.
+  const executableDir=path.dirname(fs.realpathSync(binary));
+  for(const client of ['codex','claude']) assert.equal(fs.existsSync(path.join(executableDir,client)),false,`${client} must not shadow the isolated fake client`);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acom-test-'));
   const home = path.join(root, 'state'), bin = path.join(root, 'bin');
   const first = path.join(root, 'first'), second = path.join(root, 'second');
@@ -95,8 +99,9 @@ process.stdin.on('end', async () => {
   const port = probe.address().port;
   await new Promise(resolve => probe.close(resolve));
   const url = `http://127.0.0.1:${port}`;
-  const env = { ...process.env, ACOM_HOME: home, CODEX_HOME:path.join(root,'codex'), CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: `${bin}:${process.env.PATH}` };
-  delete env.ACOM_ID; delete env.ACOM_URL;
+  // No inherited PATH: a missing fake client must never fall through to a real provider.
+  const env = { ...process.env, ACOM_HOME: home, CODEX_HOME:path.join(root,'codex'), CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: bin };
+  delete env.ACOM_ID; delete env.ACOM_URL; delete env.CLAUDE_CODE_OAUTH_TOKEN;
   let server, stderr = '';
   const start = async () => {
     server = spawn(binary, ['serve', '--port', String(port)], { env, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -129,10 +134,15 @@ process.stdin.on('end', async () => {
     await start();
     assert.equal((await api('GET', '/overview')).project, null);
     await api('POST', '/agents', { harness: 'codex', task: 'Missing project' }, 400);
-    const defaults = (await api('GET', '/configs'))[0].settings;
+    const builtin = (await api('GET', '/configs')).find(c=>c.id===1);
+    assert.equal(builtin.name,'Default');
+    const defaults = structuredClone(builtin.settings);
     assert.equal(defaults.harnesses.codex.model,'gpt-6-sol');
+    await api('PUT','/configs/1',{settings:defaults},409);
+    await api('PUT','/configs/1',{name:'Changed Default',settings:defaults},409);
+    await api('POST','/configs/1/remove',{},409);
     defaults.prompts={launch:'Literal {task} launch',wake:'Literal {updates} wake',resume:'Literal {updates} resume'};
-    await api('PUT','/configs/1',{settings:defaults});
+    const mine=await api('POST','/configs',{name:'Mine',settings:defaults});
     const folder = await api('GET', '/folders');
     assert.equal(folder.path, fs.realpathSync(os.homedir()));
     fs.writeFileSync(path.join(first,'visible.txt'),'file listing, not file contents');
@@ -156,28 +166,29 @@ process.stdin.on('end', async () => {
     assert.deepEqual(defaults.crash_retries,{});
     assert.equal(defaults.max_lock_ttl_secs,900);
     for (const ttl of [0,-1,1.5,4294967296,null]) {
-      await api('PUT','/configs/1',{settings:{...defaults,max_lock_ttl_secs:ttl}},400);
+      await api('PUT',`/configs/${mine.id}`,{settings:{...defaults,max_lock_ttl_secs:ttl}},400);
     }
     assert.match(cli(root,['models']),/Models and providers/);
     assert.match(cli(root,['models','--catalog']),/claude-haiku-5-5/);
     const reference=await fetch(url+'/models');
     assert.match(reference.headers.get('content-type'),/text\/plain/);
     assert.match(await reference.text(),/Unresolved cross-generation/);
-    if (process.env.ACOM_BROWSER_TEST) await browserChecks(url, api, first, second, defaults);
+    if (process.env.ACOM_BROWSER_TEST) await browserChecks(url, api, first, second, defaults, mine.id);
     const a = await api('POST', '/projects', { path: first });
     const b = await api('POST', '/projects', { path: second });
+    for(const project of [a.id,b.id]) await api('PUT',`/projects/${project}/config`,{config:mine.id});
     const windowConfig = structuredClone(defaults);
     windowConfig.limits.usage.claude_five_hour = {soft:25,hard:75};
     windowConfig.limits.usage.claude_seven_day = {soft:60,hard:90};
-    await api('PUT','/configs/1',{settings:windowConfig});
+    await api('PUT',`/configs/${mine.id}`,{settings:windowConfig});
     const windowView = await api('GET',`/overview?project=${a.id}`);
     assert.deepEqual(windowView.settings.limits.usage.claude_five_hour,{soft:25,hard:75});
     assert.deepEqual(windowView.settings.limits.usage.claude_seven_day,{soft:60,hard:90});
     assert.match(cli(first,['limits']),/claude five-hour unknown \(soft 25%, hard 75%\)/);
     assert.match(cli(first,['limits']),/claude weekly unknown \(soft 60%, hard 90%\)/);
     const invalid = structuredClone(windowConfig); invalid.limits.usage.claude_seven_day.hard = 101;
-    await api('PUT','/configs/1',{settings:invalid},400);
-    await api('PUT','/configs/1',{settings:defaults});
+    await api('PUT',`/configs/${mine.id}`,{settings:invalid},400);
+    await api('PUT',`/configs/${mine.id}`,{settings:defaults});
     assert.equal((await api('POST', '/projects', { path: first })).id, a.id);
     assert.equal((await api('GET', `/projects?path=${encodeURIComponent(path.join(first, 'child'))}`)).id, a.id);
     await api('POST', '/projects', { path: path.join(root, 'missing') }, 400);
@@ -230,7 +241,7 @@ process.stdin.on('end', async () => {
     await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
     assert.equal((await api('GET',`/locks?project=${b.id}`))[0].expires_at,shortened,'raising the ceiling never extends a held lock');
     assert.ok((await api('GET',`/locks?project=${a.id}`))[0].expires_at>shortened,'other project retains its ceiling');
-    await api('PUT',`/projects/${b.id}/config`,{config:1});
+    await api('PUT',`/projects/${b.id}/config`,{config:mine.id});
     await api('POST', '/threads', { project: a.id, title: 'Wrong project', members: [String(two.id)] }, 400);
     const thread = await api('POST', '/threads', { project: a.id, title: 'Review', members: [String(one.id)] });
     await api('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 400);
@@ -282,7 +293,7 @@ process.stdin.on('end', async () => {
     assert.ok(runs().filter(r => r.id === one.id)[1].args.includes('--dangerously-bypass-approvals-and-sandbox'));
     await finished(one.id, 'done');
     await api('POST', `/agents/${one.id}/close`, {});
-    await api('PUT', `/projects/${a.id}/config`, {config:1});
+    await api('PUT', `/projects/${a.id}/config`, {config:mine.id});
     assert.equal((await api('GET', `/locks?project=${a.id}`))[0].holder, null);
     const crashed = await api('POST', '/agents', {project:a.id,harness:'codex',task:'CRASH_TEST'});
     await finished(crashed.id, 'crashed');
@@ -302,7 +313,7 @@ process.stdin.on('end', async () => {
     assert.doesNotMatch(crashRetry.prompt, /# acom guide|user changed the limits or rules/);
     await finished(crashed.id);
     assert.equal((await api('GET', `/agents/${crashed.id}`)).session, crashSession);
-    await api('PUT', `/projects/${a.id}/config`, {config:1});
+    await api('PUT', `/projects/${a.id}/config`, {config:mine.id});
     for (const task of ['REROUTE_TEST', 'POLICY_TEST']) {
       const failed = await api('POST', '/agents', { project: a.id, harness: 'codex', task });
       await finished(failed.id,'crashed');
@@ -338,19 +349,15 @@ process.stdin.on('end', async () => {
     assert.equal(selfRun.model,'gpt-6-luna'); assert.equal(selfRun.resume,true);
     assert.match(selfRun.prompt,/Running configuration[\s\S]*gpt-6-luna \/ effort high/);
     await finished(self.id); assert.equal((await api('GET',`/agents/${self.id}`)).session,selfBefore.session);
-    await api('PUT',`/projects/${a.id}/config`,{config:1});
+    await api('PUT',`/projects/${a.id}/config`,{config:mine.id});
 
     // Explicit same-provider recovery preserves the failed turn, not queued choices.
     const retryConfig=structuredClone(defaults);
     retryConfig.crash_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna'};
     retryConfig.limits.active.hard=0;
     retryConfig.limits.active.soft=null;
-    const legacyRetryConfig=structuredClone(retryConfig);
-    legacyRetryConfig.flagged_retries=legacyRetryConfig.crash_retries; delete legacyRetryConfig.crash_retries;
-    await api('PUT',`/projects/${a.id}/config`,{custom:legacyRetryConfig});
-    const migratedRules=(await api('GET',`/overview?project=${a.id}`)).settings;
-    assert.equal(migratedRules.crash_retries['gpt-6-sol'].same_model_retries,0,'old mappings default to immediate replacement');
-    assert.equal(migratedRules.flagged_retries,undefined,'old config names serialize using the new recovery name');
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    assert.equal((await api('GET',`/overview?project=${a.id}`)).settings.crash_retries['gpt-6-sol'].same_model_retries,0);
     const retry=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'POLICY_TEST',force:true});
     await until(async()=>(await api('GET',`/agents/${retry.id}`)).retry?.blocked?.includes('Hard limit'),'retry waits for an active slot');
     assert.equal(runs().filter(r=>r.id===retry.id).length,1);
@@ -459,7 +466,7 @@ process.stdin.on('end', async () => {
     await api('POST',`/agents/${shutdown.id}/close`,{});
 
     // Cross-provider handoff retains threads/marks, references the actual history,
-    // starts a fresh native session, and keeps the predecessor crashed.
+    // starts a fresh native session, and leaves an inspectable replaced predecessor.
     retryConfig.crash_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5'};
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     const handoff=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'HANDOFF_TEST',group:'reviewers'});
@@ -482,7 +489,38 @@ process.stdin.on('end', async () => {
     assert.ok((await api('GET',`/threads/${handoffThread.id}`)).members.includes(replacement));
     assert.ok((await api('GET',`/inbox/${replacement}?mark=in-progress`)).some(m=>m.id===handoffMessage.id));
     assert.doesNotMatch(replacementRun.prompt,/respect provider policies|evade refusal|prohibited work/i);
-    await finished(replacement); assert.equal((await api('GET',`/agents/${handoff.id}`)).state,'crashed');
+    await finished(replacement);
+    const predecessor=await api('GET',`/agents/${handoff.id}`);
+    assert.equal(predecessor.state,'replaced');
+    for(const action of ['resume','reopen','pause','close']) await api('POST',`/agents/${handoff.id}/${action}`,{},409);
+    await api('POST','/agent-config',{id:handoff.id,model:'gpt-6-luna',effort:'medium'},409);
+    await api('POST',`/agents/${handoff.id}/status`,{text:'Cannot edit a replaced agent'},409);
+    await api('POST',`/agents/${handoff.id}/group`,{group:'Cannot move a replaced agent'},409);
+    await api('POST',`/agents/${handoff.id}/done`,{},409);
+    const unchangedPredecessor=await api('GET',`/agents/${handoff.id}`);
+    assert.deepEqual(unchangedPredecessor.retry,predecessor.retry,'terminal operations preserve the replacement link and retry history');
+    assert.equal(unchangedPredecessor.state,'replaced');
+    assert.equal(unchangedPredecessor.session,predecessor.session);
+    assert.equal(unchangedPredecessor.group,predecessor.group);
+    assert.equal(unchangedPredecessor.status,predecessor.status);
+    assert.ok((await api('GET',`/agents/${handoff.id}/log`)).lines.length>0,'replaced output remains readable');
+
+    // Preparing a handoff is not replacement until its native process starts.
+    fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude-unavailable'));
+    try {
+      const failedHandoff=await api('POST','/agents',{project:a.id,harness:'codex',task:'HANDOFF_TEST'});
+      const failedView=await until(async()=>{
+        const view=await api('GET',`/agents/${failedHandoff.id}`);
+        return view.retry?.handled && view.retry?.blocked && view;
+      },'replacement spawn failure');
+      assert.equal(failedView.state,'crashed','failed replacement leaves the predecessor recoverable');
+      assert.match(failedView.problem,/Temporary handoff failure/);
+      if(failedView.retry.replacement) {
+        assert.equal((await api('GET',`/agents/${failedView.retry.replacement}`)).state,'crashed');
+        assert.equal(runs().some(run=>run.id===failedView.retry.replacement),false,'missing client never starts a replacement process');
+      }
+      await api('POST',`/agents/${failedHandoff.id}/close`,{});
+    } finally { fs.renameSync(path.join(bin,'claude-unavailable'),path.join(bin,'claude')); }
 
     for(const [model,expected] of [['claude-sonnet-5-5','max'],['claude-haiku-4-5','medium']]) {
       retryConfig.crash_retries['gpt-6-sol']={harness:'claude',model};
@@ -510,14 +548,16 @@ process.stdin.on('end', async () => {
     await stop(); await start();
     await new Promise(r=>setTimeout(r,1100));
     assert.equal(runs().filter(r=>r.id===cycleNext).length,1);
-    await api('PUT',`/projects/${a.id}/config`,{config:1});
+    assert.equal((await api('GET',`/agents/${handoff.id}`)).state,'replaced');
+    assert.deepEqual((await api('GET',`/agents/${handoff.id}`)).retry,predecessor.retry,'replacement history survives restart');
+    await api('PUT',`/projects/${a.id}/config`,{config:mine.id});
 
     const rejected=await api('POST','/agents',{project:a.id,harness:'codex',model:'gpt-6.1-sol',task:'UNSUPPORTED_TEST'});
     await until(async()=>(await api('GET',`/agents/${rejected.id}`)).state==='crashed','unsupported model error');
     assert.match((await api('GET',`/agents/${rejected.id}`)).problem,/^The 'gpt-6.1-sol' model is not supported/);
     const noCap=structuredClone(defaults); noCap.limits.usage.codex={soft:null,hard:null}; noCap.auto_resume=false; noCap.usage_poll_secs=15;
     noCap.crash_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna',same_model_retries:2};
-    await api('PUT','/configs/1',{settings:noCap});
+    await api('PUT',`/configs/${mine.id}`,{settings:noCap});
     const quota=(used,reset)=>({rateLimits:{primary:{usedPercent:used,resetsAt:reset}}});
     const subscription=path.join(home,'subscription.json');
     const resetAt=Math.floor(Date.now()/1000)+2;
@@ -529,7 +569,7 @@ process.stdin.on('end', async () => {
     assert.equal(runs().filter(r=>r.id===exhausted.id).length,1,'quota waits do not consume crash retries');
     const checks=fs.readFileSync(path.join(home,'checks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     assert.ok(checks.some(c=>c.at>=resetAt*1000 && c.at<=(resetAt+2)*1000),'provider-reported reset gets an immediate check, not the periodic delay');
-    noCap.usage_poll_secs=3600; await api('PUT','/configs/1',{settings:noCap});
+    noCap.usage_poll_secs=3600; await api('PUT',`/configs/${mine.id}`,{settings:noCap});
     fs.writeFileSync(subscription,JSON.stringify({hang:true})); await api('POST','/usage/check',{provider:'codex'});
     await until(async()=>(await api('GET',`/limits?project=${a.id}`)).checks.some(c=>c.provider==='codex'&&c.error?.includes('timed out')),'a stalled usage probe times out',20000);
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
@@ -540,18 +580,18 @@ process.stdin.on('end', async () => {
     fs.writeFileSync(subscription,'{}'); await api('POST','/usage/check',{provider:'codex'});
     await until(async()=>(await api('GET',`/limits?project=${a.id}`)).checks.some(c=>c.provider==='codex'&&c.error),'unknown status does not clear quota');
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
-    noCap.usage_poll_secs=15; await api('PUT','/configs/1',{settings:noCap});
+    noCap.usage_poll_secs=15; await api('PUT',`/configs/${mine.id}`,{settings:noCap});
     fs.writeFileSync(subscription,JSON.stringify(quota(0,Math.floor(Date.now()/1000)+3600)));
     await until(async()=>(await api('GET',`/limits?project=${a.id}`)).usage.filter(u=>u.provider==='codex').every(u=>u.used_pct===0),'periodic checks discover an early reset',20000);
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused','auto-resume is off');
-    noCap.auto_resume=true; await api('PUT','/configs/1',{settings:noCap});
+    noCap.auto_resume=true; await api('PUT',`/configs/${mine.id}`,{settings:noCap});
     await until(()=>runs().filter(r=>r.id===exhausted.id).length===2,'automatic same-session recovery');
     const recovery=runs().filter(r=>r.id===exhausted.id)[1];
     assert.ok(recovery.resume); assert.match(recovery.prompt,/Commands may have only partially executed/);
     assert.match(recovery.prompt,/Literal \{updates\} resume/);
     assert.match(recovery.prompt,/codex 0% \(no limit\)/);
     assert.ok(recovery.prompt.lastIndexOf('## Limits and rules right now') > recovery.prompt.lastIndexOf('user changed the limits or rules'));
-    await finished(exhausted.id); await api('PUT','/configs/1',{settings:defaults});
+    await finished(exhausted.id); await api('PUT',`/configs/${mine.id}`,{settings:defaults});
     const solo=await api('POST','/threads',{project:a.id,title:'User notes',members:[]});
     assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[0]);
     assert.match(cli(first,['thread','read',String(solo.id)]),/user/);
@@ -621,15 +661,19 @@ process.stdin.on('end', async () => {
     await finished(scopedA.id, 'done');
     const savedRead = (await api('GET', `/threads/${thread.id}`)).last_read;
     await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread survives restart' });
+    await api('PUT',`/configs/${mine.id}`,{name:'Mine renamed',settings:defaults});
     await stop(); await start();
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, savedRead);
     assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 1);
     assert.equal((await api('GET', `/overview?project=${a.id}`)).settings.auto_resume, false);
     assert.equal((await api('GET', `/overview?project=${b.id}`)).project.config, null);
     assert.equal((await api('GET', '/configs')).find(c => c.id === saved.id).name, 'Small renamed');
+    assert.deepEqual((await api('GET','/configs')).find(c=>c.id===1).settings,builtin.settings,'Default stays built-in after configuration edits and restart');
+    assert.equal((await api('GET','/configs')).find(c=>c.id===mine.id).name,'Mine renamed');
+    assert.deepEqual((await api('GET','/configs')).find(c=>c.id===mine.id).settings,defaults,'startup preserves editable saved configurations');
     await api('PUT', `/projects/${b.id}/config`, { config: saved.id });
     assert.deepEqual((await api('GET', '/configs')).find(c => c.id === saved.id).projects, [a.id, b.id]);
-    for (const p of [a.id, b.id]) await api('PUT', `/projects/${p}/config`, { config: 1 });
+    for (const p of [a.id, b.id]) await api('PUT', `/projects/${p}/config`, { config: mine.id });
     await api('POST', `/configs/${saved.id}/remove`, {});
     assert.equal((await api('GET', '/projects')).length, 2);
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
@@ -683,7 +727,7 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
   } finally { await browser.close(); }
 }
 
-async function browserChecks(url, api, first, second, defaults) {
+async function browserChecks(url, api, first, second, defaults, mineId) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
   const page = await browser.newPage();
@@ -762,6 +806,7 @@ async function browserChecks(url, api, first, second, defaults) {
     assert.equal(await page.locator('#launch-effort option[value=ultra]').count(), 0);
     await page.locator('[data-close="launch-dialog"]').click();
     await page.locator('[data-page=settings]').click();
+    await page.locator('#config-select').selectOption(String(mineId));
     const cfg = page.locator('[data-harness=codex]');
     await cfg.locator('.model-picker summary').click();
     await cfg.locator('[name=add_model]').fill('custom-next');
@@ -775,9 +820,10 @@ async function browserChecks(url, api, first, second, defaults) {
     await page.locator('[name=usage_poll_secs]').fill('45');
     await page.locator('[form=settings-form]').click();
     await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
-    assert.equal((await api('GET', '/configs'))[0].settings.limits.active.soft, null);
-    assert.equal((await api('GET', '/configs'))[0].settings.prompts.resume,guidance);
-    assert.equal((await api('GET', '/configs'))[0].settings.usage_poll_secs,45);
+    const editedMine=(await api('GET','/configs')).find(c=>c.id===mineId);
+    assert.equal(editedMine.settings.limits.active.soft, null);
+    assert.equal(editedMine.settings.prompts.resume,guidance);
+    assert.equal(editedMine.settings.usage_poll_secs,45);
     await page.reload();
     await page.locator('[data-page=settings]').click();
     await cfg.locator('[name=model] option[value=custom-next]').waitFor({ state: 'attached' });
@@ -787,7 +833,7 @@ async function browserChecks(url, api, first, second, defaults) {
     await active.locator('[name=hard]').fill('8');
     await page.locator('[form=settings-form]').click();
     await page.waitForFunction(() => document.querySelector('#toast').textContent.includes("soft can't be above hard"));
-    assert.equal((await api('GET', '/configs'))[0].settings.limits.active.soft, null);
+    assert.equal((await api('GET', '/configs')).find(c=>c.id===mineId).settings.limits.active.soft, null);
     await active.locator('[name=soft]').fill('');
     await active.locator('[name=hard]').fill('2');
     await page.locator('#save-config-as').click();
@@ -806,6 +852,7 @@ async function browserChecks(url, api, first, second, defaults) {
     assert.deepEqual((await api('GET', '/configs')).find(c => c.id === named.id).projects, [firstId, secondId]);
     await page.locator('#config-select').selectOption('custom');
     assert.equal(await active.locator('[name=hard]').inputValue(), '8');
+    await active.locator('[name=soft]').fill('');
     await active.locator('[name=hard]').fill('1');
     await page.locator('[form=settings-form]').click();
     await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
@@ -827,6 +874,6 @@ async function browserChecks(url, api, first, second, defaults) {
     assert.equal(fs.existsSync(first), true); assert.equal(fs.existsSync(second), true);
     assert.deepEqual(errors, []);
     await api('POST', `/configs/${named.id}/remove`, {});
-    await api('PUT', '/configs/1', { settings: defaults });
+    await api('PUT', `/configs/${mineId}`, { settings: defaults });
   } finally { await browser.close(); }
 }

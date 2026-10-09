@@ -29,8 +29,8 @@ function settings() {
 }
 
 async function fixture(run) {
-  const data = { settings: settings(), agents: [], threads: [], reads: {}, agentLogs: {}, detailRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 1 }, { id: 2, name: 'other', path: '/projects/other', config: 1 }], requests: [], hardLimit: false };
-  data.configs = [{ id: 1, name: 'Default', settings: data.settings }];
+  const data = { settings: settings(), agents: [], threads: [], reads: {}, agentLogs: {}, detailRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
+  data.configs = [{ id: 1, name: 'Default', settings: settings() }, { id: 2, name: 'Mine', settings: data.settings }];
   data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
   const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
@@ -83,10 +83,11 @@ async function fixture(run) {
     if (/^\/configs\/\d+(\/remove)?$/.test(req.url)) {
       if (data.writeDelay) await new Promise(resolve => setTimeout(resolve, data.writeDelay));
       const id = Number(req.url.split('/')[2]);
+      if (id === 1) { res.statusCode = 403; return send({error:'Default is read-only'}); }
       if (req.url.endsWith('/remove')) data.configs = data.configs.filter(c => c.id !== id);
       else {
         Object.assign(data.configs.find(c => c.id === id), body);
-        if (id === 1) data.settings = body.settings;
+        if (id === 2) data.settings = body.settings;
       }
       return send({});
     }
@@ -350,17 +351,17 @@ test('project and model strings are text, not injected markup', async () => fixt
   assert.equal(await page.evaluate(() => window.pwned), undefined);
 }));
 
-test('flag, limit and crash reasons are visible and flagged resume keeps the model', async () => fixture(async (page, data) => {
+test('replacement, limit and crash reasons remain visible with matching controls', async () => fixture(async (page, data) => {
   data.agents = [
-    { id: 1, name: 'Flagged agent', project: 1, state: 'paused', pause_reason: 'flagged', problem: 'Model refused <example>', harness: 'codex', model: 'gpt-6.1-sol', effort: 'medium' },
+    { id: 1, name: 'Replaced agent', project: 1, state: 'replaced', problem: 'Prior stream failure <example>', harness: 'codex', model: 'gpt-6.1-sol', effort: 'medium' },
     { id: 2, name: 'Limit agent', project: 1, state: 'paused', pause_reason: 'limit', problem: 'Usage limit reached' },
     { id: 3, name: 'Crash agent', project: 1, state: 'crashed', problem: 'Stream disconnected' },
   ];
   await page.reload();
   await page.locator('[data-agent="1"]').waitFor();
-  assert.equal(await page.locator('[data-agent="1"] .problem').textContent(), 'Flagged: Model refused <example>');
-  assert.equal(await page.locator('[data-agent="1"] [data-action=resume]').textContent(), 'Resume same model');
-  assert.equal(await page.locator('[data-agent="1"] .pill').textContent(), 'paused · flagged');
+  assert.equal(await page.locator('[data-agent="1"] .problem').textContent(), 'Previous crash: Prior stream failure <example>');
+  assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
+  assert.equal(await page.locator('[data-agent="1"] .pill').textContent(), 'replaced');
   assert.equal(await page.locator('[data-agent="2"] .problem').textContent(), 'Usage limit: Usage limit reached');
   assert.equal(await page.locator('[data-agent="3"] .problem').textContent(), 'Crashed: Stream disconnected');
 }));
@@ -385,7 +386,7 @@ test('shared edits name affected projects; Custom starts from Default and stays 
   await page.locator('#project-select').selectOption('2');
   await page.waitForFunction(() => document.querySelector('[data-limit=active] [name=hard]')?.value === '10');
   await page.locator('#config-select').selectOption('custom');
-  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '10');
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '8');
   await page.locator('[data-limit=active] [name=soft]').fill('');
   await page.locator('[data-limit=active] [name=hard]').fill('2');
   await saveSettings(page);
@@ -396,7 +397,7 @@ test('shared edits name affected projects; Custom starts from Default and stays 
   await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'custom');
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '2');
   await page.locator('#project-select').selectOption('1');
-  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '2');
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '10');
   assert.doesNotMatch(await page.locator('#config-scope').textContent(), /other/);
 }));
@@ -414,29 +415,29 @@ test('named configs can be saved, reused, renamed and removed only when unused',
   await page.locator('#config-form [name=name]').fill('Large jobs');
   await page.locator('#config-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
-  assert.equal(data.projects[0].config, 2);
-  assert.equal(data.configs[1].settings.limits.active.hard, 12);
+  assert.equal(data.projects[0].config, 3);
+  assert.equal(data.configs[2].settings.limits.active.hard, 12);
   assert.equal(data.settings.limits.active.hard, 8);
   assert.equal(await page.locator('#remove-config').isDisabled(), true);
   await page.locator('#project-select').selectOption('2');
-  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
-  await page.locator('#config-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '2');
+  await page.locator('#config-select').selectOption('3');
   await saveSettings(page);
-  assert.deepEqual(data.projects.map(p => p.config), [2, 2]);
+  assert.deepEqual(data.projects.map(p => p.config), [3, 3]);
   await page.locator('[name=config_name]').fill('Bigger jobs');
   await saveSettings(page);
-  assert.equal(data.configs[1].name, 'Bigger jobs');
+  assert.equal(data.configs[2].name, 'Bigger jobs');
   for (const project of ['1', '2']) {
     await page.locator('#project-select').selectOption(project);
     await page.waitForFunction(() => !!document.querySelector('#config-select'));
     await page.locator('#config-select').selectOption('1');
     await saveSettings(page);
   }
-  await page.locator('#config-select').selectOption('2');
+  await page.locator('#config-select').selectOption('3');
   assert.equal(await page.locator('#remove-config').isEnabled(), true);
   page.once('dialog', d => d.accept()); await page.locator('#remove-config').click();
-  await page.waitForFunction(() => !document.querySelector('#config-select option[value="2"]'));
-  assert.equal(data.configs.length, 1);
+  await page.waitForFunction(() => !document.querySelector('#config-select option[value="3"]'));
+  assert.equal(data.configs.length, 2);
   assert.equal(await page.locator('#remove-config').count(), 0);
 }));
 
@@ -450,8 +451,8 @@ test('duplicate config names keep the draft and dialog for correction', async ()
   assert.equal(await page.locator('#config-dialog').isVisible(), true);
   assert.equal(await page.locator('#config-form button.primary').isEnabled(), true);
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '9');
-  assert.equal(data.configs.length, 1);
-  assert.equal(data.projects[0].config, 1);
+  assert.equal(data.configs.length, 2);
+  assert.equal(data.projects[0].config, 2);
 }));
 
 test('project/config switches ask before discarding drafts, and cancelled switches keep them', async () => fixture(async page => {
@@ -460,12 +461,65 @@ test('project/config switches ask before discarding drafts, and cancelled switch
   for (const selector of ['#project-select', '#config-select']) {
     page.once('dialog', d => d.dismiss());
     await page.locator(selector).selectOption(selector === '#project-select' ? '2' : 'custom');
-    assert.equal(await page.locator(selector).inputValue(), '1');
+    assert.equal(await page.locator(selector).inputValue(), selector === '#project-select' ? '1' : '2');
     assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '9');
   }
   page.once('dialog', d => d.accept());
   await page.locator('#project-select').selectOption('2');
   await page.waitForFunction(() => document.querySelector('[data-limit=active] [name=hard]')?.value === '8');
+}));
+
+test('config selection alone survives polling and switches without discard confirmations', async () => fixture(async (page, data) => {
+  let dialogs = 0;
+  page.on('dialog', dialog => { dialogs++; dialog.dismiss(); });
+  await page.locator('[data-page=settings]').click();
+  for (const config of ['1','2','1','2','1']) {
+    await page.locator('#config-select').selectOption(config);
+    await page.evaluate(() => refresh());
+    assert.equal(await page.locator('#config-select').inputValue(), config);
+    assert.equal(await page.evaluate(() => state.editor.dirty), false);
+  }
+  assert.equal(dialogs, 0);
+  assert.equal(data.requests.length, 0, 'selection requires explicit Save to apply');
+  assert.equal(await page.locator('[form=settings-form]').isEnabled(), true);
+  await saveSettings(page);
+  assert.equal(data.projects[0].config, 1);
+  assert.deepEqual(data.requests, [{url:'/projects/1/config',method:'PUT',body:{config:1}}]);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
+  await page.locator('#config-select').selectOption('2');
+  await page.locator('#config-select').selectOption('1');
+  assert.equal(dialogs, 0);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
+}));
+
+test('Default is read-only, copied settings are editable, and busy restoration preserves read-only controls', async () => fixture(async (page, data) => {
+  data.settings.limits.active.hard = 9;
+  data.writeDelay = 250;
+  const originalDefault = structuredClone(data.configs[0].settings);
+  await page.reload(); await page.locator('[data-page=settings]').click();
+  await page.locator('#config-select').selectOption('1');
+  assert.match(await page.locator('#config-scope').textContent(), /Default is read-only.*Selection is not applied yet/);
+  assert.equal(await page.locator('#config-select').isEnabled(), true);
+  assert.equal(await page.locator('#save-config-as').isEnabled(), true);
+  for (const selector of ['[data-limit=active] [name=hard]','[name=auto_resume]','[name=prompt_launch]','[data-harness=codex] [name=model]','#add-retry-rule']) {
+    assert.equal(await page.locator(selector).isDisabled(), true, selector);
+  }
+  await saveSettings(page);
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').isDisabled(), true);
+  assert.equal(await page.locator('[name=prompt_launch]').isDisabled(), true);
+  assert.equal(await page.locator('#config-select').isEnabled(), true);
+  assert.equal(await page.locator('#save-config-as').isEnabled(), true);
+  await page.locator('#save-config-as').click();
+  await page.locator('#config-form [name=name]').fill('Personal');
+  await page.locator('#config-form button.primary').click();
+  await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
+  assert.equal(data.projects[0].config, 3);
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').isEnabled(), true);
+  await page.locator('[data-limit=active] [name=hard]').fill('12'); await saveSettings(page);
+  assert.equal(data.configs[2].settings.limits.active.hard, 12);
+  assert.deepEqual(data.configs[0].settings, originalDefault);
+  assert.equal(data.settings.limits.active.hard, 9, 'Mine persists independently of Default and copies');
+  assert.equal(data.requests.some(request => request.url === '/configs/1'), false);
 }));
 
 test('launch loads the target project defaults and ignores stale target responses', async () => fixture(async (page, data) => {
@@ -491,9 +545,12 @@ test('launch loads the target project defaults and ignores stale target response
   assert.equal(data.requests.at(-1).body.project, 2);
 }));
 
-test('without projects Default remains editable and named configs can be created', async () => fixture(async (page, data) => {
+test('without projects Default is read-only while Mine and copied configs remain editable', async () => fixture(async (page, data) => {
   data.projects = []; await page.reload();
   await page.locator('[data-page=settings]').click();
+  assert.equal(await page.locator('[data-limit=active] [name=hard]').isDisabled(), true);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
+  await page.locator('#config-select').selectOption('2');
   await page.locator('[data-limit=active] [name=hard]').fill('9');
   await saveSettings(page);
   assert.equal(data.settings.limits.active.hard, 9);
@@ -501,7 +558,7 @@ test('without projects Default remains editable and named configs can be created
   await page.locator('#config-form [name=name]').fill('Unused');
   await page.locator('#config-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
-  assert.equal(await page.locator('#config-select').inputValue(), '2');
+  assert.equal(await page.locator('#config-select').inputValue(), '3');
   assert.equal(data.projects.length, 0);
   assert.equal(data.requests.some(r => r.url.startsWith('/projects')), false);
 }));
@@ -530,7 +587,7 @@ test('polling cannot unlock project controls during a settings save', async () =
   }
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
   assert.equal(await page.locator('#project-select').isEnabled(), true);
-  assert.equal(data.projects[0].config, 1);
+  assert.equal(data.projects[0].config, 2);
   assert.equal(data.settings.limits.active.hard, 9);
 }));
 
@@ -651,14 +708,14 @@ test('generic crashed turns offer same-model retry and explicit alternative with
   data.agents = [
     {id:1,project:1,name:'Failed turn',state:'crashed',harness:'codex',model:'gpt-6.1-sol',effort:'high',task:'Continue the original task',problem:'Stream failed: cyber-risk error'},
     {id:2,project:1,name:'Quota pause',state:'paused',pause_reason:'limit',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
-    {id:3,project:1,name:'Legacy flag',state:'paused',pause_reason:'flagged',harness:'claude',model:'claude-opus-5-5',effort:'medium'},
+    {id:3,project:1,name:'Manual pause',state:'paused',pause_reason:'user',harness:'claude',model:'claude-opus-5-5',effort:'medium'},
   ];
   await page.reload();
   const crash = page.locator('[data-agent="1"]');
   assert.equal(await crash.locator('[data-action=resume]').textContent(), 'Retry same model');
   assert.equal(await crash.locator('[data-action=another-model]').textContent(), 'Launch another model…');
   assert.equal(await page.locator('[data-agent="2"] [data-action=resume]').textContent(), 'Resume');
-  assert.equal(await page.locator('[data-agent="3"] [data-action=resume]').textContent(), 'Resume same model');
+  assert.equal(await page.locator('[data-agent="3"] [data-action=resume]').textContent(), 'Resume');
   await crash.locator('[data-action=another-model]').click();
   assert.equal(await page.locator('#launch-harness').inputValue(), 'codex');
   assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'Continue the original task');
@@ -935,17 +992,12 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   assert.equal(data.settings.allow_agent_model_change, true);
   assert.equal(data.settings.allow_agent_effort_change, false);
   assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:2}});
-  // Old saved overrides must not survive another settings save.
-  data.settings.flagged_retries = data.settings.crash_retries;
-  delete data.settings.crash_retries;
-  data.settings.flagged_retries['claude-opus-5-5'].effort = 'low';
   await page.reload(); await page.locator('[data-page=settings]').click();
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
   assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
   assert.equal(await rule.locator('[name=same_model_retries]').inputValue(), '2');
   await saveSettings(page);
   assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:2}});
-  assert.equal(data.settings.flagged_retries, undefined);
   await rule.locator('[data-remove-retry]').click(); await saveSettings(page);
   assert.deepEqual(data.settings.crash_retries, {});
 }));
@@ -1079,6 +1131,7 @@ test('agent details preserve model drafts while polling and save provider-fixed 
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'ultra'}];
   await page.reload(); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
+  await config.locator('#save-agent-config').waitFor();
   assert.match(await config.textContent(), /current turn is not interrupted/);
   await config.locator('[name=agent_model]').selectOption('gpt-6-luna');
   assert.equal(await config.locator('[name=agent_effort] option[value=ultra]').count(), 0);
@@ -1102,6 +1155,7 @@ test('agent details expose pending, blocked and replacement retry status safely'
   data.agents = [{id:1,project:1,name:'Worker',state:'crashed',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null,same_model_attempts:1,effort:'medium',eligible_at:Date.now()/1000+120}}];
   await page.reload(); await page.locator('[data-action=details]').click();
   const details = page.locator('#agent-details');
+  await details.locator('dt[data-key=retry]').waitFor();
   assert.match(await details.textContent(), /crash recovery.*Same-model retries: 1.*effort medium.*Pending; requires a configured rule/);
   assert.match(await details.textContent(), /Earliest retry:/);
   data.agents[0].effort = 'high';
@@ -1120,6 +1174,31 @@ test('agent details expose pending, blocked and replacement retry status safely'
   data.agents[0].retry.blocked = 'cannot start replacement';
   await page.evaluate(() => refresh());
   assert.match(await details.textContent(), /Replacement agent #2.*Stopped: cannot start replacement/);
+}));
+
+test('replaced agents expose history and replacement details without restart or configure controls', async () => fixture(async (page, data) => {
+  data.agents = [
+    {id:1,project:1,name:'Predecessor',state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',conversation_history:'/history/old.jsonl',output_log:'/logs/old.jsonl',retry:{source:'gpt-6.1-sol',handled:1,replacement:2,blocked:null,same_model_attempts:0,effort:'high'}},
+    {id:2,project:1,name:'Replacement',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
+  ];
+  data.agentLogs[1] = ['Retained predecessor history'];
+  await page.reload();
+  assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-details dt[data-key=retry]').waitFor();
+  assert.match(await page.locator('#agent-details').textContent(), /\/history\/old.jsonl.*Replacement agent #2/s);
+  assert.equal(await page.locator('#agent-log').textContent(), 'Retained predecessor history');
+  assert.equal(await page.locator('#agent-config').textContent(), '');
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  await page.locator('[data-agent="2"] [data-action=details]').click();
+  await page.locator('#save-agent-config').waitFor();
+  assert.equal(await page.locator('#save-agent-config').count(), 1);
+  data.agents[1].state = 'replaced';
+  data.agents[1].retry = {source:'claude-sonnet-5-5',handled:1,replacement:3,blocked:null};
+  await page.evaluate(() => refresh());
+  assert.equal(await page.locator('#save-agent-config').count(), 0, 'polling removes controls after replacement');
+  assert.deepEqual(await page.locator('[data-agent="2"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
+  assert.equal(data.requests.length, 0);
 }));
 
 test('details polling preserves selected task text and defers selected log updates', async () => fixture(async (page, data) => {
