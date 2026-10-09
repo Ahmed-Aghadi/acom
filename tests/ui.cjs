@@ -876,16 +876,20 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   await rule.locator('[name=retry_source]').selectOption('claude-opus-5-5');
   await rule.locator('[name=retry_harness]').selectOption('codex');
   await rule.locator('[name=retry_model]').selectOption('gpt-6-luna');
-  assert.equal(await rule.locator('[name=retry_effort] option[value=ultra]').count(), 0);
-  await rule.locator('[name=retry_effort]').selectOption('high');
+  assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
   await page.evaluate(() => refresh());
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
   await saveSettings(page);
   assert.equal(data.settings.allow_agent_model_change, true);
   assert.equal(data.settings.allow_agent_effort_change, false);
-  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',effort:'high'}});
+  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna'}});
+  // Old saved overrides must not survive another settings save.
+  data.settings.flagged_retries['claude-opus-5-5'].effort = 'low';
   await page.reload(); await page.locator('[data-page=settings]').click();
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
+  assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
+  await saveSettings(page);
+  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna'}});
   await rule.locator('[data-remove-retry]').click(); await saveSettings(page);
   assert.deepEqual(data.settings.flagged_retries, {});
 }));
@@ -900,7 +904,7 @@ test('retry rules support custom IDs and reject duplicate source models without 
   await rule.locator('[name=retry_custom_model]').fill('future-target');
   const beforeGrant = data.requests.length;
   await page.locator('[form=settings-form]').click();
-  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('allow its model and effort'));
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('allow its model in Harnesses'));
   assert.equal(data.requests.length, beforeGrant, 'a retry cannot implicitly allow its target');
   const harness = page.locator('[data-harness=claude]');
   await harness.locator('.model-picker summary').click();

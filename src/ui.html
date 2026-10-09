@@ -626,7 +626,7 @@
         <label class="inline-check"><input type="checkbox" name="allow_agent_model_change" ${s.allow_agent_model_change ? 'checked' : ''}> Allow agents to change their model within the same provider</label>
         <label class="inline-check"><input type="checkbox" name="allow_agent_effort_change" ${s.allow_agent_effort_change ? 'checked' : ''}> Allow agents to change their effort level</label>
         <p class="meta launch-project">Both permissions are off by default. Changes use allowed models and efforts, and apply to the next turn. Provider-native sessions cannot move between providers; a new agent can read the previous agent's history instead. <a href="/models" target="_blank" rel="noopener">Model and provider reference</a></p>
-        <h3>Flagged-model retries</h3><p class="meta launch-project">No retries are configured by default. Each rule launches a replacement when its source model is flagged. Enable its provider and allow its model and effort in Harnesses above. The replacement receives the original conversation history path, including when changing providers.</p>
+        <h3>Flagged-model retries</h3><p class="meta launch-project">No retries are configured by default. Each rule chooses a replacement provider and model; it inherits the flagged turn's effort. Enable its provider and allow its model in Harnesses above. If the inherited effort isn't supported or allowed, the retry stops or waits with a reason. Cross-provider replacements receive the original conversation history path.</p>
         <div id="retry-rules">${Object.entries(s.flagged_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
         <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
@@ -698,7 +698,6 @@
         <label>Flagged source model <select name="retry_source">${options(sources, source)}</select></label><label data-retry-custom-source hidden>Custom source model ID <input name="retry_custom_source"></label>
         <label>Replacement provider <select name="retry_harness">${options(Object.keys(state.catalog), harness)}</select></label>
         <label>Replacement model <select name="retry_model">${modelOptions(harness, [...new Set([...(state.editor?.settings?.harnesses?.[harness]?.models || []), ...(rule.model ? [rule.model] : [])])], rule.model)}</select></label><label data-retry-custom-model hidden>Custom replacement model ID <input name="retry_custom_model"></label>
-        <label>Replacement effort <select name="retry_effort">${options(providerEfforts(harness, rule.model), rule.effort || 'medium')}</select></label>
       </div><button type="button" data-remove-retry>Remove rule</button></div>`;
     }
     function syncRetryChoices(root, providerChanged = false) {
@@ -709,8 +708,6 @@
       const model = $('[name=retry_model]', root);
       if (providerChanged) model.innerHTML = modelOptions(harness, retryAllowed(harness, 'models'));
       showCustom(model, $('[data-retry-custom-model]', root));
-      const effort = $('[name=retry_effort]', root), values = providerEfforts(harness, model.value).filter(value => retryAllowed(harness, 'efforts').includes(value));
-      effort.innerHTML = options(values, values.includes(effort.value) ? effort.value : 'medium');
     }
     function renderAgentConfig(a) {
       const root = $('#agent-config');
@@ -1155,10 +1152,10 @@
         const selected = (name, custom) => $('[name='+name+']',root).value === '__custom__' ? customModel($('[name='+custom+']',root).value) : $('[name='+name+']',root).value;
         const source = selected('retry_source','retry_custom_source');
         if (Object.hasOwn(next.flagged_retries, source)) throw new Error(`Only one retry rule is allowed for ${source}.`);
-        const rule = {harness:$('[name=retry_harness]',root).value,model:selected('retry_model','retry_custom_model'),effort:$('[name=retry_effort]',root).value};
+        const rule = {harness:$('[name=retry_harness]',root).value,model:selected('retry_model','retry_custom_model')};
         const target = next.harnesses[rule.harness];
         if (source === rule.model) throw new Error('Choose a different replacement model.');
-        if (!target?.enabled || !target.models.includes(rule.model) || !target.efforts.includes(rule.effort)) throw new Error('Enable the retry provider and allow its model and effort in Harnesses.');
+        if (!target?.enabled || !target.models.includes(rule.model)) throw new Error('Enable the retry provider and allow its model in Harnesses.');
         next.flagged_retries[source] = rule;
       });
       next.usage_poll_secs = Number($('[name=usage_poll_secs]', form).value);

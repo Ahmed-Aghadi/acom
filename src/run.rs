@@ -145,6 +145,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
             pid,
             stopping: false,
             model: a.model.clone(),
+            effort: a.effort.clone(),
         },
     );
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {

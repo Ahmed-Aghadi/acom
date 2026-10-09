@@ -310,28 +310,40 @@ process.stdin.on('end', async () => {
 
     // Explicit same-provider rule resumes once; repeated flag events cannot duplicate it.
     const retryConfig=structuredClone(defaults);
-    retryConfig.flagged_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna',effort:'high'};
+    retryConfig.flagged_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna'};
     retryConfig.limits.active.hard=0;
     retryConfig.limits.active.soft=null;
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
-    const retry=await api('POST','/agents',{project:a.id,harness:'codex',task:'POLICY_TEST',force:true});
+    const retry=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'POLICY_TEST',force:true});
     await until(async()=>(await api('GET',`/agents/${retry.id}`)).retry?.blocked?.includes('Hard limit'),'retry waits for an active slot');
     assert.equal(runs().filter(r=>r.id===retry.id).length,1);
+    await api('POST','/agent-config',{id:retry.id,effort:'low'});
+    await stop(); await start(); // Preserve the flagged effort, not the queued one.
     retryConfig.limits.active.hard=1;
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     await until(()=>runs().filter(r=>r.id===retry.id).length===2,'configured same-provider retry');
     const retryRuns=runs().filter(r=>r.id===retry.id);
     assert.equal(retryRuns[1].resume,true); assert.equal(retryRuns[1].model,'gpt-6-luna');
+    assert.ok(retryRuns[1].args.includes('model_reasoning_effort="high"'));
+    assert.equal((await api('GET',`/agents/${retry.id}`)).effort,'high');
     assert.equal(fs.existsSync(`/proc/${retryRuns[0].pid}`),false,'old process exited before retry');
     assert.match(retryRuns[1].prompt,/Explicit flagged-model retry/);
     await finished(retry.id);
     retryConfig.limits.active=structuredClone(defaults.limits.active);
 
+    // Unsupported inherited effort stops visibly without downgrading or launching.
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const incompatible=await api('POST','/agents',{project:a.id,harness:'codex',effort:'ultra',task:'POLICY_TEST'});
+    await until(async()=>(await api('GET',`/agents/${incompatible.id}`)).retry?.blocked?.includes("doesn't support effort ultra"),'unsupported inherited effort');
+    assert.equal(runs().filter(r=>r.id===incompatible.id).length,1);
+    assert.equal((await api('GET',`/agents/${incompatible.id}`)).effort,'ultra');
+
     // Cross-provider handoff retains threads/marks, references the actual history,
     // starts a fresh native session, and keeps the predecessor paused.
-    retryConfig.flagged_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5',effort:'medium'};
+    retryConfig.flagged_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5'};
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
-    const handoff=await api('POST','/agents',{project:a.id,harness:'codex',task:'HANDOFF_TEST',group:'reviewers'});
+    const handoff=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'HANDOFF_TEST',group:'reviewers'});
+    await api('POST','/agent-config',{id:handoff.id,effort:'low'});
     const handoffThread=await api('POST','/threads',{project:a.id,title:'Inherited task',members:[String(handoff.id)]});
     const handoffMessage=await api('POST','/messages',{thread:handoffThread.id,text:'Context for replacement'});
     await api('POST','/marks',{agent:handoff.id,ids:[handoffMessage.id],mark:'in-progress'});
@@ -340,6 +352,8 @@ process.stdin.on('end', async () => {
     await until(()=>runs().some(r=>r.id===replacement),'replacement launched');
     const replacementRun=runs().find(r=>r.id===replacement);
     assert.equal(replacementRun.harness,'claude'); assert.equal(replacementRun.resume,false);
+    assert.equal(replacementRun.args[replacementRun.args.indexOf('--effort')+1],'high');
+    assert.equal((await api('GET',`/agents/${replacement}`)).effort,'high');
     assert.ok(replacementRun.prompt.includes(handed.conversation_history));
     assert.ok(replacementRun.prompt.includes(handed.output_log));
     assert.match(replacementRun.prompt,new RegExp(`launched by agent ${handoff.id}`));
@@ -350,7 +364,7 @@ process.stdin.on('end', async () => {
     await finished(replacement); assert.equal((await api('GET',`/agents/${handoff.id}`)).state,'paused');
 
     // A -> B -> A cycle stops after B even across providers and server restart.
-    retryConfig.flagged_retries['claude-sonnet-5-5']={harness:'codex',model:'gpt-6-sol',effort:'medium'};
+    retryConfig.flagged_retries['claude-sonnet-5-5']={harness:'codex',model:'gpt-6-sol'};
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     const cycle=await api('POST','/agents',{project:a.id,harness:'codex',task:'RETRY_CHAIN_TEST'});
     const cycleNext=await until(async()=>{const v=await api('GET',`/agents/${cycle.id}`);return v.retry?.replacement;},'cycle first replacement');

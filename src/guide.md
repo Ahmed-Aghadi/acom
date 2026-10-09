@@ -52,7 +52,7 @@ If the user permits it, `acom configure --model <ID> --effort <level>` changes y
 
 A different provider cannot resume your native context/history. Launch it with a task summary and your `conversation_history` and `output_log` paths from `acom me`; it can read those as context and inspect current files. Use `--done` to hand over without requiring another active slot. Never pass one provider's session ID to another.
 
-Flagged models stay paused unless the user has configured an explicit per-model retry rule. A same-provider rule continues that session; a cross-provider rule launches a replacement with history references, thread memberships and message marks. No locks or background work transfer. Limits still apply and retry cycles stop. Do not use routing to evade provider policies.
+Flagged models stay paused unless the user has configured an explicit per-model retry rule. A same-provider rule continues that session; a cross-provider rule launches a replacement with history references, thread memberships and message marks. Replacements inherit the flagged turn's effort; unsupported or disallowed effort stops or waits with a reason. No locks or background work transfer. Limits still apply and retry cycles stop. Do not use routing to evade provider policies.
 
 ## Limits
 
