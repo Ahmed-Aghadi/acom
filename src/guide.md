@@ -1,6 +1,6 @@
 # acom guide
 
-acom launched you in a project: the folder you're working in. Other agents may be working in the same project, and you can talk to them, share locks, and launch helpers, all with the `acom` command. You only see your own project's agents, threads and locks. Your agent ID is in `ACOM_ID`; acom reads it, so you never pass it.
+acom launched you in a project: the folder you're working in. Other agents may be working in the same project, and you can talk to them, share locks, and launch helpers, all with the `acom` command. Agents in the same project share its files, not isolated copies. You only see your own project's agents, threads and locks. Your agent ID is in `ACOM_ID`; acom reads it, so you never pass it.
 
 How you coordinate is up to you and your task. This explains the tool.
 
@@ -30,12 +30,14 @@ Each message you receive carries your own mark: `new` (not dealt with; every mes
 
 ## Locks
 
-Locks are named, and any agent can create one when it needs it: `acom lock new <name> --about "what it's for"`. `acom locks` lists them with their holders.
+A lock is a named reservation for work that only one agent should do at a time. For example, agents editing the same database schema can agree to acquire a `schema` lock before making changes. Each lock has at most one holder, within its project. Locks are cooperative: acom tracks ownership but does not prevent file writes or shell commands. Agree on the name and what it protects with teammates; unrelated work needs no lock.
+
+`acom locks` lists existing locks, their purpose and holders. Reuse the agreed lock rather than creating a different name for the same resource. If needed, create one with `acom lock new <name> --about "what it protects"`; creating it does not acquire it.
 
 - `acom lock acquire <name>` takes it if it's free, or fails and says who holds it. `--wait 90s` waits in a first-come-first-served queue instead.
-- `--ttl 15m` frees the lock by itself that long after you take it, in case you stop unexpectedly. Acquiring a lock you already hold renews it.
+- `acom lock acquire <name> --ttl 15m` gives the lock a 15-minute lifetime, after which it is freed even if you're still working. Acquiring it again with `--ttl 15m` renews that lifetime. Without `--ttl`, it has no timed expiry.
 - `acom lock release <name>` gives it back. Release locks as soon as you're done with them.
-- If you're paused, you may lose your locks. You'll be told when you resume, and must acquire them again if you still need them.
+- If a lock expires or is released while you're paused, you'll be told. Stop the protected work and acquire it again before continuing; don't assume ownership survived an interruption.
 - Keep any `--wait` shorter than your shell tool's timeout, or the command is killed while waiting.
 
 ## Other agents
@@ -46,11 +48,27 @@ To hand your work over, add `--done`: you're marked done and the new agent is la
 
 `acom agents` lists everyone, and `acom agent <ID>` shows one. `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details.
 
-`acom models` explains providers, model capability ordering and uncertain comparisons, with source links. `acom models --catalog` lists known IDs and effort choices. Account access and harness versions still determine what works.
+## Models and effort
 
-If the user permits it, `acom configure --model <ID> --effort <level>` changes your own next-turn configuration. Model and effort permissions are independent, off by default, and shown in `acom limits`, along with allowed choices. Finish this turn normally; current tools are not interrupted. The next turn keeps your native session within the same provider. It does not grant a new active slot or reset usage.
+A harness is the provider's client: `claude` is Claude Code (Anthropic), and `codex` is OpenAI's client. A model is the selected model ID; effort controls its reasoning setting. Effort choices differ by model, and identical labels across providers do not imply equal reasoning budgets.
 
-A different provider cannot resume your native context/history. Launch it with a task summary and your `conversation_history` and `output_log` paths from `acom me`; it can read those as context and inspect current files. Use `--done` to hand over without requiring another active slot. Never pass one provider's session ID to another.
+- `acom models` gives the dated provider/model reference: relative capability ordering, uncertain comparisons, selection guidance and source links. Rankings are task-dependent, not an absolute intelligence score.
+- `acom models --catalog` lists known model IDs and each model's supported effort choices. This is not the project's allowed list or a guarantee of account access; installed harness versions and login still determine what works.
+- `acom limits` shows whether you may change model or effort, and the project's allowed models and efforts. These rules are also in your launch briefing. `acom me` shows your own configuration and history/output paths.
+
+While working, you may change your own configuration if the user has enabled the relevant permission:
+
+- `acom configure --effort <level>` changes effort only.
+- `acom configure --model <ID>` changes model only, within your current provider.
+- `acom configure --model <ID> --effort <level>` changes both together, useful when the new model needs a different supported effort.
+
+Model and effort permissions are independent and off by default. Choose a model/effort combination supported by the model and allowed by the project. You can configure only yourself, not other agents, and cannot enable these permissions yourself. If a change is denied, keep the current configuration or ask the user; don't bypass the restriction by editing settings or using user commands.
+
+Changes apply only when your next turn starts. Current tools and this turn's model/effort are unchanged; finish the current work normally. A same-provider change keeps your native session. It does not grant a new active slot, reset usage or create a fresh conversation.
+
+## Handoffs and flagged models
+
+A different provider cannot resume your native session. Launch it with a task summary and the Conversation history and Output log paths shown by `acom me`; it can read those files as context and inspect current project state, but this does not import your native context. Add it to the relevant threads with `acom thread add <TID> <ID>`. Use `acom launch --task "..." --harness <harness> --model <ID> --effort <level> --done` to hand over without requiring another active slot. End your turn after a successful handoff. Never pass one provider's session ID to another.
 
 Flagged models stay paused unless the user has configured an explicit per-model retry rule. A same-provider rule continues that session; a cross-provider rule launches a replacement with history references, thread memberships and message marks. Replacements inherit the flagged turn's effort; unsupported or disallowed effort stops or waits with a reason. No locks or background work transfer. Limits still apply and retry cycles stop. Do not use routing to evade provider policies.
 
