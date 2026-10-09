@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const GUIDE: &str = include_str!("guide.md");
+pub const MODELS: &str = include_str!("models.md");
 pub const STATES: [&str; 6] = ["working", "idle", "paused", "done", "closed", "crashed"];
 pub const MARKS: [&str; 3] = ["new", "in-progress", "handled"];
 
@@ -120,6 +121,7 @@ impl Limits {
             let key = match window {
                 "five_hour" => "claude_five_hour",
                 "seven_day" => "claude_seven_day",
+                "seven_day_fable" => return self.usage.get("claude_seven_day_fable"),
                 _ => return None,
             };
             // Previously saved provider-wide thresholds supply both windows until edited.
@@ -134,8 +136,13 @@ fn window_label(window: &str) -> &str {
     match window {
         "five_hour" => "five-hour",
         "seven_day" => "weekly",
+        "seven_day_fable" => "weekly Fable",
         _ => window,
     }
+}
+
+fn is_fable(model: &str) -> bool {
+    model == "fable" || model.starts_with("claude-fable-")
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -148,6 +155,45 @@ pub struct Settings {
     pub usage_poll_secs: u64,
     #[serde(default)]
     pub prompts: Prompts,
+    #[serde(default)]
+    pub allow_agent_model_change: bool,
+    #[serde(default)]
+    pub allow_agent_effort_change: bool,
+    #[serde(default)]
+    pub flagged_retries: BTreeMap<String, RetryRule>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct RetryRule {
+    pub harness: String,
+    pub model: String,
+    pub effort: String,
+}
+
+fn check_choice(harness: &str, model: &str, effort: &str) -> R<()> {
+    if model.trim().is_empty() || model.contains(char::is_whitespace) {
+        return Err(bad(format!("{model:?} isn't a model ID")));
+    }
+    if effort.trim().is_empty() || effort.contains(char::is_whitespace) {
+        return Err(bad("choose a nonempty effort level"));
+    }
+    for h in crate::harness::KNOWN {
+        if let Some(m) = crate::harness::catalog(h)
+            .into_iter()
+            .find(|m| m.id == model)
+        {
+            if h != harness {
+                return Err(bad(format!("{model} belongs to {h}, not {harness}")));
+            }
+            if !m.efforts.contains(&effort) {
+                return Err(bad(format!(
+                    "{model} doesn't support effort {effort} (it supports {})",
+                    m.efforts.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn poll_interval() -> u64 {
@@ -217,7 +263,12 @@ impl Default for Settings {
         for h in ["claude", "codex"] {
             active_per_harness.insert(h.to_string(), per(4.0, 6.0));
         }
-        for k in ["claude_five_hour", "claude_seven_day", "codex"] {
+        for k in [
+            "claude_five_hour",
+            "claude_seven_day",
+            "claude_seven_day_fable",
+            "codex",
+        ] {
             usage.insert(k.to_string(), per(80.0, 95.0));
         }
         Settings {
@@ -232,6 +283,9 @@ impl Default for Settings {
             done_closes: true,
             usage_poll_secs: poll_interval(),
             prompts: Prompts::default(),
+            allow_agent_model_change: false,
+            allow_agent_effort_change: false,
+            flagged_retries: BTreeMap::new(),
         }
     }
 }
@@ -285,6 +339,32 @@ impl Settings {
                 )));
             }
         }
+        for (source, rule) in &self.flagged_retries {
+            if source.trim().is_empty()
+                || source.contains(char::is_whitespace)
+                || source == &rule.model
+            {
+                return Err(bad(
+                    "retry rules need a source model ID and a different target model",
+                ));
+            }
+            check_choice(&rule.harness, &rule.model, &rule.effort)?;
+            let target = self
+                .harnesses
+                .get(&rule.harness)
+                .filter(|h| h.enabled)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "retry target harness {} isn't enabled",
+                        rule.harness
+                    ))
+                })?;
+            if !target.models.contains(&rule.model) || !target.efforts.contains(&rule.effort) {
+                return Err(bad(
+                    "retry target model and effort must be in the target harness's allowed lists",
+                ));
+            }
+        }
         let l = &self.limits;
         for k in l.active_per_harness.keys() {
             if !crate::harness::KNOWN.contains(&k.as_str()) {
@@ -292,7 +372,15 @@ impl Settings {
             }
         }
         for (k, lim) in &l.usage {
-            if !["claude", "claude_five_hour", "claude_seven_day", "codex"].contains(&k.as_str()) {
+            if ![
+                "claude",
+                "claude_five_hour",
+                "claude_seven_day",
+                "claude_seven_day_fable",
+                "codex",
+            ]
+            .contains(&k.as_str())
+            {
                 return Err(bad(format!("unknown subscription window {k}")));
             }
             if [lim.soft, lim.hard].iter().flatten().any(|v| *v > 100.0) {
@@ -327,6 +415,7 @@ impl Settings {
 pub struct Proc {
     pub pid: u32,
     pub stopping: bool,
+    pub model: String,
 }
 
 pub struct St {
@@ -334,8 +423,6 @@ pub struct St {
     /// Lock queues by (project, lock name).
     pub queues: HashMap<(i64, String), Vec<i64>>,
     pub procs: HashMap<i64, Proc>,
-    /// (project, provider) pairs over their usage limits, so each crossing acts once.
-    pub over_hard: HashSet<(i64, String)>,
     pub over_soft: HashSet<(i64, String)>,
 }
 
@@ -375,6 +462,7 @@ CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT);
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
 ";
 
@@ -575,6 +663,24 @@ impl St {
         Ok(())
     }
 
+    fn remember_flag(&self, id: i64, a: &Agent) -> R<()> {
+        let source = self
+            .procs
+            .get(&id)
+            .map(|p| p.model.as_str())
+            .unwrap_or(&a.model);
+        self.db.execute(
+            "INSERT INTO agent_retries(agent_id,source,tried) VALUES(?1,?2,?3)
+            ON CONFLICT(agent_id) DO UPDATE SET source=excluded.source,handled=0,blocked=NULL",
+            params![
+                id,
+                source,
+                json!([format!("{}:{source}", a.harness)]).to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Active agents in a project (or everywhere), in total and per harness.
     fn active_counts(&self, project: Option<i64>) -> R<(i64, BTreeMap<String, i64>)> {
         let mut per = BTreeMap::new();
@@ -595,7 +701,7 @@ impl St {
     /// Last observed usage, including expired windows until a fresh check confirms a reset.
     pub fn used_pct(&self, provider: &str) -> R<Option<f64>> {
         Ok(self.db.query_row(
-            "SELECT max(used_pct) FROM usage WHERE provider=?1",
+            "SELECT max(used_pct) FROM usage WHERE provider=?1 AND win<>'seven_day_fable'",
             [provider],
             |r| r.get::<_, Option<f64>>(0),
         )?)
@@ -612,7 +718,7 @@ impl St {
             .optional()?)
     }
 
-    fn usage_checks(&self, limits: &Limits, provider: &str) -> R<Vec<Check>> {
+    fn usage_checks(&self, limits: &Limits, provider: &str, model: Option<&str>) -> R<Vec<Check>> {
         let mut checks = Vec::new();
         if provider != "claude" {
             // Codex keeps one provider-wide threshold; stream and status window names can differ.
@@ -632,6 +738,9 @@ impl St {
                 [provider],
             )? {
                 let window = r["win"].as_str().unwrap();
+                if window == "seven_day_fable" && !model.is_some_and(is_fable) {
+                    continue;
+                }
                 if let Some(lim) = limits.usage_limit(provider, window) {
                     checks.push(Check {
                         what: format!("{provider} {} subscription usage", window_label(window)),
@@ -641,6 +750,25 @@ impl St {
                     });
                 }
             }
+        }
+        if provider == "claude"
+            && model.is_some_and(is_fable)
+            && self
+                .window_pct(provider, "seven_day_fable")?
+                .is_some_and(|v| v >= 100.0)
+            && !checks
+                .iter()
+                .any(|c| c.what.contains("weekly Fable") && c.over(c.lim.hard))
+        {
+            checks.push(Check {
+                what: "claude weekly Fable subscription exhausted".into(),
+                value: 100.0,
+                lim: Limit {
+                    soft: None,
+                    hard: Some(100.0),
+                },
+                unit: "%",
+            });
         }
         if self.used_pct(provider)?.is_some_and(|used| used >= 100.0)
             && !checks.iter().any(|c| c.over(c.lim.hard))
@@ -671,6 +799,7 @@ impl St {
         for (h, window) in [
             ("claude", "five_hour"),
             ("claude", "seven_day"),
+            ("claude", "seven_day_fable"),
             ("codex", ""),
         ] {
             let lim = l.usage_limit(h, window).cloned().unwrap_or(Limit {
@@ -696,6 +825,38 @@ impl St {
         out += &format!("\nContext per agent: {}", l.context.text(" tokens"));
         if l.context.hard.is_some() {
             out += " (the harness compacts at the hard value)";
+        }
+        out += &format!(
+            "\nAgent self-changes (next turn, same provider only): model {}; effort {}.",
+            if s.allow_agent_model_change {
+                "allowed"
+            } else {
+                "disabled"
+            },
+            if s.allow_agent_effort_change {
+                "allowed"
+            } else {
+                "disabled"
+            }
+        );
+        for (h, cfg) in &s.harnesses {
+            out += &format!(
+                "\n  {h} ({}): allowed models {}; allowed efforts {}.",
+                if cfg.enabled { "enabled" } else { "disabled" },
+                cfg.models.join(", "),
+                cfg.efforts.join(", ")
+            );
+        }
+        if s.flagged_retries.is_empty() {
+            out += "\nFlagged-model retries: none configured; flagged agents stay paused.";
+        } else {
+            out += "\nFlagged-model retry rules (limits apply; cycles stop):";
+            for (source, rule) in &s.flagged_retries {
+                out += &format!(
+                    "\n  {source} -> {} / {} / {}",
+                    rule.harness, rule.model, rule.effort
+                );
+            }
         }
         out += if s.done_closes {
             "\nWhen an agent runs `acom done` it's closed: messages wait until the user explicitly reopens it."
@@ -723,7 +884,7 @@ impl St {
                 unit: "",
             });
         }
-        checks.extend(self.usage_checks(&l, harness)?);
+        checks.extend(self.usage_checks(&l, harness, None)?);
         Ok(checks)
     }
 
@@ -731,6 +892,21 @@ impl St {
     fn no_room(&self, project: i64, harness: &str) -> R<Option<String>> {
         let checks = self.limit_checks(project, harness)?;
         Ok(checks
+            .iter()
+            .find(|c| c.over(c.lim.hard))
+            .map(|c| c.line("Hard")))
+    }
+
+    fn model_no_room(&self, project: i64, harness: &str, model: &str) -> R<Option<String>> {
+        if let Some(why) = self.no_room(project, harness)? {
+            return Ok(Some(why));
+        }
+        Ok(self
+            .usage_checks(
+                &self.settings_for(Some(project)).limits,
+                harness,
+                Some(model),
+            )?
             .iter()
             .find(|c| c.over(c.lim.hard))
             .map(|c| c.line("Hard")))
@@ -933,7 +1109,6 @@ impl App {
             db,
             queues: HashMap::new(),
             procs: HashMap::new(),
-            over_hard: HashSet::new(),
             over_soft: HashSet::new(),
         };
         // Agents that were mid-turn when the server stopped can't be followed any more.
@@ -976,8 +1151,8 @@ impl App {
 
     // ---------- launching and turns ----------
 
-    /// Launch an agent. All or nothing: if anything fails, including starting the
-    /// process, nothing is recorded and a caller handing over with `done` stays working.
+    /// Validate and commit identity before spawning. A refused launch records
+    /// nothing; a failed spawn leaves a visible crashed row and restores handoff state.
     pub fn launch(
         self: &Arc<Self>,
         by: i64,
@@ -986,18 +1161,40 @@ impl App {
         req: LaunchReq,
     ) -> R<(i64, Vec<String>)> {
         let mut st = self.lock();
+        let handoff = req.done;
+        let was_done = if by > 0 {
+            st.agent(by)?.done_req
+        } else {
+            false
+        };
         st.db.execute_batch("SAVEPOINT launch")?;
-        let r = self.launch_in(&mut st, by, via, project, req);
+        let r = self.prepare_launch(&mut st, by, via, project, req);
         let end = if r.is_ok() {
             "RELEASE launch"
         } else {
             "ROLLBACK TO launch; RELEASE launch"
         };
         st.db.execute_batch(end)?;
-        r
+        let (id, warnings) = r?;
+        let started = self
+            .briefing(&st, id)
+            .and_then(|prompt| run::start_turn(self, &mut st, id, &prompt));
+        if let Err(e) = started {
+            st.set_state(id, "crashed")?;
+            st.db
+                .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, e.1])?;
+            if handoff {
+                st.db.execute(
+                    "UPDATE agents SET done_req=?2 WHERE id=?1",
+                    params![by, was_done],
+                )?;
+            }
+            return Err(e);
+        }
+        Ok((id, warnings))
     }
 
-    fn launch_in(
+    fn prepare_launch(
         self: &Arc<Self>,
         st: &mut St,
         by: i64,
@@ -1055,6 +1252,7 @@ impl App {
             )));
         }
         let effort = req.effort.unwrap_or_else(|| h.effort.clone());
+        check_choice(&harness, &model, &effort)?;
         if by > 0 && !h.efforts.contains(&effort) {
             return Err(bad(format!(
                 "effort {effort} isn't allowed for {harness} (allowed: {})",
@@ -1082,7 +1280,15 @@ impl App {
                 .execute("UPDATE agents SET done_req=1 WHERE id=?1", [by])?;
         }
         let mut warnings = Vec::new();
-        for c in st.limit_checks(project, &harness)? {
+        let mut checks = st.limit_checks(project, &harness)?;
+        if is_fable(&model) {
+            checks.extend(
+                st.usage_checks(&s.limits, &harness, Some(&model))?
+                    .into_iter()
+                    .filter(|c| c.what.contains("weekly Fable")),
+            );
+        }
+        for c in checks {
             if c.over(c.lim.hard) {
                 let msg = c.line("Hard");
                 if by > 0 {
@@ -1121,8 +1327,6 @@ impl App {
             &actor(by, via),
             &format!("launched agent {id} ({harness} / {model} / {effort})"),
         )?;
-        let prompt = self.briefing(st, id)?;
-        run::start_turn(self, st, id, &prompt)?;
         Ok((id, warnings))
     }
 
@@ -1159,6 +1363,17 @@ impl App {
             return Ok(());
         }
         if a.state == "idle" {
+            if st
+                .usage_checks(
+                    &st.settings_for(Some(a.project)).limits,
+                    &a.harness,
+                    Some(&a.model),
+                )?
+                .iter()
+                .any(|c| c.over(c.lim.hard))
+            {
+                return self.pause_locked(st, id, LockMode::Release, "limit", "acom");
+            }
             return self.wake(st, id, "idle");
         }
         st.db.execute(
@@ -1202,7 +1417,7 @@ impl App {
                 )?;
                 continue;
             }
-            match st.no_room(a.project, &a.harness)? {
+            match st.model_no_room(a.project, &a.harness, &a.model)? {
                 Some(why) => {
                     if r["wake_why"].is_null() {
                         st.db.execute(
@@ -1360,6 +1575,13 @@ impl App {
     }
 
     fn resume_locked(self: &Arc<Self>, st: &mut St, id: i64, by: &str) -> R<()> {
+        match self.prepare_resume(st, id, by)? {
+            Some(prompt) => run::start_turn(self, st, id, &prompt),
+            None => self.maybe_wake(st, id),
+        }
+    }
+
+    fn prepare_resume(&self, st: &mut St, id: i64, by: &str) -> R<Option<String>> {
         let a = st.agent(id)?;
         if a.state != "paused" && a.state != "crashed" {
             return Err(conflict(format!("agent {id} is {}, not paused", a.state)));
@@ -1369,9 +1591,13 @@ impl App {
                 "agent {id} is still stopping; try again in a moment"
             )));
         }
+        if by != "acom" {
+            st.db
+                .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
+        }
         st.unfreeze_locks(id)?;
         st.db.execute(
-            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL, seen_model=NULL WHERE id=?1",
+            "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL, seen_model=NULL,done_req=0,rest='idle' WHERE id=?1",
             [id],
         )?;
         st.log_for(id, by, &format!("resumed agent {id}"))?;
@@ -1389,7 +1615,7 @@ impl App {
                 "{interruption}\n[acom] Resumed at {} after an error.\n{updates}\n\n## Guidance\n\n{guidance}",
                 hhmm(now())
             );
-            return run::start_turn(self, st, id, &prompt);
+            return Ok(Some(prompt));
         }
         let from = a.pause_from.unwrap_or_else(|| "idle".into());
         if from == "working" {
@@ -1398,10 +1624,10 @@ impl App {
                 "{interruption}\n[acom] Resumed at {}.\n{updates}\n\n## Guidance\n\n{guidance}",
                 hhmm(now())
             );
-            run::start_turn(self, st, id, &prompt)
+            Ok(Some(prompt))
         } else {
             st.set_state(id, &from)?;
-            self.maybe_wake(st, id)
+            Ok(None)
         }
     }
 
@@ -1469,6 +1695,58 @@ impl App {
     }
 
     // ---------- agent self-service ----------
+
+    /// Change the requested model/effort for the next turn; never interrupt tools.
+    pub fn configure_agent(
+        &self,
+        id: i64,
+        by: i64,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> R<()> {
+        let st = self.lock();
+        let a = st.agent(id)?;
+        let s = st.settings_for(Some(a.project));
+        if model.is_none() && effort.is_none() {
+            return Err(bad("give a model or effort"));
+        }
+        let model = model.unwrap_or(&a.model);
+        let effort = effort.unwrap_or(&a.effort);
+        let cfg = s
+            .harnesses
+            .get(&a.harness)
+            .filter(|h| h.enabled)
+            .ok_or_else(|| bad("this harness is disabled"))?;
+        check_choice(&a.harness, model, effort)?;
+        if by != 0 {
+            if by != id || a.state != "working" {
+                return Err(conflict("agents may only change themselves while working"));
+            }
+            if (model != a.model && !s.allow_agent_model_change)
+                || (effort != a.effort && !s.allow_agent_effort_change)
+            {
+                return Err(conflict(
+                    "the project's self-change permission is disabled; see acom limits",
+                ));
+            }
+            if !cfg.models.iter().any(|m| m == model) || !cfg.efforts.iter().any(|e| e == effort) {
+                return Err(bad(
+                    "model and effort must be in this harness's allowed lists",
+                ));
+            }
+        }
+        st.db.execute(
+            "UPDATE agents SET model=?2, effort=?3 WHERE id=?1",
+            params![id, model, effort],
+        )?;
+        let text = format!(
+            "Requested {}/{model}/effort {effort} for your next turn. This turn is unchanged; the native session stays the same.",
+            a.harness
+        );
+        st.notice(id, &text)?;
+        st.log_for(id, &who(by), &format!("agent {id}: {text}"))?;
+        Ok(())
+    }
 
     pub fn agent_project(&self, id: i64) -> R<i64> {
         Ok(self.lock().agent(id)?.project)
@@ -1971,17 +2249,40 @@ impl App {
     }
 
     /// The model refused or was flagged, or the harness switched models. Pause the agent
-    /// (releasing its locks) and keep the reason for the user; it stays paused until they act.
+    /// (releasing its locks) and keep the reason. Explicit retry rules run after it stops.
     pub fn flag(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
-        self.stop_for(id, "flagged", reason, "was flagged and paused")
+        self.stop_for(id, "flagged", reason, "was flagged and paused", None)
     }
 
     /// The subscription's usage limit was hit mid-turn: pause until the window resets.
     pub fn limit_hit(self: &Arc<Self>, id: i64, text: &str) -> R<()> {
-        self.stop_for(id, "limit", text, "hit its usage limit and was paused")
+        self.stop_for(
+            id,
+            "limit",
+            text,
+            "hit its usage limit and was paused",
+            None,
+        )
     }
 
-    fn stop_for(self: &Arc<Self>, id: i64, why: &str, problem: &str, what: &str) -> R<()> {
+    pub fn window_limit_hit(self: &Arc<Self>, id: i64, window: &str, text: &str) -> R<()> {
+        self.stop_for(
+            id,
+            "limit",
+            text,
+            "hit its model usage limit and was paused",
+            Some(window),
+        )
+    }
+
+    fn stop_for(
+        self: &Arc<Self>,
+        id: i64,
+        why: &str,
+        problem: &str,
+        what: &str,
+        window: Option<&str>,
+    ) -> R<()> {
         let mut st = self.lock();
         let a = st.agent(id)?;
         let reason: Option<String> =
@@ -2003,6 +2304,7 @@ impl App {
                 "UPDATE agents SET pause_reason='flagged', problem=?2 WHERE id=?1",
                 params![id, problem],
             )?;
+            st.remember_flag(id, &a)?;
             return st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"));
         }
         st.db.execute(
@@ -2012,8 +2314,9 @@ impl App {
         if why == "limit" {
             // Only a fresh provider check can clear this marker; don't invent a reset time.
             st.db.execute(
-                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,'limit',100,NULL,?2)",
-                params![a.harness, now()],
+                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,?2,100,
+                    (SELECT resets_at FROM usage WHERE provider=?1 AND win=?2),?3)",
+                params![a.harness, window.unwrap_or("limit"), now()],
             )?;
             st.db.execute(
                 "UPDATE usage_checks SET next_check=?2 WHERE provider=?1",
@@ -2022,27 +2325,30 @@ impl App {
         }
         if matches!(a.state.as_str(), "working" | "idle" | "done") {
             self.pause_locked(&mut st, id, LockMode::Release, why, "acom")?;
+            if why == "flagged" {
+                st.remember_flag(id, &a)?;
+            }
         }
         st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"))
     }
 
     /// Flag the agent if a model other than the one it was launched with answered,
     /// or if the model changed during its session.
-    pub fn check_model(self: &Arc<Self>, id: i64, answered: &str) -> R<()> {
+    pub fn check_model(self: &Arc<Self>, id: i64, asked: &str, answered: &str) -> R<()> {
         let reason = {
             let st = self.lock();
-            let (asked, seen): (String, Option<String>) = st.db.query_row(
-                "SELECT model, seen_model FROM agents WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let seen: Option<String> =
+                st.db
+                    .query_row("SELECT seen_model FROM agents WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })?;
             // A short alias (e.g. "opus") can't be compared with what answers.
             let full_id = asked.contains('-');
             let reason = match &seen {
                 Some(seen) if !same_model(seen, answered) => Some(format!(
                     "the model changed from {seen} to {answered} during the session"
                 )),
-                _ if full_id && !same_model(&asked, answered) => {
+                _ if full_id && !same_model(asked, answered) => {
                     Some(format!("{answered} answered instead of {asked}"))
                 }
                 _ => None,
@@ -2071,6 +2377,200 @@ impl App {
         Ok(())
     }
 
+    /// Retry only explicit rules, after the flagged process exits. Keep a durable
+    /// visited-model list across replacements so duplicate events and cycles stop.
+    fn retry_flagged(self: &Arc<Self>, st: &mut St, id: i64) -> R<bool> {
+        if st.procs.contains_key(&id) {
+            return Ok(false);
+        }
+        let a = st.agent(id)?;
+        let (source, tried, handled): (String, String, bool) = st.db.query_row(
+            "SELECT source,tried,handled FROM agent_retries WHERE agent_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if a.state != "paused" || handled {
+            return Ok(false);
+        }
+        let s = st.settings_for(Some(a.project));
+        let Some(rule) = s.flagged_retries.get(&source) else {
+            return Ok(false);
+        };
+        let mut tried: Vec<String> = serde_json::from_str(&tried)
+            .map_err(|_| bad("invalid saved retry history; retry stopped"))?;
+        let target = format!("{}:{}", rule.harness, rule.model);
+        let problem = if tried.contains(&target) {
+            Some((
+                "retry cycle stopped: target model was already tried".to_string(),
+                true,
+            ))
+        } else if !s.harnesses.get(&rule.harness).is_some_and(|h| {
+            h.enabled && h.models.contains(&rule.model) && h.efforts.contains(&rule.effort)
+        }) {
+            Some((
+                "retry target is disabled or no longer allowed".into(),
+                false,
+            ))
+        } else if let Err(e) = check_choice(&rule.harness, &rule.model, &rule.effort) {
+            Some((e.1, true))
+        } else {
+            st.model_no_room(a.project, &rule.harness, &rule.model)?
+                .map(|why| (why, false))
+        };
+        if let Some((why, terminal)) = problem {
+            let old: Option<String> = st.db.query_row(
+                "SELECT blocked FROM agent_retries WHERE agent_id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            st.db.execute(
+                "UPDATE agent_retries SET blocked=?2,handled=?3 WHERE agent_id=?1",
+                params![id, why, terminal],
+            )?;
+            if old.as_deref() != Some(&why) {
+                st.log_for(
+                    id,
+                    "acom",
+                    &format!("agent {id} flagged retry waiting/stopped: {why}"),
+                )?;
+            }
+            return Ok(false);
+        }
+        tried.push(target);
+        st.db.execute_batch("SAVEPOINT flagged_retry")?;
+        let result = (|| -> R<(i64, String)> {
+            st.db.execute(
+                "UPDATE agent_retries SET tried=?2,handled=1,blocked=NULL WHERE agent_id=?1",
+                params![id, json!(tried).to_string()],
+            )?;
+            if rule.harness == a.harness {
+                st.db.execute(
+                    "UPDATE agents SET model=?2,effort=?3 WHERE id=?1",
+                    params![id, rule.model, rule.effort],
+                )?;
+                st.notice(id, &format!("Explicit flagged-model retry: {source} -> {} / effort {}. Same provider and session; respect provider policies and check partial work before continuing.", rule.model, rule.effort))?;
+                // A flagged done/idle turn must retry too, not merely restore rest.
+                st.db
+                    .execute("UPDATE agents SET pause_from='working' WHERE id=?1", [id])?;
+                let prompt = self.prepare_resume(st, id, "acom")?.unwrap();
+                return Ok((id, prompt));
+            }
+            let history = a
+                .session
+                .as_deref()
+                .and_then(|sid| crate::harness::history_file(&a.harness, sid));
+            let history = history
+                .map(|p| format!("{:?}", p))
+                .unwrap_or_else(|| "unavailable; use the output log and threads".into());
+            let threads = rows(
+                &st.db,
+                "SELECT thread_id FROM members WHERE agent_id=?1 ORDER BY thread_id",
+                [id],
+            )?
+            .iter()
+            .map(|r| format!("thread #{}", r["thread_id"]))
+            .collect::<Vec<_>>()
+            .join(", ");
+            let task = format!(
+                "{}\n\n## Handoff from agent {id}\n\nExplicit flagged-model retry from {} / {source}; reason: {}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Related threads: {threads}. You inherit its thread memberships and message marks. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay. Respect provider policies. Do not repeat prohibited work or try to evade the refusal.",
+                a.task,
+                a.harness,
+                a.problem.as_deref().unwrap_or("model flagged"),
+                rule.harness,
+                run::log_path(self, id, "jsonl")
+            );
+            let (new, _) = self.prepare_launch(
+                st,
+                0,
+                None,
+                Some(a.project),
+                LaunchReq {
+                    task,
+                    harness: Some(rule.harness.clone()),
+                    model: Some(rule.model.clone()),
+                    effort: Some(rule.effort.clone()),
+                    name: Some(a.name.clone()),
+                    group: a.grp.clone(),
+                    force: false,
+                    done: false,
+                },
+            )?;
+            st.db.execute(
+                "UPDATE agents SET launched_by=?2 WHERE id=?1",
+                params![new, id],
+            )?;
+            st.db.execute("INSERT INTO members(thread_id,agent_id,last_notified) SELECT thread_id,?2,last_notified FROM members WHERE agent_id=?1", params![id, new])?;
+            st.db.execute("INSERT INTO marks(agent_id,message_id,mark) SELECT ?2,message_id,mark FROM marks WHERE agent_id=?1", params![id, new])?;
+            st.db.execute(
+                "INSERT INTO agent_retries(agent_id,source,tried,handled) VALUES(?1,?2,?3,1)",
+                params![new, rule.model, json!(tried).to_string()],
+            )?;
+            st.db.execute(
+                "UPDATE agent_retries SET replacement=?2 WHERE agent_id=?1",
+                params![id, new],
+            )?;
+            // Keep the predecessor paused for inspection; it cannot auto-resume.
+            st.notice(
+                new,
+                &format!("Agent {id} handed off to you; read inherited messages with acom inbox."),
+            )?;
+            Ok((new, self.briefing(st, new)?))
+        })();
+        match result {
+            Ok((new, prompt)) => {
+                st.db.execute_batch("RELEASE flagged_retry")?;
+                // All identities and inherited records are committed before any
+                // subprocess can act; failed spawns never orphan rolled-back IDs.
+                if let Err(e) = run::start_turn(self, st, new, &prompt) {
+                    st.db.execute(
+                        "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
+                        params![id, e.1],
+                    )?;
+                    if new == id {
+                        st.db.execute("UPDATE agents SET model=?2,effort=?3,state='paused',pause_reason='flagged',problem=?4,pause_from='working',paused_at=?5 WHERE id=?1",
+                            params![id, a.model, a.effort, a.problem, a.paused_at.unwrap_or_else(now)])?;
+                    } else {
+                        st.set_state(new, "crashed")?;
+                        st.db.execute(
+                            "UPDATE agents SET problem=?2 WHERE id=?1",
+                            params![new, e.1],
+                        )?;
+                    }
+                    st.log_for(
+                        id,
+                        "acom",
+                        &format!("agent {id} flagged retry failed: {}", e.1),
+                    )?;
+                    return Ok(false);
+                }
+                st.log_for(
+                    id,
+                    "acom",
+                    &format!(
+                        "explicit flagged retry: agent {id} ({source}) -> agent {new} ({} / {})",
+                        rule.harness, rule.model
+                    ),
+                )?;
+                Ok(true)
+            }
+            Err(e) => {
+                st.db
+                    .execute_batch("ROLLBACK TO flagged_retry; RELEASE flagged_retry")?;
+                // A missing client or failed spawn gets one attempt, not a loop.
+                st.db.execute(
+                    "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
+                    params![id, e.1],
+                )?;
+                st.log_for(
+                    id,
+                    "acom",
+                    &format!("agent {id} flagged retry failed: {}", e.1),
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Once a second: expire locks, act on subscription limits.
     pub fn tick(self: &Arc<Self>) -> R<()> {
         let mut st = self.lock();
@@ -2084,6 +2584,14 @@ impl App {
             changed |= self.check_usage(&mut st, project)?;
         }
         changed |= self.drain_wakes(&mut st)?;
+        for r in rows(
+            &st.db,
+            "SELECT a.id FROM agents a JOIN agent_retries r ON r.agent_id=a.id
+            WHERE a.state='paused' AND a.pause_reason='flagged' AND r.handled=0 ORDER BY a.id",
+            [],
+        )? {
+            changed |= self.retry_flagged(&mut st, r["id"].as_i64().unwrap())?;
+        }
         if changed {
             self.cv.notify_all();
         }
@@ -2095,67 +2603,49 @@ impl App {
         let s = st.settings_for(Some(project));
         let mut changed = false;
         for p in crate::harness::KNOWN {
-            let p = &p.to_string();
-            let key = (project, p.clone());
-            let Some(used) = st.used_pct(p)? else {
-                st.over_hard.remove(&key);
-                // Unknown is not evidence that an exhausted subscription recovered.
-                continue;
-            };
-            let checks = st.usage_checks(&s.limits, p)?;
-            for check in &checks {
-                let key = (project, check.what.clone());
-                if check.over(check.lim.soft) {
-                    if st.over_soft.insert(key) {
-                        for r in rows(
-                            &st.db,
-                            "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state NOT IN ('closed','crashed')",
-                            params![project, p],
-                        )? {
-                            st.notice(r["id"].as_i64().unwrap(), &check.line("Soft"))?;
+            for r in rows(
+                &st.db,
+                "SELECT id,model,state FROM agents WHERE project=?1 AND harness=?2
+                AND state NOT IN ('closed','crashed')",
+                params![project, p],
+            )? {
+                let id = r["id"].as_i64().unwrap();
+                let model = st
+                    .procs
+                    .get(&id)
+                    .map(|p| p.model.as_str())
+                    .or(r["model"].as_str());
+                let checks = st.usage_checks(&s.limits, p, model)?;
+                for check in &checks {
+                    let key = (project, format!("{id}:{}", check.what));
+                    if check.over(check.lim.soft) {
+                        if st.over_soft.insert(key) {
+                            st.notice(id, &check.line("Soft"))?;
                         }
+                    } else {
+                        st.over_soft.remove(&key);
                     }
-                } else {
-                    st.over_soft.remove(&key);
+                }
+                let hard: Vec<_> = checks.iter().filter(|c| c.over(c.lim.hard)).collect();
+                if !hard.is_empty() && matches!(r["state"].as_str(), Some("working" | "idle")) {
+                    self.pause_locked(st, id, LockMode::Release, "limit", "acom")?;
+                    st.log_for(
+                        id,
+                        "acom",
+                        &format!(
+                            "{}; paused agent {id}",
+                            hard.iter()
+                                .map(|c| c.line("Hard"))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    )?;
+                    changed = true;
                 }
             }
-            let hard: Vec<_> = checks.iter().filter(|c| c.over(c.lim.hard)).collect();
-            if !hard.is_empty() {
-                if st.over_hard.insert(key) {
-                    let ids: Vec<i64> = rows(
-                        &st.db,
-                        "SELECT id FROM agents WHERE project=?1 AND harness=?2 AND state IN ('working','idle')",
-                        params![project, p],
-                    )?
-                    .iter()
-                    .map(|r| r["id"].as_i64().unwrap())
-                    .collect();
-                    for id in &ids {
-                        self.pause_locked(st, *id, LockMode::Release, "limit", "acom")?;
-                    }
-                    if !ids.is_empty() {
-                        let n = ids.len();
-                        st.log(
-                            Some(project),
-                            "acom",
-                            &format!(
-                                "{}; paused {n} agent{}",
-                                hard.iter()
-                                    .map(|c| c.line("Hard"))
-                                    .collect::<Vec<_>>()
-                                    .join("; "),
-                                if n == 1 { "" } else { "s" }
-                            ),
-                        )?;
-                        changed = true;
-                    }
-                }
-            } else {
-                st.over_hard.remove(&key);
-                // A window that's used up blocks the agents whatever the limits say.
-                if s.auto_resume && used < 100.0 {
-                    changed |= self.resume_limited(st, project, p, 0)?;
-                }
+            // Missing readings cannot prove that a subscription recovered.
+            if s.auto_resume && st.used_pct(p)?.is_some_and(|used| used < 100.0) {
+                changed |= self.resume_limited(st, project, p, 0)?;
             }
         }
         Ok(changed)
@@ -2180,7 +2670,10 @@ impl App {
         .collect();
         let mut changed = false;
         for id in &ids {
-            if !st.procs.contains_key(id) && st.no_room(project, provider)?.is_none() {
+            let a = st.agent(*id)?;
+            if !st.procs.contains_key(id)
+                && st.model_no_room(project, provider, &a.model)?.is_none()
+            {
                 self.resume_locked(st, *id, "acom")?;
                 changed = true;
             }
@@ -2193,7 +2686,7 @@ impl App {
     /// Tell a project's agents its limits or rules changed, if they did.
     fn rules_changed(st: &St, project: i64, old: &Settings) -> R<()> {
         let new = st.settings_for(Some(project));
-        if old.limits == new.limits && old.done_closes == new.done_closes {
+        if old == &new {
             return Ok(());
         }
         let text = format!(
@@ -2493,6 +2986,14 @@ impl App {
                     ))
             );
         a["output_log"] = json!(crate::run::log_path(self, id, "jsonl"));
+        a["retry"] = json!(
+            rows(
+                &st.db,
+                "SELECT source,handled,replacement,blocked FROM agent_retries WHERE agent_id=?1",
+                [id]
+            )?
+            .pop()
+        );
         a["limits"] = json!(st.limits_text(Some(project))?);
         a["lost_locks"] = json!(rows(
             &st.db,
@@ -2690,7 +3191,6 @@ mod tests {
             db,
             queues: HashMap::new(),
             procs: HashMap::new(),
-            over_hard: HashSet::new(),
             over_soft: HashSet::new(),
         }
     }
@@ -3157,7 +3657,7 @@ mod tests {
             .unwrap();
         let st = app.lock();
         let checks = st
-            .usage_checks(&Settings::default().limits, "codex")
+            .usage_checks(&Settings::default().limits, "codex", None)
             .unwrap();
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].value, 85.0);
@@ -3392,5 +3892,295 @@ mod tests {
             },
         );
         assert!(s.check().is_err());
+    }
+
+    #[test]
+    fn self_changes_are_independent_opt_ins_and_validate_before_writing() {
+        let app = app_with_two_projects();
+        app.lock().db.execute("UPDATE agents SET state='working',model='claude-opus-5-5',effort='medium' WHERE id=1", []).unwrap();
+        assert!(app.configure_agent(1, 1, None, Some("high")).is_err());
+        assert!(
+            app.configure_agent(1, 1, Some("claude-sonnet-5-5"), None)
+                .is_err()
+        );
+        custom(&app, 1, |s| s.allow_agent_effort_change = true);
+        app.configure_agent(1, 1, None, Some("high")).unwrap();
+        assert!(
+            app.configure_agent(1, 1, Some("claude-sonnet-5-5"), None)
+                .is_err()
+        );
+        assert!(app.configure_agent(1, 2, None, Some("low")).is_err());
+        assert!(app.configure_agent(1, 1, Some("gpt-6-sol"), None).is_err());
+        custom(&app, 1, |s| {
+            s.allow_agent_effort_change = true;
+            s.allow_agent_model_change = true;
+        });
+        assert!(
+            app.configure_agent(1, 1, Some("unallowed-model"), None)
+                .is_err()
+        );
+        app.configure_agent(1, 1, Some("claude-sonnet-5-5"), Some("medium"))
+            .unwrap();
+        assert_eq!(app.lock().agent(1).unwrap().model, "claude-sonnet-5-5");
+        assert_eq!(app.lock().agent(1).unwrap().state, "working");
+        // A current-turn event is checked against its launch snapshot, not the queued model.
+        app.check_model(1, "claude-opus-5-5", "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(app.lock().agent(1).unwrap().state, "working");
+        app.configure_agent(1, 0, Some("custom-model"), Some("high"))
+            .unwrap();
+        assert!(
+            app.limits(Some(1)).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("model allowed; effort allowed")
+        );
+    }
+
+    #[test]
+    fn old_settings_do_not_enable_self_changes_or_retry_rules() {
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        for key in [
+            "allow_agent_model_change",
+            "allow_agent_effort_change",
+            "flagged_retries",
+        ] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        old["limits"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_seven_day_fable");
+        let restored: Settings = serde_json::from_value(old).unwrap();
+        assert!(!restored.allow_agent_model_change && !restored.allow_agent_effort_change);
+        assert!(restored.flagged_retries.is_empty());
+        assert!(
+            restored
+                .limits
+                .usage_limit("claude", "seven_day_fable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fable_exhaustion_is_scoped_and_omission_or_old_checks_do_not_clear_it() {
+        let app = app_with_two_projects();
+        app.lock().db.execute("UPDATE agents SET model=CASE id WHEN 1 THEN 'claude-fable-5-1' ELSE 'claude-opus-5-5' END,effort='medium'", []).unwrap();
+        set_usage(&app, 0.0);
+        app.window_limit_hit(1, "seven_day_fable", "Fable weekly exhausted")
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        assert_eq!(state(&app, 2).0, "idle");
+        assert_eq!(app.lock().used_pct("claude").unwrap(), Some(0.0));
+        let refresh = |fable: Option<f64>| {
+            let mut windows = vec![
+                crate::usage::Window {
+                    name: "five_hour".into(),
+                    used: 0.0,
+                    reset: None,
+                },
+                crate::usage::Window {
+                    name: "seven_day".into(),
+                    used: 0.0,
+                    reset: None,
+                },
+            ];
+            if let Some(used) = fable {
+                windows.push(crate::usage::Window {
+                    name: "seven_day_fable".into(),
+                    used,
+                    reset: None,
+                });
+            }
+            crate::usage::finish(&app, "claude", 120, Ok(windows)).unwrap();
+        };
+        refresh(None); // omitted optional is not zero
+        assert_eq!(
+            app.lock().window_pct("claude", "seven_day_fable").unwrap(),
+            Some(100.0)
+        );
+        refresh(Some(0.0)); // begun before exhaustion: still not recovery
+        assert_eq!(
+            app.lock().window_pct("claude", "seven_day_fable").unwrap(),
+            Some(100.0)
+        );
+        {
+            let st = app.lock();
+            st.db
+                .execute(
+                    "UPDATE usage SET at=?1 WHERE win='seven_day_fable'",
+                    [now() - 1],
+                )
+                .unwrap();
+            st.db.execute("INSERT OR REPLACE INTO usage_checks(provider,attempted_at) VALUES('claude',?1)", [now()]).unwrap();
+        }
+        refresh(Some(0.0));
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+    }
+
+    #[test]
+    fn flag_after_quota_pause_is_recorded_once_and_no_rule_means_no_retry() {
+        let app = app_with_two_projects();
+        app.limit_hit(1, "quota").unwrap();
+        app.flag(1, "refusal").unwrap();
+        app.flag(1, "duplicate refusal").unwrap();
+        app.tick().unwrap();
+        let st = app.lock();
+        assert_eq!(st.agent(1).unwrap().problem.as_deref(), Some("refusal"));
+        assert_eq!(
+            st.db
+                .query_row(
+                    "SELECT count(*) FROM agent_retries WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(st.procs.is_empty());
+        assert_eq!(st.agent(1).unwrap().state, "paused");
+    }
+
+    #[test]
+    fn retry_cycles_stop_and_db_setup_failure_cannot_spawn_a_replacement() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET model='claude-fable-5-1',effort='medium' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        custom(&app, 1, |s| {
+            s.flagged_retries.insert(
+                "claude-fable-5-1".into(),
+                RetryRule {
+                    harness: "codex".into(),
+                    model: "gpt-6-sol".into(),
+                    effort: "medium".into(),
+                },
+            );
+        });
+        let (thread, _) = app
+            .new_thread(0, Some(1), "handoff", &["1".into()], true)
+            .unwrap();
+        app.flag(1, "flag").unwrap();
+        {
+            let st = app.lock();
+            st.db.execute_batch("CREATE TRIGGER fail_handoff BEFORE INSERT ON members WHEN NEW.agent_id>2 BEGIN SELECT RAISE(ABORT,'injected handoff failure'); END").unwrap();
+        }
+        app.tick().unwrap();
+        assert!(app.lock().procs.is_empty());
+        assert_eq!(app.agents(None, None).unwrap().len(), 2);
+        assert!(
+            app.agent_view(1).unwrap()["retry"]["blocked"]
+                .as_str()
+                .unwrap()
+                .contains("injected handoff failure")
+        );
+        assert!(app.thread(thread).unwrap()["members"].is_array());
+        {
+            let st = app.lock();
+            st.db.execute("UPDATE agent_retries SET tried='[\"claude:claude-fable-5-1\",\"codex:gpt-6-sol\"]',handled=0 WHERE agent_id=1", []).unwrap();
+        }
+        app.tick().unwrap();
+        assert!(
+            app.agent_view(1).unwrap()["retry"]["blocked"]
+                .as_str()
+                .unwrap()
+                .contains("cycle")
+        );
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn preparing_retry_clears_old_finish_request_without_starting_a_process() {
+        let app = app_with_two_projects();
+        app.lock().db.execute("UPDATE agents SET state='paused',pause_reason='flagged',pause_from='working',done_req=1,rest='done' WHERE id=1", []).unwrap();
+        let mut st = app.lock();
+        let prompt = app.prepare_resume(&mut st, 1, "acom").unwrap().unwrap();
+        assert!(prompt.contains("Previous turn interrupted"));
+        assert!(!st.agent(1).unwrap().done_req);
+        assert_eq!(st.agent(1).unwrap().rest, "idle");
+        assert!(st.procs.is_empty());
+    }
+
+    #[test]
+    fn running_model_not_next_turn_model_controls_fable_warnings() {
+        let app = app_with_two_projects();
+        {
+            let mut st = app.lock();
+            st.db.execute("UPDATE agents SET state='working',model=CASE id WHEN 1 THEN 'claude-opus-5-5' ELSE 'claude-fable-5-1' END", []).unwrap();
+            // Only a soft crossing; these placeholder PIDs are never signalled.
+            st.procs.insert(
+                1,
+                Proc {
+                    pid: 0,
+                    stopping: false,
+                    model: "claude-fable-5-1".into(),
+                },
+            );
+            st.procs.insert(
+                2,
+                Proc {
+                    pid: 0,
+                    stopping: false,
+                    model: "claude-opus-5-5".into(),
+                },
+            );
+        }
+        app.record_usage("claude", "seven_day_fable", 85.0, None)
+            .unwrap();
+        app.tick().unwrap();
+        let st = app.lock();
+        let first = rows(&st.db, "SELECT text FROM notices WHERE agent_id=1", []).unwrap();
+        let second = rows(&st.db, "SELECT text FROM notices WHERE agent_id=2", []).unwrap();
+        assert!(
+            first
+                .iter()
+                .any(|r| r["text"].as_str().unwrap().contains("weekly Fable"))
+        );
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn failed_state_write_after_spawn_reaps_child_before_sending_the_task() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = app_with_two_projects();
+        let bin = app.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let client = bin.join("codex");
+        // Reads stdin before recording anything: supervisor must not feed the
+        // task until state is saved. This test cannot reach a real provider.
+        std::fs::write(&client, "#!/bin/sh\nread -r task\nexit 0\n").unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::get_mut(&mut app).unwrap().exe = bin.join("acom");
+        let mut st = app.lock();
+        st.db
+            .execute(
+                "UPDATE projects SET path=?1 WHERE id=1",
+                [app.home.to_string_lossy()],
+            )
+            .unwrap();
+        st.db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol',effort='medium' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        st.db.execute_batch("CREATE TRIGGER fail_worker BEFORE UPDATE OF state ON agents WHEN NEW.state='working' BEGIN SELECT RAISE(ABORT,'injected worker state failure'); END").unwrap();
+        let error = run::start_turn(&app, &mut st, 1, "must not execute").unwrap_err();
+        assert!(error.1.contains("injected worker state failure"));
+        assert!(st.procs.is_empty());
+        assert_eq!(st.agent(1).unwrap().state, "idle");
+        assert_eq!(
+            st.db
+                .query_row("SELECT turns FROM agents WHERE id=1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

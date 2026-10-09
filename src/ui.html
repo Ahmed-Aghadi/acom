@@ -281,7 +281,7 @@
     </form>
   </dialog>
 
-  <dialog id="agent-dialog"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><h3>Recent activity</h3><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel">Close</button></div></form></dialog>
+  <dialog id="agent-dialog"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
   <dialog id="pause-dialog">
     <form method="dialog">
       <h2>Pause agent</h2>
@@ -394,6 +394,7 @@
       const windows = [
         {provider:'claude',win:'five_hour',label:'Claude · 5-hour'},
         {provider:'claude',win:'seven_day',label:'Claude · Weekly'},
+        {provider:'claude',win:'seven_day_fable',label:'Claude · Fable weekly'},
         {provider:'codex',win:null,label:'Codex'},
       ];
       root.innerHTML = windows.map(({provider,win,label}) => {
@@ -405,19 +406,19 @@
         const kind = value >= 100 || lim.hard != null && value >= lim.hard ? 'hard' : lim.soft != null && value >= lim.soft ? 'warn' : '';
         const marks = [['soft', lim.soft], ['hard', lim.hard]].filter(([,n]) => n != null).map(([kind,n]) => `<span class="mark ${kind}" title="${kind} ${esc(n)}%" style="left:${Math.max(0, Math.min(Number(n), 100))}%"></span>`).join('');
         const reset = readings.filter(u => u.resets_at && (win || u.used_pct >= 100)).map(u => u.resets_at).sort((a,b)=>a-b).at(-1);
-        const resetLabel = reset ? new Date(reset*1000).toLocaleString([], { ...(win === 'seven_day' ? {weekday:'short'} : {}), hour:'2-digit',minute:'2-digit' }) : '';
+        const resetLabel = reset ? new Date(reset*1000).toLocaleString([], { ...(win?.startsWith('seven_day') ? {weekday:'short'} : {}), hour:'2-digit',minute:'2-digit' }) : '';
         return `<button class="meter" data-usage="${esc(provider)}" data-window="${win || ''}" title="Usage windows, reset times and check status${reset ? ` · ${esc(when(reset))}` : ''}"><div class="meter-label"><span>${esc(label)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div><div class="meta">${reset ? reset > now ? `resets ${esc(resetLabel)}` : 'reset due · checking' : 'View usage details'}</div></button>`;
       }).join('');
       if (state.usageProvider) {
         const check = state.limits?.checks?.find(c => c.provider === state.usageProvider);
         $('#usage-details').innerHTML = `<p>${esc(state.usageProvider)} · Last checked: ${esc(when(check?.checked_at))}<br>Next check: ${esc(when(check?.next_check))}</p>
-          ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win === 'five_hour' ? '5-hour' : u.win === 'seven_day' ? 'Weekly' : u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
+          ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win === 'five_hour' ? '5-hour' : u.win === 'seven_day' ? 'Weekly' : u.win === 'seven_day_fable' ? 'Fable weekly' : u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
           ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}">Check now</button>`;
       }
     }
 
     function usageLimit(limits, provider, win) {
-      return (provider === 'claude' ? limits[`claude_${win}`] || limits.claude : limits[provider]) || {soft:null,hard:null};
+      return (provider === 'claude' ? limits[`claude_${win}`] || (win !== 'seven_day_fable' ? limits.claude : null) : limits[provider]) || {soft:null,hard:null};
     }
 
     function renderAgents() {
@@ -558,8 +559,11 @@
         const fields = Object.entries(a).filter(([,v]) => !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([k,v]) => `<dt>${esc(k.replaceAll('_',' '))}</dt><dd>${esc(display(k, v))}</dd>`).join('');
         const held = `<dt>locks held</dt><dd>${a.locks?.map(esc).join(', ') || '—'}</dd>`;
         const lost = `<dt>locks lost</dt><dd>${a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'}</dd>`;
-        const details = `${fields}${held}${lost}`;
+        const retryStatus = a.retry?.blocked ? `${a.retry.handled ? 'Stopped' : 'Waiting'}: ${esc(a.retry.blocked)}` : a.retry?.replacement ? '' : a.retry?.handled ? 'Retry attempt handled' : 'Pending; requires a configured rule and available limits';
+        const retry = a.retry ? `<dt>flagged retry</dt><dd>${esc(a.retry.source)} · ${a.retry.replacement ? `Replacement agent #${esc(a.retry.replacement)}${retryStatus ? '<br>' : ''}` : ''}${retryStatus}</dd>` : '';
+        const details = `${fields}${held}${lost}${retry}`;
         if ($('#agent-details').innerHTML !== details) $('#agent-details').innerHTML = details;
+        if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         const el = $('#agent-log'), text = (log.lines || []).join('\n') || 'No activity yet';
         if (el.textContent !== text) {
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
@@ -614,14 +618,20 @@
       const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label></div>`;
       const capital = name => name.charAt(0).toUpperCase() + name.slice(1);
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
-      const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
+      const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['claude','seven_day_fable','Claude Fable weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
       $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
         <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
         <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
         <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents require explicit Reopen; messages wait in their inbox. Turn this off to let finished agents wake for new messages.</span></label>
+        <label class="inline-check"><input type="checkbox" name="allow_agent_model_change" ${s.allow_agent_model_change ? 'checked' : ''}> Allow agents to change their model within the same provider</label>
+        <label class="inline-check"><input type="checkbox" name="allow_agent_effort_change" ${s.allow_agent_effort_change ? 'checked' : ''}> Allow agents to change their effort level</label>
+        <p class="meta launch-project">Both permissions are off by default. Changes use allowed models and efforts, and apply to the next turn. Provider-native sessions cannot move between providers; a new agent can read the previous agent's history instead. <a href="/models" target="_blank" rel="noopener">Model and provider reference</a></p>
+        <h3>Flagged-model retries</h3><p class="meta launch-project">No retries are configured by default. Each rule launches a replacement when its source model is flagged. Enable its provider and allow its model and effort in Harnesses above. The replacement receives the original conversation history path, including when changing providers.</p>
+        <div id="retry-rules">${Object.entries(s.flagged_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
         <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
+      $('#retry-rules').querySelectorAll('[data-retry-rule]').forEach(root => syncRetryChoices(root));
     }
 
     function splitList(value) { return value.split(',').map(x => x.trim()).filter(Boolean); }
@@ -670,6 +680,46 @@
     }
     function modelEfforts(name, id) {
       return state.catalog[name]?.find(x => x.id === id)?.efforts;
+    }
+    function providerModels(name, current = '') {
+      return [...new Set([...(state.catalog[name] || []).map(x => x.id), ...(state.editor?.settings || state.settings)?.harnesses?.[name]?.models || [], ...(current ? [current] : [])])];
+    }
+    function providerEfforts(name, model) {
+      return modelEfforts(name, model) || (name === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    }
+    function retryAllowed(name, kind) {
+      const root = [...$('#settings-form').querySelectorAll('[data-harness]')].find(root => root.dataset.harness === name);
+      return root ? checked(root, kind === 'models' ? 'allowed_model' : 'allowed_effort') : state.editor?.settings?.harnesses?.[name]?.[kind] || [];
+    }
+    function retryRule(source = '', rule = {}) {
+      const harness = rule.harness || Object.keys(state.catalog)[0] || 'claude';
+      const sources = [...new Set([...Object.keys(state.catalog).flatMap(name => providerModels(name)), ...(source ? [source] : [])])];
+      return `<div class="harness-settings" data-retry-rule><div class="form-grid">
+        <label>Flagged source model <select name="retry_source">${options(sources, source)}</select></label><label data-retry-custom-source hidden>Custom source model ID <input name="retry_custom_source"></label>
+        <label>Replacement provider <select name="retry_harness">${options(Object.keys(state.catalog), harness)}</select></label>
+        <label>Replacement model <select name="retry_model">${modelOptions(harness, [...new Set([...(state.editor?.settings?.harnesses?.[harness]?.models || []), ...(rule.model ? [rule.model] : [])])], rule.model)}</select></label><label data-retry-custom-model hidden>Custom replacement model ID <input name="retry_custom_model"></label>
+        <label>Replacement effort <select name="retry_effort">${options(providerEfforts(harness, rule.model), rule.effort || 'medium')}</select></label>
+      </div><button type="button" data-remove-retry>Remove rule</button></div>`;
+    }
+    function syncRetryChoices(root, providerChanged = false) {
+      const harness = $('[name=retry_harness]', root).value;
+      const source = $('[name=retry_source]', root);
+      if (![...source.options].some(o => o.value === '__custom__')) source.insertAdjacentHTML('beforeend', '<option value="__custom__">Custom model…</option>');
+      showCustom(source, $('[data-retry-custom-source]', root));
+      const model = $('[name=retry_model]', root);
+      if (providerChanged) model.innerHTML = modelOptions(harness, retryAllowed(harness, 'models'));
+      showCustom(model, $('[data-retry-custom-model]', root));
+      const effort = $('[name=retry_effort]', root), values = providerEfforts(harness, model.value).filter(value => retryAllowed(harness, 'efforts').includes(value));
+      effort.innerHTML = options(values, values.includes(effort.value) ? effort.value : 'medium');
+    }
+    function renderAgentConfig(a) {
+      const root = $('#agent-config');
+      root.dataset.harness = a.harness;
+      root.innerHTML = `<h3>Next-turn model and effort</h3><p class="meta launch-project">The current turn is not interrupted. This keeps the same provider and native session. A different provider requires a new agent supplied with this agent's history.</p><div class="form-grid">
+        <label>Model <select name="agent_model">${modelOptions(a.harness, providerModels(a.harness, a.model), a.model)}</select></label>
+        <label data-agent-custom-model hidden>Custom model ID <input name="agent_custom_model"></label>
+        <label>Effort <select name="agent_effort">${options(providerEfforts(a.harness, a.model), a.effort || 'medium')}</select></label>
+      </div><button type="button" id="save-agent-config">Apply to next turn</button>`;
     }
     function syncDefaultEfforts(root) {
       const supported = modelEfforts(root.dataset.harness, $('[name=model]', root).value);
@@ -823,6 +873,27 @@
         } catch (error) { toast(error.message, true); }
         return;
       }
+      if (event.target.closest('#add-retry-rule')) {
+        $('#retry-rules').insertAdjacentHTML('beforeend', retryRule());
+        syncRetryChoices($('#retry-rules').lastElementChild);
+        state.editor.dirty = true;
+        return;
+      }
+      if (event.target.closest('[data-remove-retry]')) {
+        event.target.closest('[data-retry-rule]').remove(); state.editor.dirty = true; return;
+      }
+      const saveAgentConfig = event.target.closest('#save-agent-config');
+      if (saveAgentConfig) {
+        const root = $('#agent-config'), model = $('[name=agent_model]', root);
+        if (!$('#agent-dialog form').reportValidity()) return;
+        saveAgentConfig.disabled = true;
+        try {
+          await api('/agent-config', {method:'POST',body:JSON.stringify({id:selectedAgent, model:model.value === '__custom__' ? customModel($('[name=agent_custom_model]',root).value) : model.value, effort:$('[name=agent_effort]',root).value})});
+          toast('Model and effort saved for the next turn'); await refresh();
+        } catch (error) { toast(error.message, true); }
+        finally { saveAgentConfig.disabled = false; }
+        return;
+      }
       const open = event.target.closest('[data-open]');
       if (open) {
         if (open.dataset.open === 'launch-dialog') {
@@ -859,7 +930,7 @@
         } else if (action.dataset.action === 'details') {
           selectedAgent = id; agentRequest++;
           $('#agent-title').textContent = `Agent #${id}`;
-          $('#agent-details').replaceChildren(); $('#agent-log').textContent = '';
+          $('#agent-details').replaceChildren(); $('#agent-config').replaceChildren(); $('#agent-log').textContent = '';
           $('#agent-detail-status').textContent = 'Loading…';
           $('#agent-dialog').showModal();
           await refreshAgentDetails();
@@ -932,12 +1003,20 @@
         renderSettings(); return;
       }
       if (state.editor) state.editor.dirty = true;
+      const retry = event.target.closest('[data-retry-rule]');
+      if (retry) { syncRetryChoices(retry, event.target.name === 'retry_harness'); return; }
       const root = event.target.closest('[data-harness]');
       if (!root) return;
       if (['allowed_model', 'allowed_effort'].includes(event.target.name)) syncHarnessChoices(root);
       if (event.target.name === 'model') { showCustom(event.target, $('[data-custom-default]', root)); syncDefaultEfforts(root); }
     });
     $('#settings-form').addEventListener('input', event => { if (state.editor && event.target.id !== 'config-select') state.editor.dirty = true; });
+    $('#agent-config').addEventListener('change', event => {
+      const root = $('#agent-config'), model = $('[name=agent_model]', root);
+      showCustom(model, $('[data-agent-custom-model]', root));
+      const effort = $('[name=agent_effort]', root), values = providerEfforts(root.dataset.harness, model.value);
+      effort.innerHTML = options(values, values.includes(effort.value) ? effort.value : 'medium');
+    });
     function discardSettings() { return !state.editor?.dirty || confirm('Discard unsaved settings?'); }
     function setLaunchChoices() {
       const name = $('#launch-harness').value;
@@ -1069,6 +1148,19 @@
       delete next.limits.usage.claude;
       next.auto_resume = $('[name=auto_resume]', form).checked;
       next.done_closes = $('[name=done_closes]', form).checked;
+      next.allow_agent_model_change = $('[name=allow_agent_model_change]', form).checked;
+      next.allow_agent_effort_change = $('[name=allow_agent_effort_change]', form).checked;
+      next.flagged_retries = Object.create(null);
+      form.querySelectorAll('[data-retry-rule]').forEach(root => {
+        const selected = (name, custom) => $('[name='+name+']',root).value === '__custom__' ? customModel($('[name='+custom+']',root).value) : $('[name='+name+']',root).value;
+        const source = selected('retry_source','retry_custom_source');
+        if (Object.hasOwn(next.flagged_retries, source)) throw new Error(`Only one retry rule is allowed for ${source}.`);
+        const rule = {harness:$('[name=retry_harness]',root).value,model:selected('retry_model','retry_custom_model'),effort:$('[name=retry_effort]',root).value};
+        const target = next.harnesses[rule.harness];
+        if (source === rule.model) throw new Error('Choose a different replacement model.');
+        if (!target?.enabled || !target.models.includes(rule.model) || !target.efforts.includes(rule.effort)) throw new Error('Enable the retry provider and allow its model and effort in Harnesses.');
+        next.flagged_retries[source] = rule;
+      });
       next.usage_poll_secs = Number($('[name=usage_poll_secs]', form).value);
       next.prompts = Object.fromEntries(['launch','wake','resume'].map(name=>[name,$(`[name=prompt_${name}]`,form).value]));
       return next;

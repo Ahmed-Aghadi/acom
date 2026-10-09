@@ -4,7 +4,7 @@ mod run;
 mod server;
 mod usage;
 
-use app::{GUIDE, hhmm, who};
+use app::{GUIDE, MODELS, hhmm, who};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Read;
@@ -20,6 +20,8 @@ Agents never run user commands.
 
 Agent commands (your ID comes from ACOM_ID; they act on your project):
   guide                                   Print the guide for agents
+  models [--catalog]                     Model/provider guidance, or IDs and effort choices
+  configure [ID] [--model m] [--effort e] Set next-turn model/effort (agents: themselves only)
   me                                      Your details, usage and locks
   limits                                  Limits and current usage
   status <text>                           Set your status text
@@ -71,6 +73,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Guide,
+    Models {
+        #[arg(long)]
+        catalog: bool,
+    },
+    Configure {
+        id: Option<i64>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+    },
     Me,
     Limits,
     Status {
@@ -453,6 +466,20 @@ fn print_agent(a: &Value) {
         }
     );
     println!("Task:\n{}", a["task"].as_str().unwrap_or(""));
+    for (label, key) in [
+        ("Conversation history", "conversation_history"),
+        ("Output log", "output_log"),
+    ] {
+        if let Some(path) = a[key].as_str() {
+            println!("{label}: {path}");
+        }
+    }
+    if let Some(new) = a["retry"]["replacement"].as_i64() {
+        println!("Retry replacement: agent {new}");
+    }
+    if let Some(why) = a["retry"]["blocked"].as_str() {
+        println!("Retry waiting/stopped: {why}");
+    }
 }
 
 fn hook() {
@@ -486,6 +513,34 @@ fn main() {
         Cmd::Serve { port } => server::serve(port),
         Cmd::Hook => hook(),
         Cmd::Guide => print!("{GUIDE}"),
+        Cmd::Models { catalog } => {
+            if catalog {
+                for h in harness::KNOWN {
+                    for m in harness::catalog(h) {
+                        println!(
+                            "{h}: {} · {} · efforts {}",
+                            m.id,
+                            m.name,
+                            m.efforts.join(", ")
+                        );
+                    }
+                }
+            } else {
+                print!("{MODELS}");
+            }
+        }
+        Cmd::Configure { id, model, effort } => {
+            let by = my_id().unwrap_or(0);
+            let id = id.or_else(my_id).unwrap_or_else(|| die("give an agent ID"));
+            if by > 0 && id != by {
+                die("agents may only configure themselves");
+            }
+            post(
+                "/agent-config",
+                json!({ "id": id, "agent": by, "model": model, "effort": effort }),
+            );
+            println!("Configuration saved for the next turn; current tools are unchanged.");
+        }
         Cmd::Me => print_agent(&get(&format!("/agents/{}", me()))),
         Cmd::Limits => println!(
             "{}",

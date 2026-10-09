@@ -38,6 +38,8 @@ pub enum Event {
     Flagged(String),
     /// The subscription's usage limit was hit mid-turn. acom pauses the agent until the window resets.
     LimitHit(String),
+    /// A model-scoped window exhausted; do not mark the whole provider exhausted.
+    WindowLimitHit { win: String, text: String },
     /// The model that actually answered.
     Model(String),
 }
@@ -142,6 +144,7 @@ pub fn claude_catalog() -> Vec<Model> {
         ("claude-opus-5-5", "Opus 5.5"),
         ("claude-fable-5-1", "Fable 5.1"),
         ("claude-sonnet-5-5", "Sonnet 5.5"),
+        ("claude-haiku-5-5", "Haiku 5.5"),
         ("claude-haiku-4-5", "Haiku 4.5"),
         ("claude-sonnet-5", "Sonnet 5"),
         ("claude-opus-5", "Opus 5"),
@@ -152,7 +155,15 @@ pub fn claude_catalog() -> Vec<Model> {
         ("claude-mythos-5-1", "Mythos 5.1"),
     ]
     .into_iter()
-    .map(|(id, name)| Model { id, name, efforts })
+    .map(|(id, name)| Model {
+        id,
+        name,
+        efforts: if id == "claude-haiku-4-5" {
+            &["medium"]
+        } else {
+            efforts
+        },
+    })
     .collect()
 }
 
@@ -162,7 +173,11 @@ fn claude_command(l: &Launch) -> (Command, Option<String>) {
     c.args(l.flags);
     // Keep session, model, compaction, hook and subagent controls after the
     // configurable flags so project settings cannot replace these invariants.
-    c.args(["--model", l.model, "--effort", l.effort]);
+    c.args(["--model", l.model]);
+    // Haiku 4.5 has fixed effort; medium is its catalog placeholder, not a knob.
+    if !crate::app::same_model("claude-haiku-4-5", l.model) {
+        c.args(["--effort", l.effort]);
+    }
     if let Some(s) = l.session {
         c.args([if l.resume { "--resume" } else { "--session-id" }, s]);
     }
@@ -199,6 +214,14 @@ fn refused(model: &str, category: &str, explanation: &str) -> String {
         format!(": {}", short(explanation, 200))
     };
     format!("{model} refused under its safeguards{category}{explanation}")
+}
+
+/// The Claude stream names Fable's weekly bucket differently from the UI.
+pub fn claude_window_name(name: &str) -> &str {
+    match name {
+        "seven_day_overage_included" => "seven_day_fable",
+        _ => name,
+    }
 }
 
 fn claude_events(v: &Value) -> Vec<Event> {
@@ -320,7 +343,7 @@ fn claude_events(v: &Value) -> Vec<Event> {
             for (win, w) in info["unifiedWindows"].as_object().into_iter().flatten() {
                 if let Some(u) = w["utilization"].as_f64() {
                     out.push(Event::Usage {
-                        win: win.clone(),
+                        win: claude_window_name(win).to_string(),
                         used_pct: u * 100.0,
                         resets_at: w["resetsAt"].as_i64(),
                     });
@@ -330,13 +353,19 @@ fn claude_events(v: &Value) -> Vec<Event> {
             if info["status"] == "rejected" {
                 let window = info["rateLimitType"].as_str().unwrap_or("limit");
                 out.push(Event::Usage {
-                    win: window.to_string(),
+                    win: claude_window_name(window).to_string(),
                     used_pct: 100.0,
                     resets_at: info["resetsAt"].as_i64(),
                 });
-                out.push(Event::LimitHit(format!(
-                    "Claude subscription window {window} exhausted"
-                )));
+                let text = format!("Claude subscription window {window} exhausted");
+                if claude_window_name(window) == "seven_day_fable" {
+                    out.push(Event::WindowLimitHit {
+                        win: "seven_day_fable".into(),
+                        text,
+                    });
+                } else {
+                    out.push(Event::LimitHit(text));
+                }
             }
         }
         _ => {}
@@ -696,6 +725,67 @@ mod tests {
         let ev = parse_line("claude", line);
         assert!(
             matches!(&ev[0], Event::Usage { win, used_pct, resets_at: Some(100) } if win == "five_hour" && (*used_pct - 25.0).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn fable_stream_usage_and_rejections_share_the_weekly_bucket() {
+        let value = json!({"type":"rate_limit_event","rate_limit_info":{
+            "status":"allowed","unifiedWindows":{
+                "seven_day_overage_included":{"utilization":0.87,"resetsAt":999},
+                "seven_day":{"utilization":0},"five_hour":null
+            }
+        }});
+        let events = parse_line("claude", &value.to_string());
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| matches!(e, Event::Usage { win, used_pct, resets_at: Some(999) } if win == "seven_day_fable" && (*used_pct - 87.0).abs() < 1e-9)));
+        let rejection = json!({"type":"rate_limit_event","rate_limit_info":{
+            "status":"rejected","rateLimitType":"seven_day_overage_included","resetsAt":999
+        }});
+        let events = parse_line("claude", &rejection.to_string());
+        assert!(
+            matches!(&events[0], Event::Usage {win, used_pct: 100.0, resets_at: Some(999)} if win == "seven_day_fable")
+        );
+        assert!(
+            matches!(&events[1], Event::WindowLimitHit { win, .. } if win == "seven_day_fable")
+        );
+        assert!(parse_line("claude", r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"seven_day_overage_included":null}}}"#).is_empty());
+    }
+
+    #[test]
+    fn haiku_55_catalog_has_the_supported_effort_levels() {
+        let models = claude_catalog();
+        let haiku = models.iter().find(|m| m.id == "claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.efforts, &["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            models.iter().filter(|m| m.id == "claude-haiku-5-5").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn haiku_45_fixed_effort_does_not_send_an_effort_flag() {
+        let flags = vec![];
+        let launch = Launch {
+            harness: "claude",
+            model: "claude-haiku-4-5",
+            effort: "medium",
+            session: None,
+            resume: false,
+            prompt: "task",
+            context_limit: 0,
+            flags: &flags,
+            acom: Path::new("/bin/acom"),
+        };
+        let (cmd, _) = command(&launch);
+        assert!(!cmd.get_args().any(|arg| arg == "--effort"));
+        assert_eq!(
+            claude_catalog()
+                .iter()
+                .find(|m| m.id == "claude-haiku-4-5")
+                .unwrap()
+                .efforts,
+            &["medium"]
         );
     }
 

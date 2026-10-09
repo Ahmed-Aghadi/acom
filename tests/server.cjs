@@ -51,11 +51,12 @@ let prompt = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => prompt += chunk);
 process.stdin.on('end', async () => {
-  const args = process.argv.slice(2), id = Number(process.env.ACOM_ID);
-  const resume = args[1] === 'resume';
-  fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, cwd: process.cwd(), resume }) + '\\n');
-  const session = resume ? args.at(-2) : crypto.randomUUID();
-  console.log(JSON.stringify({ type: 'thread.started', thread_id: session }));
+  const args = process.argv.slice(2), id = Number(process.env.ACOM_ID), claude = path.basename(process.argv[1]) === 'claude';
+  const resume = claude ? args.includes('--resume') : args[1] === 'resume';
+  const model = args[args.indexOf(claude ? '--model' : '-m') + 1];
+  fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume }) + '\\n');
+  const session = claude ? args[args.indexOf(resume?'--resume':'--session-id')+1] : resume ? args.at(-2) : crypto.randomUUID();
+  console.log(JSON.stringify(claude ? {type:'system',subtype:'init',session_id:session} : { type: 'thread.started', thread_id: session }));
   const sessions=path.join(process.env.CODEX_HOME,'sessions','2026','10','08'); fs.mkdirSync(sessions,{recursive:true});
   fs.appendFileSync(path.join(sessions,'rollout-'+session+'.jsonl'),JSON.stringify({type:'session_meta',payload:{id:session}})+'\\n');
   if (prompt.includes('CRASH_TEST') && !resume) { process.exitCode=1; return; }
@@ -63,6 +64,17 @@ process.stdin.on('end', async () => {
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
   if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
   if (prompt.includes('UNSUPPORTED_TEST')) { console.log(JSON.stringify({type:'turn.failed',error:{message:JSON.stringify({error:{message:"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}})}})); process.exitCode=1;return; }
+  if (prompt.includes('RETRY_CHAIN_TEST')) {
+    const flag = claude ? {type:'system',subtype:'model_refusal_no_fallback',original_model:model} : {type:'refusal'};
+    console.log(JSON.stringify(flag)); console.log(JSON.stringify(flag));
+  }
+  if (prompt.includes('HANDOFF_TEST') && !claude) { await new Promise(r=>setTimeout(r,500)); console.log(JSON.stringify({type:'refusal'})); }
+  if (prompt.includes('SELF_CHANGE_TEST') && !resume) {
+    await new Promise(r=>setTimeout(r,500));
+    const configured=await fetch(process.env.ACOM_URL+'/agent-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,agent:id,model:'gpt-6-luna',effort:'high'})});
+    if(!configured.ok) {process.exitCode=1;return;}
+    console.log(JSON.stringify({type:'response.created',response:{model}}));
+  }
   await fetch(process.env.ACOM_URL + '/hook/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   await new Promise(resolve => setTimeout(resolve, 2000));
   await fetch(process.env.ACOM_URL + '/agents/' + id + '/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
@@ -70,6 +82,7 @@ process.stdin.on('end', async () => {
 });
 }
 `, { mode: 0o755 });
+  fs.copyFileSync(path.join(bin,'codex'),path.join(bin,'claude'));
   const probe = net.createServer();
   await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   const port = probe.address().port;
@@ -131,6 +144,14 @@ process.stdin.on('end', async () => {
     assert.equal(defaults.done_closes, true);
     assert.deepEqual(defaults.harnesses.codex.flags, ['--dangerously-bypass-approvals-and-sandbox']);
     assert.deepEqual(defaults.harnesses.claude.flags, ['--dangerously-skip-permissions']);
+    assert.equal(defaults.allow_agent_model_change,false);
+    assert.equal(defaults.allow_agent_effort_change,false);
+    assert.deepEqual(defaults.flagged_retries,{});
+    assert.match(cli(root,['models']),/Models and providers/);
+    assert.match(cli(root,['models','--catalog']),/claude-haiku-5-5/);
+    const reference=await fetch(url+'/models');
+    assert.match(reference.headers.get('content-type'),/text\/plain/);
+    assert.match(await reference.text(),/Unresolved cross-generation/);
     if (process.env.ACOM_BROWSER_TEST) await browserChecks(url, api, first, second, defaults);
     const a = await api('POST', '/projects', { path: first });
     const b = await api('POST', '/projects', { path: second });
@@ -265,6 +286,81 @@ process.stdin.on('end', async () => {
       await finished(flagged.id);
       assert.equal((await api('GET', `/agents/${flagged.id}`)).problem, null);
     }
+    // Independent self-change permissions apply to next turn, never mid-command.
+    const selfConfig=structuredClone(defaults); selfConfig.allow_agent_model_change=true; selfConfig.allow_agent_effort_change=true;
+    await api('PUT',`/projects/${a.id}/config`,{custom:selfConfig});
+    const self=await api('POST','/agents',{project:a.id,harness:'codex',task:'SELF_CHANGE_TEST'});
+    await until(()=>runs().some(r=>r.id===self.id),'self-config first turn');
+    await api('POST','/agent-config',{id:self.id,agent:self.id,model:'gpt-6-luna',effort:'ultra'},400);
+    await api('POST','/agent-config',{id:self.id,agent:self.id,model:'claude-opus-5-5'},400);
+    await api('POST','/agent-config',{id:self.id,agent:self.id,model:'custom-unallowed'},400);
+    await finished(self.id);
+    const selfBefore=await api('GET',`/agents/${self.id}`);
+    assert.equal(selfBefore.model,'gpt-6-luna'); assert.equal(selfBefore.effort,'high');
+    assert.equal(runs().filter(r=>r.id===self.id).length,1);
+    const selfThread=await api('POST','/threads',{project:a.id,title:'Continue with changed configuration',members:[String(self.id)]});
+    await api('POST','/messages',{thread:selfThread.id,text:'Continue'});
+    await api('POST',`/agents/${self.id}/reopen`,{});
+    await until(()=>runs().filter(r=>r.id===self.id).length===2,'self-change second turn');
+    const selfRun=runs().filter(r=>r.id===self.id)[1];
+    assert.equal(selfRun.model,'gpt-6-luna'); assert.equal(selfRun.resume,true);
+    assert.match(selfRun.prompt,/Running configuration[\s\S]*gpt-6-luna \/ effort high/);
+    await finished(self.id); assert.equal((await api('GET',`/agents/${self.id}`)).session,selfBefore.session);
+    await api('PUT',`/projects/${a.id}/config`,{config:1});
+
+    // Explicit same-provider rule resumes once; repeated flag events cannot duplicate it.
+    const retryConfig=structuredClone(defaults);
+    retryConfig.flagged_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna',effort:'high'};
+    retryConfig.limits.active.hard=0;
+    retryConfig.limits.active.soft=null;
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const retry=await api('POST','/agents',{project:a.id,harness:'codex',task:'POLICY_TEST',force:true});
+    await until(async()=>(await api('GET',`/agents/${retry.id}`)).retry?.blocked?.includes('Hard limit'),'retry waits for an active slot');
+    assert.equal(runs().filter(r=>r.id===retry.id).length,1);
+    retryConfig.limits.active.hard=1;
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    await until(()=>runs().filter(r=>r.id===retry.id).length===2,'configured same-provider retry');
+    const retryRuns=runs().filter(r=>r.id===retry.id);
+    assert.equal(retryRuns[1].resume,true); assert.equal(retryRuns[1].model,'gpt-6-luna');
+    assert.equal(fs.existsSync(`/proc/${retryRuns[0].pid}`),false,'old process exited before retry');
+    assert.match(retryRuns[1].prompt,/Explicit flagged-model retry/);
+    await finished(retry.id);
+    retryConfig.limits.active=structuredClone(defaults.limits.active);
+
+    // Cross-provider handoff retains threads/marks, references the actual history,
+    // starts a fresh native session, and keeps the predecessor paused.
+    retryConfig.flagged_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5',effort:'medium'};
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const handoff=await api('POST','/agents',{project:a.id,harness:'codex',task:'HANDOFF_TEST',group:'reviewers'});
+    const handoffThread=await api('POST','/threads',{project:a.id,title:'Inherited task',members:[String(handoff.id)]});
+    const handoffMessage=await api('POST','/messages',{thread:handoffThread.id,text:'Context for replacement'});
+    await api('POST','/marks',{agent:handoff.id,ids:[handoffMessage.id],mark:'in-progress'});
+    const handed=await until(async()=>{const v=await api('GET',`/agents/${handoff.id}`);return v.retry?.replacement && v;},'cross-provider replacement');
+    const replacement=handed.retry.replacement;
+    await until(()=>runs().some(r=>r.id===replacement),'replacement launched');
+    const replacementRun=runs().find(r=>r.id===replacement);
+    assert.equal(replacementRun.harness,'claude'); assert.equal(replacementRun.resume,false);
+    assert.ok(replacementRun.prompt.includes(handed.conversation_history));
+    assert.ok(replacementRun.prompt.includes(handed.output_log));
+    assert.match(replacementRun.prompt,new RegExp(`launched by agent ${handoff.id}`));
+    assert.match(replacementRun.prompt,new RegExp(`thread #${handoffThread.id}`));
+    assert.equal((await api('GET',`/agents/${replacement}`)).group,'reviewers');
+    assert.ok((await api('GET',`/threads/${handoffThread.id}`)).members.includes(replacement));
+    assert.ok((await api('GET',`/inbox/${replacement}?mark=in-progress`)).some(m=>m.id===handoffMessage.id));
+    await finished(replacement); assert.equal((await api('GET',`/agents/${handoff.id}`)).state,'paused');
+
+    // A -> B -> A cycle stops after B even across providers and server restart.
+    retryConfig.flagged_retries['claude-sonnet-5-5']={harness:'codex',model:'gpt-6-sol',effort:'medium'};
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const cycle=await api('POST','/agents',{project:a.id,harness:'codex',task:'RETRY_CHAIN_TEST'});
+    const cycleNext=await until(async()=>{const v=await api('GET',`/agents/${cycle.id}`);return v.retry?.replacement;},'cycle first replacement');
+    await until(async()=>{const v=await api('GET',`/agents/${cycleNext}`);return v.retry?.blocked?.includes('cycle');},'cycle stopped');
+    assert.equal(runs().filter(r=>r.id===cycle.id).length,1); assert.equal(runs().filter(r=>r.id===cycleNext).length,1);
+    await stop(); await start();
+    await new Promise(r=>setTimeout(r,1100));
+    assert.equal(runs().filter(r=>r.id===cycleNext).length,1);
+    await api('PUT',`/projects/${a.id}/config`,{config:1});
+
     const rejected=await api('POST','/agents',{project:a.id,harness:'codex',model:'gpt-6.1-sol',task:'UNSUPPORTED_TEST'});
     await until(async()=>(await api('GET',`/agents/${rejected.id}`)).state==='crashed','unsupported model error');
     assert.match((await api('GET',`/agents/${rejected.id}`)).problem,/^The 'gpt-6.1-sol' model is not supported/);
@@ -418,7 +514,7 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     fs.appendFileSync(path.join(home, 'logs', `${agent}.txt`), '\nLive log line from the test harness\n');
     await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Live log line from the test harness'));
     assert.match(await page.locator('#agent-details').textContent(), /Live status from the test harness/);
-    await page.locator('#agent-dialog button').click();
+    await page.locator('#agent-dialog button[value=cancel]').click();
     await page.reload();
     assert.equal((await api('GET', `/threads/${thread}`)).unread, 0);
     assert.deepEqual(errors, []);

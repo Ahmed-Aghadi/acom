@@ -21,6 +21,7 @@ function settings() {
     }])),
     limits: { active: { soft: 6, hard: 8 }, active_per_harness: {}, usage: {}, context: { soft: null, hard: 200000 } },
     auto_resume: true, done_closes: true,
+    allow_agent_model_change: false, allow_agent_effort_change: false, flagged_retries: {},
     usage_poll_secs: 120,
     prompts: { launch:'Launch guidance', wake:'Wake guidance', resume:'Resume guidance' },
   };
@@ -96,6 +97,10 @@ async function fixture(run) {
     if (req.url === '/agents') {
       if (data.hardLimit && !body.force) { res.statusCode = 409; return send({ error: 'hard limit reached: confirm to continue' }); }
       return send({ id: 1, warnings: [] });
+    }
+    if (req.url === '/agent-config') {
+      Object.assign(data.agents.find(a => a.id === body.id), {model:body.model,effort:body.effort});
+      return send({});
     }
     if (/^\/agents\/\d+(\/log\?lines=100)?$/.test(req.url)) {
       const id = Number(req.url.split('/')[2]);
@@ -796,7 +801,7 @@ test('open details update status and logs, preserve history scroll and recover f
   assert.match(await page.locator('#agent-log').textContent(), /<img/);
   data.detailFailure = false; data.agentLogs[1].push('Recovered');
   await page.waitForFunction(() => document.querySelector('#agent-log').textContent.endsWith('Recovered'));
-  await page.locator('#agent-dialog button').click();
+  await page.locator('#agent-dialog button[value=cancel]').click();
   await page.waitForTimeout(100);
   const requests = data.detailRequests.length;
   await page.waitForTimeout(2200);
@@ -808,7 +813,7 @@ test('closing pending details and opening another agent ignores old responses', 
   data.agentLogs = { 1: ['Old log'], 2: ['New log'] };
   await page.reload(); data.detailDelay = 1000;
   await page.locator('[data-action=details][data-id="1"]').click();
-  await page.locator('#agent-dialog button').click();
+  await page.locator('#agent-dialog button[value=cancel]').click();
   data.detailDelay = 0;
   await page.locator('[data-action=details][data-id="2"]').click();
   await page.waitForFunction(() => document.querySelector('#agent-title').textContent === 'Worker 2 · #2');
@@ -816,10 +821,10 @@ test('closing pending details and opening another agent ignores old responses', 
   assert.equal(await page.locator('#agent-title').textContent(), 'Worker 2 · #2');
   assert.equal(await page.locator('#agent-log').textContent(), 'New log');
   assert.equal(await page.locator('#agent-dialog').isVisible(), true);
-  await page.locator('#agent-dialog button').click();
+  await page.locator('#agent-dialog button[value=cancel]').click();
   data.detailDelay = 800;
   await page.locator('[data-action=details][data-id="1"]').click();
-  await page.locator('#agent-dialog button').click();
+  await page.locator('#agent-dialog button[value=cancel]').click();
   await page.waitForTimeout(1000);
   assert.equal(await page.locator('#agent-dialog').isVisible(), false);
 }));
@@ -853,6 +858,134 @@ test('Claude windows display and save independent thresholds, including older sa
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 }));
 
+test('agent self-change permissions are independent opt-ins and retry rules are explicit', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  const form = page.locator('#settings-form');
+  assert.equal(await form.locator('[name=allow_agent_model_change]').isChecked(), false);
+  assert.equal(await form.locator('[name=allow_agent_effort_change]').isChecked(), false);
+  assert.equal(await form.locator('[data-retry-rule]').count(), 0);
+  await form.locator('[name=allow_agent_effort_change]').check();
+  await saveSettings(page);
+  assert.equal(data.settings.allow_agent_model_change, false);
+  assert.equal(data.settings.allow_agent_effort_change, true);
+  assert.deepEqual(data.settings.flagged_retries, {});
+  await form.locator('[name=allow_agent_model_change]').check();
+  await form.locator('[name=allow_agent_effort_change]').uncheck();
+  await form.locator('#add-retry-rule').click();
+  const rule = form.locator('[data-retry-rule]').first();
+  await rule.locator('[name=retry_source]').selectOption('claude-opus-5-5');
+  await rule.locator('[name=retry_harness]').selectOption('codex');
+  await rule.locator('[name=retry_model]').selectOption('gpt-6-luna');
+  assert.equal(await rule.locator('[name=retry_effort] option[value=ultra]').count(), 0);
+  await rule.locator('[name=retry_effort]').selectOption('high');
+  await page.evaluate(() => refresh());
+  assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
+  await saveSettings(page);
+  assert.equal(data.settings.allow_agent_model_change, true);
+  assert.equal(data.settings.allow_agent_effort_change, false);
+  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',effort:'high'}});
+  await page.reload(); await page.locator('[data-page=settings]').click();
+  assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
+  await rule.locator('[data-remove-retry]').click(); await saveSettings(page);
+  assert.deepEqual(data.settings.flagged_retries, {});
+}));
+
+test('retry rules support custom IDs and reject duplicate source models without writes', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('#add-retry-rule').click();
+  const rule = page.locator('[data-retry-rule]').first();
+  await rule.locator('[name=retry_source]').selectOption('__custom__');
+  await rule.locator('[name=retry_custom_source]').fill('future-source');
+  await rule.locator('[name=retry_model]').selectOption('__custom__');
+  await rule.locator('[name=retry_custom_model]').fill('future-target');
+  const beforeGrant = data.requests.length;
+  await page.locator('[form=settings-form]').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('allow its model and effort'));
+  assert.equal(data.requests.length, beforeGrant, 'a retry cannot implicitly allow its target');
+  const harness = page.locator('[data-harness=claude]');
+  await harness.locator('.model-picker summary').click();
+  await harness.locator('[name=add_model]').fill('future-target');
+  await harness.locator('[data-add-model]').click();
+  await saveSettings(page);
+  assert.equal(data.settings.flagged_retries['future-source'].model, 'future-target');
+  await page.reload(); await page.locator('[data-page=settings]').click();
+  assert.equal(await rule.locator('[name=retry_source]').inputValue(), 'future-source');
+  assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'future-target');
+  await page.locator('#add-retry-rule').click();
+  const second = page.locator('[data-retry-rule]').last();
+  await second.locator('[name=retry_source]').selectOption('__custom__');
+  await second.locator('[name=retry_custom_source]').fill('future-source');
+  const writes = data.requests.length;
+  await page.locator('[form=settings-form]').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Only one retry rule'));
+  assert.equal(data.requests.length, writes);
+}));
+
+test('Fable weekly usage has an independent meter and no inherited legacy threshold', async () => fixture(async (page, data) => {
+  data.settings.limits.usage.claude = {soft:50,hard:90};
+  data.usage = [{provider:'claude',win:'seven_day_fable',used_pct:80,resets_at:Date.now()/1000+86400}];
+  await page.reload();
+  assert.match(await page.locator('[data-window=seven_day_fable] .meter-label').textContent(), /Fable weekly.*80%/);
+  assert.equal(await page.locator('[data-window=seven_day_fable] .fill.warn').count(), 0);
+  await page.locator('[data-window=seven_day_fable]').click();
+  assert.match(await page.locator('#usage-details').textContent(), /Fable weekly: 80%/);
+  await page.locator('#usage-dialog button').filter({hasText:'Close'}).click();
+  await page.locator('[data-page=settings]').click();
+  const fable = page.locator('[data-limit="usage.claude_seven_day_fable"]');
+  assert.equal(await fable.locator('[name=hard]').inputValue(), '');
+  await fable.locator('[name=soft]').fill('60'); await fable.locator('[name=hard]').fill('95');
+  await saveSettings(page);
+  assert.deepEqual(data.settings.limits.usage.claude_seven_day_fable, {soft:60,hard:95});
+  assert.deepEqual(data.settings.limits.usage.claude_seven_day, {soft:50,hard:90});
+  await page.evaluate(() => refresh());
+  assert.equal(await page.locator('[data-window=seven_day_fable] .fill.warn').count(), 1);
+  await page.setViewportSize({width:375,height:800});
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+}));
+
+test('agent details preserve model drafts while polling and save provider-fixed next-turn changes', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'ultra'}];
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const config = page.locator('#agent-config');
+  assert.match(await config.textContent(), /current turn is not interrupted/);
+  await config.locator('[name=agent_model]').selectOption('gpt-6-luna');
+  assert.equal(await config.locator('[name=agent_effort] option[value=ultra]').count(), 0);
+  await config.locator('[name=agent_effort]').selectOption('max');
+  await page.evaluate(() => refresh());
+  assert.equal(await config.locator('[name=agent_model]').inputValue(), 'gpt-6-luna');
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('saved for the next turn'));
+  assert.deepEqual(data.requests.at(-1), {url:'/agent-config',method:'POST',body:{id:1,model:'gpt-6-luna',effort:'max'}});
+  assert.equal(data.agents[0].state, 'working');
+  assert.equal(data.agents[0].harness, 'codex');
+  assert.equal(await config.locator('select option[value="claude-sonnet-5-5"]').count(), 0);
+  await config.locator('[name=agent_model]').selectOption('__custom__');
+  const writes = data.requests.length;
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  assert.equal(await page.locator('#agent-dialog').isVisible(), false);
+  assert.equal(data.requests.length, writes, 'close ignores an empty custom-model draft');
+}));
+
+test('agent details expose pending, blocked and replacement retry status safely', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'paused',pause_reason:'flagged',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null}}];
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const details = page.locator('#agent-details');
+  assert.match(await details.textContent(), /flagged retry.*Pending; requires a configured rule/);
+  data.agents[0].retry.blocked = 'Usage limit <waiting>';
+  await page.evaluate(() => refresh());
+  assert.match(await details.textContent(), /Waiting: Usage limit <waiting>/);
+  assert.equal(await details.locator('waiting').count(), 0);
+  data.agents[0].retry.handled = 1;
+  await page.evaluate(() => refresh());
+  assert.match(await details.textContent(), /Stopped: Usage limit/);
+  data.agents[0].retry.blocked = null; data.agents[0].retry.replacement = 2;
+  await page.evaluate(() => refresh());
+  assert.match(await details.textContent(), /Replacement agent #2/);
+  data.agents[0].retry.blocked = 'cannot start replacement';
+  await page.evaluate(() => refresh());
+  assert.match(await details.textContent(), /Replacement agent #2.*Stopped: cannot start replacement/);
+}));
+
 test('thread identifiers are visible and copyable for references in another conversation', async () => fixture(async (page, data) => {
   data.threads = [conversation([]),conversation([], {id:2,title:'Follow-up'})];
   await page.reload(); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
@@ -876,7 +1009,7 @@ test('agent details expose native history and output paths; closed behavior is e
   await page.waitForFunction(() => document.querySelector('#agent-details').textContent.includes('conversation history'));
   assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.claude\/projects\/-work\/session.jsonl/);
   assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.acom\/logs\/1.jsonl/);
-  await page.locator('#agent-dialog button').click();
+  await page.locator('#agent-dialog button[value=cancel]').click();
   await page.locator('[data-page=settings]').click();
   assert.match(await page.locator('[name=done_closes]').locator('..').locator('..').textContent(), /require explicit Reopen/);
 }));

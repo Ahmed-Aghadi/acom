@@ -77,7 +77,10 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
         // Closed/crashed agents do not receive rule-change notices. Refresh every
         // continuation, after queued notices so older rules cannot be the last word.
         briefed = format!(
-            "{prompt}\n\n## Limits and rules right now\n\n{}",
+            "{prompt}\n\n## Running configuration\n\n{} / {} / effort {}\n\n## Limits and rules right now\n\n{}",
+            a.harness,
+            a.model,
+            a.effort,
             st.limits_text(Some(a.project))?
         );
         &briefed
@@ -126,23 +129,29 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
     let mut child = cmd
         .spawn()
         .map_err(|e| Fail(500, format!("can't start {}: {e}", a.harness)))?;
-    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
-        thread::spawn(move || {
-            let _ = stdin.write_all(text.as_bytes());
-        });
-    }
     let pid = child.id();
+    // Don't feed the task or register a worker until its state is saved. A DB
+    // failure after spawn must stop and reap the child, not leave it unattended.
+    if let Err(e) = st.db.execute(
+        "UPDATE agents SET seen_model=NULL,state='working',pid=?2,turns=turns+1,ended_at=NULL WHERE id=?1",
+        params![id, pid]) {
+        kill_group(pid, libc::SIGKILL);
+        let _ = child.wait();
+        return Err(e.into());
+    }
     st.procs.insert(
         id,
         Proc {
             pid,
             stopping: false,
+            model: a.model.clone(),
         },
     );
-    st.db.execute(
-        "UPDATE agents SET state='working', pid=?2, turns=turns+1, ended_at=NULL WHERE id=?1",
-        params![id, pid],
-    )?;
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        thread::spawn(move || {
+            let _ = stdin.write_all(text.as_bytes());
+        });
+    }
     append(
         &log_path(app, id, "txt"),
         &format!(
@@ -172,7 +181,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
                     {
                         last_error = Some(e.to_string());
                     }
-                    apply(&app, id, &harness, ev);
+                    apply(&app, id, &harness, &a.model, ev);
                 }
             }
         }
@@ -208,7 +217,7 @@ fn last_line(path: &PathBuf, from: u64) -> Option<String> {
     Some(line.chars().take(300).collect())
 }
 
-fn apply(app: &Arc<App>, id: i64, harness: &str, ev: Event) {
+fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event) {
     let r = match ev {
         Event::Session(s) => app.set_session(id, &s),
         Event::Tokens { t, add } => app.record_tokens(id, t, add),
@@ -220,7 +229,8 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, ev: Event) {
         } => app.record_usage(harness, &win, used_pct, resets_at),
         Event::Flagged(reason) => app.flag(id, &reason),
         Event::LimitHit(text) => app.limit_hit(id, &text),
-        Event::Model(m) => app.check_model(id, &m),
+        Event::WindowLimitHit { win, text } => app.window_limit_hit(id, &win, &text),
+        Event::Model(m) => app.check_model(id, asked, &m),
         Event::Text(t) => {
             append(&log_path(app, id, "txt"), &t);
             Ok(())
@@ -260,7 +270,15 @@ fn follow_side_file(app: &Arc<App>, id: i64, harness: &str, resume: bool, done: 
                         harness::parse_line(harness, String::from_utf8_lossy(&line).trim_end())
                     {
                         if !matches!(ev, Event::Text(_)) {
-                            apply(app, id, harness, ev);
+                            // The running process keeps its original requested model even
+                            // if the user/agent has changed the next-turn configuration.
+                            let asked = app
+                                .lock()
+                                .procs
+                                .get(&id)
+                                .map(|p| p.model.clone())
+                                .unwrap_or_default();
+                            apply(app, id, harness, &asked, ev);
                         }
                     }
                 }

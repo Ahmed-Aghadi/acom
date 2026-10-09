@@ -17,18 +17,50 @@ pub struct Window {
 
 pub fn parse(provider: &str, v: &Value) -> Result<Vec<Window>, String> {
     let mut out = Vec::new();
+    let mut invalid = false;
     if provider == "claude" {
-        for (name, w) in v.as_object().into_iter().flatten() {
-            if let Some(used) = w["utilization"].as_f64() {
-                let reset = w["resets_at"]
+        let mut add = |name: &str, used: &Value, reset: &Value| {
+            if let Some(used) = used.as_f64() {
+                if !used.is_finite() || !(0.0..=100.0).contains(&used) {
+                    invalid = true;
+                    return;
+                }
+                let reset = reset
                     .as_str()
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|t| t.timestamp() + i64::from(t.timestamp_subsec_nanos() != 0));
-                out.push(Window {
-                    name: name.clone(),
-                    used,
-                    reset,
-                });
+                let name = crate::harness::claude_window_name(name);
+                // Alternate provider representations can describe the same bucket.
+                // Keep the highest reading instead of inserting duplicate DB keys.
+                if let Some(old) = out.iter_mut().find(|w: &&mut Window| w.name == name) {
+                    if used >= old.used {
+                        old.used = used;
+                        old.reset = reset;
+                    }
+                } else {
+                    out.push(Window {
+                        name: name.into(),
+                        used,
+                        reset,
+                    });
+                }
+            }
+        };
+        for (name, w) in v.as_object().into_iter().flatten() {
+            add(name, &w["utilization"], &w["resets_at"]);
+        }
+        // OAuth /usage reports model windows in limits[]; get_usage exposes
+        // them as model_scoped[]. Neither omission nor null means zero usage.
+        for row in v["limits"].as_array().into_iter().flatten() {
+            if row["kind"] == "weekly_scoped"
+                && is_fable_label(&row["scope"]["model"]["display_name"])
+            {
+                add("seven_day_fable", &row["percent"], &row["resets_at"]);
+            }
+        }
+        for row in v["model_scoped"].as_array().into_iter().flatten() {
+            if is_fable_label(&row["display_name"]) {
+                add("seven_day_fable", &row["utilization"], &row["resets_at"]);
             }
         }
     } else {
@@ -70,7 +102,8 @@ pub fn parse(provider: &str, v: &Value) -> Result<Vec<Window>, String> {
     {
         return Err("Claude usage response omitted the five-hour or weekly window; keeping the last reading.".into());
     }
-    if out.is_empty()
+    if invalid
+        || out.is_empty()
         || out
             .iter()
             .any(|w| !w.used.is_finite() || !(0.0..=100.0).contains(&w.used))
@@ -80,6 +113,12 @@ pub fn parse(provider: &str, v: &Value) -> Result<Vec<Window>, String> {
         );
     }
     Ok(out)
+}
+
+fn is_fable_label(value: &Value) -> bool {
+    value.as_str().is_some_and(|label| {
+        label.eq_ignore_ascii_case("Fable") || label.to_ascii_lowercase().starts_with("fable ")
+    })
 }
 
 fn read(provider: &str) -> Result<Vec<Window>, String> {
@@ -319,18 +358,31 @@ pub fn finish(
                 "SELECT at FROM usage WHERE provider=?1 AND win='limit' AND at>=coalesce((SELECT attempted_at FROM usage_checks WHERE provider=?1),0)",
                 [provider],
             )?;
-            if !marker.is_empty() && windows.iter().all(|w| w.used < 100.0) {
+            if !marker.is_empty()
+                && windows
+                    .iter()
+                    .filter(|w| w.name != "seven_day_fable")
+                    .all(|w| w.used < 100.0)
+            {
                 windows.push(Window {
                     name: "limit".into(),
                     used: 100.0,
                     reset: None,
                 });
             }
+            // A check begun before a Fable exhaustion event cannot clear it.
+            let fable_marker = rows(&st.db, "SELECT at FROM usage WHERE provider=?1 AND win='seven_day_fable'
+                AND used_pct>=100 AND at>=coalesce((SELECT attempted_at FROM usage_checks WHERE provider=?1),0)", [provider])?;
+            if !fable_marker.is_empty() {
+                windows.retain(|w| w.name != "seven_day_fable");
+            }
             let tx = st.db.unchecked_transaction()?;
-            tx.execute("DELETE FROM usage WHERE provider=?1", [provider])?;
+            // An omitted optional Fable bucket is unknown, not proof of reset.
+            // Retain its last confirmed reading until a new one replaces it.
+            tx.execute("DELETE FROM usage WHERE provider=?1 AND NOT (provider='claude' AND win='seven_day_fable')", [provider])?;
             for w in &windows {
                 tx.execute(
-                    "INSERT INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,?2,?3,?4,?5)",
+                    "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,?2,?3,?4,?5)",
                     params![provider, w.name, w.used, w.reset, now()],
                 )?;
             }
@@ -418,6 +470,65 @@ mod tests {
                 .reset,
             Some(1791459001)
         );
+    }
+
+    #[test]
+    fn fable_weekly_usage_handles_oauth_and_cli_representations() {
+        let mut value = json!({
+            "five_hour":{"utilization":10}, "seven_day":{"utilization":20},
+            "limits":[
+                {"kind":"weekly_scoped","percent":87,"resets_at":"2026-10-08T11:30:00Z","scope":{"model":{"display_name":"Fable 5.1"}}},
+                {"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Other"}}},
+                {"kind":"daily_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}
+            ]
+        });
+        let windows = parse("claude", &value).unwrap();
+        assert_eq!(windows.len(), 3);
+        let fable = windows
+            .iter()
+            .find(|w| w.name == "seven_day_fable")
+            .unwrap();
+        assert_eq!(fable.used, 87.0);
+        assert_eq!(fable.reset, Some(1791459000));
+        value["model_scoped"] = json!([{"display_name":"fable","utilization":90}]);
+        value["seven_day_fable"] = json!({"utilization":0});
+        value["seven_day_overage_included"] = json!({"utilization":80});
+        let windows = parse("claude", &value).unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(
+            windows
+                .iter()
+                .find(|w| w.name == "seven_day_fable")
+                .unwrap()
+                .used,
+            90.0
+        );
+        value["model_scoped"][0]["utilization"] = json!(-1);
+        assert!(parse("claude", &value).is_err());
+    }
+
+    #[test]
+    fn fable_window_is_optional_but_zero_is_a_real_reading() {
+        let mut value = json!({"five_hour":{"utilization":10},"seven_day":{"utilization":20}});
+        for optional in [Value::Null, json!({"utilization":null})] {
+            value["seven_day_fable"] = optional;
+            assert_eq!(parse("claude", &value).unwrap().len(), 2);
+        }
+        value["limits"] = json!([{"kind":"weekly_scoped","percent":null,"scope":{"model":{"display_name":"Fable"}}}]);
+        value["model_scoped"] = json!([{"display_name":"Fable","utilization":null}]);
+        assert_eq!(parse("claude", &value).unwrap().len(), 2);
+        value["seven_day_fable"] = json!({"utilization":0});
+        let windows = parse("claude", &value).unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .find(|w| w.name == "seven_day_fable")
+                .unwrap()
+                .used,
+            0.0
+        );
+        value.as_object_mut().unwrap().remove("seven_day");
+        assert!(parse("claude", &value).is_err());
     }
 
     #[test]

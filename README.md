@@ -37,7 +37,9 @@ When an agent runs `acom done` it's closed by default: no message wakes it. Mess
 
 Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Settings are saved in the database and kept across upgrades; new defaults only apply to a fresh `~/.acom`.
 
-Claude's five-hour and weekly limits are separate, with both readings visible in the top bar. Either window can pause that project's agents; recovery requires both to allow work. Unknown isn't zero. Previously saved Claude provider-wide thresholds are shown for both windows until you save separate values. Launch briefings include the full acom guide, identity, project folder, task, model/effort, limits and finishing rule; custom guidance supplements rather than replaces them.
+Claude's five-hour, weekly and weekly Fable limits are separate, with all readings visible in the top bar. The general windows can pause any Claude agent; Fable's window only pauses Fable models. Unknown isn't zero: an omitted optional Fable reading keeps the last confirmed reading and its timestamp. Previously saved Claude provider-wide thresholds supply the general windows, not a new Fable threshold. Launch briefings include the full acom guide, identity, project folder, task, model/effort, limits and finishing rule; custom guidance supplements rather than replaces them.
+
+Settings → Agent self-changes independently permits agents to change their model or effort. Both are off by default. `acom configure --model <ID> --effort <level>` applies to the agent's next turn without interrupting current tools, keeps the same provider/session, and respects allowed models/efforts. The user can also change these in Details or with `acom configure <ID> ...`. Cross-provider changes require a new agent: give it a summary and the previous agent's history/output paths so it can inspect them rather than attempt an incompatible native resume.
 
 ## Recovery and prompts
 
@@ -51,14 +53,16 @@ Settings → Prompt guidance (advanced) lets each saved or custom config edit la
 
 Settings and the Launch dialog offer the models acom knows, by full ID:
 
-- Claude: `claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-haiku-4-5`, `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-mythos-5-1`
+- Claude: `claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-haiku-4-5`, `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-mythos-5-1`
 - Codex: `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`
 
 A newer model can be typed in as a custom ID. The allowed-model list in Settings limits what agents may launch; your own launches can use any ID.
 
+`acom models` prints the dated, sourced [model and provider reference](src/models.md), including capability orderings and uncertain comparisons; `acom models --catalog` lists IDs and effort choices. The guide points agents to both. Haiku 4.5 has fixed effort: its `medium` catalog value is a placeholder and acom omits the effort flag for it.
+
 The catalog isn't a guarantee that your installed harness supports a model. Fresh configs default to `gpt-6-sol`; existing model choices aren't rewritten. An older Codex CLI can reject `gpt-6.1-sol` while a newer editor-bundled CLI accepts it with the same ChatGPT login. acom uses `codex` from the server's PATH, not the editor's client, and inherits its login/configuration (`CODEX_HOME` if set). Compare `command -v codex`, `codex --version` and `codex login status`; update the standalone client or start acom with the newer client's directory first in PATH. No API key is needed when that client is signed in with ChatGPT. See [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
 
-Errors are shown plainly, with **Retry same model** and **Launch another model…**; acom never silently substitutes one.
+Errors are shown plainly, with **Retry same model** and **Launch another model…**. Settings → Flagged-model retries optionally maps a source model to a replacement harness/model/effort. No rules are configured by default; no rule means no automatic retry. Rules apply only to flags/refusals/unexpected harness model changes, not ordinary crashes or quota pauses. Same-provider retries keep the agent/session; cross-provider retries create a replacement with the original task, history/output paths, thread memberships and message marks. The predecessor stays paused for inspection. Limits and target allowed lists apply, the stopped process must exit first, and visited models stop retry cycles. A failed spawn is not retried in a loop; Details/activity explain waiting or failure. Manual Resume starts a fresh retry chain. Routing does not override provider safety policies.
 
 ## Permissions
 

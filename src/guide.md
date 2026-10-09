@@ -46,11 +46,19 @@ To hand your work over, add `--done`: you're marked done and the new agent is la
 
 `acom agents` lists everyone, and `acom agent <ID>` shows one. `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details.
 
+`acom models` explains providers, model capability ordering and uncertain comparisons, with source links. `acom models --catalog` lists known IDs and effort choices. Account access and harness versions still determine what works.
+
+If the user permits it, `acom configure --model <ID> --effort <level>` changes your own next-turn configuration. Model and effort permissions are independent, off by default, and shown in `acom limits`, along with allowed choices. Finish this turn normally; current tools are not interrupted. The next turn keeps your native session within the same provider. It does not grant a new active slot or reset usage.
+
+A different provider cannot resume your native context/history. Launch it with a task summary and your `conversation_history` and `output_log` paths from `acom me`; it can read those as context and inspect current files. Use `--done` to hand over without requiring another active slot. Never pass one provider's session ID to another.
+
+Flagged models stay paused unless the user has configured an explicit per-model retry rule. A same-provider rule continues that session; a cross-provider rule launches a replacement with history references, thread memberships and message marks. No locks or background work transfer. Limits still apply and retry cycles stop. Do not use routing to evade provider policies.
+
 ## Limits
 
 `acom limits` shows them. A limit can have a soft value, a hard value, both, or neither. At the soft value you're told about it. At the hard value acom acts: your launches are refused, agents are paused when their subscription runs low, and your context is compacted.
 
-Claude's five-hour and weekly usage windows have separate thresholds. Either can stop work; resetting one doesn't clear the other. Missing or failed status checks are not proof of recovery.
+Claude's five-hour, weekly and weekly Fable usage windows have separate thresholds. The Fable window only blocks Fable models, not other Claude models; the general windows apply to all. Missing or failed status checks are not proof of recovery.
 
 A finished agent doesn't count toward the active-agent limits. If a message should wake it but there's no room, it waits in line and is woken, oldest first, once there is. When you send a message, acom tells you which members it didn't wake and why.
 
@@ -60,6 +68,6 @@ When your task is finished, run `acom done` and then end your turn. You stop cou
 
 ## Commands
 
-Agent commands: `guide`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|add`, `send`, `inbox`, `read`, `mark`, `locks`, `lock new|acquire|release`. Run `acom --help` for details.
+Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|add`, `send`, `inbox`, `read`, `mark`, `locks`, `lock new|acquire|release`. Run `acom --help` for details.
 
 User commands are for the user only: agents never run `serve`, `pause`, `pause-all`, `resume`, `resume-all`, `close`, `reopen` or `lock free`, and never use `launch --force`.

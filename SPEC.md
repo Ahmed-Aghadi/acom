@@ -96,7 +96,7 @@ Limits are part of each project's settings (see Settings) and apply to that proj
 | Limit | Soft | Hard |
 |---|---|---|
 | **Active agents** in the project (working or idle, not counting ones that ran `acom done`), in total and per harness | Agents launching, and you, are told it's reached and what the hard value is | Agents' launch requests are refused, and done agents aren't woken (they wait in line); you can confirm a launch past it |
-| **Subscription usage**, separate Claude five-hour/weekly thresholds and Codex's highest window (in %) | That provider's agents are told which window crossed its threshold | When either applicable window crosses its hard threshold, that provider's agents are paused. Agents' launches on that provider are refused and wakes wait in line while it's over |
+| **Subscription usage**, separate Claude five-hour/weekly/weekly Fable thresholds and Codex's highest window (in %) | Affected agents are told which window crossed its threshold | When any applicable window crosses its hard threshold, affected agents are paused. Their launches are refused and wakes wait in line while it's over; Fable's window doesn't block other Claude models |
 | **Context size**, per agent (tokens) | That agent is told its context is getting large | The harness auto-compacts at this size (Claude `--autocompact`, which takes 100k to 1M; Codex `model_auto_compact_token_limit`) |
 
 A subscription limit only affects that provider's agents: Claude hitting its limit doesn't pause Codex agents. The hard usage action happens when usage crosses the limit, so an agent you launch or resume past it afterwards keeps running: you've seen the warning and chosen to.
@@ -111,7 +111,7 @@ A model can refuse a request under its safeguards (e.g. a false cyber flag on se
 
 - Claude agents run with `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` and `CLAUDE_CODE_NO_MODEL_FALLBACK=1`, so Claude Code doesn't switch models.
 - Codex has no switch for its safety reroute (it can move a turn to another model, e.g. for "high risk cyber activity"). acom watches for the reroute event and pauses the agent, but it can't rule out a substitution Codex doesn't report.
-- When an agent is refused or flagged, acom pauses it (its locks are released), shows the reason on the agent (e.g. "claude-fable-5-1 refused under its safeguards (cyber): ..."), and logs it. It isn't resumed automatically: you resume it with the same model, or launch an agent with another model.
+- When an agent is refused or flagged, acom pauses it (its locks are released), shows the reason and logs it. With no matching retry rule it stays paused. Optional per-source-model rules specify a target harness/model/effort; there are no rules by default. A retry waits for the old process to exit and respects target allowed lists and active/usage limits. Same-provider retries preserve the agent and native session; cross-provider retries create a replacement with the original task, history/output paths, group, thread memberships, notification cursors and message marks. The predecessor stays paused for inspection. No locks or background processes transfer. Durable visited-model records stop cycles and duplicate launches across restarts. Failed spawns stop the chain with a visible reason; manual Resume resets the chain. Routing never overrides provider policies.
 - As a safety net, acom checks the model that actually answers. If it isn't the one the agent was launched with (a dated ID like `claude-haiku-4-5-20251001` counts as `claude-haiku-4-5`), or it changes during the session, the agent is paused the same way.
 - When an agent hits its subscription's usage limit mid-turn ("You've hit your session limit"), acom pauses it with reason `limit`, even if no hard limit is set. With auto-resume enabled, it resumes only after a fresh account check confirms available usage.
 - When a turn crashes, the harness's last error (or its last line on stderr) is shown on the agent.
@@ -188,7 +188,13 @@ There's no authentication: the split is a convention, not a security boundary. W
 
 ## Agent guide
 
-`acom guide` prints what every agent needs, and the launch briefing includes it. It explains the tool, not how to split work:
+`acom guide` prints what every agent needs, and the launch briefing includes it. It explains the tool, not how to split work.
+
+`acom models` prints the embedded, dated [model and provider reference](src/models.md); `acom models --catalog` lists current IDs and effort choices. The guide points agents to these details without copying the entire reference into every prompt. The catalog includes Haiku 5.5. Haiku 4.5's `medium` entry denotes fixed effort; no effort flag is sent for that model.
+
+`acom configure [ID] --model <ID> --effort <level>` sets next-turn configuration. Agents may only configure themselves while working, with independent project opt-ins for model and effort changes (both default false), within allowed lists. The user can configure any agent through CLI or Details. Current tools are not interrupted. The next turn retains the same provider/session and refreshes the model/effort and rules in its prompt; models from a different provider require a new launch with a summary and history/output references, not a native resume. Mid-turn model checks and quota enforcement use the running turn's original model, not a queued change.
+
+The launch guide covers:
 
 - your ID is in `ACOM_ID`; you never pass it; you only see your own project
 - your turn only ends when your process exits, so don't leave background tasks or monitors running
@@ -206,7 +212,7 @@ There's no authentication: the split is a convention, not a security boundary. W
 Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshing every 2 seconds.
 
 - **Project picker:** every project with its folder, plus adding and removing projects. The folder browser starts at Home, shows files and folders, navigates up and into folders, and creates new folders; exact-path entry remains available. Agents, threads, locks and activity below are for the selected project.
-- **Top bar:** separate Claude five-hour and weekly subscription usage meters, plus Codex (or "unknown"); click for reset/check times, errors and **Check now**. Each Claude window has its own soft/hard config fields. Either can block work, and resetting one doesn't clear the other. **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
+- **Top bar:** separate Claude five-hour, weekly and weekly Fable subscription usage meters, plus Codex (or "unknown"); click for reset/check times, errors and **Check now**. Each Claude window has its own soft/hard config fields. General windows block all Claude models; Fable's only blocks Fable. Resetting one doesn't clear another. **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
 - **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, whether it's waiting in the wake line and why, and any problem (flagged, usage limit, crash) with its reason. Buttons to pause, resume, close and reopen. Details show the task, launch details, usage, held and lost locks, native conversation-history path (when created), raw output-log path, and live recent activity (the harness's output).
 - **Threads:** **Mine**, **All**, **Unread** and **Agent-only** filters, membership labels, and join/leave controls distinguish user participation. List rows and the open thread show its ID; **Copy reference** copies `thread #<ID>` for another conversation. Click one to read it; a box at the bottom posts as `user`. **New thread** takes a title and searchable member checkboxes, with active/all selection and an Include me checkbox. Advanced IDs/selectors remain available; existing threads have an Add members picker. After posting you're told who couldn't be woken yet.
 - **Locks:** name, description, holder, since, expires (or frozen with the time left), queue, and a **Free** button.
@@ -230,7 +236,9 @@ Every rule reads the settings of the agent's project. Active-agent limits count 
 A config holds:
 
 - **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags. Defaults: every catalog model allowed; Claude `claude-opus-5-5` / medium with `--dangerously-skip-permissions`; Codex `gpt-6-sol` / medium with `--dangerously-bypass-approvals-and-sandbox`. Agents run unattended and nobody can answer a permission prompt, so they get full permissions by default; restrict them here (e.g. `--permission-mode acceptEdits`, `--sandbox workspace-write`) and anything the harness would ask about is denied. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
-- **Limits:** soft and hard values for active agents (total and per harness), Claude five-hour and weekly subscription usage, Codex usage and context size. Usage keys are `claude_five_hour`, `claude_seven_day` and `codex`; percentages must be 0–100. Any value can be empty.
+- **Limits:** soft and hard values for active agents (total and per harness), Claude five-hour, weekly and weekly Fable subscription usage, Codex usage and context size. Usage keys are `claude_five_hour`, `claude_seven_day`, `claude_seven_day_fable` and `codex`; percentages must be 0–100. Any value can be empty. Fable thresholds and exhaustion only affect Fable models; no quota relationship with Mythos is assumed. Missing optional Fable readings preserve the last reading and timestamp, never imply zero or recovery. A check begun before an exhaustion event cannot clear it. Older saved provider-wide limits supply the general windows only.
+- **Agent self-changes:** independent `allow_agent_model_change` and `allow_agent_effort_change` permissions, false by default and when missing from older settings.
+- **Flagged-model retries:** `flagged_retries`, an empty mapping by default, from source model ID to `{harness, model, effort}`. Targets must be enabled and allowed; no silent substitute.
 - **Auto-resume** after a limit clears: on (default) or off.
 - **Usage check interval:** 120 seconds by default; reported reset times also trigger checks.
 - **Prompt guidance:** literal launch, wake and resume text, without placeholders. Generated identity, task, guide, limits, updates and interruption warnings cannot be removed by editing guidance.
@@ -238,7 +246,7 @@ A config holds:
 
 Defaults: active agents soft 6 / hard 8, per harness 4 / 6, subscription usage 80% / 95%, context 160,000 / 200,000 tokens.
 
-**Model catalog.** Claude: `claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-haiku-4-5`, `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-mythos-5-1` (efforts low to max). Codex: `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` (efforts low to ultra; the Luna models stop at max). The catalog is built into the binary; newer models are typed in as custom IDs until it's updated.
+**Model catalog.** Claude: `claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-haiku-4-5`, `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-mythos-5-1` (efforts low to max, except fixed-effort Haiku 4.5). Codex: `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` (efforts low to ultra; the Luna models stop at max). The catalog is built into the binary; newer models are typed in as custom IDs until it's updated.
 
 ## HTTP API
 
@@ -254,14 +262,14 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 | Threads & messages | `GET /threads?project=`, `POST /threads` (`project` for the user, `include_user` defaults true), `GET /threads/{tid}`, `POST /threads/{tid}/members`, `POST /threads/{tid}/user` (`joined`: boolean), `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}`, `GET /inbox/{agent}?mark=`, `POST /marks` |
 | Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
 | Configs | `GET /configs` (each with its settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: a saved config's id, or `custom`: settings) |
-| Other | `GET /limits?project=` (includes usage and check status), `POST /usage/check` (`provider`), `GET /activity?project=`, `POST /hook/{agent}` (what's new for that agent) |
+| Other | `GET /limits?project=` (includes usage and check status), `POST /usage/check` (`provider`), `GET /activity?project=`, `POST /hook/{agent}` (what's new for that agent), `GET /models` (plain-text reference), `POST /agent-config` (`id`, optional `agent`, `model`, `effort`; next-turn configuration) |
 
 ## Build notes
 
 - Rust, one crate, one binary. Crates: `rusqlite` (bundled SQLite), `tiny_http` (blocking, one thread per request), `ureq` (HTTPS client), `chrono` (provider reset timestamps), `serde` / `serde_json`, `clap`, `libc`.
-- Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and all the rules), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/usage.rs` (account checks and scheduling), `src/ui.html` and `src/guide.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
+- Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and all the rules), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/usage.rs` (account checks and scheduling), `src/ui.html`, `src/guide.md` and `src/models.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
 - One SQLite connection behind a mutex, plus a condvar that every change notifies. `lock acquire --wait` blocks on it. A once-a-second tick expires locks, acts on usage limits, and serves the wake line. Lock queues live in memory.
-- **Launching** runs inside a SQLite savepoint, so a launch that fails at any point (including starting the process) leaves nothing behind.
+- **Launching** validates and records identity inside a SQLite savepoint, committed before spawning. A refused launch leaves nothing behind; a failed spawn leaves a visible crashed record and restores a caller's handoff state. A DB failure immediately after spawning kills and reaps the child before feeding it a task.
 - **Running a turn.** acom starts the harness in the agent's project folder, in its own process group, with `ACOM_ID`, `ACOM_URL`, and `PATH` starting with acom's own folder:
   - Claude: `claude -p --output-format stream-json --verbose <extra flags> --model <m> --effort <e> --session-id <uuid>` (or `--resume <uuid>`) `--autocompact <hard context> --settings <PostToolUse hook running acom hook> --disallowedTools Agent,Workflow,SendMessage,ListAgents --allowedTools "Bash(acom *)"`. The prompt goes on stdin.
   - Codex: `codex exec [resume] --json --skip-git-repo-check <extra flags> -m <m> -c model=<m> -c model_reasoning_effort=<e> --disable multi_agent -c model_auto_compact_token_limit=<hard context> -c sandbox_workspace_write.network_access=true -c hooks.PostToolUse=... --dangerously-bypass-hook-trust [<session>] -`, with the prompt on stdin. `exec resume` doesn't take every flag `exec` does (e.g. `--sandbox`), so those are dropped on resume; the session keeps them.

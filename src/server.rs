@@ -90,6 +90,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     });
     let (code, body, ctype) = match res {
         Ok(Reply::Html(h)) => (200, h.to_string(), "text/html; charset=utf-8"),
+        Ok(Reply::Text(t)) => (200, t.to_string(), "text/plain; charset=utf-8"),
         Ok(Reply::Json(v)) => (200, v.to_string(), "application/json"),
         Err(Fail(code, msg)) => (
             code,
@@ -128,6 +129,7 @@ fn same_origin(app: &App, req: &tiny_http::Request, method: &str) -> bool {
 enum Reply {
     Json(Value),
     Html(&'static str),
+    Text(&'static str),
 }
 
 struct Query<'a>(&'a str);
@@ -225,6 +227,16 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
     use Reply::Json as J;
     Ok(match (method, p) {
         ("GET", []) => Reply::Html(UI),
+        ("GET", ["models"]) => Reply::Text(crate::app::MODELS),
+        ("POST", ["agent-config"]) => {
+            app.configure_agent(
+                int(b, "id")?,
+                opt_int(b, "agent").unwrap_or(0),
+                opt_text(b, "model").as_deref(),
+                opt_text(b, "effort").as_deref(),
+            )?;
+            J(json!({}))
+        }
         ("GET", ["overview"]) => {
             // Everything the page shows, for one project (the first one by default).
             let projects = app.projects()?;
