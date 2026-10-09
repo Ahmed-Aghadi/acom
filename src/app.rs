@@ -161,14 +161,35 @@ pub struct Settings {
     pub allow_agent_model_change: bool,
     #[serde(default)]
     pub allow_agent_effort_change: bool,
-    #[serde(default)]
-    pub flagged_retries: BTreeMap<String, RetryRule>,
+    #[serde(default, alias = "flagged_retries")]
+    pub crash_retries: BTreeMap<String, RetryRule>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct RetryRule {
     pub harness: String,
     pub model: String,
+    #[serde(default)]
+    pub same_model_retries: u32,
+}
+
+/// Only documented catalog conversions; custom models retain the requested effort.
+fn recovery_effort(harness: &str, model: &str, inherited: &str) -> String {
+    let Some(m) = crate::harness::catalog(harness)
+        .into_iter()
+        .find(|m| m.id == model)
+    else {
+        return inherited.into();
+    };
+    if m.efforts.contains(&inherited) {
+        inherited.into()
+    } else if m.efforts.len() == 1 {
+        m.efforts[0].into()
+    } else if inherited == "ultra" && m.efforts.contains(&"max") {
+        "max".into()
+    } else {
+        inherited.into()
+    }
 }
 
 fn check_model(harness: &str, model: &str) -> R<()> {
@@ -299,7 +320,7 @@ impl Default for Settings {
             prompts: Prompts::default(),
             allow_agent_model_change: false,
             allow_agent_effort_change: false,
-            flagged_retries: BTreeMap::new(),
+            crash_retries: BTreeMap::new(),
         }
     }
 }
@@ -356,7 +377,7 @@ impl Settings {
                 )));
             }
         }
-        for (source, rule) in &self.flagged_retries {
+        for (source, rule) in &self.crash_retries {
             if source.trim().is_empty()
                 || source.contains(char::is_whitespace)
                 || source == &rule.model
@@ -434,6 +455,7 @@ pub struct Proc {
     pub stopping: bool,
     pub model: String,
     pub effort: String,
+    pub failure: Option<String>,
 }
 
 pub struct St {
@@ -480,17 +502,27 @@ CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT);
+CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
 ";
 
-fn ensure_retry_effort(db: &Connection) -> R<()> {
+fn ensure_retry_schema(db: &Connection) -> R<()> {
     let columns = db
         .prepare("PRAGMA table_info(agent_retries)")?
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     if !columns.iter().any(|name| name == "effort") {
         db.execute("ALTER TABLE agent_retries ADD COLUMN effort TEXT", [])?;
+    }
+    for column in ["same_model_attempts", "eligible_at"] {
+        if !columns.iter().any(|name| name == column) {
+            db.execute(
+                &format!(
+                    "ALTER TABLE agent_retries ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                ),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -692,7 +724,7 @@ impl St {
         Ok(())
     }
 
-    fn remember_flag(&self, id: i64, a: &Agent) -> R<()> {
+    fn remember_crash(&self, id: i64, a: &Agent) -> R<()> {
         let source = self
             .procs
             .get(&id)
@@ -704,13 +736,18 @@ impl St {
             .map(|p| p.effort.as_str())
             .unwrap_or(&a.effort);
         self.db.execute(
-            "INSERT INTO agent_retries(agent_id,source,tried,effort) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(agent_id) DO UPDATE SET source=excluded.source,effort=excluded.effort,handled=0,blocked=NULL",
+            "INSERT INTO agent_retries(agent_id,source,tried,effort,eligible_at) VALUES(?1,?2,?3,?4,?5)
+            ON CONFLICT(agent_id) DO UPDATE SET
+            same_model_attempts=CASE WHEN source=excluded.source THEN same_model_attempts ELSE 0 END,
+            source=excluded.source,effort=excluded.effort,handled=0,blocked=NULL,eligible_at=excluded.eligible_at",
             params![
                 id,
                 source,
                 json!([format!("{}:{source}", a.harness)]).to_string(),
-                effort
+                effort,
+                // Round up since persisted timestamps have one-second precision:
+                // even a failure at the end of a second gets a full 2s cooldown.
+                now() + 3
             ],
         )?;
         Ok(())
@@ -886,12 +923,15 @@ impl St {
                 cfg.efforts.join(", ")
             );
         }
-        if s.flagged_retries.is_empty() {
-            out += "\nFlagged-model retries: none configured; flagged agents stay paused.";
+        if s.crash_retries.is_empty() {
+            out += "\nCrash recovery: none configured; failed agents stay crashed.";
         } else {
-            out += "\nFlagged-model retry rules (inherit flagged turn's effort; limits apply; cycles stop):";
-            for (source, rule) in &s.flagged_retries {
-                out += &format!("\n  {source} -> {} / {}", rule.harness, rule.model);
+            out += "\nCrash recovery (2-second delay; limits apply; cycles stop). Keep supported effort; unsupported ultra becomes max; fixed-effort models use their sole catalog effort. Allowed-effort restrictions still apply:";
+            for (source, rule) in &s.crash_retries {
+                out += &format!(
+                    "\n  {source}: {} same-model retries, then {} / {}",
+                    rule.same_model_retries, rule.harness, rule.model
+                );
             }
         }
         out += if s.done_closes {
@@ -1159,7 +1199,7 @@ impl App {
         let db = Connection::open(home.join("acom.db"))?;
         check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
-        ensure_retry_effort(&db)?;
+        ensure_retry_schema(&db)?;
         db.execute("UPDATE usage_checks SET in_flight=0", [])?;
         db.execute(
             "INSERT OR IGNORE INTO configs(id,name,settings) VALUES(1,'Default',?1)",
@@ -1513,12 +1553,19 @@ impl App {
         if st.procs.get(&id).is_some_and(|p| p.pid != pid) {
             return Ok(()); // not this process's entry; never happens since turns don't overlap
         }
-        let stopping = st.procs.remove(&id).map(|p| p.stopping).unwrap_or(false);
+        let a = st.agent(id)?;
+        let failure = st.procs.get(&id).and_then(|p| p.failure.clone());
+        let stopping = st.procs.get(&id).is_some_and(|p| p.stopping);
+        let failed = (!ok || failure.is_some()) && !stopping && a.state == "working";
+        if failed {
+            // Record the running choice before removing it: the row may hold queued changes.
+            st.remember_crash(id, &a)?;
+        }
+        st.procs.remove(&id);
         st.db.execute(
             "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
             params![id, pid],
         )?;
-        let a = st.agent(id)?;
         if a.state != "working" {
             // Paused or closed by someone: they already set the state.
             self.maybe_wake(&mut st, id)?;
@@ -1526,7 +1573,7 @@ impl App {
             return Ok(());
         }
         let s = st.settings_for(Some(a.project));
-        let next = if !ok && !stopping {
+        let next = if failed {
             "crashed"
         } else if a.done_req {
             if s.done_closes { "closed" } else { "done" }
@@ -1543,12 +1590,19 @@ impl App {
             st.release_all(id, &why)?;
         }
         if next == "crashed" {
-            let why = error.unwrap_or("its process exited with an error");
+            let why = failure
+                .as_deref()
+                .or(error)
+                .unwrap_or("its process exited with an error");
             st.db
                 .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, why])?;
             st.log_for(id, "acom", &format!("agent {id} crashed: {why}"))?;
-        } else if a.done_req {
-            st.log_for(id, &who(id), &format!("finished: {next}"))?;
+        } else {
+            st.db
+                .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
+            if a.done_req {
+                st.log_for(id, &who(id), &format!("finished: {next}"))?;
+            }
         }
         self.maybe_wake(&mut st, id)?;
         self.cv.notify_all();
@@ -2318,10 +2372,24 @@ impl App {
         Ok(())
     }
 
-    /// The model refused or was flagged, or the harness switched models. Pause the agent
-    /// (releasing its locks) and keep the reason. Explicit retry rules run after it stops.
-    pub fn flag(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
-        self.stop_for(id, "flagged", reason, "was flagged and paused", None)
+    /// A provider reported a failed turn, even if its process later exits with status zero.
+    /// Do not recover until stdout and side-file workers finish and the child is reaped.
+    pub fn fail_turn(&self, id: i64, reason: &str) -> R<()> {
+        let mut st = self.lock();
+        if let Some(p) = st.procs.get_mut(&id) {
+            p.failure.get_or_insert_with(|| reason.into());
+        }
+        Ok(())
+    }
+
+    /// Stop a reported model substitution without turning it into a user/quota pause.
+    pub fn fail_and_stop(&self, id: i64, reason: &str) -> R<()> {
+        self.fail_turn(id, reason)?;
+        let st = self.lock();
+        if let Some(p) = st.procs.get(&id) {
+            run::stop(p.pid);
+        }
+        Ok(())
     }
 
     /// The subscription's usage limit was hit mid-turn: pause until the window resets.
@@ -2355,27 +2423,8 @@ impl App {
     ) -> R<()> {
         let mut st = self.lock();
         let a = st.agent(id)?;
-        let reason: Option<String> =
-            st.db
-                .query_row("SELECT pause_reason FROM agents WHERE id=?1", [id], |r| {
-                    r.get(0)
-                })?;
         if a.state == "paused" {
-            // One refusal often arrives as several events, and a flag outranks
-            // everything else: a flagged agent must never be resumed automatically.
-            if reason.as_deref() == Some(why) || reason.as_deref() == Some("flagged") {
-                return Ok(());
-            }
-            if why != "flagged" {
-                return Ok(());
-            }
-            st.release_all(id, "you were flagged and paused")?;
-            st.db.execute(
-                "UPDATE agents SET pause_reason='flagged', problem=?2 WHERE id=?1",
-                params![id, problem],
-            )?;
-            st.remember_flag(id, &a)?;
-            return st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"));
+            return Ok(()); // Never override a user's pause or an existing quota pause.
         }
         st.db.execute(
             "UPDATE agents SET problem=?2 WHERE id=?1",
@@ -2395,14 +2444,11 @@ impl App {
         }
         if matches!(a.state.as_str(), "working" | "idle" | "done") {
             self.pause_locked(&mut st, id, LockMode::Release, why, "acom")?;
-            if why == "flagged" {
-                st.remember_flag(id, &a)?;
-            }
         }
         st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"))
     }
 
-    /// Flag the agent if a model other than the one it was launched with answered,
+    /// Fail the turn if a model other than the one it was launched with answered,
     /// or if the model changed during its session.
     pub fn check_model(self: &Arc<Self>, id: i64, asked: &str, answered: &str) -> R<()> {
         let reason = {
@@ -2433,7 +2479,7 @@ impl App {
             reason
         };
         match reason {
-            Some(r) => self.flag(id, &r),
+            Some(r) => self.fail_and_stop(id, &r),
             None => Ok(()),
         }
     }
@@ -2447,64 +2493,75 @@ impl App {
         Ok(())
     }
 
-    /// Retry only explicit rules, after the flagged process exits. Keep a durable
+    /// Retry only explicit rules, after the failed process exits. Keep a durable
     /// visited-model list across replacements so duplicate events and cycles stop.
-    fn retry_flagged(self: &Arc<Self>, st: &mut St, id: i64) -> R<bool> {
+    fn retry_crashed(self: &Arc<Self>, st: &mut St, id: i64) -> R<bool> {
         if st.procs.contains_key(&id) {
             return Ok(false);
         }
         let a = st.agent(id)?;
-        let (source, tried, handled, effort): (String, String, bool, Option<String>) =
+        let (source, tried, handled, effort, attempts, eligible_at): (String, String, bool, Option<String>, u32, i64) =
             st.db.query_row(
-                "SELECT source,tried,handled,effort FROM agent_retries WHERE agent_id=?1",
+                "SELECT source,tried,handled,effort,same_model_attempts,eligible_at FROM agent_retries WHERE agent_id=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )?;
-        if a.state != "paused" || handled {
+        if a.state != "crashed" || handled || now() < eligible_at {
             return Ok(false);
         }
         let s = st.settings_for(Some(a.project));
-        let Some(rule) = s.flagged_retries.get(&source) else {
+        let Some(rule) = s.crash_retries.get(&source) else {
             return Ok(false);
+        };
+        let same = attempts < rule.same_model_retries;
+        let target_harness = if same {
+            a.harness.as_str()
+        } else {
+            rule.harness.as_str()
+        };
+        let target_model = if same {
+            source.as_str()
+        } else {
+            rule.model.as_str()
         };
         // Older retry records have no running-effort snapshot. Do not guess
         // from the agent row: it may contain a queued next-turn change.
-        let effort = effort.unwrap_or_default();
+        let inherited = effort.unwrap_or_default();
+        let effort = recovery_effort(target_harness, target_model, &inherited);
         let mut tried: Vec<String> = serde_json::from_str(&tried)
             .map_err(|_| bad("invalid saved retry history; retry stopped"))?;
-        let target = format!("{}:{}", rule.harness, rule.model);
-        let problem = if effort.is_empty() {
+        let target = format!("{target_harness}:{target_model}");
+        let problem = if inherited.is_empty() {
             Some((
-                "flagged turn's effort wasn't recorded; resume manually to start a new retry chain"
+                "failed turn's effort wasn't recorded; resume manually to start a new retry chain"
                     .into(),
                 true,
             ))
-        } else if tried.contains(&target) {
+        } else if !same && tried.contains(&target) {
             Some((
                 "retry cycle stopped: target model was already tried".to_string(),
                 true,
             ))
         } else if !s
             .harnesses
-            .get(&rule.harness)
-            .is_some_and(|h| h.enabled && h.models.contains(&rule.model))
+            .get(target_harness)
+            .is_some_and(|h| h.enabled && h.models.iter().any(|m| m == target_model))
         {
             Some((
                 "retry target is disabled or no longer allowed".into(),
                 false,
             ))
-        } else if let Err(e) = check_choice(&rule.harness, &rule.model, &effort) {
+        } else if let Err(e) = check_choice(target_harness, target_model, &effort) {
             Some((e.1, true))
-        } else if !s.harnesses[&rule.harness].efforts.contains(&effort) {
+        } else if !s.harnesses[target_harness].efforts.contains(&effort) {
             Some((
                 format!(
-                    "inherited effort {effort} isn't allowed for {}",
-                    rule.harness
+                    "recovery effort {effort} (from {inherited}) isn't allowed for {target_harness}"
                 ),
                 false,
             ))
         } else {
-            st.model_no_room(a.project, &rule.harness, &rule.model)?
+            st.model_no_room(a.project, target_harness, target_model)?
                 .map(|why| (why, false))
         };
         if let Some((why, terminal)) = problem {
@@ -2521,25 +2578,41 @@ impl App {
                 st.log_for(
                     id,
                     "acom",
-                    &format!("agent {id} flagged retry waiting/stopped: {why}"),
+                    &format!("agent {id} crash recovery waiting/stopped: {why}"),
                 )?;
             }
             return Ok(false);
         }
-        tried.push(target);
-        st.db.execute_batch("SAVEPOINT flagged_retry")?;
+        if !same {
+            tried.push(target);
+        }
+        let effort_note = if effort == inherited {
+            format!("inherited effort {effort}")
+        } else {
+            format!("effort {inherited} -> {effort} for target model compatibility")
+        };
+        let attempt_note = if same {
+            format!(
+                "same-model retry {} of {}",
+                attempts + 1,
+                rule.same_model_retries
+            )
+        } else {
+            format!("replacement after {attempts} same-model retries")
+        };
+        st.db.execute_batch("SAVEPOINT crash_retry")?;
         let result = (|| -> R<(i64, String)> {
             st.db.execute(
-                "UPDATE agent_retries SET tried=?2,handled=1,blocked=NULL WHERE agent_id=?1",
-                params![id, json!(tried).to_string()],
+                "UPDATE agent_retries SET tried=?2,handled=1,blocked=NULL,same_model_attempts=?3 WHERE agent_id=?1",
+                params![id, json!(tried).to_string(), if same { attempts + 1 } else { attempts }],
             )?;
-            if rule.harness == a.harness {
+            if target_harness == a.harness {
                 st.db.execute(
                     "UPDATE agents SET model=?2,effort=?3 WHERE id=?1",
-                    params![id, rule.model, effort],
+                    params![id, target_model, effort],
                 )?;
-                st.notice(id, &format!("Explicit flagged-model retry: {source} -> {} / inherited effort {effort}. Same provider and session; respect provider policies and check partial work before continuing.", rule.model))?;
-                // A flagged done/idle turn must retry too, not merely restore rest.
+                st.notice(id, &format!("Crash recovery: {source} -> {target_model}; {attempt_note}; {effort_note}. Failure: {}. Same provider and session. Check partial work before continuing.", a.problem.as_deref().unwrap_or("turn failed")))?;
+                // A failed done/idle turn must retry too, not merely restore rest.
                 st.db
                     .execute("UPDATE agents SET pause_from='working' WHERE id=?1", [id])?;
                 let prompt = self.prepare_resume(st, id, "acom")?.unwrap();
@@ -2562,11 +2635,11 @@ impl App {
             .collect::<Vec<_>>()
             .join(", ");
             let task = format!(
-                "{}\n\n## Handoff from agent {id}\n\nExplicit flagged-model retry from {} / {source}; reason: {}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Related threads: {threads}. You inherit its thread memberships and message marks. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay. Respect provider policies. Do not repeat prohibited work or try to evade the refusal.",
+                "{}\n\n## Handoff from agent {id}\n\nCrash recovery from {} / {source}; reason: {}. {attempt_note}; {effort_note}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Related threads: {threads}. You inherit its thread memberships and message marks. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay.",
                 a.task,
                 a.harness,
-                a.problem.as_deref().unwrap_or("model flagged"),
-                rule.harness,
+                a.problem.as_deref().unwrap_or("turn failed"),
+                target_harness,
                 run::log_path(self, id, "jsonl")
             );
             let (new, _) = self.prepare_launch(
@@ -2576,8 +2649,8 @@ impl App {
                 Some(a.project),
                 LaunchReq {
                     task,
-                    harness: Some(rule.harness.clone()),
-                    model: Some(rule.model.clone()),
+                    harness: Some(target_harness.into()),
+                    model: Some(target_model.into()),
                     effort: Some(effort.clone()),
                     name: Some(a.name.clone()),
                     group: a.grp.clone(),
@@ -2593,13 +2666,13 @@ impl App {
             st.db.execute("INSERT INTO marks(agent_id,message_id,mark) SELECT ?2,message_id,mark FROM marks WHERE agent_id=?1", params![id, new])?;
             st.db.execute(
                 "INSERT INTO agent_retries(agent_id,source,tried,handled,effort) VALUES(?1,?2,?3,1,?4)",
-                params![new, rule.model, json!(tried).to_string(), effort],
+                params![new, target_model, json!(tried).to_string(), effort],
             )?;
             st.db.execute(
                 "UPDATE agent_retries SET replacement=?2 WHERE agent_id=?1",
                 params![id, new],
             )?;
-            // Keep the predecessor paused for inspection; it cannot auto-resume.
+            // Keep the predecessor crashed for inspection; its retry is handled.
             st.notice(
                 new,
                 &format!("Agent {id} handed off to you; read inherited messages with acom inbox."),
@@ -2608,7 +2681,7 @@ impl App {
         })();
         match result {
             Ok((new, prompt)) => {
-                st.db.execute_batch("RELEASE flagged_retry")?;
+                st.db.execute_batch("RELEASE crash_retry")?;
                 // All identities and inherited records are committed before any
                 // subprocess can act; failed spawns never orphan rolled-back IDs.
                 if let Err(e) = run::start_turn(self, st, new, &prompt) {
@@ -2617,8 +2690,8 @@ impl App {
                         params![id, e.1],
                     )?;
                     if new == id {
-                        st.db.execute("UPDATE agents SET model=?2,effort=?3,state='paused',pause_reason='flagged',problem=?4,pause_from='working',paused_at=?5 WHERE id=?1",
-                            params![id, a.model, a.effort, a.problem, a.paused_at.unwrap_or_else(now)])?;
+                        st.db.execute("UPDATE agents SET model=?2,effort=?3,state='crashed',problem=?4 WHERE id=?1",
+                            params![id, a.model, a.effort, a.problem])?;
                     } else {
                         st.set_state(new, "crashed")?;
                         st.db.execute(
@@ -2629,7 +2702,7 @@ impl App {
                     st.log_for(
                         id,
                         "acom",
-                        &format!("agent {id} flagged retry failed: {}", e.1),
+                        &format!("agent {id} crash recovery failed: {}", e.1),
                     )?;
                     return Ok(false);
                 }
@@ -2637,15 +2710,14 @@ impl App {
                     id,
                     "acom",
                     &format!(
-                        "explicit flagged retry: agent {id} ({source}) -> agent {new} ({} / {})",
-                        rule.harness, rule.model
+                        "crash recovery: agent {id} ({source}) -> agent {new} ({target_harness} / {target_model}); {attempt_note}; {effort_note}"
                     ),
                 )?;
                 Ok(true)
             }
             Err(e) => {
                 st.db
-                    .execute_batch("ROLLBACK TO flagged_retry; RELEASE flagged_retry")?;
+                    .execute_batch("ROLLBACK TO crash_retry; RELEASE crash_retry")?;
                 // A missing client or failed spawn gets one attempt, not a loop.
                 st.db.execute(
                     "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
@@ -2654,7 +2726,7 @@ impl App {
                 st.log_for(
                     id,
                     "acom",
-                    &format!("agent {id} flagged retry failed: {}", e.1),
+                    &format!("agent {id} crash recovery failed: {}", e.1),
                 )?;
                 Ok(false)
             }
@@ -2679,10 +2751,10 @@ impl App {
         for r in rows(
             &st.db,
             "SELECT a.id FROM agents a JOIN agent_retries r ON r.agent_id=a.id
-            WHERE a.state='paused' AND a.pause_reason='flagged' AND r.handled=0 ORDER BY a.id",
+            WHERE a.state='crashed' AND r.handled=0 ORDER BY a.id",
             [],
         )? {
-            changed |= self.retry_flagged(&mut st, r["id"].as_i64().unwrap())?;
+            changed |= self.retry_crashed(&mut st, r["id"].as_i64().unwrap())?;
         }
         if changed {
             self.cv.notify_all();
@@ -3082,7 +3154,7 @@ impl App {
         a["retry"] = json!(
             rows(
                 &st.db,
-                "SELECT source,handled,replacement,blocked FROM agent_retries WHERE agent_id=?1",
+                "SELECT source,effort,same_model_attempts,eligible_at,handled,replacement,blocked FROM agent_retries WHERE agent_id=?1",
                 [id]
             )?
             .pop()
@@ -3658,6 +3730,20 @@ mod tests {
             .unwrap();
     }
 
+    fn record_test_crash(app: &App, id: i64) {
+        let st = app.lock();
+        st.remember_crash(id, &st.agent(id).unwrap()).unwrap();
+        st.db
+            .execute("UPDATE agents SET state='crashed' WHERE id=?1", [id])
+            .unwrap();
+        st.db
+            .execute(
+                "UPDATE agent_retries SET eligible_at=0 WHERE agent_id=?1",
+                [id],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn user_reads_are_scoped_monotonic_and_persistent() {
         let app = app_with_two_projects();
@@ -4194,7 +4280,7 @@ mod tests {
         for key in [
             "allow_agent_model_change",
             "allow_agent_effort_change",
-            "flagged_retries",
+            "crash_retries",
         ] {
             old.as_object_mut().unwrap().remove(key);
         }
@@ -4204,13 +4290,134 @@ mod tests {
             .remove("claude_seven_day_fable");
         let restored: Settings = serde_json::from_value(old).unwrap();
         assert!(!restored.allow_agent_model_change && !restored.allow_agent_effort_change);
-        assert!(restored.flagged_retries.is_empty());
+        assert!(restored.crash_retries.is_empty());
         assert!(
             restored
                 .limits
                 .usage_limit("claude", "seven_day_fable")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_retry_settings_migrate_without_changing_the_target() {
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("crash_retries");
+        old["flagged_retries"] = json!({"gpt-6-sol": {"harness":"codex", "model":"gpt-6-luna"}});
+        let restored: Settings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.crash_retries["gpt-6-sol"].same_model_retries, 0);
+        restored.check().unwrap();
+        let saved = serde_json::to_value(restored).unwrap();
+        assert!(saved.get("flagged_retries").is_none());
+        assert_eq!(saved["crash_retries"]["gpt-6-sol"]["model"], "gpt-6-luna");
+        for count in [json!(-1), json!(0.5), json!(4294967296u64)] {
+            assert!(
+                serde_json::from_value::<RetryRule>(
+                    json!({"harness":"codex", "model":"gpt-6-luna", "same_model_retries":count})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_effort_uses_only_documented_conversions() {
+        for (harness, model, inherited, expected) in [
+            ("codex", "gpt-6-luna", "ultra", "max"),
+            ("codex", "gpt-5.6-luna", "ultra", "max"),
+            ("claude", "claude-opus-5-5", "ultra", "max"),
+            ("claude", "claude-haiku-4-5", "ultra", "medium"),
+            ("claude", "claude-haiku-4-5", "high", "medium"),
+            ("claude", "claude-sonnet-5-5", "high", "high"),
+            ("codex", "gpt-6-sol", "ultra", "ultra"),
+            ("codex", "custom-model", "ultra", "ultra"),
+            ("codex", "gpt-6-luna", "unknown", "unknown"),
+        ] {
+            assert_eq!(recovery_effort(harness, model, inherited), expected);
+        }
+    }
+
+    #[test]
+    fn failed_turns_capture_running_choices_and_wait_before_recovery() {
+        let app = app_with_two_projects();
+        {
+            let mut st = app.lock();
+            st.db.execute("UPDATE agents SET state='working',harness='codex',model='gpt-6-luna',effort='low',done_req=1 WHERE id=1", []).unwrap();
+            st.procs.insert(
+                1,
+                Proc {
+                    pid: 0,
+                    stopping: false,
+                    model: "gpt-6-sol".into(),
+                    effort: "ultra".into(),
+                    failure: None,
+                },
+            );
+        }
+        app.fail_turn(1, "network failure").unwrap();
+        app.fail_turn(1, "duplicate event").unwrap();
+        app.tick().unwrap(); // Live process cannot be retried.
+        assert!(app.agent_view(1).unwrap()["retry"].is_null());
+        app.turn_ended(1, 0, true, None).unwrap(); // Explicit failed turn with successful exit.
+        let view = app.agent_view(1).unwrap();
+        assert_eq!(view["state"], "crashed");
+        assert_eq!(view["problem"], "network failure");
+        assert_eq!(view["retry"]["source"], "gpt-6-sol");
+        assert_eq!(view["retry"]["effort"], "ultra");
+        assert!(view["retry"]["eligible_at"].as_i64().unwrap() > now());
+        app.tick().unwrap();
+        assert!(app.lock().procs.is_empty()); // No rule, no automatic launch.
+    }
+
+    #[test]
+    fn retry_counters_persist_reset_on_source_change_success_and_manual_resume() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol',effort='medium' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        record_test_crash(&app, 1);
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agent_retries SET same_model_attempts=2,handled=1 WHERE agent_id=1",
+                [],
+            )
+            .unwrap();
+        record_test_crash(&app, 1);
+        assert_eq!(
+            app.agent_view(1).unwrap()["retry"]["same_model_attempts"],
+            2
+        );
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        assert_eq!(
+            app.agent_view(1).unwrap()["retry"]["same_model_attempts"],
+            2
+        );
+        app.lock()
+            .db
+            .execute("UPDATE agents SET model='gpt-6-luna' WHERE id=1", [])
+            .unwrap();
+        record_test_crash(&app, 1);
+        assert_eq!(
+            app.agent_view(1).unwrap()["retry"]["same_model_attempts"],
+            0
+        );
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working' WHERE id=1", [])
+            .unwrap();
+        app.turn_ended(1, 0, true, None).unwrap();
+        assert!(app.agent_view(1).unwrap()["retry"].is_null());
+        record_test_crash(&app, 1);
+        app.prepare_resume(&mut app.lock(), 1, "user").unwrap();
+        assert!(app.agent_view(1).unwrap()["retry"].is_null());
+        assert!(app.lock().procs.is_empty());
     }
 
     #[test]
@@ -4272,14 +4479,14 @@ mod tests {
     }
 
     #[test]
-    fn flag_after_quota_pause_is_recorded_once_and_no_rule_means_no_retry() {
+    fn failed_events_do_not_override_quota_pause() {
         let app = app_with_two_projects();
         app.limit_hit(1, "quota").unwrap();
-        app.flag(1, "refusal").unwrap();
-        app.flag(1, "duplicate refusal").unwrap();
+        app.fail_turn(1, "failure").unwrap();
+        app.fail_turn(1, "duplicate failure").unwrap();
         app.tick().unwrap();
         let st = app.lock();
-        assert_eq!(st.agent(1).unwrap().problem.as_deref(), Some("refusal"));
+        assert_eq!(st.agent(1).unwrap().problem.as_deref(), Some("quota"));
         assert_eq!(
             st.db
                 .query_row(
@@ -4288,7 +4495,7 @@ mod tests {
                     |r| r.get::<_, i64>(0)
                 )
                 .unwrap(),
-            1
+            0
         );
         assert!(st.procs.is_empty());
         assert_eq!(st.agent(1).unwrap().state, "paused");
@@ -4303,16 +4510,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&rule).unwrap(),
             json!({
-                "harness": "codex", "model": "gpt-6-luna"
+                "harness": "codex", "model": "gpt-6-luna", "same_model_retries": 0
             })
         );
         let mut s = Settings::default();
-        s.flagged_retries.insert("gpt-6-sol".into(), rule);
+        s.crash_retries.insert("gpt-6-sol".into(), rule);
         assert!(s.check().is_ok());
-        s.flagged_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-sol".into();
+        s.crash_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-sol".into();
         assert!(s.check().unwrap_err().1.contains("different target model"));
-        s.flagged_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-luna".into();
-        s.flagged_retries.get_mut("gpt-6-sol").unwrap().harness = "claude".into();
+        s.crash_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-luna".into();
+        s.crash_retries.get_mut("gpt-6-sol").unwrap().harness = "claude".into();
         assert!(s.check().unwrap_err().1.contains("belongs to codex"));
     }
 
@@ -4321,8 +4528,8 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT);
             INSERT INTO agent_retries(agent_id,source,tried) VALUES(1,'gpt-6-sol','[\"codex:gpt-6-sol\"]');").unwrap();
-        ensure_retry_effort(&db).unwrap();
-        ensure_retry_effort(&db).unwrap();
+        ensure_retry_schema(&db).unwrap();
+        ensure_retry_schema(&db).unwrap();
         let record: (String, String, Option<String>) = db
             .query_row(
                 "SELECT source,tried,effort FROM agent_retries WHERE agent_id=1",
@@ -4340,18 +4547,19 @@ mod tests {
     fn retry_keeps_running_effort_snapshot_and_waits_for_allowed_effort() {
         let app = app_with_two_projects();
         custom(&app, 1, |s| {
-            s.flagged_retries.insert(
+            s.crash_retries.insert(
                 "gpt-6-sol".into(),
                 RetryRule {
                     harness: "codex".into(),
                     model: "gpt-6-luna".into(),
+                    same_model_retries: 0,
                 },
             );
             s.harnesses.get_mut("codex").unwrap().efforts = vec!["medium".into()];
         });
         {
             let mut st = app.lock();
-            st.db.execute("UPDATE agents SET harness='codex',model='gpt-6-luna',effort='medium',state='paused',pause_reason='flagged' WHERE id=1", []).unwrap();
+            st.db.execute("UPDATE agents SET harness='codex',model='gpt-6-luna',effort='medium',state='crashed' WHERE id=1", []).unwrap();
             st.procs.insert(
                 1,
                 Proc {
@@ -4359,9 +4567,13 @@ mod tests {
                     stopping: false,
                     model: "gpt-6-sol".into(),
                     effort: "high".into(),
+                    failure: None,
                 },
             );
-            st.remember_flag(1, &st.agent(1).unwrap()).unwrap();
+            st.remember_crash(1, &st.agent(1).unwrap()).unwrap();
+            st.db
+                .execute("UPDATE agent_retries SET eligible_at=0", [])
+                .unwrap();
             st.procs.remove(&1); // No child was started or signalled.
         }
         let home = app.home.clone();
@@ -4383,7 +4595,7 @@ mod tests {
                 "gpt-6-sol".into(),
                 "high".into(),
                 false,
-                "inherited effort high isn't allowed for codex".into()
+                "recovery effort high (from high) isn't allowed for codex".into()
             )
         );
         assert_eq!(st.agent(1).unwrap().effort, "medium");
@@ -4391,16 +4603,18 @@ mod tests {
     }
 
     #[test]
-    fn retry_never_substitutes_unsupported_or_missing_effort() {
+    fn retry_mapping_still_obeys_allowed_efforts_and_missing_snapshot_stops() {
         let app = app_with_two_projects();
         custom(&app, 1, |s| {
-            s.flagged_retries.insert(
+            s.crash_retries.insert(
                 "gpt-6-sol".into(),
                 RetryRule {
                     harness: "codex".into(),
                     model: "gpt-6-luna".into(),
+                    same_model_retries: 0,
                 },
             );
+            s.harnesses.get_mut("codex").unwrap().efforts = vec!["medium".into()];
         });
         app.lock()
             .db
@@ -4409,13 +4623,13 @@ mod tests {
                 [],
             )
             .unwrap();
-        app.flag(1, "refusal").unwrap();
+        record_test_crash(&app, 1);
         app.tick().unwrap();
         assert!(
             app.agent_view(1).unwrap()["retry"]["blocked"]
                 .as_str()
                 .unwrap()
-                .contains("doesn't support effort ultra")
+                .contains("recovery effort max (from ultra) isn't allowed")
         );
         assert_eq!(app.lock().agent(1).unwrap().effort, "ultra");
         app.lock()
@@ -4446,18 +4660,19 @@ mod tests {
             )
             .unwrap();
         custom(&app, 1, |s| {
-            s.flagged_retries.insert(
+            s.crash_retries.insert(
                 "claude-fable-5-1".into(),
                 RetryRule {
                     harness: "codex".into(),
                     model: "gpt-6-sol".into(),
+                    same_model_retries: 0,
                 },
             );
         });
         let (thread, _) = app
             .new_thread(0, Some(1), "handoff", &["1".into()], true)
             .unwrap();
-        app.flag(1, "flag").unwrap();
+        record_test_crash(&app, 1);
         {
             let st = app.lock();
             st.db.execute_batch("CREATE TRIGGER fail_handoff BEFORE INSERT ON members WHEN NEW.agent_id>2 BEGIN SELECT RAISE(ABORT,'injected handoff failure'); END").unwrap();
@@ -4512,6 +4727,7 @@ mod tests {
                     stopping: false,
                     model: "claude-fable-5-1".into(),
                     effort: "medium".into(),
+                    failure: None,
                 },
             );
             st.procs.insert(
@@ -4521,6 +4737,7 @@ mod tests {
                     stopping: false,
                     model: "claude-opus-5-5".into(),
                     effort: "medium".into(),
+                    failure: None,
                 },
             );
         }

@@ -34,8 +34,10 @@ pub enum Event {
     },
     /// A short readable line for the agent's activity view.
     Text(String),
-    /// The model refused or was safety-flagged, or the harness switched models. acom pauses the agent.
-    Flagged(String),
+    /// A structured harness failure. The supervisor decides recovery after exit.
+    Failed(String),
+    /// An unexpected model switch; stop the process before it can do more work.
+    ModelSwitched(String),
     /// The subscription's usage limit was hit mid-turn. acom pauses the agent until the window resets.
     LimitHit(String),
     /// A model-scoped window exhausted; do not mark the whole provider exhausted.
@@ -193,27 +195,12 @@ fn claude_command(l: &Launch) -> (Command, Option<String>) {
     c.args(["--settings", &hook.to_string()]);
     // No subagents or side channels: every agent goes through acom.
     c.args(["--disallowedTools", "Agent,Workflow,SendMessage,ListAgents"]);
-    // Never switch to another model on its own, e.g. after a safeguards flag:
-    // acom pauses the agent and tells the user instead.
+    // Model recovery is controlled by acom, never silently by the harness.
     c.env("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "1");
     c.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
     c.args(["--allowedTools", "Bash(acom *)"]);
     c.stdin(Stdio::piped());
     (c, Some(l.prompt.to_string()))
-}
-
-fn refused(model: &str, category: &str, explanation: &str) -> String {
-    let category = if category.is_empty() {
-        String::new()
-    } else {
-        format!(" ({category})")
-    };
-    let explanation = if explanation.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", short(explanation, 200))
-    };
-    format!("{model} refused under its safeguards{category}{explanation}")
 }
 
 /// The Claude stream names Fable's weekly bucket differently from the UI.
@@ -242,25 +229,12 @@ fn claude_events(v: &Value) -> Vec<Event> {
                     out.push(Event::Session(s.to_string()));
                 }
             }
-            sub @ ("model_refusal_no_fallback"
-            | "model_refusal_fallback"
-            | "model_fallback"
-            | "model_consent_fallback") => {
+            "model_refusal_fallback" | "model_fallback" | "model_consent_fallback" => {
                 let from = field("original_model", "originalModel");
                 let to = field("fallback_model", "fallbackModel");
-                let mut reason = refused(
-                    &from,
-                    &field("api_refusal_category", "apiRefusalCategory"),
-                    &field("api_refusal_explanation", "apiRefusalExplanation"),
-                );
-                if sub != "model_refusal_no_fallback" {
-                    reason = if sub == "model_refusal_fallback" {
-                        format!("{reason}, and Claude Code switched to {to}")
-                    } else {
-                        format!("Claude Code switched from {from} to {to}")
-                    };
-                }
-                out.push(Event::Flagged(reason));
+                out.push(Event::ModelSwitched(format!(
+                    "Claude Code switched from {from} to {to}"
+                )));
             }
             _ => {}
         },
@@ -268,14 +242,6 @@ fn claude_events(v: &Value) -> Vec<Event> {
             let m = &v["message"];
             if let Some(model) = m["model"].as_str().filter(|x| !x.starts_with('<')) {
                 out.push(Event::Model(model.to_string()));
-            }
-            if m["stop_reason"] == "refusal" {
-                let d = &m["stop_details"];
-                out.push(Event::Flagged(refused(
-                    m["model"].as_str().unwrap_or("the model"),
-                    d["category"].as_str().unwrap_or(""),
-                    d["explanation"].as_str().unwrap_or(""),
-                )));
             }
             // A synthetic message stands in for errors such as the session limit.
             if matches!(v["error"].as_str(), Some("rate_limit" | "billing_error")) {
@@ -325,16 +291,37 @@ fn claude_events(v: &Value) -> Vec<Event> {
                 add: true,
             });
             if v["is_error"] == true {
-                let text = v["result"].as_str().unwrap_or("");
-                out.push(Event::Text(format!("error: {}", short(text, 300))));
+                let errors = v["errors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let text = v["result"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if errors.is_empty() {
+                            v["subtype"].as_str().unwrap_or("Claude turn failed")
+                        } else {
+                            &errors
+                        }
+                    });
                 let lower = text.to_lowercase();
-                if lower.contains("safeguards flagged") {
-                    out.push(Event::Flagged(short(text, 300)));
-                } else if ["session limit", "usage limit", "out of usage credits"]
-                    .iter()
-                    .any(|x| lower.contains(x))
+                if [
+                    "session limit",
+                    "usage limit",
+                    "rate limit",
+                    "quota exceeded",
+                    "out of usage credits",
+                ]
+                .iter()
+                .any(|x| lower.contains(x))
                 {
                     out.push(Event::LimitHit(short(text, 200)));
+                } else {
+                    out.push(Event::Failed(short(text, 300)));
                 }
             }
         }
@@ -506,13 +493,10 @@ fn codex_events(v: &Value) -> Vec<Event> {
             .or(event["toModel"].as_str())
             .unwrap_or("another model");
         let reason = event["reason"].as_str().unwrap_or("unspecified reason");
-        return vec![Event::Flagged(short(
+        return vec![Event::ModelSwitched(short(
             &format!("Codex rerouted from {from} to {to} ({reason})"),
             300,
         ))];
-    }
-    if kind == "refusal" || v["type"] == "response.refusal.done" {
-        return vec![Event::Flagged("Codex reported a model refusal".into())];
     }
     if kind == "error" || v["type"] == "turn.failed" {
         let error = if event["error"].is_object() {
@@ -540,20 +524,10 @@ fn codex_events(v: &Value) -> Vec<Event> {
                 .and_then(|v| v.pointer("/error/code"))
                 .and_then(Value::as_str))
             .unwrap_or("");
-        let mut out = vec![Event::Text(format!("error: {}", short(message, 300)))];
-        // Match error frames only, never user/tool text or an assistant merely
-        // discussing policies. Free-form refusals have no reliable classifier.
+        // Errors are failures regardless of their wording. Only quota errors
+        // have a distinct recovery path; ordinary assistant/tool text is ignored.
         let lower = message.to_ascii_lowercase();
         if matches!(
-            code,
-            "content_policy_violation" | "policy_violation" | "content_filter" | "safety_violation"
-        ) || lower.contains("usage policy")
-            || lower.contains("safeguards flagged")
-            || lower.contains("high-risk cyber")
-            || lower.contains("high risk cyber")
-        {
-            out.push(Event::Flagged(short(message, 300)));
-        } else if matches!(
             code,
             "usage_limit_reached"
                 | "rate_limit_exceeded"
@@ -564,19 +538,9 @@ fn codex_events(v: &Value) -> Vec<Event> {
             || lower.contains("quota exceeded")
             || lower.contains("out of usage credits")
         {
-            out.push(Event::LimitHit(short(message, 200)));
+            return vec![Event::LimitHit(short(message, 200))];
         }
-        return out;
-    }
-    if v["type"] == "response_item" && event["payload"]["type"] == "message" {
-        let message = &event["payload"];
-        if message["role"] == "assistant"
-            && message["content"]
-                .as_array()
-                .is_some_and(|c| c.iter().any(|p| p["type"] == "refusal"))
-        {
-            return vec![Event::Flagged("Codex reported a model refusal".into())];
-        }
+        return vec![Event::Failed(short(message, 300))];
     }
     if matches!(
         v["type"].as_str(),
@@ -790,31 +754,27 @@ mod tests {
     }
 
     #[test]
-    fn claude_refusals_fallbacks_and_limits_are_reported() {
+    fn claude_model_switches_and_limits_are_reported() {
         let refusal = r#"{"type":"assistant","message":{"model":"claude-fable-5-1","stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"This request triggered restrictions."},"content":[]}}"#;
         let ev = parse_line("claude", refusal);
         assert!(matches!(&ev[0], Event::Model(m) if m == "claude-fable-5-1"));
-        assert!(
-            matches!(&ev[1], Event::Flagged(r) if r == "claude-fable-5-1 refused under its safeguards (cyber): This request triggered restrictions.")
-        );
+        assert!(!ev.iter().any(|e| matches!(e, Event::Failed(_))));
         let no_fallback = r#"{"type":"system","subtype":"model_refusal_no_fallback","original_model":"claude-opus-5-5","api_refusal_category":"cyber"}"#;
-        assert!(
-            matches!(&parse_line("claude", no_fallback)[0], Event::Flagged(r) if r == "claude-opus-5-5 refused under its safeguards (cyber)")
-        );
+        assert!(parse_line("claude", no_fallback).is_empty());
         let fallback = r#"{"type":"system","subtype":"model_fallback","originalModel":"claude-opus-5-5","fallbackModel":"claude-opus-4-8","trigger":"overloaded"}"#;
         assert!(
-            matches!(&parse_line("claude", fallback)[0], Event::Flagged(r) if r == "Claude Code switched from claude-opus-5-5 to claude-opus-4-8")
+            matches!(&parse_line("claude", fallback)[0], Event::ModelSwitched(r) if r == "Claude Code switched from claude-opus-5-5 to claude-opus-4-8")
         );
         let limit = r#"{"type":"assistant","error":"rate_limit","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit · resets 3:30pm"}]}}"#;
         let ev = parse_line("claude", limit);
         assert!(
             matches!(&ev[0], Event::LimitHit(t) if t.starts_with("You've hit your session limit"))
         );
-        let flagged_result = r#"{"type":"result","is_error":true,"result":"API Error: Opus 5.5's safeguards flagged this session","usage":{}}"#;
+        let error_result = r#"{"type":"result","is_error":true,"result":"API Error: request could not be completed","usage":{}}"#;
         assert!(
-            parse_line("claude", flagged_result)
+            parse_line("claude", error_result)
                 .iter()
-                .any(|e| matches!(e, Event::Flagged(_)))
+                .any(|e| matches!(e, Event::Failed(_)))
         );
         let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":99}}"#;
         assert!(matches!(
@@ -826,6 +786,58 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::LimitHit(_)))
         );
+    }
+
+    #[test]
+    fn claude_error_results_fail_without_keyword_classification() {
+        for (value, reason) in [
+            (
+                json!({"type":"result","is_error":true,"result":"stream disconnected before completion"}),
+                "stream disconnected before completion",
+            ),
+            (
+                json!({"type":"result","is_error":true,"subtype":"error_during_execution","errors":["authentication failed","server unavailable"]}),
+                "authentication failed; server unavailable",
+            ),
+            (
+                json!({"type":"result","is_error":true,"subtype":"error_max_turns"}),
+                "error_max_turns",
+            ),
+            (
+                json!({"type":"result","is_error":true}),
+                "Claude turn failed",
+            ),
+        ] {
+            let events = parse_line("claude", &value.to_string());
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::Failed(text) if text == reason))
+            );
+            assert!(!events.iter().any(|e| matches!(e, Event::LimitHit(_))));
+        }
+        for reason in [
+            "You've hit your session limit",
+            "rate limit exceeded",
+            "quota exceeded",
+        ] {
+            let events = parse_line(
+                "claude",
+                &json!({"type":"result","is_error":true,"result":reason}).to_string(),
+            );
+            assert!(events.iter().any(|e| matches!(e, Event::LimitHit(_))));
+            assert!(!events.iter().any(|e| matches!(e, Event::Failed(_))));
+        }
+        for value in [
+            json!({"type":"result","is_error":false,"result":"An example says safeguards flagged this session; usage limit."}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"error: authentication failed; this is sample output."}]}}),
+        ] {
+            assert!(
+                !parse_line("claude", &value.to_string())
+                    .iter()
+                    .any(|e| matches!(e, Event::Failed(_) | Event::LimitHit(_)))
+            );
+        }
     }
 
     #[test]
@@ -1065,37 +1077,88 @@ mod tests {
     }
 
     #[test]
-    fn codex_flags_observable_reroutes_and_structured_refusals() {
+    fn codex_failures_include_reroutes_and_explicit_error_frames() {
         for line in [
             r#"{"type":"event_msg","payload":{"type":"model_reroute","from_model":"gpt-6-sol","to_model":"gpt-other","reason":"high_risk_cyber_activity"}}"#,
             r#"{"method":"model/rerouted","params":{"fromModel":"gpt-6-sol","toModel":"gpt-other","reason":"highRiskCyberActivity"}}"#,
             r#"{"type":"turn.failed","error":{"code":"policy_violation","message":"request blocked under the usage policy"}}"#,
             r#"{"type":"item.completed","item":{"type":"error","message":"the safeguards flagged this request"}}"#,
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"not permitted"}]}}"#,
-            r#"{"type":"response.refusal.done","refusal":"not permitted"}"#,
         ] {
             assert!(
                 parse_line("codex", line)
                     .iter()
-                    .any(|e| matches!(e, Event::Flagged(_))),
+                    .any(|e| matches!(e, Event::Failed(_) | Event::ModelSwitched(_))),
                 "{line}"
             );
         }
     }
 
     #[test]
-    fn codex_does_not_classify_prose_tool_output_or_network_errors_as_flags() {
+    fn codex_does_not_classify_prose_or_tool_output_as_failures() {
         for line in [
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"This test explains usage policy refusals and model reroutes."}}"#,
             r#"{"type":"item.completed","item":{"type":"command_execution","command":"test","aggregated_output":"safeguards flagged this request"}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"refusal","refusal":"quoted example"}]}}"#,
-            r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"not permitted"}]}}"#,
+            r#"{"type":"response.refusal.done","refusal":"not permitted"}"#,
+            r#"{"type":"refusal","refusal":"not permitted"}"#,
             r#"{"type":"turn_context","payload":{"model":"gpt-requested-model"}}"#,
         ] {
             assert!(
-                parse_line("codex", line)
-                    .iter()
-                    .all(|e| !matches!(e, Event::Flagged(_) | Event::Model(_))),
+                parse_line("codex", line).iter().all(|e| !matches!(
+                    e,
+                    Event::Failed(_) | Event::ModelSwitched(_) | Event::Model(_)
+                )),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn normally_completed_refusal_is_not_a_failed_turn() {
+        for (provider, lines) in [
+            (
+                "claude",
+                vec![
+                    r#"{"type":"assistant","message":{"stop_reason":"refusal","content":[{"type":"text","text":"I can't help with this request."}]}}"#,
+                    r#"{"type":"system","subtype":"model_refusal_no_fallback"}"#,
+                    r#"{"type":"result","is_error":false,"subtype":"success","result":"I can't help with this request."}"#,
+                ],
+            ),
+            (
+                "codex",
+                vec![
+                    r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I can't help with this request."}]}}"#,
+                    r#"{"type":"response.refusal.done","refusal":"I can't help with this request."}"#,
+                    r#"{"type":"turn.completed","usage":{}}"#,
+                ],
+            ),
+        ] {
+            for line in lines {
+                assert!(
+                    !parse_line(provider, line)
+                        .iter()
+                        .any(|e| matches!(e, Event::Failed(_) | Event::ModelSwitched(_))),
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_generic_error_frames_fail_independently_of_message_words() {
+        for line in [
+            r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#,
+            r#"{"type":"error","message":"invalid credentials"}"#,
+            r#"{"type":"event_msg","payload":{"type":"error","message":"server unavailable"}}"#,
+            r#"{"type":"item.completed","item":{"type":"error","message":"model not found"}}"#,
+            r#"{"type":"turn.failed","error":"unexpected harness failure"}"#,
+            r#"{"type":"turn.failed"}"#,
+        ] {
+            let events = parse_line("codex", line);
+            assert_eq!(events.len(), 1, "{line}");
+            assert!(
+                matches!(&events[0], Event::Failed(text) if !text.is_empty()),
                 "{line}"
             );
         }
@@ -1108,6 +1171,7 @@ mod tests {
             r#"{"type":"turn.failed","error":{"code":"usage_limit_reached","message":"You've hit your usage limit"}}"#,
         );
         assert!(events.iter().any(|e| matches!(e, Event::LimitHit(_))));
+        assert!(!events.iter().any(|e| matches!(e, Event::Failed(_))));
         let events = parse_line(
             "codex",
             r#"{"type":"response.completed","response":{"model":"gpt-6-sol"}}"#,
@@ -1116,14 +1180,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_unwraps_account_model_errors_without_treating_them_as_limits_or_flags() {
+    fn codex_unwraps_account_model_errors_as_failures_not_quota() {
         let events = parse_line("codex", &serde_json::json!({"type":"turn.failed","error":{"message":serde_json::json!({"error":{"message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}).to_string()}}).to_string());
-        assert!(matches!(&events[0],Event::Text(t) if t.starts_with("error: The 'gpt-6.1-sol'")));
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, Event::LimitHit(_) | Event::Flagged(_)))
-        );
+        assert!(matches!(&events[0],Event::Failed(t) if t.starts_with("The 'gpt-6.1-sol'")));
+        assert!(!events.iter().any(|e| matches!(e, Event::LimitHit(_))));
         let events = parse_line(
             "codex",
             r#"{"type":"turn.failed","error":{"codexErrorInfo":"UsageLimitExceeded","message":"Account blocked"}}"#,

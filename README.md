@@ -31,7 +31,7 @@ Unread counts appear on Threads, individual conversations, project choices and t
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
 
-An open **Details** dialog refreshes status and recent activity every two seconds. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back. Connection failures keep the last view and show a retry status.
+An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Connection failures keep the last view and show a retry status.
 
 When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
@@ -64,7 +64,25 @@ A newer model can be typed in as a custom ID. The allowed-model list in Settings
 
 The catalog isn't a guarantee that your installed harness supports a model. Fresh configs default to `gpt-6-sol`; existing model choices aren't rewritten. An older Codex CLI can reject `gpt-6.1-sol` while a newer editor-bundled CLI accepts it with the same ChatGPT login. acom uses `codex` from the server's PATH, not the editor's client, and inherits its login/configuration (`CODEX_HOME` if set). Compare `command -v codex`, `codex --version` and `codex login status`; update the standalone client or start acom with the newer client's directory first in PATH. No API key is needed when that client is signed in with ChatGPT. See [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
 
-Errors are shown plainly, with **Retry same model** and **Launch another model…**. Settings → Flagged-model retries optionally maps a source model to a replacement harness/model. The replacement inherits the flagged turn's effort, not a queued next-turn change; unsupported or disallowed effort stops or waits visibly, without downgrading. No rules are configured by default; no rule means no automatic retry. Rules apply only to flags/refusals/unexpected harness model changes, not ordinary crashes or quota pauses. Same-provider retries keep the agent/session; cross-provider retries create a replacement with the original task, history/output paths, thread memberships and message marks. The predecessor stays paused for inspection. Limits and target allowed lists apply, the stopped process must exit first, and visited models stop retry cycles. A failed spawn is not retried in a loop; Details/activity explain waiting or failure. Manual Resume starts a fresh retry chain. Routing does not override provider safety policies.
+## Crash recovery
+
+Errors are shown plainly, with **Retry same model** and **Launch another model…**. Settings → Crash recovery optionally maps a source model to a different replacement model/provider and a **Same-model retries** count. No rules are configured by default; no matching rule means the agent stays crashed.
+
+The count defaults to `0` (go straight to the replacement). With `2`, a failed original turn gets two retries with the same model/session before switching. An unexpected nonzero process exit or a harness-reported failed turn triggers recovery, regardless of error wording; successful responses, including refusal text, do not. Manual pauses, closes, server-shutdown pauses and subscription-quota pauses are separate. A retry waits at least two seconds after failure, until the old process exits, and until target allowed lists and active/usage limits permit it.
+
+Recovery uses the failed turn's actual effort, not a queued next-turn change:
+
+| Replacement supports | Recovery effort |
+| --- | --- |
+| The inherited effort | Keep it |
+| `max` but not inherited `ultra` (Claude or Codex Luna) | `max` |
+| Only one effort (Haiku 4.5) | Its fixed effort: `medium` in the catalog; no effort flag is sent |
+
+These are compatibility conversions, not a separately configured replacement effort. Converted efforts must still be in the project's allowed-effort list. Other unsupported efforts stop with a reason; disallowed targets/efforts or full limits wait. Notices and activity show any conversion.
+
+Same-provider recovery keeps the agent and native session. Cross-provider recovery creates a new agent/session with the original task, failure reason, history/output paths, name/group, thread memberships, notification cursors and message marks. Its prompt tells it to inspect partial work and read predecessor records as context, not replay commands. No locks or background processes transfer; the predecessor stays crashed for inspection.
+
+Attempt counts and visited models survive restarts; successful turns and manual **Retry same model** reset the chain. Returning to an already-tried model stops a replacement cycle. Failed setup or spawn stops visibly instead of launching repeatedly. Existing saved `flagged_retries` mappings are accepted as crash-recovery rules with zero same-model retries; upgrading does not automatically retry previously crashed or paused agents.
 
 ## Permissions
 

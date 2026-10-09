@@ -22,7 +22,7 @@ function settings() {
     limits: { active: { soft: 6, hard: 8 }, active_per_harness: {}, usage: {}, context: { soft: null, hard: 200000 } },
     auto_resume: true, done_closes: true,
     max_lock_ttl_secs: 900,
-    allow_agent_model_change: false, allow_agent_effort_change: false, flagged_retries: {},
+    allow_agent_model_change: false, allow_agent_effort_change: false, crash_retries: {},
     usage_poll_secs: 120,
     prompts: { launch:'Launch guidance', wake:'Wake guidance', resume:'Resume guidance' },
   };
@@ -102,6 +102,10 @@ async function fixture(run) {
     if (req.url === '/agent-config') {
       Object.assign(data.agents.find(a => a.id === body.id), {model:body.model,effort:body.effort});
       return send({});
+    }
+    if (/^\/agents\/\d+\/resume$/.test(req.url)) {
+      Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'working',pause_reason:null,problem:null});
+      return send({warnings:[]});
     }
     if (/^\/agents\/\d+(\/log\?lines=100)?$/.test(req.url)) {
       const id = Number(req.url.split('/')[2]);
@@ -643,6 +647,29 @@ test('model errors offer an explicit alternative launch while retaining the orig
   assert.equal(data.agents[0].model,'gpt-6.1-sol');
 }));
 
+test('generic crashed turns offer same-model retry and explicit alternative without changing paused controls', async () => fixture(async (page, data) => {
+  data.agents = [
+    {id:1,project:1,name:'Failed turn',state:'crashed',harness:'codex',model:'gpt-6.1-sol',effort:'high',task:'Continue the original task',problem:'Stream failed: cyber-risk error'},
+    {id:2,project:1,name:'Quota pause',state:'paused',pause_reason:'limit',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
+    {id:3,project:1,name:'Legacy flag',state:'paused',pause_reason:'flagged',harness:'claude',model:'claude-opus-5-5',effort:'medium'},
+  ];
+  await page.reload();
+  const crash = page.locator('[data-agent="1"]');
+  assert.equal(await crash.locator('[data-action=resume]').textContent(), 'Retry same model');
+  assert.equal(await crash.locator('[data-action=another-model]').textContent(), 'Launch another model…');
+  assert.equal(await page.locator('[data-agent="2"] [data-action=resume]').textContent(), 'Resume');
+  assert.equal(await page.locator('[data-agent="3"] [data-action=resume]').textContent(), 'Resume same model');
+  await crash.locator('[data-action=another-model]').click();
+  assert.equal(await page.locator('#launch-harness').inputValue(), 'codex');
+  assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'Continue the original task');
+  assert.equal(data.requests.length, 0, 'opening an alternative does not relaunch or rewrite the original');
+  await page.locator('[data-close=launch-dialog]').click();
+  await crash.locator('[data-action=resume]').click();
+  await page.waitForFunction(() => document.querySelector('[data-agent="1"] .pill').textContent === 'working');
+  assert.deepEqual(data.requests.at(-1), {url:'/agents/1/resume',method:'POST',body:{}});
+  assert.equal(data.agents[0].model, 'gpt-6.1-sol');
+}));
+
 test('cancelling member selection preserves a draft only within its project',async()=>fixture(async(page,data)=> {
   data.agents=[{id:1,project:1,name:'First',state:'working'},{id:2,project:2,name:'Second',state:'idle'}];
   await page.reload(); await page.locator('[data-page=threads]').click();
@@ -891,7 +918,7 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   await saveSettings(page);
   assert.equal(data.settings.allow_agent_model_change, false);
   assert.equal(data.settings.allow_agent_effort_change, true);
-  assert.deepEqual(data.settings.flagged_retries, {});
+  assert.deepEqual(data.settings.crash_retries, {});
   await form.locator('[name=allow_agent_model_change]').check();
   await form.locator('[name=allow_agent_effort_change]').uncheck();
   await form.locator('#add-retry-rule').click();
@@ -899,22 +926,28 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   await rule.locator('[name=retry_source]').selectOption('claude-opus-5-5');
   await rule.locator('[name=retry_harness]').selectOption('codex');
   await rule.locator('[name=retry_model]').selectOption('gpt-6-luna');
+  assert.equal(await rule.locator('[name=same_model_retries]').inputValue(), '0');
+  await rule.locator('[name=same_model_retries]').fill('2');
   assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
   await page.evaluate(() => refresh());
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
   await saveSettings(page);
   assert.equal(data.settings.allow_agent_model_change, true);
   assert.equal(data.settings.allow_agent_effort_change, false);
-  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna'}});
+  assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:2}});
   // Old saved overrides must not survive another settings save.
+  data.settings.flagged_retries = data.settings.crash_retries;
+  delete data.settings.crash_retries;
   data.settings.flagged_retries['claude-opus-5-5'].effort = 'low';
   await page.reload(); await page.locator('[data-page=settings]').click();
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
   assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
+  assert.equal(await rule.locator('[name=same_model_retries]').inputValue(), '2');
   await saveSettings(page);
-  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna'}});
+  assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:2}});
+  assert.equal(data.settings.flagged_retries, undefined);
   await rule.locator('[data-remove-retry]').click(); await saveSettings(page);
-  assert.deepEqual(data.settings.flagged_retries, {});
+  assert.deepEqual(data.settings.crash_retries, {});
 }));
 
 test('retry model choices exclude the source and update when source or provider changes', async () => fixture(async (page, data) => {
@@ -939,7 +972,31 @@ test('retry model choices exclude the source and update when source or provider 
   await page.evaluate(() => refresh());
   assert.equal(await model.inputValue(), 'gpt-6-luna');
   await saveSettings(page);
-  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna'}});
+  assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:0}});
+}));
+
+test('crash recovery retry counts are bounded integers and effort behavior is explained', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  const form = page.locator('#settings-form');
+  assert.match(await form.textContent(), /Crash recovery.*count excludes the original turn; zero goes straight to the replacement/);
+  assert.match(await form.textContent(), /Successful responses, including refusals, do not trigger recovery\. Manual\/usage pauses are separate/);
+  assert.match(await form.textContent(), /ultra maps to max when supported/);
+  assert.match(await form.textContent(), /Haiku 4\.5.*medium placeholder.*omits the effort flag.*Allowed-effort restrictions/);
+  await page.locator('#add-retry-rule').click();
+  const retries = page.locator('[name=same_model_retries]');
+  for (const value of ['-1','1.5','4294967296','']) {
+    await retries.fill(value);
+    assert.equal(await retries.evaluate(el => el.checkValidity()), false);
+    const writes = data.requests.length;
+    await page.locator('[form=settings-form]').click();
+    assert.equal(data.requests.length, writes);
+  }
+  await retries.fill('4294967295');
+  assert.equal(await retries.evaluate(el => el.checkValidity()), true);
+  await page.evaluate(() => refresh());
+  assert.equal(await retries.inputValue(), '4294967295');
+  await saveSettings(page);
+  assert.equal(Object.values(data.settings.crash_retries)[0].same_model_retries, 4294967295);
 }));
 
 test('custom retry IDs cannot equal the source, including when editing the source', async () => fixture(async (page, data) => {
@@ -982,7 +1039,7 @@ test('retry rules support custom IDs and reject duplicate source models without 
   await harness.locator('[name=add_model]').fill('future-target');
   await harness.locator('[data-add-model]').click();
   await saveSettings(page);
-  assert.equal(data.settings.flagged_retries['future-source'].model, 'future-target');
+  assert.equal(data.settings.crash_retries['future-source'].model, 'future-target');
   await page.reload(); await page.locator('[data-page=settings]').click();
   assert.equal(await rule.locator('[name=retry_source]').inputValue(), 'future-source');
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'future-target');
@@ -1042,23 +1099,63 @@ test('agent details preserve model drafts while polling and save provider-fixed 
 }));
 
 test('agent details expose pending, blocked and replacement retry status safely', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'paused',pause_reason:'flagged',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null}}];
+  data.agents = [{id:1,project:1,name:'Worker',state:'crashed',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null,same_model_attempts:1,effort:'medium',eligible_at:Date.now()/1000+120}}];
   await page.reload(); await page.locator('[data-action=details]').click();
   const details = page.locator('#agent-details');
-  assert.match(await details.textContent(), /flagged retry.*Pending; requires a configured rule/);
+  assert.match(await details.textContent(), /crash recovery.*Same-model retries: 1.*effort medium.*Pending; requires a configured rule/);
+  assert.match(await details.textContent(), /Earliest retry:/);
+  data.agents[0].effort = 'high';
   data.agents[0].retry.blocked = 'Usage limit <waiting>';
   await page.evaluate(() => refresh());
   assert.match(await details.textContent(), /Waiting: Usage limit <waiting>/);
+  assert.match(await details.textContent(), /failed effort medium; requested effort high/);
   assert.equal(await details.locator('waiting').count(), 0);
   data.agents[0].retry.handled = 1;
   await page.evaluate(() => refresh());
   assert.match(await details.textContent(), /Stopped: Usage limit/);
+  assert.doesNotMatch(await details.textContent(), /Earliest retry:/);
   data.agents[0].retry.blocked = null; data.agents[0].retry.replacement = 2;
   await page.evaluate(() => refresh());
   assert.match(await details.textContent(), /Replacement agent #2/);
   data.agents[0].retry.blocked = 'cannot start replacement';
   await page.evaluate(() => refresh());
   assert.match(await details.textContent(), /Replacement agent #2.*Stopped: cannot start replacement/);
+}));
+
+test('details polling preserves selected task text and defers selected log updates', async () => fixture(async (page, data) => {
+  const task = `Don't replace this "task" <text> while counters change.`;
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',task,fresh_in:1}];
+  data.agentLogs[1] = Array.from({length:80}, (_,i) => `Line ${i}`);
+  await page.reload(); await page.locator('[data-action=details]').click();
+  await page.locator('#agent-config [name=agent_model]').selectOption('gpt-6-luna');
+  await page.locator('#agent-config [name=agent_effort]').selectOption('max');
+  await page.evaluate(() => {
+    const el = document.querySelector('dt[data-key=task]').nextElementSibling;
+    window.selectedTaskNode = el;
+    const range = document.createRange(); range.selectNodeContents(el);
+    const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    document.querySelector('#agent-log').scrollTop = 35;
+  });
+  data.agents[0].fresh_in = 2; data.agents[0].status = 'Working'; data.agentLogs[1].push('New activity');
+  await page.evaluate(() => refresh());
+  await page.waitForFunction(() => document.querySelector('dt[data-key=fresh_in]').nextElementSibling.textContent === '2');
+  assert.equal(await page.evaluate(() => document.querySelector('dt[data-key=task]').nextElementSibling === window.selectedTaskNode), true);
+  assert.equal(await page.evaluate(() => getSelection().toString()), task);
+  assert.equal(await page.locator('#agent-config [name=agent_model]').inputValue(), 'gpt-6-luna');
+  assert.equal(await page.locator('#agent-config [name=agent_effort]').inputValue(), 'max');
+  assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollTop), 35);
+  await page.evaluate(() => {
+    const range = document.createRange(); range.selectNodeContents(document.querySelector('#agent-log'));
+    const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+  });
+  const selectedLog = await page.evaluate(() => getSelection().toString());
+  data.agentLogs[1].push('Deferred while selected'); data.agents[0].fresh_in = 3;
+  await page.evaluate(() => refresh());
+  assert.equal(await page.evaluate(() => getSelection().toString()), selectedLog);
+  assert.equal((await page.locator('#agent-log').textContent()).includes('Deferred while selected'), false);
+  await page.evaluate(() => { getSelection().removeAllRanges(); return refresh(); });
+  await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Deferred while selected'));
+  assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollTop), 35);
 }));
 
 test('thread identifiers are visible and copyable for references in another conversation', async () => fixture(async (page, data) => {

@@ -146,6 +146,7 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
             stopping: false,
             model: a.model.clone(),
             effort: a.effort.clone(),
+            failure: None,
         },
     );
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
@@ -170,28 +171,22 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
             let (app, harness, done) = (app.clone(), harness.clone(), done.clone());
             thread::spawn(move || follow_side_file(&app, id, &harness, resume, &done))
         };
-        // The last error the harness reported, to explain a crash.
-        let mut last_error = None;
         if let Some(out) = child.stdout.take() {
             let raw = log_path(&app, id, "jsonl");
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 append(&raw, &line);
                 for ev in harness::parse_line(&harness, &line) {
-                    if let Event::Text(t) = &ev
-                        && let Some(e) = t.strip_prefix("error: ")
-                    {
-                        last_error = Some(e.to_string());
-                    }
                     apply(&app, id, &harness, &a.model, ev);
                 }
             }
         }
         let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        if !ok && last_error.is_none() {
-            last_error = last_line(&log_path(&app, id, "err"), err_from);
-        }
+        let exit_error = (!ok)
+            .then(|| last_line(&log_path(&app, id, "err"), err_from))
+            .flatten();
         done.store(true, Ordering::SeqCst);
         let _ = side.join();
+        cleanup_failed_group(&app, id, pid, ok);
         append(
             &log_path(&app, id, "txt"),
             &format!(
@@ -200,11 +195,23 @@ pub fn start_turn(app: &Arc<App>, st: &mut St, id: i64, prompt: &str) -> R<()> {
                 if ok { "" } else { " (exit with error)" }
             ),
         );
-        if let Err(e) = app.turn_ended(id, pid, ok, last_error.as_deref()) {
+        if let Err(e) = app.turn_ended(id, pid, ok, exit_error.as_deref()) {
             eprintln!("agent {id}: {}", e.1);
         }
     });
     Ok(())
+}
+
+/// Failed/stopped turns must not leave old background tools running into recovery.
+fn cleanup_failed_group(app: &App, id: i64, pid: u32, ok: bool) {
+    let kill = app
+        .lock()
+        .procs
+        .get(&id)
+        .is_some_and(|p| p.pid == pid && (!ok || p.failure.is_some() || p.stopping));
+    if kill {
+        kill_group(pid, libc::SIGKILL);
+    }
 }
 
 /// The last non-empty line written to a file after `from` bytes.
@@ -228,7 +235,14 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event) {
             used_pct,
             resets_at,
         } => app.record_usage(harness, &win, used_pct, resets_at),
-        Event::Flagged(reason) => app.flag(id, &reason),
+        Event::Failed(reason) => {
+            append(&log_path(app, id, "txt"), &format!("error: {reason}"));
+            app.fail_turn(id, &reason)
+        }
+        Event::ModelSwitched(reason) => {
+            append(&log_path(app, id, "txt"), &reason);
+            app.fail_and_stop(id, &reason)
+        }
         Event::LimitHit(text) => app.limit_hit(id, &text),
         Event::WindowLimitHit { win, text } => app.window_limit_hit(id, &win, &text),
         Event::Model(m) => app.check_model(id, asked, &m),
@@ -289,5 +303,98 @@ fn follow_side_file(app: &Arc<App>, id: i64, harness: &str, resume: bool, done: 
             return;
         }
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
+
+    fn test_app(pid: u32) -> Arc<App> {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT); INSERT INTO agents VALUES(1,'working');").unwrap();
+        Arc::new(App {
+            st: Mutex::new(St {
+                db,
+                queues: Default::default(),
+                procs: [(
+                    1,
+                    Proc {
+                        pid,
+                        stopping: false,
+                        model: "gpt-6-sol".into(),
+                        effort: "medium".into(),
+                        failure: None,
+                    },
+                )]
+                .into(),
+                over_soft: Default::default(),
+            }),
+            cv: Condvar::new(),
+            home: std::env::temp_dir().join(format!("acom-worker-test-{}", harness::new_uuid())),
+            url: String::new(),
+            exe: PathBuf::new(),
+        })
+    }
+
+    #[test]
+    fn structured_failure_is_retained_without_ending_the_worker() {
+        let app = test_app(0);
+        for reason in ["stream disconnected", "duplicate failure"] {
+            apply(&app, 1, "codex", "gpt-6-sol", Event::Failed(reason.into()));
+        }
+        let st = app.lock();
+        let worker = st.procs.get(&1).unwrap();
+        assert_eq!(worker.failure.as_deref(), Some("stream disconnected"));
+        assert!(!worker.stopping);
+        assert_eq!(
+            st.db
+                .query_row("SELECT state FROM agents WHERE id=1", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "working"
+        );
+    }
+
+    #[test]
+    fn failed_group_cleanup_preserves_successful_and_unrelated_workers() {
+        for (ok, failed, stopping) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let app = test_app(pid);
+            {
+                let mut st = app.lock();
+                let worker = st.procs.get_mut(&1).unwrap();
+                worker.failure = failed.then(|| "turn failed".into());
+                worker.stopping = stopping;
+            }
+            cleanup_failed_group(&app, 1, pid + 1, false);
+            let unaffected = child.try_wait().unwrap().is_none();
+            cleanup_failed_group(&app, 1, pid, ok);
+            let successful_still_running = if ok && !failed && !stopping {
+                let running = child.try_wait().unwrap().is_none();
+                kill_group(pid, libc::SIGKILL);
+                running
+            } else {
+                true
+            };
+            let status = child.wait().unwrap();
+            assert!(unaffected, "an unrelated PID must not affect this worker");
+            assert!(
+                successful_still_running,
+                "successful turns keep their background work"
+            );
+            assert!(!status.success());
+        }
     }
 }

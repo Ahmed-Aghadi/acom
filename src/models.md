@@ -49,4 +49,4 @@ There is no unconditional `Fable > Opus > Sonnet` ladder: Opus 5.5 beats Fable 5
 
 ## Choosing agents
 
-Use a strong model for ambiguous planning, difficult debugging and review; a lighter one for narrow edits, extraction and routine checks. More effort may help difficult tasks, but the same effort label does not imply equal compute across models/providers. Different providers can offer useful independent review, but disagreement is not evidence that one is correct: verify against code, tests and sources. Do not use model routing to evade provider safety policies.
+Use a strong model for ambiguous planning, difficult debugging and review; a lighter one for narrow edits, extraction and routine checks. More effort may help difficult tasks, but the same effort label does not imply equal compute across models/providers. Different providers can offer useful independent review, but disagreement is not evidence that one is correct: verify against code, tests and sources.

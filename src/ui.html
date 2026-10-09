@@ -435,7 +435,7 @@
       const unavailable = /model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
         ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
-        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${unavailable ? 'Retry same model' : a.pause_reason === 'flagged' ? 'Resume same model' : 'Resume'}</button>${unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.state === 'crashed' || unavailable ? 'Retry same model' : a.pause_reason === 'flagged' ? 'Resume same model' : 'Resume'}</button>${a.state === 'crashed' || unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
       const close = a.state !== 'closed' ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
       const waiting = a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
@@ -556,16 +556,18 @@
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
         $('#agent-title').textContent = `${a.name} · #${a.id}`;
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([,v]) => !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([k,v]) => `<dt>${esc(k.replaceAll('_',' '))}</dt><dd>${esc(display(k, v))}</dd>`).join('');
-        const held = `<dt>locks held</dt><dd>${a.locks?.map(esc).join(', ') || '—'}</dd>`;
-        const lost = `<dt>locks lost</dt><dd>${a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'}</dd>`;
+        const fields = Object.entries(a).filter(([k,v]) => k !== 'retry' && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:key.replaceAll('_',' '),content:esc(display(key, value))}));
+        fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
         const retryStatus = a.retry?.blocked ? `${a.retry.handled ? 'Stopped' : 'Waiting'}: ${esc(a.retry.blocked)}` : a.retry?.replacement ? '' : a.retry?.handled ? 'Retry attempt handled' : 'Pending; requires a configured rule and available limits';
-        const retry = a.retry ? `<dt>flagged retry</dt><dd>${esc(a.retry.source)} · ${a.retry.replacement ? `Replacement agent #${esc(a.retry.replacement)}${retryStatus ? '<br>' : ''}` : ''}${retryStatus}</dd>` : '';
-        const details = `${fields}${held}${lost}${retry}`;
-        if ($('#agent-details').innerHTML !== details) $('#agent-details').innerHTML = details;
+        const retryEffort = a.retry?.effort ? a.retry.effort === a.effort ? ` · effort ${esc(a.retry.effort)}` : ` · failed effort ${esc(a.retry.effort)}; requested effort ${esc(a.effort)}` : '';
+        const eligible = a.retry && !a.retry.handled && a.retry.eligible_at ? `<br>Earliest retry: ${esc(when(a.retry.eligible_at))}` : '';
+        if (a.retry) fields.push({key:'retry',label:'crash recovery',content:`${esc(a.retry.source)} · Same-model retries: ${esc(a.retry.same_model_attempts ?? 0)}${retryEffort}<br>${a.retry.replacement ? `Replacement agent #${esc(a.retry.replacement)}${retryStatus ? '<br>' : ''}` : ''}${retryStatus}${eligible}`});
+        updateAgentDetails(fields);
         if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         const el = $('#agent-log'), text = (log.lines || []).join('\n') || 'No activity yet';
-        if (el.textContent !== text) {
+        const selection = getSelection();
+        const selectingLog = selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).intersectsNode(el);
+        if (el.textContent !== text && !selectingLog) {
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
           const top = el.scrollTop;
           el.textContent = text;
@@ -575,6 +577,23 @@
       } catch (error) {
         if (request === agentRequest && $('#agent-dialog').open) $('#agent-detail-status').textContent = `Updates unavailable: ${error.message}. Retrying automatically.`;
       } finally { if (agentLoading === request) agentLoading = null; }
+    }
+
+    function updateAgentDetails(fields) {
+      const root = $('#agent-details');
+      const existing = new Map([...root.querySelectorAll('dt')].map(term => [term.dataset.key, [term, term.nextElementSibling]]));
+      for (const {key,label,content} of fields) {
+        let pair = existing.get(key);
+        if (!pair) {
+          pair = [document.createElement('dt'),document.createElement('dd')];
+          pair[0].dataset.key = key; pair[0].textContent = label; root.append(...pair);
+        }
+        // Cache the source string: browsers normalize innerHTML entities, so
+        // comparing serialized markup would replace unchanged text selections.
+        if (pair[1]._detailContent !== content) { pair[1].innerHTML = content; pair[1]._detailContent = content; }
+        existing.delete(key);
+      }
+      for (const pair of existing.values()) pair.forEach(node => node.remove());
     }
 
     $('#agent-dialog').addEventListener('close', () => { if (!$('#agent-dialog').open) { selectedAgent = null; agentRequest++; } });
@@ -627,8 +646,8 @@
         <label class="inline-check"><input type="checkbox" name="allow_agent_model_change" ${s.allow_agent_model_change ? 'checked' : ''}> Allow agents to change their model within the same provider</label>
         <label class="inline-check"><input type="checkbox" name="allow_agent_effort_change" ${s.allow_agent_effort_change ? 'checked' : ''}> Allow agents to change their effort level</label>
         <p class="meta launch-project">Both permissions are off by default. Changes use allowed models and efforts, and apply to the next turn. Provider-native sessions cannot move between providers; a new agent can read the previous agent's history instead. <a href="/models" target="_blank" rel="noopener">Model and provider reference</a></p>
-        <h3>Flagged-model retries</h3><p class="meta launch-project">No retries are configured by default. Each rule chooses a replacement provider and model; it inherits the flagged turn's effort. Enable its provider and allow its model in Harnesses above. If the inherited effort isn't supported or allowed, the retry stops or waits with a reason. Cross-provider replacements receive the original conversation history path.</p>
-        <div id="retry-rules">${Object.entries(s.flagged_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
+        <h3>Crash recovery</h3><p class="meta launch-project">No retries are configured by default. The same-model count excludes the original turn; zero goes straight to the replacement. Successful responses, including refusals, do not trigger recovery. Manual/usage pauses are separate. Supported effort is preserved; ultra maps to max when supported. Fixed-effort Haiku 4.5 uses a medium placeholder and omits the effort flag. Allowed-effort restrictions still apply. Enable the replacement provider and allow its model in Harnesses above. Cross-provider replacements receive the original conversation history path.</p>
+        <div id="retry-rules">${Object.entries(s.crash_retries || s.flagged_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
         <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
@@ -696,7 +715,8 @@
       const harness = rule.harness || Object.keys(state.catalog)[0] || 'claude';
       const sources = [...new Set([...Object.keys(state.catalog).flatMap(name => providerModels(name)), ...(source ? [source] : [])])];
       return `<div class="harness-settings" data-retry-rule><div class="form-grid">
-        <label>Flagged source model <select name="retry_source">${options(sources, source)}</select></label><label data-retry-custom-source hidden>Custom source model ID <input name="retry_custom_source"></label>
+        <label>Crashed source model <select name="retry_source">${options(sources, source)}</select></label><label data-retry-custom-source hidden>Custom source model ID <input name="retry_custom_source"></label>
+        <label>Same-model retries before replacement <input type="number" name="same_model_retries" min="0" max="4294967295" step="1" required value="${rule.same_model_retries ?? 0}"></label>
         <label>Replacement provider <select name="retry_harness">${options(Object.keys(state.catalog), harness)}</select></label>
         <label>Replacement model <select name="retry_model">${modelOptions(harness, [...new Set([...(state.editor?.settings?.harnesses?.[harness]?.models || []), ...(rule.model ? [rule.model] : [])])], rule.model)}</select></label><label data-retry-custom-model hidden>Custom replacement model ID <input name="retry_custom_model"></label>
       </div><button type="button" data-remove-retry>Remove rule</button></div>`;
@@ -1160,16 +1180,19 @@
       next.done_closes = $('[name=done_closes]', form).checked;
       next.allow_agent_model_change = $('[name=allow_agent_model_change]', form).checked;
       next.allow_agent_effort_change = $('[name=allow_agent_effort_change]', form).checked;
-      next.flagged_retries = Object.create(null);
+      next.crash_retries = Object.create(null);
+      delete next.flagged_retries;
       form.querySelectorAll('[data-retry-rule]').forEach(root => {
         const selected = (name, custom) => $('[name='+name+']',root).value === '__custom__' ? customModel($('[name='+custom+']',root).value) : $('[name='+name+']',root).value;
         const source = selected('retry_source','retry_custom_source');
-        if (Object.hasOwn(next.flagged_retries, source)) throw new Error(`Only one retry rule is allowed for ${source}.`);
-        const rule = {harness:$('[name=retry_harness]',root).value,model:selected('retry_model','retry_custom_model')};
+        if (Object.hasOwn(next.crash_retries, source)) throw new Error(`Only one retry rule is allowed for ${source}.`);
+        const sameModelRetries = Number($('[name=same_model_retries]', root).value);
+        if (!Number.isInteger(sameModelRetries) || sameModelRetries < 0 || sameModelRetries > 4294967295) throw new Error('Same-model retries must be a whole number from 0 to 4294967295.');
+        const rule = {harness:$('[name=retry_harness]',root).value,model:selected('retry_model','retry_custom_model'),same_model_retries:sameModelRetries};
         const target = next.harnesses[rule.harness];
         if (source === rule.model) throw new Error('Choose a different replacement model.');
         if (!target?.enabled || !target.models.includes(rule.model)) throw new Error('Enable the retry provider and allow its model in Harnesses.');
-        next.flagged_retries[source] = rule;
+        next.crash_retries[source] = rule;
       });
       next.usage_poll_secs = Number($('[name=usage_poll_secs]', form).value);
       next.prompts = Object.fromEntries(['launch','wake','resume'].map(name=>[name,$(`[name=prompt_${name}]`,form).value]));

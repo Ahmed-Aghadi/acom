@@ -67,11 +67,13 @@ Model and effort permissions are independent and off by default. Choose a model/
 
 Changes apply only when your next turn starts. Current tools and this turn's model/effort are unchanged; finish the current work normally. A same-provider change keeps your native session. It does not grant a new active slot, reset usage or create a fresh conversation.
 
-## Handoffs and flagged models
+## Handoffs and crash recovery
 
 A different provider cannot resume your native session. Launch it with a task summary and the Conversation history and Output log paths shown by `acom me`; it can read those files as context and inspect current project state, but this does not import your native context. Add it to the relevant threads with `acom thread add <TID> <ID>`. Use `acom launch --task "..." --harness <harness> --model <ID> --effort <level> --done` to hand over without requiring another active slot. End your turn after a successful handoff. Never pass one provider's session ID to another.
 
-Flagged models stay paused unless the user has configured an explicit per-model retry rule. A same-provider rule continues that session; a cross-provider rule launches a replacement with history references, thread memberships and message marks. Replacements inherit the flagged turn's effort; unsupported or disallowed effort stops or waits with a reason. No locks or background work transfer. Limits still apply and retry cycles stop. Do not use routing to evade provider policies.
+Failed turns stay crashed unless the user has configured an explicit per-model crash-recovery rule. `acom limits` shows the rules: each allows a number of same-model retries (default zero), then a different replacement. Successful responses aren't classified by refusal wording. Recovery waits at least two seconds after failure and for the old process to exit. A same-provider retry continues that session; a cross-provider retry launches a new session with the task, failure reason, history references, thread memberships and message marks. Inspect partial work before continuing; no locks or background work transfer.
+
+Recovery inherits the failed turn's actual effort. If supported, it stays unchanged; unsupported `ultra` becomes `max` when supported (including Codex Luna and Claude). A fixed-effort model uses its sole catalog effort: Haiku 4.5 uses the `medium` placeholder without an effort flag. Converted efforts must still be allowed by the project. Other unsupported efforts stop; disallowed efforts and full limits wait with a reason. Counts survive restarts; a successful turn or explicit manual retry resets the chain, and replacement cycles stop. Manual pauses and subscription-quota pauses aren't crash recovery.
 
 ## Limits
 

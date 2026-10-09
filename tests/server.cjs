@@ -54,6 +54,8 @@ process.stdin.on('end', async () => {
   const args = process.argv.slice(2), id = Number(process.env.ACOM_ID), claude = path.basename(process.argv[1]) === 'claude';
   const resume = claude ? args.includes('--resume') : args[1] === 'resume';
   const model = args[args.indexOf(claude ? '--model' : '-m') + 1];
+  const previous=fs.existsSync(path.join(process.env.ACOM_HOME,'runs.jsonl')) ? fs.readFileSync(path.join(process.env.ACOM_HOME,'runs.jsonl'),'utf8').trim().split('\\n').map(JSON.parse).filter(r=>r.id===id) : [];
+  const task=previous[0]?.prompt || prompt;
   fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume }) + '\\n');
   const session = claude ? args[args.indexOf(resume?'--resume':'--session-id')+1] : resume ? args.at(-2) : crypto.randomUUID();
   console.log(JSON.stringify(claude ? {type:'system',subtype:'init',session_id:session} : { type: 'thread.started', thread_id: session }));
@@ -63,12 +65,17 @@ process.stdin.on('end', async () => {
   if (prompt.includes('REROUTE_TEST') && !resume) console.log(JSON.stringify({ type: 'model_reroute', from_model: 'gpt-6.1-sol', to_model: 'gpt-other', reason: 'high_risk_cyber_activity' }));
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
   if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
+  if (prompt.includes('REFUSAL_OK_TEST')) console.log(JSON.stringify({type:'refusal',message:'Cannot complete this request'}));
   if (prompt.includes('UNSUPPORTED_TEST')) { console.log(JSON.stringify({type:'turn.failed',error:{message:JSON.stringify({error:{message:"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}})}})); process.exitCode=1;return; }
-  if (prompt.includes('RETRY_CHAIN_TEST')) {
-    const flag = claude ? {type:'system',subtype:'model_refusal_no_fallback',original_model:model} : {type:'refusal'};
-    console.log(JSON.stringify(flag)); console.log(JSON.stringify(flag));
+  if (task.includes('CYBER_FAILURE_TEST') && !resume) {
+    const message='This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you’re doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying.';
+    console.log(JSON.stringify({type:'error',message})); console.log(JSON.stringify({type:'turn.failed',error:{message}})); process.exitCode=1; return;
   }
-  if (prompt.includes('HANDOFF_TEST') && !claude) { await new Promise(r=>setTimeout(r,500)); console.log(JSON.stringify({type:'refusal'})); }
+  if (task.includes('RETRY_COUNT_TEST') && model==='gpt-6-sol' || task.includes('RECOVER_ONCE_TEST') && previous.length%2===0 || task.includes('RETRY_CHAIN_TEST')) {
+    const failure=claude ? {type:'result',is_error:true,result:'Temporary test failure'} : {type:'turn.failed',error:{message:'Temporary test failure'}};
+    console.log(JSON.stringify(failure)); console.log(JSON.stringify(failure)); return;
+  }
+  if (prompt.includes('HANDOFF_TEST') && !claude) { await new Promise(r=>setTimeout(r,500)); console.log(JSON.stringify({type:'turn.failed',error:{message:'Temporary handoff failure'}})); return; }
   if (prompt.includes('SELF_CHANGE_TEST') && !resume) {
     await new Promise(r=>setTimeout(r,500));
     const configured=await fetch(process.env.ACOM_URL+'/agent-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,agent:id,model:'gpt-6-luna',effort:'high'})});
@@ -146,7 +153,7 @@ process.stdin.on('end', async () => {
     assert.deepEqual(defaults.harnesses.claude.flags, ['--dangerously-skip-permissions']);
     assert.equal(defaults.allow_agent_model_change,false);
     assert.equal(defaults.allow_agent_effort_change,false);
-    assert.deepEqual(defaults.flagged_retries,{});
+    assert.deepEqual(defaults.crash_retries,{});
     assert.equal(defaults.max_lock_ttl_secs,900);
     for (const ttl of [0,-1,1.5,4294967296,null]) {
       await api('PUT','/configs/1',{settings:{...defaults,max_lock_ttl_secs:ttl}},400);
@@ -297,19 +304,19 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', `/agents/${crashed.id}`)).session, crashSession);
     await api('PUT', `/projects/${a.id}/config`, {config:1});
     for (const task of ['REROUTE_TEST', 'POLICY_TEST']) {
-      const flagged = await api('POST', '/agents', { project: a.id, harness: 'codex', task });
-      await until(async () => (await api('GET', `/agents/${flagged.id}`)).state === 'paused', 'flagged pause');
-      const view = await api('GET', `/agents/${flagged.id}`);
-      assert.equal(view.pause_reason, 'flagged');
+      const failed = await api('POST', '/agents', { project: a.id, harness: 'codex', task });
+      await finished(failed.id,'crashed');
+      const view = await api('GET', `/agents/${failed.id}`);
       assert.match(view.problem, /rerouted|usage policy/);
-      await new Promise(resolve => setTimeout(resolve, 1100));
-      assert.equal((await api('GET', `/agents/${flagged.id}`)).state, 'paused');
-      await api('POST', `/agents/${flagged.id}/resume`, {});
-      await until(() => runs().filter(r => r.id === flagged.id).length === 2, 'same-model resume');
-      const resumed = runs().filter(r => r.id === flagged.id)[1];
+      await new Promise(resolve => setTimeout(resolve, 2100));
+      assert.equal((await api('GET', `/agents/${failed.id}`)).state, 'crashed');
+      assert.equal(runs().filter(r=>r.id===failed.id).length,1,'no rule means no automatic retry');
+      await api('POST', `/agents/${failed.id}/resume`, {});
+      await until(() => runs().filter(r => r.id === failed.id).length === 2, 'same-model resume');
+      const resumed = runs().filter(r => r.id === failed.id)[1];
       assert.equal(resumed.args[resumed.args.indexOf('-m') + 1], defaults.harnesses.codex.model);
-      await finished(flagged.id);
-      assert.equal((await api('GET', `/agents/${flagged.id}`)).problem, null);
+      await finished(failed.id);
+      assert.equal((await api('GET', `/agents/${failed.id}`)).problem, null);
     }
     // Independent self-change permissions apply to next turn, never mid-command.
     const selfConfig=structuredClone(defaults); selfConfig.allow_agent_model_change=true; selfConfig.allow_agent_effort_change=true;
@@ -333,17 +340,22 @@ process.stdin.on('end', async () => {
     await finished(self.id); assert.equal((await api('GET',`/agents/${self.id}`)).session,selfBefore.session);
     await api('PUT',`/projects/${a.id}/config`,{config:1});
 
-    // Explicit same-provider rule resumes once; repeated flag events cannot duplicate it.
+    // Explicit same-provider recovery preserves the failed turn, not queued choices.
     const retryConfig=structuredClone(defaults);
-    retryConfig.flagged_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna'};
+    retryConfig.crash_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna'};
     retryConfig.limits.active.hard=0;
     retryConfig.limits.active.soft=null;
-    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const legacyRetryConfig=structuredClone(retryConfig);
+    legacyRetryConfig.flagged_retries=legacyRetryConfig.crash_retries; delete legacyRetryConfig.crash_retries;
+    await api('PUT',`/projects/${a.id}/config`,{custom:legacyRetryConfig});
+    const migratedRules=(await api('GET',`/overview?project=${a.id}`)).settings;
+    assert.equal(migratedRules.crash_retries['gpt-6-sol'].same_model_retries,0,'old mappings default to immediate replacement');
+    assert.equal(migratedRules.flagged_retries,undefined,'old config names serialize using the new recovery name');
     const retry=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'POLICY_TEST',force:true});
     await until(async()=>(await api('GET',`/agents/${retry.id}`)).retry?.blocked?.includes('Hard limit'),'retry waits for an active slot');
     assert.equal(runs().filter(r=>r.id===retry.id).length,1);
     await api('POST','/agent-config',{id:retry.id,effort:'low'});
-    await stop(); await start(); // Preserve the flagged effort, not the queued one.
+    await stop(); await start(); // Preserve the failed effort, not the queued one.
     retryConfig.limits.active.hard=1;
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     await until(()=>runs().filter(r=>r.id===retry.id).length===2,'configured same-provider retry');
@@ -352,20 +364,103 @@ process.stdin.on('end', async () => {
     assert.ok(retryRuns[1].args.includes('model_reasoning_effort="high"'));
     assert.equal((await api('GET',`/agents/${retry.id}`)).effort,'high');
     assert.equal(fs.existsSync(`/proc/${retryRuns[0].pid}`),false,'old process exited before retry');
-    assert.match(retryRuns[1].prompt,/Explicit flagged-model retry/);
+    assert.match(retryRuns[1].prompt,/crash recovery/i);
     await finished(retry.id);
     retryConfig.limits.active=structuredClone(defaults.limits.active);
 
-    // Unsupported inherited effort stops visibly without downgrading or launching.
+    // An unsupported ultra maps to max on Luna, unless max is disallowed.
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     const incompatible=await api('POST','/agents',{project:a.id,harness:'codex',effort:'ultra',task:'POLICY_TEST'});
-    await until(async()=>(await api('GET',`/agents/${incompatible.id}`)).retry?.blocked?.includes("doesn't support effort ultra"),'unsupported inherited effort');
-    assert.equal(runs().filter(r=>r.id===incompatible.id).length,1);
-    assert.equal((await api('GET',`/agents/${incompatible.id}`)).effort,'ultra');
+    await until(()=>runs().filter(r=>r.id===incompatible.id).length===2,'ultra mapped to Luna max');
+    assert.ok(runs().filter(r=>r.id===incompatible.id)[1].args.includes('model_reasoning_effort="max"'));
+    assert.equal((await api('GET',`/agents/${incompatible.id}`)).effort,'max');
+    await finished(incompatible.id);
+
+    const forbiddenMapping=structuredClone(retryConfig);
+    forbiddenMapping.harnesses.codex.efforts=forbiddenMapping.harnesses.codex.efforts.filter(e=>e!=='max');
+    await api('PUT',`/projects/${a.id}/config`,{custom:forbiddenMapping});
+    const disallowed=await api('POST','/agents',{project:a.id,harness:'codex',effort:'ultra',task:'POLICY_TEST'});
+    await until(async()=>(await api('GET',`/agents/${disallowed.id}`)).retry?.blocked?.includes('effort'),'mapped max remains subject to project effort permissions');
+    assert.equal(runs().filter(r=>r.id===disallowed.id).length,1);
+    await api('POST',`/agents/${disallowed.id}/close`,{});
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+
+    // Duplicate error frames and the real cyber-risk wording are a single crash.
+    const cyber=await api('POST','/agents',{project:a.id,harness:'codex',task:'CYBER_FAILURE_TEST'});
+    await until(()=>runs().filter(r=>r.id===cyber.id).length===2,'cyber-risk process crash recovers');
+    assert.equal(runs().filter(r=>r.id===cyber.id)[1].model,'gpt-6-luna');
+    assert.match(runs().filter(r=>r.id===cyber.id)[1].prompt,/flagged for possible cybersecurity risk/);
+    await finished(cyber.id);
+    assert.equal(runs().filter(r=>r.id===cyber.id).length,2,'duplicate terminal frames do not launch duplicate retries');
+    const refusal=await api('POST','/agents',{project:a.id,harness:'codex',task:'REFUSAL_OK_TEST'});
+    await finished(refusal.id);
+    assert.equal(runs().filter(r=>r.id===refusal.id).length,1,'a normally completed refusal is not a crash');
+
+    // Two retries means original + two same-session attempts, then replacement.
+    retryConfig.crash_retries['gpt-6-sol'].same_model_retries=2;
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const counted=await api('POST','/agents',{project:a.id,harness:'codex',task:'RETRY_COUNT_TEST'});
+    await until(()=>runs().filter(r=>r.id===counted.id).length===2,'first same-model attempt');
+    await finished(counted.id,'crashed');
+    retryConfig.limits.active.hard=0; retryConfig.limits.active.soft=null;
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    await until(async()=>(await api('GET',`/agents/${counted.id}`)).retry?.blocked?.includes('Hard limit'),'second attempt waits within active limit');
+    await stop(); await start();
+    assert.equal(runs().filter(r=>r.id===counted.id).length,2,'restart does not bypass a waiting retry');
+    retryConfig.limits.active=structuredClone(defaults.limits.active);
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    await until(()=>runs().filter(r=>r.id===counted.id).length===4,'persisted retry count reaches replacement');
+    const countRuns=runs().filter(r=>r.id===counted.id);
+    assert.deepEqual(countRuns.map(r=>r.model),['gpt-6-sol','gpt-6-sol','gpt-6-sol','gpt-6-luna']);
+    assert.deepEqual(countRuns.map(r=>r.resume),[false,true,true,true]);
+    for(let index=1;index<countRuns.length;index++) {
+      assert.ok(countRuns[index].at-countRuns[index-1].at>=1900,'failures wait at least two seconds before the next attempt');
+      assert.equal(fs.existsSync(`/proc/${countRuns[index-1].pid}`),false,'prior process exited before the next attempt');
+    }
+    await finished(counted.id);
+
+    // Success starts a fresh retry budget on the next failed turn.
+    retryConfig.crash_retries['gpt-6-sol'].same_model_retries=1;
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const reset=await api('POST','/agents',{project:a.id,harness:'codex',task:'RECOVER_ONCE_TEST'});
+    await finished(reset.id);
+    assert.deepEqual(runs().filter(r=>r.id===reset.id).map(r=>r.model),['gpt-6-sol','gpt-6-sol']);
+    const resetThread=await api('POST','/threads',{project:a.id,title:'A new turn after successful recovery',members:[String(reset.id)]});
+    await api('POST','/messages',{thread:resetThread.id,text:'Continue with a fresh retry budget'});
+    await api('POST',`/agents/${reset.id}/reopen`,{});
+    await finished(reset.id);
+    assert.deepEqual(runs().filter(r=>r.id===reset.id).map(r=>r.model),Array(4).fill('gpt-6-sol'));
+
+    // An explicit manual retry also starts over rather than inheriting used attempts.
+    const manual=await api('POST','/agents',{project:a.id,harness:'codex',task:'RETRY_COUNT_TEST'});
+    await until(()=>runs().filter(r=>r.id===manual.id).length===2,'manual-reset first retry');
+    await finished(manual.id,'crashed');
+    await api('POST',`/agents/${manual.id}/resume`,{});
+    await until(()=>runs().filter(r=>r.id===manual.id).length===4,'manual retry has a new same-model budget');
+    assert.deepEqual(runs().filter(r=>r.id===manual.id).map(r=>r.model),Array(4).fill('gpt-6-sol'));
+    await api('POST',`/agents/${manual.id}/close`,{});
+    retryConfig.crash_retries['gpt-6-sol'].same_model_retries=0;
+
+    // User pause and server shutdown remain pauses, not recovery triggers.
+    await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const paused=await api('POST','/agents',{project:a.id,harness:'codex',task:'USER_PAUSE_TEST'});
+    await until(()=>runs().some(r=>r.id===paused.id),'pause fixture started');
+    await api('POST',`/agents/${paused.id}/pause`,{});
+    await new Promise(r=>setTimeout(r,2100));
+    assert.equal((await api('GET',`/agents/${paused.id}`)).state,'paused');
+    assert.equal(runs().filter(r=>r.id===paused.id).length,1);
+    await api('POST',`/agents/${paused.id}/close`,{});
+    const shutdown=await api('POST','/agents',{project:a.id,harness:'codex',task:'SERVER_STOP_TEST'});
+    await until(()=>runs().some(r=>r.id===shutdown.id),'shutdown fixture started');
+    await stop(); await start();
+    await new Promise(r=>setTimeout(r,2100));
+    assert.equal((await api('GET',`/agents/${shutdown.id}`)).state,'paused');
+    assert.equal(runs().filter(r=>r.id===shutdown.id).length,1);
+    await api('POST',`/agents/${shutdown.id}/close`,{});
 
     // Cross-provider handoff retains threads/marks, references the actual history,
-    // starts a fresh native session, and keeps the predecessor paused.
-    retryConfig.flagged_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5'};
+    // starts a fresh native session, and keeps the predecessor crashed.
+    retryConfig.crash_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5'};
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     const handoff=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'HANDOFF_TEST',group:'reviewers'});
     await api('POST','/agent-config',{id:handoff.id,effort:'low'});
@@ -386,10 +481,27 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET',`/agents/${replacement}`)).group,'reviewers');
     assert.ok((await api('GET',`/threads/${handoffThread.id}`)).members.includes(replacement));
     assert.ok((await api('GET',`/inbox/${replacement}?mark=in-progress`)).some(m=>m.id===handoffMessage.id));
-    await finished(replacement); assert.equal((await api('GET',`/agents/${handoff.id}`)).state,'paused');
+    assert.doesNotMatch(replacementRun.prompt,/respect provider policies|evade refusal|prohibited work/i);
+    await finished(replacement); assert.equal((await api('GET',`/agents/${handoff.id}`)).state,'crashed');
+
+    for(const [model,expected] of [['claude-sonnet-5-5','max'],['claude-haiku-4-5','medium']]) {
+      retryConfig.crash_retries['gpt-6-sol']={harness:'claude',model};
+      await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+      const effortSource=await api('POST','/agents',{project:a.id,harness:'codex',effort:'ultra',task:'HANDOFF_TEST'});
+      const targetId=await until(async()=>(await api('GET',`/agents/${effortSource.id}`)).retry?.replacement,`${model} mapped effort handoff`);
+      await until(()=>runs().some(r=>r.id===targetId),'mapped effort replacement launched');
+      const effortRun=runs().find(r=>r.id===targetId);
+      assert.equal(effortRun.model,model);
+      assert.equal((await api('GET',`/agents/${targetId}`)).effort,expected);
+      if(expected==='medium') assert.equal(effortRun.args.includes('--effort'),false,'fixed-effort Haiku receives no artificial flag');
+      else assert.equal(effortRun.args[effortRun.args.indexOf('--effort')+1],expected);
+      assert.match(effortRun.prompt,new RegExp(`ultra[^\\n]*${expected}`));
+      await finished(targetId);
+    }
 
     // A -> B -> A cycle stops after B even across providers and server restart.
-    retryConfig.flagged_retries['claude-sonnet-5-5']={harness:'codex',model:'gpt-6-sol'};
+    retryConfig.crash_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5'};
+    retryConfig.crash_retries['claude-sonnet-5-5']={harness:'codex',model:'gpt-6-sol'};
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
     const cycle=await api('POST','/agents',{project:a.id,harness:'codex',task:'RETRY_CHAIN_TEST'});
     const cycleNext=await until(async()=>{const v=await api('GET',`/agents/${cycle.id}`);return v.retry?.replacement;},'cycle first replacement');
@@ -404,6 +516,7 @@ process.stdin.on('end', async () => {
     await until(async()=>(await api('GET',`/agents/${rejected.id}`)).state==='crashed','unsupported model error');
     assert.match((await api('GET',`/agents/${rejected.id}`)).problem,/^The 'gpt-6.1-sol' model is not supported/);
     const noCap=structuredClone(defaults); noCap.limits.usage.codex={soft:null,hard:null}; noCap.auto_resume=false; noCap.usage_poll_secs=15;
+    noCap.crash_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna',same_model_retries:2};
     await api('PUT','/configs/1',{settings:noCap});
     const quota=(used,reset)=>({rateLimits:{primary:{usedPercent:used,resetsAt:reset}}});
     const subscription=path.join(home,'subscription.json');
@@ -413,6 +526,7 @@ process.stdin.on('end', async () => {
     await until(async()=>(await api('GET',`/agents/${exhausted.id}`)).pause_reason==='limit','harness subscription pause with no hard cap');
     await new Promise(resolve=>setTimeout(resolve,3200));
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
+    assert.equal(runs().filter(r=>r.id===exhausted.id).length,1,'quota waits do not consume crash retries');
     const checks=fs.readFileSync(path.join(home,'checks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     assert.ok(checks.some(c=>c.at>=resetAt*1000 && c.at<=(resetAt+2)*1000),'provider-reported reset gets an immediate check, not the periodic delay');
     noCap.usage_poll_secs=3600; await api('PUT','/configs/1',{settings:noCap});
@@ -549,10 +663,19 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
     const details = await api('GET', `/agents/${agent}`);
     assert.ok((await page.locator('#agent-details').textContent()).includes(details.conversation_history));
+    const selectedTask=await page.evaluate(()=>{
+      const task=document.querySelector('#agent-details dt[data-key="task"]').nextElementSibling;
+      window.selectedTaskNode=task;
+      const range=document.createRange(); range.selectNodeContents(task);
+      const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      return selection.toString();
+    });
     await api('POST', `/agents/${agent}/status`, { text: 'Live status from the test harness' });
     fs.appendFileSync(path.join(home, 'logs', `${agent}.txt`), '\nLive log line from the test harness\n');
     await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Live log line from the test harness'));
     assert.match(await page.locator('#agent-details').textContent(), /Live status from the test harness/);
+    assert.equal(await page.evaluate(()=>getSelection().toString()),selectedTask,'live status and activity updates preserve task selection');
+    assert.equal(await page.evaluate(()=>window.selectedTaskNode===document.querySelector('#agent-details dt[data-key="task"]').nextElementSibling),true,'task field remains the same DOM node');
     await page.locator('#agent-dialog button[value=cancel]').click();
     await page.reload();
     assert.equal((await api('GET', `/threads/${thread}`)).unread, 0);
