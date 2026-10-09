@@ -479,6 +479,9 @@ pub struct App {
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS configs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, settings TEXT NOT NULL);
+-- ID 1 belongs to the binary's virtual Default, not a stored config.
+INSERT INTO sqlite_sequence(name,seq) SELECT 'configs',1
+  WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='configs');
 CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL,
   config INTEGER DEFAULT 1, custom TEXT);
 CREATE TABLE IF NOT EXISTS agents (
@@ -512,20 +515,19 @@ CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at
 /// database or alter its records. Starting with a separate ACOM_HOME is safe.
 fn check_stored_schema(db: &Connection) -> R<()> {
     let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('agents','configs','projects'))",
         [],
         |r| r.get(0),
     )?;
     if !exists {
         return Ok(());
     }
-    let project_sql: Option<String> = db
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let autoincrement_tables: i64 = db.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('projects','configs')
+         AND upper(sql) LIKE '%AUTOINCREMENT%'",
+        [],
+        |r| r.get(0),
+    )?;
     if db
         .prepare(
             "SELECT a.project, a.seen_model, a.problem, t.project, l.project, x.project,
@@ -533,7 +535,8 @@ fn check_stored_schema(db: &Connection) -> R<()> {
                    FROM agents a, threads t, locks l, activity x, projects p, configs c, agent_retries r LIMIT 0",
         )
         .is_err()
-        || !project_sql.is_some_and(|s| s.to_ascii_uppercase().contains("AUTOINCREMENT"))
+        || autoincrement_tables != 2
+        || db.query_row("SELECT EXISTS(SELECT 1 FROM configs WHERE id=1 OR name='Default')", [], |r| r.get::<_, bool>(0))?
     {
         return Err(bad(
             "this database uses an earlier development schema. It has not been changed. Keep it as a backup and start with a separate ACOM_HOME folder.",
@@ -618,16 +621,13 @@ impl St {
                 .db
                 .query_row(
                     "SELECT coalesce(p.custom, c.settings) FROM projects p
-                     LEFT JOIN configs c ON c.id=p.config WHERE p.id=?1",
+                     LEFT JOIN configs c ON c.id=p.config AND p.config<>1 WHERE p.id=?1",
                     [p],
                     |r| r.get(0),
                 )
                 .ok()
                 .flatten(),
-            None => self
-                .db
-                .query_row("SELECT settings FROM configs WHERE id=1", [], |r| r.get(0))
-                .ok(),
+            None => None,
         };
         json.and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
@@ -1181,11 +1181,6 @@ impl App {
         check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
         db.execute("UPDATE usage_checks SET in_flight=0", [])?;
-        db.execute(
-            "INSERT INTO configs(id,name,settings) VALUES(1,'Default',?1)
-             ON CONFLICT(id) DO UPDATE SET name='Default',settings=excluded.settings",
-            [serde_json::to_string(&Settings::default()).unwrap()],
-        )?;
         let mut st = St {
             db,
             queues: HashMap::new(),
@@ -2872,15 +2867,17 @@ impl App {
 
     pub fn configs(&self) -> R<Vec<Value>> {
         let st = self.lock();
-        let mut v = rows(
+        let mut v = vec![json!({"id":1,"name":"Default","settings":Settings::default()})];
+        v.extend(rows(
             &st.db,
             "SELECT id, name, settings FROM configs ORDER BY id",
             [],
-        )?;
+        )?);
         for c in &mut v {
-            let settings: Settings =
-                serde_json::from_str(c["settings"].as_str().unwrap_or("{}")).unwrap_or_default();
-            c["settings"] = serde_json::to_value(settings).unwrap();
+            if let Some(text) = c["settings"].as_str() {
+                let settings: Settings = serde_json::from_str(text).unwrap_or_default();
+                c["settings"] = serde_json::to_value(settings).unwrap();
+            }
             let used = rows(
                 &st.db,
                 "SELECT id FROM projects WHERE config=?1 AND custom IS NULL ORDER BY id",
@@ -2898,6 +2895,9 @@ impl App {
         let name = name.trim();
         if name.is_empty() {
             return Err(bad("give the config a name"));
+        }
+        if name == "Default" {
+            return Err(conflict("Default is reserved for the built-in config"));
         }
         let added = st.db.execute(
             "INSERT OR IGNORE INTO configs(name,settings) VALUES(?1,?2)",
@@ -2938,6 +2938,9 @@ impl App {
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .unwrap_or(&old_name);
+        if name == "Default" {
+            return Err(conflict("Default is reserved for the built-in config"));
+        }
         st.db
             .execute(
                 "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
@@ -2977,7 +2980,7 @@ impl App {
         Ok(())
     }
 
-    /// Make a project use a saved config, or its own custom settings.
+    /// Make a project use Default, a saved config, or its own custom settings.
     pub fn set_project_config(
         &self,
         project: i64,
@@ -2990,11 +2993,14 @@ impl App {
         let old = st.settings_for(Some(project));
         match (config, custom) {
             (Some(id), None) => {
-                let name: String = st
-                    .db
-                    .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
-                    .optional()?
-                    .ok_or_else(|| not_found(format!("no config {id}")))?;
+                let name: String = if id == 1 {
+                    "Default".into()
+                } else {
+                    st.db
+                        .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+                        .optional()?
+                        .ok_or_else(|| not_found(format!("no config {id}")))?
+                };
                 st.db.execute(
                     "UPDATE projects SET config=?2, custom=NULL WHERE id=?1",
                     params![project, id],
@@ -3015,7 +3021,7 @@ impl App {
             }
             _ => {
                 return Err(bad(
-                    "give either config (a saved config's id) or custom (settings)",
+                    "give either config (Default or a saved config's id) or custom (settings)",
                 ));
             }
         }
@@ -3080,7 +3086,7 @@ impl App {
             &st.db,
             "SELECT p.id, p.name, p.path,
                     CASE WHEN p.custom IS NULL THEN p.config END config,
-                    CASE WHEN p.custom IS NULL THEN c.name ELSE 'Custom' END config_name,
+                    CASE WHEN p.custom IS NOT NULL THEN 'Custom' WHEN p.config=1 THEN 'Default' ELSE c.name END config_name,
                     (SELECT count(*) FROM agents a WHERE a.project=p.id) agents,
                     (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active,
                     (SELECT count(*) FROM threads t JOIN members b ON b.thread_id=t.id AND b.agent_id=0
@@ -3316,8 +3322,11 @@ mod tests {
     fn older_development_state_is_refused_without_changing_records() {
         let db = Connection::open_in_memory().unwrap();
         assert!(check_stored_schema(&db).is_ok());
-        db.execute_batch(&SCHEMA.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY"))
-            .unwrap();
+        db.execute_batch(&SCHEMA.replace(
+            "projects (id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "projects (id INTEGER PRIMARY KEY",
+        ))
+        .unwrap();
         db.execute(
             "INSERT INTO projects(id,path,name,created_at) VALUES(42,'/test','test',0)",
             [],
@@ -3333,6 +3342,51 @@ mod tests {
         let current = Connection::open_in_memory().unwrap();
         current.execute_batch(SCHEMA).unwrap();
         assert!(check_stored_schema(&current).is_ok());
+        let bad_allocator = Connection::open_in_memory().unwrap();
+        bad_allocator.execute_batch(SCHEMA).unwrap();
+        bad_allocator.execute_batch("DROP TABLE configs;
+            CREATE TABLE configs(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,settings TEXT NOT NULL);").unwrap();
+        assert!(
+            check_stored_schema(&bad_allocator)
+                .unwrap_err()
+                .1
+                .contains("earlier development schema")
+        );
+        current
+            .execute(
+                "INSERT INTO configs(id,name,settings) VALUES(1,'Default','{}')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            check_stored_schema(&current)
+                .unwrap_err()
+                .1
+                .contains("earlier development schema")
+        );
+        assert_eq!(
+            current
+                .query_row("SELECT count(*) FROM configs WHERE id=1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        current
+            .execute("DELETE FROM configs WHERE id=1", [])
+            .unwrap();
+        let partial = Connection::open_in_memory().unwrap();
+        partial
+            .execute_batch(
+                "CREATE TABLE configs(id INTEGER PRIMARY KEY,name TEXT,settings TEXT);
+            INSERT INTO configs VALUES(1,'Default','{}');",
+            )
+            .unwrap();
+        assert!(
+            check_stored_schema(&partial)
+                .unwrap_err()
+                .1
+                .contains("earlier development schema")
+        );
         current.execute_batch("DROP TABLE agent_retries;
             CREATE TABLE agent_retries(agent_id INTEGER PRIMARY KEY,source TEXT,tried TEXT,handled INTEGER,replacement INTEGER,blocked TEXT);
             INSERT INTO agent_retries VALUES(1,'m','[]',0,NULL,NULL);").unwrap();
@@ -3357,11 +3411,6 @@ mod tests {
         db.execute_batch(SCHEMA).unwrap();
         db.execute_batch(
             "INSERT INTO projects(id,path,name,created_at) VALUES(1,'/p1','p1',0),(2,'/p2','p2',0)",
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO configs(id,name,settings) VALUES(1,'Default',?1)",
-            [serde_json::to_string(&Settings::default()).unwrap()],
         )
         .unwrap();
         for (id, project) in [(1, 1), (2, 1), (3, 1), (4, 2)] {
@@ -3678,7 +3727,8 @@ mod tests {
     fn each_project_has_its_own_limits() {
         // Project 1 has three working agents, project 2 has one.
         let st = st();
-        save_config(&st, 1, &active_hard(Some(3.0)));
+        save_config(&st, 2, &active_hard(Some(3.0)));
+        st.db.execute("UPDATE projects SET config=2", []).unwrap();
         assert_eq!(
             st.no_room(1, "claude").unwrap().unwrap(),
             "Hard limit reached: 3 active agents (soft none, hard 3)"
@@ -3703,9 +3753,9 @@ mod tests {
         st.db.execute("UPDATE agents SET done_req=0", []).unwrap();
 
         // Project 1 switches to a saved config with no limit; project 2 gets its own.
-        save_config(&st, 2, &active_hard(None));
+        save_config(&st, 3, &active_hard(None));
         st.db
-            .execute("UPDATE projects SET config=2 WHERE id=1", [])
+            .execute("UPDATE projects SET config=3 WHERE id=1", [])
             .unwrap();
         assert_eq!(st.no_room(1, "claude").unwrap(), None);
         assert!(
@@ -3722,7 +3772,7 @@ mod tests {
             .unwrap();
         assert!(st.no_room(2, "claude").unwrap().is_some());
         // The Default config is unchanged for everyone else.
-        assert_eq!(st.settings_for(None).limits.active.hard, Some(3.0));
+        assert_eq!(st.settings_for(None), Settings::default());
     }
 
     /// A real App on a temporary database, with two projects and one idle claude agent each
@@ -3744,9 +3794,18 @@ mod tests {
     }
 
     #[test]
-    fn default_is_read_only_and_startup_preserves_named_settings() {
+    fn default_is_binary_only_and_startup_preserves_named_settings() {
         let app = app_with_two_projects();
         let original = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM configs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(app.projects().unwrap()[0]["config_name"], "Default");
+        assert_eq!(app.configs().unwrap()[0]["projects"], json!([1, 2]));
         let mut mine = Settings {
             max_lock_ttl_secs: 42,
             ..Settings::default()
@@ -3760,6 +3819,19 @@ mod tests {
             },
         );
         let id = app.add_config("Mine", mine.clone(), "user").unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(
+            app.add_config(" Default ", mine.clone(), "user")
+                .unwrap_err()
+                .0,
+            409
+        );
+        assert_eq!(
+            app.put_config(id, Some(" Default "), mine.clone(), "user")
+                .unwrap_err()
+                .0,
+            409
+        );
         for name in [None, Some("Changed")] {
             assert_eq!(
                 app.put_config(1, name, mine.clone(), "user").unwrap_err().0,
@@ -3771,14 +3843,6 @@ mod tests {
         app.set_project_config(1, Some(id), None, "user").unwrap();
         let expected = serde_json::to_value(&mine).unwrap();
         let home = app.home.clone();
-        // A persisted row cannot turn the built-in preset into a mutable config.
-        app.lock()
-            .db
-            .execute(
-                "UPDATE configs SET settings=?1 WHERE id=1",
-                [serde_json::to_string(&mine).unwrap()],
-            )
-            .unwrap();
         drop(app);
         let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
         assert_eq!(app.configs().unwrap()[0]["settings"], original);
@@ -3788,6 +3852,8 @@ mod tests {
             expected
         );
         app.set_project_config(1, Some(1), None, "user").unwrap();
+        assert_eq!(app.projects().unwrap()[0]["config_name"], "Default");
+        assert_eq!(app.configs().unwrap()[0]["projects"], json!([1, 2]));
         assert_eq!(
             serde_json::to_value(app.settings(Some(1))).unwrap(),
             original
@@ -3799,6 +3865,24 @@ mod tests {
             expected
         );
         app.put_config(id, Some("Mine"), mine, "user").unwrap();
+        {
+            let st = app.lock();
+            let saved: (i64, String) = st
+                .db
+                .query_row("SELECT id,name FROM configs", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(saved, (id, "Mine".into()));
+            assert_eq!(
+                st.db
+                    .query_row("SELECT count(*) FROM configs", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        app.remove_config(id, "user").unwrap();
+        assert!(app.add_config("Next", Settings::default(), "user").unwrap() > id);
     }
 
     #[test]

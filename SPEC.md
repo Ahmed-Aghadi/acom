@@ -230,7 +230,7 @@ Confirmations: launching past a hard limit; pausing an agent that holds locks (r
 
 Edited on the UI's settings page, per project, and stored in the database. A **config** is a full set of settings:
 
-- **Default** (ID `1`) is built in and immutable. New projects use it; it cannot be edited, renamed or removed. Copy its settings to a saved config or Custom to make changes.
+- **Default** (virtual ID `1`) comes from the binary, not a database row. New projects use it; it cannot be edited, renamed or removed. Copy its settings to a saved config or Custom to make changes. Its name and ID are reserved; saved config IDs start at `2`.
 - **Saved configs** have names. You save one from the settings page ("Save as new config"), and any project can use it. Editing a saved config changes every project using it, and the page says which. A saved config no project uses can be removed.
 - **Custom**: a project can have its own settings instead, starting as a copy of Default.
 
@@ -267,7 +267,7 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 | Agents | `GET /agents?project=`, `GET /agents/{id}` (adds the project's name and path, `limits` text and `lost_locks`), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (`locks`: `release` or `keep`), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all` |
 | Threads & messages | `GET /threads?project=`, `POST /threads` (`project` for the user, `include_user` defaults true), `GET /threads/{tid}`, `POST /threads/{tid}/members`, `POST /threads/{tid}/user` (`joined`: boolean), `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}`, `GET /inbox/{agent}?mark=`, `POST /marks` |
 | Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
-| Configs | `GET /configs` (each with its settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: a saved config's id, or `custom`: settings) |
+| Configs | `GET /configs` (virtual Default plus saved configs, each with settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: `1` for Default or a saved config's id, or `custom`: settings) |
 | Other | `GET /limits?project=` (includes usage and check status), `POST /usage/check` (`provider`), `GET /activity?project=`, `POST /hook/{agent}` (what's new for that agent), `GET /models` (plain-text reference), `POST /agent-config` (`id`, optional `agent`, `model`, `effort`; next-turn configuration) |
 
 ## Build notes
@@ -305,7 +305,7 @@ notices  (id, agent_id, text, at, shown)                -- what to tell an agent
 usage    (provider, win, used_pct, resets_at, at)
 usage_checks (provider, checked_at, attempted_at, next_check, error, in_flight)
 activity (id, project, at, actor, what)                -- project NULL: about all projects
-configs  (id, name, settings)                          -- id 1 is Default; settings is JSON
+configs  (id, name, settings)                          -- saved configs only, IDs >= 2; settings is JSON
 ```
 
 ## Not included

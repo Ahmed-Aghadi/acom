@@ -35,7 +35,7 @@ An open **Details** dialog refreshes changed fields and recent activity every tw
 
 When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so any new message in its threads wakes it. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
-Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Saved and Custom settings are kept across upgrades. Default always uses the built-in preset; copy it before changing settings.
+Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Saved and Custom settings are kept across upgrades. Default comes directly from the binary and is never stored in the database; copy it before changing settings.
 
 Settings → Locks requires a maximum lock TTL in seconds (default 900 / 15 minutes, including older configs without this setting). Every acquisition or renewal expires: omitted `--ttl` uses the maximum, and larger or nonpositive TTLs are rejected. Lowering it shortens existing oversized leases and notifies their holders; increasing it doesn't extend them. Agents may renew, and user-frozen pauses still stop the clock. Expiry frees the lock but does not stop the agent or its commands.
 
@@ -89,6 +89,8 @@ Attempt counts and visited models survive restarts; successful turns and manual 
 Agents run unattended, so nobody can answer a permission prompt. By default they run with full permissions: Claude with `--dangerously-skip-permissions`, Codex with `--dangerously-bypass-approvals-and-sandbox`. They can do anything your user account can, so only run acom where that's acceptable. To restrict them, change the extra launch flags in Settings, e.g. `--permission-mode acceptEdits` for Claude or `--sandbox workspace-write` for Codex; anything the harness would then ask about is denied.
 
 ## Test
+
+The server regression test uses fake clients and requires Node with `node:sqlite`.
 
 ```sh
 cargo test

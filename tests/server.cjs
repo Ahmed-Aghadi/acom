@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const { DatabaseSync } = require('node:sqlite');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
 
@@ -58,7 +59,7 @@ process.stdin.on('end', async () => {
   const args = process.argv.slice(2), id = Number(process.env.ACOM_ID), claude = path.basename(process.argv[1]) === 'claude';
   const resume = claude ? args.includes('--resume') : args[1] === 'resume';
   const model = args[args.indexOf(claude ? '--model' : '-m') + 1];
-  const previous=fs.existsSync(path.join(process.env.ACOM_HOME,'runs.jsonl')) ? fs.readFileSync(path.join(process.env.ACOM_HOME,'runs.jsonl'),'utf8').trim().split('\\n').map(JSON.parse).filter(r=>r.id===id) : [];
+  const previous=fs.existsSync(path.join(process.env.ACOM_HOME,'runs.jsonl')) ? fs.readFileSync(path.join(process.env.ACOM_HOME,'runs.jsonl'),'utf8').split('\\n').slice(0,-1).map(JSON.parse).filter(r=>r.id===id) : [];
   const task=previous[0]?.prompt || prompt;
   fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume }) + '\\n');
   const session = claude ? args[args.indexOf(resume?'--resume':'--session-id')+1] : resume ? args.at(-2) : crypto.randomUUID();
@@ -110,6 +111,7 @@ process.stdin.on('end', async () => {
       if (server.exitCode !== null) throw new Error(`Server exited: ${stderr}`);
       try { return (await fetch(url + '/overview')).ok; } catch { return false; }
     }, 'server startup');
+    assert.ok(storedConfigs().every(c=>c.id!==1 && c.name!=='Default'),'startup must not persist the virtual Default');
   };
   const stop = async () => {
     if (server && server.exitCode === null) {
@@ -128,7 +130,13 @@ process.stdin.on('end', async () => {
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
   };
-  const runs = () => fs.existsSync(path.join(home, 'runs.jsonl')) ? fs.readFileSync(path.join(home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
+  // A read can overlap appendFileSync; only newline-terminated records are complete.
+  const runs = () => fs.existsSync(path.join(home, 'runs.jsonl')) ? fs.readFileSync(path.join(home, 'runs.jsonl'), 'utf8').split('\n').slice(0,-1).map(JSON.parse) : [];
+  const storedConfigs = () => {
+    const db=new DatabaseSync(path.join(home,'acom.db'),{readOnly:true});
+    try { return db.prepare('SELECT id,name,settings FROM configs ORDER BY id').all().map(row=>({...row})); }
+    finally { db.close(); }
+  };
   const finished = (id, state = 'closed') => until(async () => (await api('GET', `/agents/${id}`)).state === state, `agent ${id} ${state}`);
   try {
     await start();
@@ -136,6 +144,7 @@ process.stdin.on('end', async () => {
     await api('POST', '/agents', { harness: 'codex', task: 'Missing project' }, 400);
     const builtin = (await api('GET', '/configs')).find(c=>c.id===1);
     assert.equal(builtin.name,'Default');
+    assert.deepEqual(storedConfigs(),[],'fresh database contains no saved Default settings');
     const defaults = structuredClone(builtin.settings);
     assert.equal(defaults.harnesses.codex.model,'gpt-6-sol');
     await api('PUT','/configs/1',{settings:defaults},409);
@@ -143,6 +152,10 @@ process.stdin.on('end', async () => {
     await api('POST','/configs/1/remove',{},409);
     defaults.prompts={launch:'Literal {task} launch',wake:'Literal {updates} wake',resume:'Literal {updates} resume'};
     const mine=await api('POST','/configs',{name:'Mine',settings:defaults});
+    assert.equal(mine.id,2,'the virtual Default reserves ID 1 without storing a config row');
+    await api('PUT',`/configs/${mine.id}`,{name:'Default',settings:defaults},409);
+    await api('POST','/configs',{name:'Default',settings:defaults},409);
+    assert.deepEqual(storedConfigs().map(c=>({id:c.id,name:c.name})),[{id:mine.id,name:'Mine'}]);
     const folder = await api('GET', '/folders');
     assert.equal(folder.path, fs.realpathSync(os.homedir()));
     fs.writeFileSync(path.join(first,'visible.txt'),'file listing, not file contents');
@@ -662,7 +675,9 @@ process.stdin.on('end', async () => {
     const savedRead = (await api('GET', `/threads/${thread.id}`)).last_read;
     await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread survives restart' });
     await api('PUT',`/configs/${mine.id}`,{name:'Mine renamed',settings:defaults});
+    const savedConfigRows=storedConfigs();
     await stop(); await start();
+    assert.deepEqual(storedConfigs(),savedConfigRows,'restart leaves only named configs and preserves their exact saved settings');
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, savedRead);
     assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 1);
     assert.equal((await api('GET', `/overview?project=${a.id}`)).settings.auto_resume, false);
