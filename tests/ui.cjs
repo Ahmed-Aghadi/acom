@@ -894,6 +894,54 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   assert.deepEqual(data.settings.flagged_retries, {});
 }));
 
+test('retry model choices exclude the source and update when source or provider changes', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('#add-retry-rule').click();
+  const rule = page.locator('[data-retry-rule]').first();
+  const source = rule.locator('[name=retry_source]'), model = rule.locator('[name=retry_model]');
+  assert.equal(await source.inputValue(), 'claude-sonnet-5-5');
+  assert.equal(await model.locator('option[value="claude-sonnet-5-5"]').count(), 0);
+  assert.equal(await model.inputValue(), 'claude-opus-5-5');
+  await source.selectOption('claude-opus-5-5');
+  assert.equal(await model.locator('option[value="claude-opus-5-5"]').count(), 0);
+  assert.equal(await model.inputValue(), 'claude-sonnet-5-5');
+  await rule.locator('[name=retry_harness]').selectOption('codex');
+  await model.selectOption('gpt-6-luna');
+  await source.selectOption('gpt-6-luna');
+  assert.equal(await model.locator('option[value="gpt-6-luna"]').count(), 0);
+  assert.notEqual(await model.inputValue(), 'gpt-6-luna');
+  await source.selectOption('claude-opus-5-5');
+  assert.equal(await model.locator('option[value="gpt-6-luna"]').count(), 1);
+  await model.selectOption('gpt-6-luna');
+  await page.evaluate(() => refresh());
+  assert.equal(await model.inputValue(), 'gpt-6-luna');
+  await saveSettings(page);
+  assert.deepEqual(data.settings.flagged_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna'}});
+}));
+
+test('custom retry IDs cannot equal the source, including when editing the source', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  await page.locator('#add-retry-rule').click();
+  const rule = page.locator('[data-retry-rule]').first();
+  await rule.locator('[name=retry_source]').selectOption('__custom__');
+  await rule.locator('[name=retry_custom_source]').fill('claude-opus-5-5');
+  assert.equal(await rule.locator('[name=retry_model] option[value="claude-opus-5-5"]').count(), 0);
+  await rule.locator('[name=retry_custom_source]').fill('future-source');
+  await rule.locator('[name=retry_model]').selectOption('__custom__');
+  const target = rule.locator('[name=retry_custom_model]');
+  await target.fill(' future-source ');
+  assert.equal(await target.evaluate(el => el.validationMessage), 'Choose a different replacement model.');
+  const writes = data.requests.length;
+  await page.locator('[form=settings-form]').click();
+  assert.equal(data.requests.length, writes);
+  await target.fill('future-target');
+  assert.equal(await target.evaluate(el => el.validationMessage), '');
+  await rule.locator('[name=retry_custom_source]').fill('future-target');
+  assert.equal(await target.evaluate(el => el.validationMessage), 'Choose a different replacement model.');
+  await rule.locator('[name=retry_source]').selectOption('claude-sonnet-5-5');
+  assert.equal(await target.evaluate(el => el.validationMessage), '');
+}));
+
 test('retry rules support custom IDs and reject duplicate source models without writes', async () => fixture(async (page, data) => {
   await page.locator('[data-page=settings]').click();
   await page.locator('#add-retry-rule').click();

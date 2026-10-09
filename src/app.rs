@@ -4101,6 +4101,9 @@ mod tests {
         let mut s = Settings::default();
         s.flagged_retries.insert("gpt-6-sol".into(), rule);
         assert!(s.check().is_ok());
+        s.flagged_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-sol".into();
+        assert!(s.check().unwrap_err().1.contains("different target model"));
+        s.flagged_retries.get_mut("gpt-6-sol").unwrap().model = "gpt-6-luna".into();
         s.flagged_retries.get_mut("gpt-6-sol").unwrap().harness = "claude".into();
         assert!(s.check().unwrap_err().1.contains("belongs to codex"));
     }

@@ -705,9 +705,15 @@
       const source = $('[name=retry_source]', root);
       if (![...source.options].some(o => o.value === '__custom__')) source.insertAdjacentHTML('beforeend', '<option value="__custom__">Custom model…</option>');
       showCustom(source, $('[data-retry-custom-source]', root));
+      const sourceId = source.value === '__custom__' ? $('[name=retry_custom_source]', root).value.trim() : source.value;
       const model = $('[name=retry_model]', root);
-      if (providerChanged) model.innerHTML = modelOptions(harness, retryAllowed(harness, 'models'));
+      const selected = providerChanged ? '' : model.value;
+      const models = [...new Set([...retryAllowed(harness, 'models'), ...(selected && selected !== '__custom__' ? [selected] : [])])].filter(id => id !== sourceId);
+      model.innerHTML = modelOptions(harness, models, selected);
+      if (selected === '__custom__') model.value = selected;
       showCustom(model, $('[data-retry-custom-model]', root));
+      const custom = $('[name=retry_custom_model]', root);
+      custom.setCustomValidity(model.value === '__custom__' && sourceId && custom.value.trim() === sourceId ? 'Choose a different replacement model.' : '');
     }
     function renderAgentConfig(a) {
       const root = $('#agent-config');
@@ -1007,7 +1013,11 @@
       if (['allowed_model', 'allowed_effort'].includes(event.target.name)) syncHarnessChoices(root);
       if (event.target.name === 'model') { showCustom(event.target, $('[data-custom-default]', root)); syncDefaultEfforts(root); }
     });
-    $('#settings-form').addEventListener('input', event => { if (state.editor && event.target.id !== 'config-select') state.editor.dirty = true; });
+    $('#settings-form').addEventListener('input', event => {
+      if (state.editor && event.target.id !== 'config-select') state.editor.dirty = true;
+      const retry = event.target.closest('[data-retry-rule]');
+      if (retry && ['retry_custom_source', 'retry_custom_model'].includes(event.target.name)) syncRetryChoices(retry);
+    });
     $('#agent-config').addEventListener('change', event => {
       const root = $('#agent-config'), model = $('[name=agent_model]', root);
       showCustom(model, $('[data-agent-custom-model]', root));
