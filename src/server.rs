@@ -227,6 +227,17 @@ fn user(b: &Value) -> String {
 
 fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Reply> {
     use Reply::Json as J;
+    // Zero identifies the user; negative identities must never reach a write.
+    for key in ["agent", "via"] {
+        if opt_int(b, key).is_some_and(|id| id < 0) {
+            return Err(bad(format!(
+                "{key} must be 0 (user) or a positive agent ID"
+            )));
+        }
+    }
+    if q.int("agent")?.is_some_and(|id| id < 0) {
+        return Err(bad("agent must be 0 (user) or a positive agent ID"));
+    }
     Ok(match (method, p) {
         ("GET", []) => Reply::Html(UI),
         ("GET", ["models"]) => Reply::Text(crate::app::MODELS),
@@ -297,7 +308,10 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["agents"]) => J(json!(
             app.agents(q.int("project")?, q.get("group").as_deref())?
         )),
-        ("GET", ["agents", a]) => J(app.agent_view(id(a)?)?),
+        ("GET", ["agents", a]) => J(match q.int("agent")? {
+            None => app.agent_view(id(a)?)?,
+            agent => app.agent_view_for(id(a)?, agent)?,
+        }),
         ("GET", ["agents", a, "log"]) => {
             let n = q.int("lines")?.unwrap_or(200).max(1) as usize;
             let txt = std::fs::read_to_string(crate::run::log_path(app, id(a)?, "txt"))

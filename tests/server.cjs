@@ -30,6 +30,74 @@ async function freePort() {
   return port;
 }
 
+test('CLI paths and agent details use caller context; negative API actors cannot write', async () => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'acom-caller-context-'));
+  const home=path.join(root,'state'), serverCwd=path.join(root,'server'), clientCwd=path.join(root,'client');
+  const emptyBin=path.join(root,'empty-bin');
+  for(const dir of [home,serverCwd,clientCwd,emptyBin,path.join(serverCwd,'child'),path.join(clientCwd,'child')]) fs.mkdirSync(dir,{recursive:true});
+  const env={...process.env,ACOM_HOME:home,CODEX_HOME:path.join(root,'codex'),CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'),PATH:emptyBin};
+  delete env.ACOM_ID; delete env.ACOM_URL; delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  const url=`http://127.0.0.1:${await freePort()}`;
+  const server=spawn(binary,['serve','--port',new URL(url).port],{cwd:serverCwd,env,stdio:['ignore','ignore','pipe']});
+  let errors=''; server.stderr.on('data',chunk=>errors+=chunk);
+  const api=async(method,route,body,status=200)=>{
+    const res=await fetch(url+route,{method,headers:{'Content-Type':'application/json'},...(body ? {body:JSON.stringify(body)} : {})});
+    const value=await res.json(); assert.equal(res.status,status,JSON.stringify(value)); return value;
+  };
+  const cli=(args,extra={})=>spawnSync(binary,args,{cwd:clientCwd,env:{...env,...extra},encoding:'utf8'});
+  try {
+    await until(async()=>{
+      if(server.exitCode!==null) throw Error(`Server exited: ${errors}`);
+      try{return (await fetch(url+'/overview')).ok;}catch{return false;}
+    },'caller-context server startup');
+    const added=cli(['project','add','child']);
+    assert.equal(added.status,0,added.stderr);
+    const projects=await api('GET','/projects');
+    assert.equal(projects.length,1);
+    assert.equal(projects[0].path,path.join(clientCwd,'child'),'relative paths belong to the CLI caller, even when the server has the same child name');
+    const a=await api('POST','/projects',{path:clientCwd}), b=await api('POST','/projects',{path:serverCwd});
+    const db=new DatabaseSync(path.join(home,'acom.db'));
+    try {
+      const insert=db.prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
+      insert.run(1,a.id,'local agent','local task','codex','gpt-6-sol','medium','closed',0,0);
+      insert.run(2,b.id,'foreign agent','foreign private task','codex','gpt-6-sol','medium','closed',0,0);
+      insert.run(3,a.id,'local peer','peer task','codex','gpt-6-sol','medium','closed',0,0);
+    } finally {db.close();}
+    const actor={ACOM_ID:'1'};
+    const local=cli(['agent','1'],actor);
+    assert.equal(local.status,0,local.stderr); assert.match(local.stdout,/local task/);
+    const peer=cli(['agent','3'],actor);
+    assert.equal(peer.status,0,peer.stderr); assert.match(peer.stdout,/peer task/);
+    const foreign=cli(['agent','2'],actor);
+    assert.equal(foreign.status,1); assert.match(foreign.stderr,/another project/);
+    assert.doesNotMatch(foreign.stdout,/foreign private task/);
+    const user=cli(['agent','2']);
+    assert.equal(user.status,0,user.stderr); assert.match(user.stdout,/foreign private task/);
+    assert.equal((await api('GET','/agents/1?agent=1')).id,1);
+    assert.equal((await api('GET','/agents/3?agent=1')).id,3);
+    await api('GET','/agents/2?agent=1',null,400);
+    await api('GET','/agents/2?agent=99999',null,404);
+    assert.equal((await api('GET','/agents/2?agent=0')).id,2);
+    const thread=await api('POST','/threads',{project:a.id,title:'Invalid actor must not join'});
+    const before=await api('GET',`/threads/${thread.id}`);
+    await api('POST','/messages',{agent:-7,thread:thread.id,text:'ghost author'},400);
+    assert.deepEqual(await api('GET',`/threads/${thread.id}`),before,'invalid sender cannot create messages, membership events or unread counts');
+    await api('POST','/threads',{agent:-7,project:a.id,title:'ghost creator'},400);
+    await api('POST','/agents',{agent:-7,project:a.id,harness:'codex',task:'No process may start'},400);
+    await api('POST','/agent-config',{agent:-7,id:1,effort:'high'},400);
+    await api('POST','/projects',{via:-7,path:clientCwd},400);
+    await api('GET','/agents/2?agent=-7',null,400);
+    assert.equal((await api('GET','/agents')).length,3);
+    assert.equal((await api('GET','/threads')).length,1);
+    assert.equal((await api('GET','/agents/1')).effort,'medium');
+  } finally {
+    if(server.exitCode===null && server.signalCode===null) {
+      const exited=new Promise(resolve=>server.once('exit',resolve));server.kill('SIGTERM');await exited;
+    }
+    fs.rmSync(root,{recursive:true,force:true});
+  }
+});
+
 test('single server scopes projects, preserves settings and supervises first/resumed turns', async () => {
   // acom prepends its executable directory to child PATH. Reject any client
   // there before starting the isolated server, even when ACOM_BINARY is overridden.

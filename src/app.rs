@@ -1426,14 +1426,22 @@ impl App {
             .unwrap_or_else(|| url.clone());
         for r in rows(
             &st.db,
-            "SELECT id, pid FROM agents WHERE state='working'",
+            "SELECT id, pid, state FROM agents WHERE state='working' OR pid IS NOT NULL",
             [],
         )? {
             let id = r["id"].as_i64().unwrap();
             if let Some(pid) = r["pid"].as_i64()
-                && run::is_our_agent(pid as u32, id, &previous_url)
+                && run::is_our_agent_group(pid as u32, id, &previous_url)
             {
                 run::kill_group(pid as u32, libc::SIGKILL);
+            }
+            if r["state"] != "working" {
+                // Pause/close saves its state before signalling the process. If
+                // the server stopped before reaping it, clean the old worker
+                // without changing the user's already committed state.
+                st.db
+                    .execute("UPDATE agents SET pid=NULL WHERE id=?1", [id])?;
+                continue;
             }
             st.atomic(|st| {
                 Self::cancel_followups(st,id,"the server restarted during the turn")?;
@@ -1482,15 +1490,8 @@ impl App {
         } else {
             false
         };
-        st.db.execute_batch("SAVEPOINT launch")?;
-        let r = self.prepare_launch(&mut st, by, via, project, req, false);
-        let end = if r.is_ok() {
-            "RELEASE launch"
-        } else {
-            "ROLLBACK TO launch; RELEASE launch"
-        };
-        st.db.execute_batch(end)?;
-        let (id, warnings) = r?;
+        let (id, warnings) =
+            st.atomic(|st| self.prepare_launch(st, by, via, project, req, false))?;
         let started = self.briefing(&st, id).and_then(|prompt| {
             st.atomic(|st| {
                 let turn = run::prepare_turn(self, st, id, &prompt, None)?;
@@ -3424,8 +3425,7 @@ impl App {
         } else {
             format!("replacement after {attempts} same-model retries")
         };
-        st.db.execute_batch("SAVEPOINT crash_retry")?;
-        let result = (|| -> R<(i64, String)> {
+        let result = st.atomic(|st| -> R<(i64, String)> {
             st.db.execute(
                 "UPDATE agent_retries SET tried=?2,handled=1,blocked=NULL,same_model_attempts=?3 WHERE agent_id=?1",
                 params![id, json!(tried).to_string(), if same { attempts + 1 } else { attempts }],
@@ -3508,10 +3508,9 @@ impl App {
                 &format!("Agent {id} handed off to you; read inherited messages with acom inbox."),
             )?;
             Ok((new, self.briefing(st, new)?))
-        })();
+        });
         match result {
             Ok((new, prompt)) => {
-                st.db.execute_batch("RELEASE crash_retry")?;
                 // All identities and inherited records are committed before any
                 // subprocess can act; failed spawns never orphan rolled-back IDs.
                 if let Err(e) = run::start_turn(self, st, new, &prompt, (new != id).then_some(id)) {
@@ -3546,8 +3545,6 @@ impl App {
                 Ok(true)
             }
             Err(e) => {
-                st.db
-                    .execute_batch("ROLLBACK TO crash_retry; RELEASE crash_retry")?;
                 // A missing client or failed spawn gets one attempt, not a loop.
                 st.db.execute(
                     "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
@@ -4001,8 +3998,17 @@ impl App {
     }
 
     pub fn agent_view(&self, id: i64) -> R<Value> {
+        self.agent_view_for(id, None)
+    }
+
+    pub fn agent_view_for(&self, id: i64, agent: Option<i64>) -> R<Value> {
         let st = self.lock();
         let project = st.agent(id)?.project;
+        if let Some(a) = agent.filter(|a| *a > 0)
+            && st.agent(a)?.project != project
+        {
+            return Err(bad("agent is in another project"));
+        }
         let mut a = Self::agents_locked(&st, Some(project), None)?
             .into_iter()
             .find(|a| a["id"] == id)
@@ -5676,6 +5682,209 @@ mod tests {
     }
 
     #[test]
+    fn restart_stops_workers_already_paused_or_closed_without_changing_their_state() {
+        use std::os::unix::process::CommandExt;
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                run::kill_group(self.0.id(), libc::SIGKILL);
+                let _ = self.0.wait();
+            }
+        }
+        for state in ["paused", "closed"] {
+            let app = self_change_app();
+            std::fs::write(app.home.join("port"), "45678").unwrap();
+            let ready = app.home.join("resists-term");
+            let mut child = OwnedGroup(
+                std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg("trap '' TERM; : > \"$1\"; while :; do /bin/sleep 1; done")
+                    .arg("audit-client")
+                    .arg(&ready)
+                    .env("ACOM_ID", "1")
+                    .env("ACOM_URL", "http://127.0.0.1:45678")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut foreign = OwnedGroup(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .env("ACOM_ID", "2")
+                    .env("ACOM_URL", "http://127.0.0.1:45680")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let ready_deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < ready_deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready.exists(), "fake worker did not become ready");
+            {
+                let st = app.lock();
+                st.db.execute(
+                    "UPDATE agents SET state=?1,pid=?2,pause_reason='user',pause_from='working',paused_at=123 WHERE id=1",
+                    params![state,child.0.id()],
+                ).unwrap();
+                st.db
+                    .execute(
+                        "UPDATE agents SET state=?1,pid=?2 WHERE id=2",
+                        params![state, foreign.0.id()],
+                    )
+                    .unwrap();
+            }
+            run::kill_group(child.0.id(), libc::SIGTERM);
+            assert!(child.0.try_wait().unwrap().is_none());
+            let home = app.home.clone();
+            drop(app);
+            let reopened = App::open(home, "http://127.0.0.1:45679".into()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let stopped = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break !status.success();
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(stopped, "restart left the {state} worker running");
+            assert!(
+                foreign.0.try_wait().unwrap().is_none(),
+                "restart killed a different server's {state} worker"
+            );
+            let st = reopened.lock();
+            let retained: (
+                String,
+                Option<u32>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+            ) = st
+                .db
+                .query_row(
+                    "SELECT state,pid,pause_reason,pause_from,paused_at FROM agents WHERE id=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                retained,
+                (
+                    state.into(),
+                    None,
+                    Some("user".into()),
+                    Some("working".into()),
+                    Some(123)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn restart_cleans_owned_descendant_after_its_worker_leader_was_reaped() {
+        use std::os::unix::process::CommandExt;
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                run::kill_group(self.0.id(), libc::SIGKILL);
+                let _ = self.0.wait();
+            }
+        }
+        for url in ["http://127.0.0.1:45678", "http://127.0.0.1:45680"] {
+            let owned = url.ends_with(":45678");
+            let app = self_change_app();
+            std::fs::write(app.home.join("port"), "45678").unwrap();
+            let child_pid = app.home.join("descendant-pid");
+            let mut worker = OwnedGroup(
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "/bin/sleep 30 & printf '%s' \"$!\" > \"$1\"",
+                        "audit-worker",
+                    ])
+                    .arg(&child_pid)
+                    .env("ACOM_ID", "1")
+                    .env("ACOM_URL", url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let group = worker.0.id();
+            assert!(worker.0.wait().unwrap().success());
+            let descendant: u32 = std::fs::read_to_string(child_pid).unwrap().parse().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !run::is_our_agent(descendant, 1, url) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!run::is_our_agent(group, 1, url));
+            assert!(run::is_our_agent(descendant, 1, url));
+            // Matching environment in a different group must not authorize
+            // killing the foreign descendant's persisted process group.
+            let mut matching_elsewhere = if owned {
+                None
+            } else {
+                Some(OwnedGroup(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("30")
+                        .env("ACOM_ID", "1")
+                        .env("ACOM_URL", "http://127.0.0.1:45678")
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                ))
+            };
+            if let Some(child) = matching_elsewhere.as_ref() {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !run::is_our_agent(child.0.id(), 1, "http://127.0.0.1:45678")
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(run::is_our_agent(child.0.id(), 1, "http://127.0.0.1:45678"));
+                assert_ne!(child.0.id(), group);
+            }
+            assert_eq!(
+                run::is_our_agent_group(group, 1, "http://127.0.0.1:45678"),
+                owned
+            );
+            app.lock()
+                .db
+                .execute("UPDATE agents SET pid=?1 WHERE id=1", [group])
+                .unwrap();
+            let home = app.home.clone();
+            drop(app);
+            let reopened = App::open(home, "http://127.0.0.1:45679".into()).unwrap();
+            assert_eq!(reopened.agent_view(1).unwrap()["state"], "paused");
+            let running = || {
+                std::fs::read_to_string(format!("/proc/{descendant}/stat"))
+                    .ok()
+                    .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| !rest.starts_with('Z')))
+                    .unwrap_or(false)
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while owned && running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                running(),
+                !owned,
+                "restart handled descendant {descendant} of reaped leader {group} incorrectly"
+            );
+            if let Some(child) = matching_elsewhere.as_mut() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "restart killed matching environment in a different process group"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn continuation_requires_permission_valid_instruction_and_unfinished_turn() {
         let app = self_change_app();
         for instruction in ["", "   "] {
@@ -6718,6 +6927,108 @@ mod tests {
             CREATE TABLE commit_gate(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
             CREATE TRIGGER fail_commit AFTER UPDATE OF pid ON agents WHEN NEW.pid IS NOT NULL
             BEGIN INSERT INTO commit_gate VALUES(1); END;").unwrap();
+    }
+
+    #[test]
+    fn failed_launch_identity_commit_rolls_back_without_retaining_a_transaction() {
+        let app = waiting_client_app();
+        let before = app.agents(None, None).unwrap();
+        app.lock().db.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE commit_parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE commit_gate(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+            CREATE TRIGGER fail_commit AFTER INSERT ON agents
+            BEGIN INSERT INTO commit_gate VALUES(1); END;").unwrap();
+        let error = app
+            .launch(
+                0,
+                None,
+                Some(1),
+                LaunchReq {
+                    task: "must not execute".into(),
+                    harness: Some("codex".into()),
+                    model: Some("gpt-6-sol".into()),
+                    effort: Some("medium".into()),
+                    name: None,
+                    group: None,
+                    force: false,
+                    done: false,
+                    ack_crashes: false,
+                },
+            )
+            .unwrap_err();
+        assert!(error.1.contains("FOREIGN KEY"));
+        assert!(app.lock().db.is_autocommit());
+        assert_eq!(app.agents(None, None).unwrap(), before);
+        assert!(app.lock().procs.is_empty());
+        assert!(!app.home.join("prompt-delivered").exists());
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_commit")
+            .unwrap();
+        let (thread, _) = app
+            .new_thread(
+                0,
+                Some(1),
+                "later request commits",
+                &["1".into()],
+                false,
+                &[],
+            )
+            .unwrap();
+        let db = Connection::open(app.home.join("acom.db")).unwrap();
+        assert_eq!(
+            db.query_row("SELECT title FROM threads WHERE id=?1", [thread], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "later request commits"
+        );
+    }
+
+    #[test]
+    fn failed_recovery_preparation_commit_rolls_back_before_disarming_retry() {
+        for harness in ["codex", "claude"] {
+            let app = waiting_client_app();
+            custom(&app, 1, |s| {
+                s.crash_retries.insert(
+                    "gpt-6-sol".into(),
+                    RetryRule {
+                        harness: harness.into(),
+                        model: if harness == "codex" {
+                            "gpt-6-luna"
+                        } else {
+                            "claude-opus-5-5"
+                        }
+                        .into(),
+                        same_model_retries: 0,
+                    },
+                );
+            });
+            record_test_crash(&app, 1);
+            let before = app.agents(None, None).unwrap();
+            {
+                let st = app.lock();
+                st.db.execute_batch("PRAGMA foreign_keys=ON;
+                    CREATE TABLE commit_parent(id INTEGER PRIMARY KEY);
+                    CREATE TABLE commit_gate(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
+                // Same-provider recovery updates configuration; a cross-provider
+                // recovery creates an identity. Fail the final commit of each.
+                let trigger = if harness == "codex" {
+                    "CREATE TRIGGER fail_commit AFTER UPDATE OF model ON agents BEGIN INSERT INTO commit_gate VALUES(1); END;"
+                } else {
+                    "CREATE TRIGGER fail_commit AFTER INSERT ON agents BEGIN INSERT INTO commit_gate VALUES(1); END;"
+                };
+                st.db.execute_batch(trigger).unwrap();
+            }
+            app.tick().unwrap();
+            assert!(app.lock().db.is_autocommit());
+            assert_eq!(app.agents(None, None).unwrap(), before);
+            let retry = app.agent_view(1).unwrap()["retry"].clone();
+            assert_eq!(retry["handled"], 1);
+            assert!(retry["blocked"].as_str().unwrap().contains("FOREIGN KEY"));
+            assert!(app.lock().procs.is_empty());
+            assert!(!app.home.join("prompt-delivered").exists());
+        }
     }
 
     #[test]

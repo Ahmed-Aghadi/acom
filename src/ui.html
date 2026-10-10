@@ -67,6 +67,7 @@
     .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(310px, 1fr); gap: 18px; align-items: start; }
     .stack { display: grid; gap: 18px; }
     .panel { overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
+    #locks { overflow-x: auto; }
     .panel-head { display: flex; align-items: center; gap: 10px; min-height: 50px; padding: 10px 15px; border-bottom: 1px solid var(--line); }
     .panel-head h2 { margin: 0; font-size: 15px; }
     .panel-head .count { color: var(--muted); font-size: 12px; }
@@ -174,7 +175,7 @@
   <main>
     <div class="project-banner"><label>Project <select id="project-select" aria-label="Project"></select></label><code id="project-path">Connecting…</code><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button><span class="meta" id="project-url"></span></div>
     <nav>
-      <button class="active" data-page="overview">Overview</button>
+      <button class="active" data-page="overview" aria-current="page">Overview</button>
       <button data-page="threads">Threads <span id="unread-total" class="pill unread" hidden></span></button>
       <button data-page="settings">Settings</button>
     </nav>
@@ -217,9 +218,9 @@
     </section>
   </main>
 
-  <dialog id="launch-dialog">
+  <dialog id="launch-dialog" aria-labelledby="launch-title">
     <form method="dialog" id="launch-form">
-      <h2>Launch agent</h2>
+      <h2 id="launch-title">Launch agent</h2>
       <p class="meta launch-project" id="launch-project"></p>
       <p class="meta launch-project">Model catalogs are not access checks. If your account rejects a model, choose another explicitly; acom never silently substitutes it.</p>
       <p class="inline-error" id="launch-model-warning" hidden></p>
@@ -237,18 +238,18 @@
     </form>
   </dialog>
 
-  <dialog id="project-dialog">
+  <dialog id="project-dialog" aria-labelledby="project-title">
     <form method="dialog" id="project-form">
-      <h2>Add project</h2>
+      <h2 id="project-title">Add project</h2>
       <label>Folder path <input name="path" placeholder="/path/to/project" required><span>An existing folder on the machine running acom. Agents will work in this folder.</span></label>
       <p><button type="button" id="browse-project">Browse folders…</button></p>
       <div class="dialog-actions"><button type="button" data-close="project-dialog">Cancel</button><button class="primary">Add</button></div>
     </form>
   </dialog>
 
-  <dialog id="thread-dialog">
+  <dialog id="thread-dialog" aria-labelledby="thread-title">
     <form method="dialog" id="thread-form">
-      <h2>New thread</h2>
+      <h2 id="thread-title">New thread</h2>
       <div class="form-grid">
         <label class="wide">Title <input name="title" required></label>
         <label class="wide">Membership <select id="thread-mode" name="membership_mode"><option value="fixed">Fixed members</option><option value="live">Live filters</option></select></label>
@@ -270,8 +271,8 @@
     </form>
   </dialog>
 
-  <dialog id="folder-dialog"><form id="folder-form">
-    <h2>Choose a project folder</h2>
+  <dialog id="folder-dialog" aria-labelledby="folder-title"><form id="folder-form">
+    <h2 id="folder-title">Choose a project folder</h2>
     <div class="actions"><button type="button" id="folder-home">Home</button><button type="button" id="folder-up">Up</button></div>
     <p class="launch-project"><code id="folder-path"></code></p>
     <label class="inline-check"><input type="checkbox" id="folder-hidden"> Show hidden files</label>
@@ -280,38 +281,38 @@
     <div class="dialog-actions"><button type="button" data-close="folder-dialog">Cancel</button><button type="button" class="primary" id="folder-use">Use this folder</button></div>
   </form></dialog>
 
-  <dialog id="members-dialog"><form id="members-form"><h2>Add thread members</h2><div id="add-member-picker"></div>
+  <dialog id="members-dialog" aria-labelledby="members-title"><form id="members-form"><h2 id="members-title">Add thread members</h2><div id="add-member-picker"></div>
     <div class="dialog-actions"><button type="button" data-close="members-dialog">Cancel</button><button class="primary">Add members</button></div>
   </form></dialog>
 
-  <dialog id="usage-dialog"><form method="dialog"><h2>Subscription usage</h2><div id="usage-details"></div><div class="dialog-actions"><button>Close</button></div></form></dialog>
+  <dialog id="usage-dialog" aria-labelledby="usage-title"><form method="dialog"><h2 id="usage-title">Subscription usage</h2><div id="usage-details"></div><div class="dialog-actions"><button>Close</button></div></form></dialog>
 
-  <dialog id="config-dialog">
+  <dialog id="config-dialog" aria-labelledby="config-title">
     <form method="dialog" id="config-form">
-      <h2>Save as new config</h2>
+      <h2 id="config-title">Save as new config</h2>
       <label>Name <input name="name" required><span id="config-save-copy"></span></label>
       <div class="dialog-actions"><button type="button" data-close="config-dialog">Cancel</button><button class="primary">Save</button></div>
     </form>
   </dialog>
 
-  <dialog id="agent-dialog"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
-  <dialog id="pause-dialog">
+  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="pause-dialog" aria-labelledby="pause-title">
     <form method="dialog">
-      <h2>Pause agent</h2>
+      <h2 id="pause-title">Pause agent</h2>
       <p id="pause-copy"></p>
       <p class="meta">Keeping locks freezes their TTL clocks. Nobody else can get them until this agent resumes.</p>
       <div class="dialog-actions"><button value="cancel">Cancel</button><button value="keep">Keep locks frozen</button><button class="primary" value="release">Release locks (recommended)</button></div>
     </form>
   </dialog>
-  <dialog id="resume-dialog">
+  <dialog id="resume-dialog" aria-labelledby="resume-title">
     <form method="dialog">
-      <h2>Resume agent</h2>
+      <h2 id="resume-title">Resume agent</h2>
       <p>These other paused agents still hold frozen locks:</p>
       <div id="resume-copy"></div>
       <div class="dialog-actions"><button value="cancel">Cancel</button><button value="only">Resume only</button><button class="primary" value="release">Resume and release those locks</button></div>
     </form>
   </dialog>
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
   <script>
     function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
@@ -358,7 +359,13 @@
       if ((html ? node._renderedHTML : node.textContent) === value) { deferredContent.delete(node); return; }
       if (hasSelectedText(node)) { deferredContent.set(node, {value, html}); return; }
       deferredContent.delete(node);
-      if (html) { node.innerHTML = value; node._renderedHTML = value; }
+      if (html) {
+        const focused = node.contains(document.activeElement) ? document.activeElement : null;
+        const selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
+        node.innerHTML = value; node._renderedHTML = value;
+        const replacement = selector && node.querySelector(selector);
+        if (replacement && replacement.tagName === focused.tagName) replacement.focus({preventScroll:true});
+      }
       else node.textContent = value;
     }
     const setText = (node, value) => setContent(node, value);
@@ -376,7 +383,7 @@
       return `${Math.ceil(n)}s`;
     }
     async function api(path, options = {}) {
-      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...(!options.method || options.method === 'GET' ? {signal:AbortSignal.timeout(15000)} : {}), ...options });
       const text = await response.text();
       let body = text;
       try { body = text ? JSON.parse(text) : {}; } catch (_) {}
@@ -389,13 +396,20 @@
 
     function toast(message, error = false) {
       const el = $('#toast');
+      ([...document.querySelectorAll('dialog[open]')].at(-1) || document.body).append(el);
       el.textContent = message;
       el.className = `toast show${error ? ' error' : ''}`;
       clearTimeout(toast.timer);
       toast.timer = setTimeout(() => el.className = 'toast', 3400);
     }
 
+    let refreshPending = 0;
     async function refresh(initial = false) {
+      refreshPending++;
+      try { await refreshOverview(initial); }
+      finally { refreshPending--; }
+    }
+    async function refreshOverview(initial = false) {
       const details = refreshAgentDetails();
       let healthy = false;
       const request = ++state.overviewRequest;
@@ -530,7 +544,10 @@
 
     function renderThreads() {
       setText($('#thread-count'), `${state.threads.length}`);
-      document.querySelectorAll('[data-thread-filter]').forEach(b=>b.classList.toggle('active',b.dataset.threadFilter===state.threadFilter));
+      document.querySelectorAll('[data-thread-filter]').forEach(b => {
+        const active = b.dataset.threadFilter === state.threadFilter;
+        b.classList.toggle('active', active); b.setAttribute('aria-pressed', String(active));
+      });
       const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread > 0 : t.members?.includes(0) ? state.threadFilter === 'mine' : state.threadFilter === 'agents'));
       setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
@@ -583,8 +600,13 @@
         t.unread = t.members?.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > t.last_read).length : 0;
         state.thread = t;
         updateUnread(t.id, t.project, t.unread);
-        await markThreadRead();
-      } catch (error) { if (showError) toast(error.message, true); }
+        markThreadRead();
+      } catch (error) {
+        if (request === state.threadRequest && selected === state.selectedThread) {
+          if (showError) toast(error.message, true);
+          if (!state.thread) setText($('#thread-main .empty'), `Conversation unavailable: ${error.message}. Retrying automatically.`);
+        }
+      }
     }
 
     function updateUnread(id, project, unread) {
@@ -678,7 +700,11 @@
     }
 
     $('#agent-dialog').addEventListener('close', () => { if (!$('#agent-dialog').open) { selectedAgent = null; agentRequest++; } });
-    document.addEventListener('close', markThreadRead, true);
+    document.addEventListener('close', event => {
+      const feedback = $('#toast');
+      if (event.target.contains(feedback)) ([...document.querySelectorAll('dialog[open]')].at(-1) || document.body).append(feedback);
+      markThreadRead();
+    }, true);
     document.addEventListener('visibilitychange', markThreadRead);
     window.addEventListener('focus', markThreadRead);
 
@@ -719,7 +745,7 @@
         <div class="wide"><label>Allowed efforts</label><div class="effort-options">${[...new Set([...(name === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']), ...h.efforts])].map(x => `<label><input type="checkbox" name="allowed_effort" value="${esc(x)}" ${h.efforts.includes(x) ? 'checked' : ''}>${esc(x)}</label>`).join('')}</div></div>
         <label class="wide">Extra launch flags <input name="flags" value="${esc(flagsText(h.flags || []))}"><span>Separate arguments with spaces; double-quote values containing spaces.</span></label>
       </div></div>`).join('');
-      const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" value="${value?.soft ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label><label>Hard <input type="number" name="hard" value="${value?.hard ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label></div>`;
+      const limit = (label, path, value) => `<div class="limit-row" data-limit="${esc(path)}"><strong>${esc(label)}</strong><label>Soft <input type="number" name="soft" aria-label="${esc(label)} soft limit" value="${value?.soft ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label><label>Hard <input type="number" name="hard" aria-label="${esc(label)} hard limit" value="${value?.hard ?? ''}" min="0" ${path.startsWith('usage.') ? 'max="100" step="any"' : ''} placeholder="no limit"></label></div>`;
       const capital = name => name.charAt(0).toUpperCase() + name.slice(1);
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['claude','seven_day_fable','Claude Fable weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
@@ -872,8 +898,22 @@
       return new Promise(resolve => {
         dialog.returnValue = 'cancel';
         dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true });
-        dialog.showModal();
+        openDialog(dialog);
       });
+    }
+
+    function openDialog(dialog) {
+      dialog._session = (dialog._session || 0) + 1;
+      dialog.showModal();
+    }
+    function dialogSubmission(form) {
+      const dialog = form.closest('dialog'), session = dialog._session;
+      const values = JSON.stringify([...new FormData(form)]);
+      const request = form._submission = (form._submission || 0) + 1;
+      return {
+        current: () => request === form._submission && dialog.open && dialog._session === session && values === JSON.stringify([...new FormData(form)]),
+        latest: () => request === form._submission,
+      };
     }
 
     async function browseFolder(path) {
@@ -939,12 +979,12 @@
       }
       const folder = event.target.closest('[data-folder]');
       if (folder) { await browseFolder(folder.dataset.folder); return; }
-      if (event.target.closest('#browse-project')) { $('#folder-dialog').showModal(); await browseFolder($('#project-form [name=path]').value.trim() || undefined); return; }
+      if (event.target.closest('#browse-project')) { openDialog($('#folder-dialog')); await browseFolder($('#project-form [name=path]').value.trim() || undefined); return; }
       if (event.target.closest('#folder-home')) { await browseFolder(state.folder?.home); return; }
       if (event.target.closest('#folder-up')) { if(state.folder?.parent) await browseFolder(state.folder.parent); return; }
       if (event.target.closest('#folder-use')) { if(state.folder) { $('#project-form [name=path]').value=state.folder.path; $('#folder-dialog').close(); } return; }
       const usage = event.target.closest('[data-usage]');
-      if (usage) { state.usageProvider=usage.dataset.usage; renderUsage(); $('#usage-dialog').showModal(); return; }
+      if (usage) { state.usageProvider=usage.dataset.usage; renderUsage(); openDialog($('#usage-dialog')); return; }
       const checkUsage = event.target.closest('[data-check-usage]');
       if (checkUsage) {
         try { await mutate('/usage/check', {provider:checkUsage.dataset.checkUsage}); toast('Usage check scheduled'); } catch(error) {toast(error.message,true);} return;
@@ -957,7 +997,7 @@
       if(event.target.closest('#thread-membership')) {
         try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); await refreshThread(); } catch(error) {toast(error.message,true);} return;
       }
-      if(event.target.closest('#add-thread-members')) { memberPicker($('#add-member-picker'),state.thread?.members); $('#members-dialog').showModal(); return; }
+      if(event.target.closest('#add-thread-members')) { memberPicker($('#add-member-picker'),state.thread?.members); $('#members-form').dataset.memberThread = state.thread.id; openDialog($('#members-dialog')); return; }
       if(event.target.closest('#copy-thread')) {
         const reference = `thread #${state.selectedThread}`;
         try { await navigator.clipboard.writeText(reference); toast(`Copied ${reference}`); }
@@ -970,7 +1010,7 @@
           try {
             collectSettings(); $('#config-form').reset();
             $('#config-save-copy').textContent = state.project ? 'The current settings will be saved and used by this project.' : 'The current settings will be saved for reuse.';
-            $('#config-dialog').showModal();
+            openDialog($('#config-dialog'));
           }
           catch (error) { toast(error.message, true); }
         }
@@ -1038,7 +1078,7 @@
       if (open) {
         if (open.dataset.open === 'launch-dialog') {
           if (!state.projects.length) {
-            toast('Add a project folder before launching an agent.'); $('#project-dialog').showModal(); return;
+            toast('Add a project folder before launching an agent.'); openDialog($('#project-dialog')); return;
           }
           $('#launch-project-select').innerHTML = projectOptions(state.selectedProject);
           setLaunchProject();
@@ -1048,18 +1088,28 @@
           if ($('#thread-member-picker').dataset.project !== String(state.selectedProject)) $('#thread-form [name=include_user]').checked = true;
           memberPicker($('#thread-member-picker')); syncThreadMode();
         }
-        document.getElementById(open.dataset.open).showModal();
+        openDialog(document.getElementById(open.dataset.open));
         return;
       }
       const page = event.target.closest('[data-page]');
       if (page) {
-        document.querySelectorAll('[data-page]').forEach(x => x.classList.toggle('active', x === page));
+        document.querySelectorAll('[data-page]').forEach(x => {
+          x.classList.toggle('active', x === page);
+          if (x === page) x.setAttribute('aria-current', 'page'); else x.removeAttribute('aria-current');
+        });
         document.querySelectorAll('.page').forEach(x => x.classList.toggle('active', x.id === `page-${page.dataset.page}`));
         if (page.dataset.page === 'threads' && state.selectedThread) await refreshThread(false);
         return;
       }
       const thread = event.target.closest('[data-thread]');
-      if (thread) { state.selectedThread = Number(thread.dataset.thread); renderThreads(); await refreshThread(); return; }
+      if (thread) {
+        const id = Number(thread.dataset.thread);
+        if (id !== state.selectedThread) {
+          resetThread(); state.selectedThread = id;
+          $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>Thread #${id}</h2></div><div class="empty" role="status">Loading conversation…</div>`;
+        }
+        renderThreads(); await refreshThread(); return;
+      }
       const action = event.target.closest('[data-action]');
       if (!action) return;
       try {
@@ -1067,7 +1117,9 @@
         if (action.dataset.action === 'another-model') {
           const agent=state.agents.find(a=>a.id===id);
           $('#launch-project-select').innerHTML=projectOptions(agent.project);
-          $('#launch-dialog').showModal(); await setLaunchProject();
+          const dialog = $('#launch-dialog'); openDialog(dialog);
+          const session = dialog._session; await setLaunchProject();
+          if (!dialog.open || dialog._session !== session) return;
           if([...$('#launch-harness').options].some(o=>o.value===agent.harness)) {$('#launch-harness').value=agent.harness;setLaunchChoices();}
           $('#launch-form [name=task]').value=agent.task || '';
         } else if (action.dataset.action === 'details') {
@@ -1075,7 +1127,7 @@
           $('#agent-title').textContent = `Agent #${id}`;
           $('#agent-details').replaceChildren(); $('#agent-config').replaceChildren(); $('#agent-log').textContent = '';
           $('#agent-detail-status').textContent = 'Loading…';
-          $('#agent-dialog').showModal();
+          openDialog($('#agent-dialog'));
           await refreshAgentDetails();
         } else if (action.dataset.action === 'pause') {
           const agent = state.agents.find(a => a.id === id);
@@ -1198,6 +1250,7 @@
       event.preventDefault();
       const form = event.currentTarget;
       const button = event.submitter;
+      const submission = dialogSubmission(form);
       const data = Object.fromEntries(new FormData(form));
       data.project = Number(data.project);
       if (button) button.disabled = true;
@@ -1209,30 +1262,32 @@
         let result;
         try { result = await mutate('/agents', data); }
         catch (error) {
-          if (!/confirm|hard limit/i.test(error.message) || !confirm(`${error.message}\n\nLaunch anyway?`)) throw error;
+          if (!submission.current() || !/confirm|hard limit/i.test(error.message) || !confirm(`${error.message}\n\nLaunch anyway?`)) throw error;
           result = await mutate('/agents', {...data, force: true});
         }
-        $('#launch-dialog').close(); form.reset(); setLaunchChoices();
+        if (submission.current()) { $('#launch-dialog').close(); form.reset(); setLaunchChoices(); }
         toast(['Agent launched', ...(result.warnings || [])].join('\n'));
       } catch (error) { toast(error.message, true); }
-      finally { if (button) button.disabled = false; }
+      finally { if (button && submission.latest()) button.disabled = false; }
     });
 
     $('#thread-form').addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget;
       const button = event.submitter;
+      const submission = dialogSubmission(form), project = state.selectedProject;
       const data = new FormData(form);
       if (button) button.disabled = true;
       try {
         const membership = $('#thread-mode').value === 'live' ? {watch:[...data.getAll('watch_state'), ...splitList(data.get('watch_groups') || '').map(group => `group:${group}`)]} : {members:[...data.getAll('member'),...splitList(data.get('members') || '')]};
         if (membership.watch && !membership.watch.length) throw new Error('Choose at least one state or group for live filters.');
-        const result = await mutate('/threads', { project: state.selectedProject, title: data.get('title'), ...membership, include_user: data.has('include_user') });
+        const result = await mutate('/threads', { project, title: data.get('title'), ...membership, include_user: data.has('include_user') });
+        if (!submission.current() || project !== state.selectedProject) return;
         $('#thread-dialog').close(); form.reset(); syncThreadMode();
         if(!data.has('include_user')) {state.threadFilter='all';storeValue('thread-filter','all');renderThreads();}
         state.selectedThread = Number(result.id ?? result.thread_id); await refreshThread();
       } catch (error) { toast(error.message, true); }
-      finally { if (button) button.disabled = false; }
+      finally { if (button && submission.latest()) button.disabled = false; }
     });
 
     function syncThreadMode() {
@@ -1249,31 +1304,41 @@
     $('#folder-form').addEventListener('submit', async event=> {
       event.preventDefault(); const form=event.currentTarget, button=event.submitter;
       if (!state.folder) return;
+      const submission = dialogSubmission(form), parent = state.folder.path, request = state.folderRequest;
       if (button) button.disabled=true;
       try {
-        const result=await api('/folders',{method:'POST',body:JSON.stringify({parent:state.folder.path,name:new FormData(form).get('name')})});
-        $('[name=name]',form).value=''; await browseFolder(result.path);
-      } catch(error) { $('#folder-error').textContent=error.message; }
-      finally {if(button) button.disabled=false;}
+        const result=await api('/folders',{method:'POST',body:JSON.stringify({parent,name:new FormData(form).get('name')})});
+        if (submission.current() && request === state.folderRequest && parent === state.folder?.path) {
+          $('[name=name]',form).value=''; await browseFolder(result.path);
+        }
+      } catch(error) { if (submission.current() && request === state.folderRequest && parent === state.folder?.path) $('#folder-error').textContent=error.message; }
+      finally {if(button && submission.latest()) button.disabled=false;}
     });
     $('#members-form').addEventListener('submit',async event=> {
-      event.preventDefault(); const members=new FormData(event.currentTarget).getAll('member');
+      event.preventDefault(); const form = event.currentTarget, button = event.submitter, submission = dialogSubmission(form);
+      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread);
       if(!members.length) {toast('Choose at least one member.',true);return;}
-      try {await mutate(`/threads/${state.selectedThread}/members`,{members}); $('#members-dialog').close(); await refreshThread();} catch(error) {toast(error.message,true);}
+      if (button) button.disabled = true;
+      try {await mutate(`/threads/${thread}/members`,{members}); if (submission.current()) $('#members-dialog').close(); if (thread === state.selectedThread) await refreshThread();} catch(error) {toast(error.message,true);}
+      finally {if(button && submission.latest()) button.disabled=false;}
     });
 
     $('#project-form').addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget;
       const button = event.submitter;
+      const submission = dialogSubmission(form), project = state.selectedProject;
       if (button) button.disabled = true;
       try {
         if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
-        state.selectedProject = Number(result.id); state.editor = null; resetThread(); await refresh();
-        $('#project-dialog').close(); form.reset();
+        if (submission.current() && project === state.selectedProject) {
+          state.selectedProject = Number(result.id); state.editor = null; resetThread();
+        }
+        await refresh();
+        if (submission.current()) { $('#project-dialog').close(); form.reset(); }
       } catch (error) { toast(error.message, true); }
-      finally { if (button) button.disabled = false; }
+      finally { if (button && submission.latest()) button.disabled = false; }
     });
 
     document.addEventListener('submit', async event => {
@@ -1413,14 +1478,15 @@
     $('#config-form').addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget;
+      const submission = dialogSubmission(form);
       try {
         await saveConfig(new FormData(form).get('name').trim());
-        $('#config-dialog').close(); form.reset();
+        if (submission.current()) { $('#config-dialog').close(); form.reset(); }
       } catch (error) { toast(error.message, true); }
     });
 
     refresh(true).catch(e => toast(e.message, true));
-    setInterval(() => refresh(false), 2000);
+    setInterval(() => { if (!refreshPending) refresh(false); }, 2000);
   </script>
 </body>
 </html>

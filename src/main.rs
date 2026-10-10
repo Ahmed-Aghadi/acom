@@ -66,7 +66,7 @@ User commands (they act on the project the current folder is in):
   close <ID> / reopen <ID>
   lock free <name>                        Release a lock whoever holds it
 
-Selectors: active, working, idle, paused, done, closed, crashed, group:<name>.
+Selectors: active, working, idle, paused, done, closed, crashed, replaced, group:<name>.
 Durations: 30s, 5m, 1h.
 ";
 
@@ -80,6 +80,17 @@ struct Cli {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn help_lists_all_thread_state_selectors() {
+        let selectors = HELP
+            .lines()
+            .find(|line| line.starts_with("Selectors:"))
+            .unwrap();
+        for state in app::STATES {
+            assert!(selectors.split([',', ' ', '.']).any(|word| word == state));
+        }
+    }
 
     #[test]
     fn thread_watch_and_snapshot_members_cannot_mix() {
@@ -788,7 +799,10 @@ fn main() {
                 print_agent_line(a);
             }
         }
-        Cmd::Agent { id } => print_agent(&get(&format!("/agents/{id}"))),
+        Cmd::Agent { id } => {
+            let context = my_id().map(|a| format!("?agent={a}")).unwrap_or_default();
+            print_agent(&get(&format!("/agents/{id}{context}")));
+        }
         Cmd::Launch {
             task,
             harness,
@@ -1205,6 +1219,12 @@ fn main() {
         Cmd::Project { cmd } => match cmd {
             ProjectCmd::Add { path } => {
                 let path = path.unwrap_or_else(cwd);
+                let path = std::path::Path::new(&path);
+                let path = if path.is_relative() {
+                    std::path::Path::new(&cwd()).join(path)
+                } else {
+                    path.to_path_buf()
+                };
                 let p = post("/projects", user_body(json!({ "path": path })));
                 let (id, path) = (&p["id"], p["path"].as_str().unwrap_or(""));
                 if p["added"] == true {

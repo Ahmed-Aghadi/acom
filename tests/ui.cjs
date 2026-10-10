@@ -1811,3 +1811,235 @@ test('agent details expose native history and output paths; closed behavior is e
   await page.locator('[data-page=settings]').click();
   assert.match(await page.locator('[name=done_closes]').locator('..').locator('..').textContent(), /require explicit Reopen/);
 }));
+
+async function holdRequest(page, pattern, method = 'POST') {
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const handler = async route => {
+    if (route.request().method() !== method) return route.continue();
+    entered(); await gate;
+    await route.continue().catch(() => {}); // A bounded GET may already be aborted.
+  };
+  await page.route(pattern, handler);
+  return { started, release, remove: () => page.unroute(pattern, handler) };
+}
+
+test('slow overview requests commit without overlapping polls discarding every response', async () => fixture(async (page, data) => {
+  data.delays = {1:2400};
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live', null, {timeout:6000});
+  assert.equal(await page.locator('#project-path').textContent(), '/projects/example');
+  data.delays = {};
+  await page.waitForFunction(() => refreshPending === 0);
+}));
+
+test('a stalled GET times out and polling recovers while pending read acknowledgements keep messages live', async () => fixture(async (page, data) => {
+  const overview = await holdRequest(page, '**/overview*', 'GET');
+  await page.evaluate(() => { window.pendingOverview = refresh(); });
+  await overview.started;
+  await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'connection error', null, {timeout:18000});
+  overview.release(); await overview.remove();
+  await page.evaluate(() => window.pendingOverview);
+  await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
+  data.threads = [conversation([incoming(1)])];
+  await page.evaluate(() => refresh());
+  const read = await holdRequest(page, '**/threads/1/read');
+  await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click(); await read.started;
+  data.threads[0].messages.push(incoming(2, 'While read acknowledgement is pending'));
+  await page.locator('[data-message="2"]').waitFor({timeout:5000});
+  assert.equal(data.reads[1], undefined);
+  read.release(); await read.remove();
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+}));
+
+test('switching threads removes old controls immediately and closing the loading pane keeps drafts', async () => fixture(async (page, data) => {
+  data.threads = [conversation([], {title:'First conversation'}), conversation([], {id:2,title:'Second conversation',members:[1]})];
+  await page.reload(); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread-filter=all]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('First draft');
+  const next = await holdRequest(page, '**/threads/2', 'GET');
+  await page.locator('[data-thread="2"]').click(); await next.started;
+  assert.match(await page.locator('#thread-main').textContent(), /Thread #2.*Loading conversation/s);
+  for (const selector of ['#message-form','#thread-membership','#add-thread-members','#copy-thread']) assert.equal(await page.locator(selector).count(), 0);
+  await page.locator('#close-thread').click(); next.release(); await next.remove();
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'First draft');
+  await page.locator('[data-thread="2"]').click();
+  await page.waitForFunction(() => document.querySelector('#thread-membership')?.textContent === 'Join thread');
+  await page.locator('#thread-membership').click();
+  await page.waitForFunction(() => document.querySelector('#thread-membership')?.textContent === 'Leave thread');
+  assert.deepEqual(data.requests.find(r => r.url === '/threads/2/user').body, {joined:true});
+}));
+
+test('polling restores focus to updated controls and removes actions that no longer apply', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',status:'Starting',locks:[]}];
+  await page.reload(); await page.locator('[data-action=details]').focus();
+  data.agents[0].state = 'idle'; data.agents[0].status = 'Finished this turn';
+  await page.waitForFunction(() => document.querySelector('#agents').textContent.includes('Finished this turn'));
+  assert.equal(await page.locator('[data-action=details]').evaluate(el => document.activeElement === el), true);
+  await page.locator('[data-action=pause]').focus();
+  data.agents[0].state = 'paused';
+  await page.evaluate(() => refresh());
+  assert.equal(await page.locator('[data-action=pause]').count(), 0);
+  assert.equal(await page.locator('[data-action=resume]').count(), 1);
+  assert.equal(await page.locator('#agents').textContent().then(text => /paused/.test(text)), true);
+}));
+
+test('late thread creation keeps reopened drafts and cannot open another project conversation', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=threads]').click();
+  const pending = await holdRequest(page, '**/threads');
+  await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('#thread-form [name=title]').fill('Created in first');
+  await page.locator('#thread-form button.primary').click(); await pending.started;
+  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/other');
+  await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('#thread-form [name=title]').fill('New draft in second');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(() => !document.querySelector('#thread-form button.primary').disabled);
+  assert.equal(data.threads[0].project, 1);
+  assert.equal(await page.locator('#thread-dialog').isVisible(), true);
+  assert.equal(await page.locator('#thread-form [name=title]').inputValue(), 'New draft in second');
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#project-path').textContent(), '/projects/other');
+}));
+
+test('late launch completions preserve newer drafts in the same or reopened dialog', async () => fixture(async (page, data) => {
+  for (const reopen of [false,true]) {
+    const pending = await holdRequest(page, '**/agents');
+    await openLaunch(page);
+    await page.locator('#launch-form [name=task]').fill('Submitted task');
+    await page.locator('#launch-form button.primary').click(); await pending.started;
+    if (reopen) { await page.locator('[data-close=launch-dialog]').click(); await openLaunch(page); }
+    await page.locator('#launch-form [name=task]').fill('New unsent task');
+    pending.release(); await pending.remove();
+    await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Agent launched');
+    assert.equal(await page.locator('#launch-dialog').isVisible(), true);
+    assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'New unsent task');
+    await page.locator('[data-close=launch-dialog]').click();
+  }
+  assert.deepEqual(data.requests.filter(r=>r.url === '/agents').map(r=>r.body.task), ['Submitted task','Submitted task']);
+}));
+
+test('a stale launch failure cannot prompt or force a request from a reopened dialog', async () => fixture(async (page, data) => {
+  data.hardLimit = true;
+  const pending = await holdRequest(page, '**/agents');
+  let confirmations = 0;
+  page.on('dialog', dialog => { confirmations++; dialog.accept(); });
+  await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Original task');
+  await page.locator('#launch-form button.primary').click(); await pending.started;
+  await page.locator('[data-close=launch-dialog]').click(); await openLaunch(page);
+  await page.locator('#launch-form [name=task]').fill('New task');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('hard limit reached'));
+  assert.equal(confirmations, 0);
+  assert.equal(data.requests.filter(r => r.url === '/agents').length, 1);
+  assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'New task');
+  assert.equal(await page.locator('#launch-dialog').isVisible(), true);
+}));
+
+test('late project creation preserves reopened paths and the current project', async () => fixture(async (page, data) => {
+  const pending = await holdRequest(page, '**/projects');
+  await page.locator('[data-open=project-dialog]').click();
+  await page.locator('#project-form [name=path]').fill('/projects/created');
+  await page.locator('#project-form button.primary').click(); await pending.started;
+  await page.locator('[data-close=project-dialog]').click();
+  await page.locator('[data-open=project-dialog]').click();
+  await page.locator('#project-form [name=path]').fill('/projects/newer-draft');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(() => !document.querySelector('#project-form button.primary').disabled);
+  assert.equal(data.projects.length, 3);
+  assert.equal(await page.locator('#project-dialog').isVisible(), true);
+  assert.equal(await page.locator('#project-form [name=path]').inputValue(), '/projects/newer-draft');
+  assert.equal(await page.locator('#project-path').textContent(), '/projects/example');
+}));
+
+test('late folder creation does not clear new names or navigate away from a newer location', async () => fixture(async (page, data) => {
+  await page.locator('[data-open=project-dialog]').click(); await page.locator('#browse-project').click();
+  await page.waitForFunction(() => document.querySelector('#folder-path').textContent === '/home/example');
+  const pending = await holdRequest(page, '**/folders');
+  await page.locator('#folder-form [name=name]').fill('Created');
+  await page.locator('#folder-form button[type=submit]').click(); await pending.started;
+  await page.locator('[data-folder="/home/example/work"]').click();
+  await page.waitForFunction(() => document.querySelector('#folder-path').textContent === '/home/example/work');
+  await page.locator('#folder-form [name=name]').fill('New folder draft');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(() => !document.querySelector('#folder-form button[type=submit]').disabled);
+  assert.ok(data.folders['/home/example/Created']);
+  assert.equal(await page.locator('#folder-path').textContent(), '/home/example/work');
+  assert.equal(await page.locator('#folder-form [name=name]').inputValue(), 'New folder draft');
+}));
+
+test('late config and member saves preserve newer dialog input', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click(); await page.locator('#save-config-as').click();
+  const config = await holdRequest(page, '**/configs');
+  await page.locator('#config-form [name=name]').fill('Saved copy');
+  await page.locator('#config-form button.primary').click(); await config.started;
+  await page.locator('#config-form [name=name]').fill('Next copy draft');
+  config.release(); await config.remove();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
+  assert.equal(await page.locator('#config-dialog').isVisible(), true);
+  assert.equal(await page.locator('#config-form [name=name]').inputValue(), 'Next copy draft');
+  await page.locator('[data-close=config-dialog]').click();
+  data.agents = [1,2].map(id => ({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.threads = [conversation([], {members:[0]})];
+  await page.evaluate(() => refresh()); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click(); await page.locator('#add-thread-members').click();
+  const members = await holdRequest(page, '**/threads/1/members');
+  await page.locator('#add-member-picker [name=member][value="1"]').check();
+  await page.locator('#members-form button.primary').click(); await members.started;
+  await page.locator('#add-member-picker [name=member][value="1"]').uncheck();
+  await page.locator('#add-member-picker [name=member][value="2"]').check();
+  members.release(); await members.remove();
+  await page.waitForFunction(() => !document.querySelector('#members-form button.primary').disabled);
+  assert.equal(await page.locator('#members-dialog').isVisible(), true);
+  assert.equal(await page.locator('#add-member-picker [name=member][value="2"]').isChecked(), true);
+  assert.deepEqual(data.requests.find(r=>r.url === '/threads/1/members').body.members, ['1']);
+}));
+
+test('mobile locks can scroll every control into view and dialogs and feedback have accessible names', async () => fixture(async (page, data) => {
+  data.locks = [{name:'write-lock',project:1,about:'Editing important shared content',holder:1,holder_name:'Worker',acquired_at:1,expires_at:Date.now()/1000+600,queue:[2,3]}];
+  await page.setViewportSize({width:390,height:844}); await page.reload(); await page.locator('[data-action=free-lock]').waitFor();
+  assert.equal(await page.locator('#locks').evaluate(el => getComputedStyle(el).overflowX), 'auto');
+  await page.locator('#locks').evaluate(el => { el.scrollLeft = el.scrollWidth; });
+  assert.equal(await page.locator('[data-action=free-lock]').evaluate(el => el.getBoundingClientRect().right <= innerWidth), true);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members',usage:'Subscription usage',config:'Save as new config',agent:'Agent',pause:'Pause agent',resume:'Resume agent'};
+  for (const [id,name] of Object.entries(names)) {
+    await page.evaluate(id => openDialog(document.getElementById(id+'-dialog')), id);
+    assert.equal(await page.getByRole('dialog', {name,exact:true}).count(), 1);
+    await page.evaluate(id => document.getElementById(id+'-dialog').close(), id);
+  }
+  await openLaunch(page); await page.locator('#launch-model').selectOption('__custom__');
+  await page.locator('#launch-custom-model').fill('invalid model'); await page.locator('#launch-form [name=task]').fill('Task');
+  await page.locator('#launch-form button.primary').click();
+  assert.match(await page.getByRole('dialog',{name:'Launch agent'}).ariaSnapshot(), /status: Enter a full model ID without spaces/);
+  await page.locator('[data-close=launch-dialog]').click();
+  assert.equal(await page.locator('#toast').isVisible(), true);
+  assert.match(await page.locator('#toast').textContent(), /Enter a full model ID without spaces/);
+  assert.equal(data.requests.length, 0);
+}));
+
+test('active views and filters and each limit input expose their context to assistive technology', async () => fixture(async page => {
+  assert.equal(await page.locator('[data-page=overview]').getAttribute('aria-current'), 'page');
+  for (const view of ['threads','settings','overview']) {
+    await page.locator(`[data-page=${view}]`).click();
+    assert.equal(await page.locator('[data-page][aria-current=page]').count(), 1);
+    assert.equal(await page.locator(`[data-page=${view}]`).getAttribute('aria-current'), 'page');
+  }
+  await page.locator('[data-page=threads]').click();
+  for (const [filter,name] of [['unread','Unread'],['all','All'],['agents','Agent-only'],['mine','Mine']]) {
+    await page.locator(`[data-thread-filter=${filter}]`).click();
+    assert.equal(await page.getByRole('button', {name,exact:true,pressed:true}).count(), 1);
+    assert.equal(await page.locator('[data-thread-filter][aria-pressed=true]').count(), 1);
+  }
+  await page.locator('[data-page=settings]').click();
+  for (const name of ['Active agents soft limit','Active agents hard limit','Claude weekly subscription % soft limit','Claude weekly subscription % hard limit','Context tokens soft limit','Context tokens hard limit']) {
+    assert.equal(await page.getByRole('spinbutton', {name,exact:true}).count(), 1);
+  }
+}));

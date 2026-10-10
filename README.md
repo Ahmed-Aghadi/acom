@@ -4,7 +4,7 @@
 
 ## Build and run
 
-You need a Rust toolchain and at least one supported harness installed and signed in (`claude` or `codex`). The process supervisor targets Unix systems.
+You need a Rust toolchain and at least one supported harness installed and signed in (`claude` or `codex`). The process supervisor targets Linux; restart cleanup uses `/proc` to verify process ownership before stopping leftovers.
 
 ```sh
 cargo install --path .
@@ -37,7 +37,7 @@ Unsent conversation drafts save as you type, separately for each project/thread.
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
 
-Polling preserves unchanged text. If you select text in a changing region, that region waits until you clear the selection; unrelated panels keep updating. An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Connection failures keep the last view and show a retry status.
+Polling preserves unchanged text and keyboard focus on controls that still exist. If you select text in a changing region, that region waits until you clear the selection; unrelated panels keep updating. An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Slow reads finish before the next background poll; stalled reads time out after 15 seconds so polling can recover. Connection failures keep the last view and show a retry status. Writes are not automatically retried or canceled by this read timeout.
 
 When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so new messages delivered while it's a current member can wake it; live active-only threads remove done agents. Agents are told which rule applies. `acom launch --task "..." --done` finishes the caller according to that rule and launches another agent in one step, so it fits even when the active-agent limit is full; it does not make the caller terminally replaced. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 

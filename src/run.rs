@@ -29,6 +29,31 @@ pub fn is_our_agent(pid: u32, id: i64, url: &str) -> bool {
         && vars.contains(&format!("ACOM_URL={url}").as_bytes())
 }
 
+/// A reaped leader can leave owned tools in its process group. Validate a live
+/// member of exactly that group before allowing startup to stop its leftovers.
+pub fn is_our_agent_group(group: u32, id: i64, url: &str) -> bool {
+    if group == 0 || group > i32::MAX as u32 {
+        return false;
+    }
+    let belongs = |pid: u32| unsafe { libc::getpgid(pid as i32) == group as i32 };
+    if belongs(group) && is_our_agent(group, id, url) && belongs(group) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        belongs(pid) && is_our_agent(pid, id, url) && belongs(pid)
+    })
+}
+
 /// SIGTERM the agent's process group, then SIGKILL whatever is left a few seconds later.
 pub fn stop(pid: u32) {
     kill_group(pid, libc::SIGTERM);
@@ -58,7 +83,7 @@ pub(crate) struct PreparedTurn {
     harness: String,
     model: String,
     effort: String,
-    resume: bool,
+    side_file: Option<(PathBuf, u64)>,
     turns: i64,
     err_from: u64,
 }
@@ -222,6 +247,19 @@ pub(crate) fn prepare_turn(
     if input.is_none() {
         cmd.stdin(Stdio::null());
     }
+    // Snapshot resumed history before the client can append this turn's events.
+    // The asynchronous follower may not run until after task delivery.
+    let side_file = if resume {
+        a.session
+            .as_deref()
+            .and_then(|s| harness::side_file(&a.harness, s))
+            .map(|p| {
+                let pos = std::fs::metadata(&p).map_or(0, |m| m.len());
+                (p, pos)
+            })
+    } else {
+        None
+    };
     let mut child = cmd
         .spawn()
         .map_err(|e| Fail(500, format!("can't start {}: {e}", a.harness)))?;
@@ -279,7 +317,7 @@ pub(crate) fn prepare_turn(
         harness: a.harness,
         model: a.model,
         effort: a.effort,
-        resume,
+        side_file,
         turns,
         err_from,
     })
@@ -292,7 +330,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
     let pid = child.id();
     let model = std::mem::take(&mut turn.model);
     let harness = std::mem::take(&mut turn.harness);
-    let resume = turn.resume;
+    let side_file = turn.side_file.take();
     let turns = turn.turns;
     let err_from = turn.err_from;
     st.procs.insert(
@@ -325,7 +363,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
         let done = Arc::new(AtomicBool::new(false));
         let side = {
             let (app, harness, done) = (app.clone(), harness.clone(), done.clone());
-            thread::spawn(move || follow_side_file(&app, id, &harness, resume, &done))
+            thread::spawn(move || follow_side_file(&app, id, &harness, side_file, &done))
         };
         let out = child.stdout.take();
         // Reap independently of stdout: a descendant can otherwise keep its
@@ -443,18 +481,20 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event) {
 
 /// Some harnesses write usage to a file instead of stdout. Read it while the turn runs.
 /// On a resumed session the file already holds earlier turns, so start at its end.
-fn follow_side_file(app: &Arc<App>, id: i64, harness: &str, resume: bool, done: &AtomicBool) {
-    let mut pos = 0u64;
-    let mut path: Option<PathBuf> = None;
+fn follow_side_file(
+    app: &Arc<App>,
+    id: i64,
+    harness: &str,
+    initial: Option<(PathBuf, u64)>,
+    done: &AtomicBool,
+) {
+    let (mut path, mut pos) = initial.map_or((None, 0), |(p, pos)| (Some(p), pos));
     let mut partial = Vec::new();
     loop {
         let finished = done.load(Ordering::SeqCst);
         if path.is_none() {
             let session = app.lock().agent(id).ok().and_then(|a| a.session);
             path = session.and_then(|s| harness::side_file(harness, &s));
-            if resume && let Some(p) = &path {
-                pos = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            }
         }
         if let Some(p) = &path
             && let Ok(mut f) = File::open(p)
@@ -495,6 +535,103 @@ fn follow_side_file(app: &Arc<App>, id: i64, harness: &str, resume: bool, done: 
 mod tests {
     use super::*;
     use std::sync::{Condvar, Mutex};
+
+    #[test]
+    fn resumed_side_file_keeps_events_appended_before_the_follower_starts() {
+        const FIXTURE: &str = "ACOM_NATIVE_BASELINE_TEST_DIR";
+        // Give this fixture its own environment: other parallel tests must not
+        // observe its CODEX_HOME or client directory.
+        let Some(home) = std::env::var_os(FIXTURE).map(PathBuf::from) else {
+            let home =
+                std::env::temp_dir().join(format!("acom-native-test-{}", harness::new_uuid()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::resumed_side_file_keeps_events_appended_before_the_follower_starts",
+                    "--nocapture",
+                ])
+                .env(FIXTURE, &home)
+                .env("CODEX_HOME", home.join("codex"))
+                .env("ACOM_HOME", home.join("state"))
+                .env("PATH", home.join("bin"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt;
+        struct OwnedGroup(u32);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                kill_group(self.0, libc::SIGKILL);
+            }
+        }
+        let bin = home.join("bin");
+        let sessions = home.join("codex/sessions/2026/10/08");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let native = sessions.join("rollout-native-audit-session.jsonl");
+        std::fs::write(&native, "{}\n").unwrap();
+        let wrote = home.join("native-wrote");
+        let event = serde_json::json!({
+            "type":"event_msg", "payload":{
+                "type":"token_count",
+                "info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":100,"output_tokens":50},"last_token_usage":{"total_tokens":123}},
+                "rate_limits":{"primary":{"used_percent":98,"window_minutes":300,"resets_at":now()+3600}}
+            }
+        });
+        let quote =
+            |p: &std::path::Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        let client = bin.join("codex");
+        std::fs::write(&client, format!(
+            "#!/bin/sh\nwhile IFS= read -r task; do :; done\nprintf '%s\\n' '{event}' >> {}\n: > {}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"native-audit-session\"}}' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":20,\"output_tokens\":2}}}}'\n",
+            quote(&native), quote(&wrote)
+        )).unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::open(home.join("state"), "http://127.0.0.1:0".into()).unwrap();
+        Arc::get_mut(&mut app).unwrap().exe = bin.join("acom");
+        let project = app.add_project(home.to_str().unwrap(), "test").unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let mut st = app.lock();
+        st.db.execute(
+            "INSERT INTO agents(id,project,name,task,harness,model,effort,state,session_id,session_started,launched_by,launched_at)
+             VALUES(1,?1,'a','t','codex','gpt-6-sol','medium','idle','native-audit-session',1,0,0)",
+            [project],
+        ).unwrap();
+        start_turn(&app, &mut st, 1, "isolated fake resumed turn", None).unwrap();
+        let _worker = OwnedGroup(st.procs[&1].pid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // Holding the normal start mutex keeps the follower from initializing
+        // until the client has definitely written this turn's native events.
+        while !wrote.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            wrote.exists(),
+            "fake client did not write its native events"
+        );
+        drop(st);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !app.lock().procs.is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let st = app.lock();
+        assert!(st.procs.is_empty(), "fake turn did not finish");
+        assert_eq!(
+            st.db
+                .query_row("SELECT context FROM agents WHERE id=1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            123
+        );
+        assert_eq!(st.used_pct("codex").unwrap(), Some(98.0));
+    }
 
     fn test_app(pid: u32) -> Arc<App> {
         let db = rusqlite::Connection::open_in_memory().unwrap();
