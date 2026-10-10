@@ -85,6 +85,10 @@ process.stdin.on('end', async () => {
     const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify("setTimeout(()=>console.log(JSON.stringify({type:'turn.failed',error:{message:'Delayed background failure'}})),500);setInterval(()=>{},1000)")}],{stdio:['ignore','inherit','ignore']});
     fs.writeFileSync(path.join(process.env.ACOM_HOME,'late-failure-child-'+id),String(child.pid)); child.unref(); return;
   }
+  if(task.includes('NEXT_TURN_FAIL_OWN_HISTORY') && claude) {
+    while(!fs.existsSync(path.join(process.env.ACOM_HOME,'release-'+id))) await new Promise(resolve=>setTimeout(resolve,25));
+    console.log(JSON.stringify({type:'turn.completed'})); return;
+  }
   if (task.includes('NEXT_TURN_') && !claude) {
     if(previous.length===0) {
       if(task.includes('NEXT_TURN_REPLACE_CHILD') || task.includes('NEXT_TURN_LATE_')) {
@@ -94,11 +98,12 @@ process.stdin.on('end', async () => {
       if(!task.includes('NEXT_TURN_LATE_')) while(!fs.existsSync(path.join(process.env.ACOM_HOME,'release-'+id))) await new Promise(resolve=>setTimeout(resolve,25));
       if(task.includes('NEXT_TURN_FAIL')) { console.log(JSON.stringify({type:'turn.failed',error:{message:'Controlled first-turn failure'}})); return; }
     } else {
+      if(task.includes('NEXT_TURN_FAIL_OWN_HISTORY') && previous.length%2===1) while(!fs.existsSync(path.join(process.env.ACOM_HOME,'release-'+id+'-'+previous.length))) await new Promise(resolve=>setTimeout(resolve,25));
       const inbox=await fetch(process.env.ACOM_URL+'/inbox/'+id+'?mark=new').then(r=>r.json());
       const ids=inbox.filter(m=>!m.outside_membership).map(m=>m.id);
       if(ids.length) await fetch(process.env.ACOM_URL+'/marks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:id,ids,mark:'handled'})});
     }
-    if(previous.length || task.includes('NEXT_TURN_DONE')) {
+    if(previous.length && !(task.includes('NEXT_TURN_FAIL_OWN_HISTORY') && previous.length%2===1) || task.includes('NEXT_TURN_DONE')) {
       await new Promise(resolve=>setTimeout(resolve,300));
       await fetch(process.env.ACOM_URL+'/agents/'+id+'/done',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     }
@@ -251,7 +256,7 @@ process.stdin.on('end', async () => {
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already running/);
     const lifecycleProject=await lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults});
-    const followupProject=await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr,otherProject:lifecycleProject.id});
+    const followupProject=await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
     const boundedLocks=structuredClone(defaults); boundedLocks.max_lock_ttl_secs=60;
     await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
@@ -841,7 +846,7 @@ process.stdin.on('end', async () => {
   }
 });
 
-async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors,otherProject}) {
+async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors}) {
   const folder=path.join(root,'followups'); fs.mkdirSync(folder);
   const project=await api('POST','/projects',{path:folder});
   const config=structuredClone(defaults);
@@ -950,7 +955,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
 
   // Ready, blocked intent survives a restart without starting a provider turn.
   const waiting=await launch('NEXT_TURN_CONTINUE temporarily disabled');
-  await configure(waiting.id,{model:'gpt-6-sol',continuation:'Continue after the model is allowed again',ack_crashes:true});
+  await configure(waiting.id,{model:'gpt-6-sol',continuation:'Continue after the model is allowed again'});
   const disabled=structuredClone(config); disabled.harnesses.codex.model='gpt-6-luna';
   disabled.harnesses.codex.models=disabled.harnesses.codex.models.filter(m=>m!=='gpt-6-sol');
   await settings(disabled); release(waiting.id);
@@ -964,51 +969,77 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   assert.equal(captures(waiting.id).length,2);
   await api('POST',`/agents/${waiting.id}/close`,{});
 
-  // Crash warnings use the actual failed turn, not the queued model, and are
-  // restricted to the same project/provider/model. Users are never gated.
-  const failed=await launch('NEXT_TURN_FAIL actual snapshot',{model:'gpt-6-sol'});
+  // Warnings belong to this identity and committed replacement predecessors,
+  // not coworkers, launchers or other agents that happen to share a project.
+  const failed=await launch('NEXT_TURN_FAIL_OWN_HISTORY actual snapshot',{model:'gpt-6-sol'});
   await configure(failed.id,{model:'gpt-6-luna'});
   release(failed.id); await finished(failed.id,'crashed');
   const failure=(await events(failed.id)).find(e=>e.kind==='agent.failed');
   assert.equal(failure.details.model,'gpt-6-sol'); assert.equal(failure.details.harness,'codex');
   assert.equal((await view(failed.id)).model,'gpt-6-luna');
-  await api('POST',`/agents/${failed.id}/close`,{});
-  const warned=await launch('NEXT_TURN_CONTINUE acknowledged choice');
+  const independent=await launch('NEXT_TURN_PLAIN independent coworker');
+  await configure(independent.id,{model:'gpt-6-sol'});
+  assert.equal((await view(independent.id)).model,'gpt-6-sol','an unrelated coworker does not inherit another identity\'s crash warning');
+  release(independent.id); await finished(independent.id,'idle');
+  await api('POST',`/agents/${independent.id}/close`,{});
+  await api('POST',`/agents/${failed.id}/resume`,{});
+  await until(()=>captures(failed.id).length===2,'same identity resumes with its queued unfailed model');
+  assert.equal(captures(failed.id)[1].model,'gpt-6-luna');
+  const warned=failed;
   const beforeWarn=await events(warned.id);
   const warning=await configure(warned.id,{model:'gpt-6-sol',continuation:'Only after acknowledgement'},409);
   assert.match(JSON.stringify(warning),/Previous crashes for codex\/gpt-6-sol/);
+  assert.match(JSON.stringify(warning),/in your agent history/);
   assert.match(JSON.stringify(warning),/Controlled first-turn failure/);
   assert.equal((await view(warned.id)).model,'gpt-6-luna');
   assert.equal((await view(warned.id)).continuation,null);
   assert.deepEqual(await events(warned.id),beforeWarn);
-  const agentsBefore=await api('GET',`/agents?project=${project.id}`);
-  await api('POST','/agents',{agent:warned.id,harness:'codex',model:'gpt-6-sol',task:'Rejected prior-crash helper'},409);
-  assert.deepEqual(await api('GET',`/agents?project=${project.id}`),agentsBefore,'rejected advisory cannot create an identity');
   assert.match(rejectedCli(warned.id,['configure','--model','gpt-6-sol','--continue','Rejected CLI intent']),/Previous crashes for/);
-  assert.match(rejectedCli(warned.id,['launch','--harness','codex','--model','gpt-6-sol','--task','Rejected CLI helper']),/Previous crashes for/);
-  const otherModel=await api('POST','/agents',{agent:warned.id,harness:'codex',model:'gpt-6-luna',task:'Unfailed model helper'});
+  const helper=await api('POST','/agents',{agent:warned.id,harness:'codex',model:'gpt-6-luna',task:'NEXT_TURN_PLAIN independent helper'});
+  await until(()=>captures(helper.id).length===1,'ordinary helper starts independently');
+  await configure(helper.id,{model:'gpt-6-sol'});
+  release(helper.id); await finished(helper.id,'idle');
+  const helperOutput=cli(folder,['launch','--harness','codex','--model','gpt-6-sol','--task','Independent helper using predecessor failed model'],{ACOM_ID:String(warned.id)});
+  assert.match(helperOutput,/launched agent \d+/,'ordinary launch creates a fresh identity without caller crash history');
+  const cliHelperId=Number(helperOutput.match(/launched agent (\d+)/)[1]);
   const otherProvider=await api('POST','/agents',{agent:warned.id,harness:'claude',model:'claude-sonnet-5-5',task:'Different provider helper'});
-  const acknowledgedOutput=cli(folder,['launch','--harness','codex','--model','gpt-6-sol','--task','Acknowledged helper','--ack-crashes'],{ACOM_ID:String(warned.id)});
-  assert.match(acknowledgedOutput,/agent \d+/);
   assert.match(cli(folder,['configure','--model','gpt-6-sol','--continue','Acknowledged continuation','--ack-crashes'],{ACOM_ID:String(warned.id)}),/continuation queued/);
-  release(warned.id); await finished(warned.id,'done');
-  assert.match(captures(warned.id)[1].prompt,/Acknowledged continuation/);
-  const userChoice=await launch('NEXT_TURN_PLAIN user bypass');
-  await configure(userChoice.id,{model:'gpt-6-sol'},409); // Success did not erase the crash advisory.
-  await api('POST','/agent-config',{id:userChoice.id,model:'gpt-6-sol',effort:'medium'});
-  release(userChoice.id); await finished(userChoice.id,'idle');
-  const currentChoice=await launch('NEXT_TURN_CONTINUE same actual model',{model:'gpt-6-sol'});
-  await configure(currentChoice.id,{effort:'high',continuation:'Same running model needs no acknowledgement'});
-  release(currentChoice.id); await finished(currentChoice.id,'done');
-  await api('PUT',`/projects/${otherProject}/config`,{custom:config});
-  const otherScope=await api('POST','/agents',{project:otherProject,harness:'codex',model:'gpt-6-luna',task:'NEXT_TURN_PLAIN other project'});
-  await until(()=>captures(otherScope.id).length===1,'other-project actor starts');
-  await configure(otherScope.id,{model:'gpt-6-sol'});
-  release(otherScope.id); await finished(otherScope.id,'idle');
-  await api('POST',`/agents/${otherScope.id}/close`,{});
-  for(const id of [warned.id,userChoice.id,currentChoice.id,otherModel.id,otherProvider.id]) await api('POST',`/agents/${id}/close`,{});
-  const acknowledgedHelper=(await api('GET',`/agents?project=${project.id}`)).find(a=>a.task==='Acknowledged helper');
-  assert.ok(acknowledgedHelper); await api('POST',`/agents/${acknowledgedHelper.id}/close`,{});
+  fs.writeFileSync(path.join(home,`release-${warned.id}-1`),'');
+  await until(()=>captures(warned.id).length===3,'acknowledged own-history continuation starts');
+  assert.match(captures(warned.id)[2].prompt,/Acknowledged continuation/);
+  await configure(warned.id,{effort:'medium'}); // Same actual Sol model: effort changes do not warn.
+  await finished(warned.id,'done');
+  await api('POST','/agent-config',{id:warned.id,model:'gpt-6-luna'});
+  await api('POST',`/agents/${warned.id}/close`,{});
+  const ownHistoryThread=await api('POST','/threads',{project:project.id,title:'Continue this identity after success',members:[String(warned.id)],include_user:false});
+  await api('POST','/messages',{thread:ownHistoryThread.id,text:'Continue after the successful acknowledged turn'});
+  await api('POST',`/agents/${warned.id}/reopen`,{});
+  await until(()=>captures(warned.id).length===4,'own history survives successful turns and explicit reopen');
+  await configure(warned.id,{model:'gpt-6-sol'},409);
+  await api('POST','/agent-config',{id:warned.id,model:'gpt-6-sol',effort:'medium'}); // User override is never gated.
+  for(const id of [helper.id,cliHelperId,otherProvider.id]) await api('POST',`/agents/${id}/close`,{});
+
+  const lineageRequest={harness:'claude',model:'claude-sonnet-5-5',effort:'high',task:'Continue this identity through another provider'};
+  await api('POST',`/agents/${warned.id}/replacement`,lineageRequest);
+  fs.writeFileSync(path.join(home,`release-${warned.id}-3`),'');
+  await until(async()=>(await view(warned.id)).replacement,'own-history source receives a committed replacement');
+  const descendant=(await view(warned.id)).replacement;
+  await until(()=>captures(descendant).length===1,'own-history replacement holds its turn');
+  const backToFailed={harness:'codex',model:'gpt-6-sol',effort:'medium',task:'Return to the earlier provider'};
+  const beforeLineageGuard=await events(descendant);
+  const lineageWarning=await api('POST',`/agents/${descendant}/replacement`,backToFailed,409);
+  assert.match(JSON.stringify(lineageWarning),/Previous crashes for codex\/gpt-6-sol.*in your agent history/);
+  assert.match(JSON.stringify(lineageWarning),new RegExp(`agent ${warned.id}, event`));
+  assert.deepEqual(await events(descendant),beforeLineageGuard);
+  assert.equal((await view(descendant)).replacement_request,null);
+  assert.match(rejectedCli(descendant,['launch','--replace','--harness','codex','--model','gpt-6-sol','--task','Rejected lineage return']),/Previous crashes for/);
+  assert.match(cli(folder,['launch','--replace','--harness','codex','--model','gpt-6-sol','--task','Acknowledged lineage return','--ack-crashes'],{ACOM_ID:String(descendant)}),/Replacement queued/);
+  const doneOutput=cli(folder,['launch','--done','--harness','codex','--model','gpt-6-sol','--task','Distinct done-handoff helper'],{ACOM_ID:String(descendant)});
+  const doneHelper=Number(doneOutput.match(/launched agent (\d+)/)[1]);
+  assert.equal((await view(descendant)).replacement_request,null,'ordinary --done handoff cancels replacement, without inheriting its crash advisory');
+  release(descendant); await finished(descendant,'done');
+  await api('POST',`/agents/${descendant}/close`,{});
+  await finished(doneHelper,'done'); await api('POST',`/agents/${doneHelper}/close`,{});
 
   // --replace is not an ordinary helper launch: nothing is created or replaced
   // while the predecessor is still working. Fixed memberships/marks transfer;
@@ -1020,7 +1051,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   await api('POST','/marks',{agent:replacement.id,ids:[marked.id],mark:'in-progress'});
   await api('POST','/locks',{project:project.id,name:'handoff-lock',about:'Locks do not transfer'});
   await api('POST','/locks/acquire',{agent:replacement.id,name:'handoff-lock',wait:0,ttl:30});
-  await configure(replacement.id,{model:'gpt-6-sol',effort:'medium',continuation:'Superseded by replacement',ack_crashes:true});
+  await configure(replacement.id,{model:'gpt-6-sol',effort:'medium',continuation:'Superseded by replacement'});
   assert.deepEqual((await view(replacement.id)).running_configuration,{model:'gpt-6-luna',effort:'low'});
   const targetRequest={harness:'claude',model:'claude-sonnet-5-5',effort:'high',task:'Continue the deliberate handoff'};
   for(const invalid of [{...targetRequest,harness:'codex',model:'gpt-6-luna'},{...targetRequest,force:true},{...targetRequest,done:true}]) {

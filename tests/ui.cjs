@@ -1484,6 +1484,11 @@ test('continuation is an explicit working-agent opt-in and its pending instructi
   await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('saved for the next turn'));
   assert.equal(Object.hasOwn(data.requests.at(-1).body, 'continuation'), false);
   assert.equal(data.agents[0].continuation.text, 'Continue <review> & finish', 'ordinary configuration does not cancel a pending request');
+  await config.locator('[name=agent_continue]').check();
+  await config.locator('[name=agent_continuation]').fill('Use the latest instruction');
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => document.querySelector('dt[data-key=continuation] + dd').textContent.includes('Use the latest instruction'));
+  assert.deepEqual(data.agents[0].continuation, {text:'Use the latest instruction',blocked:null}, 'explicit continuation replaces the instruction and clears its old blocking reason');
   data.agents[0].state = 'idle'; data.agents[0].continuation = null;
   await page.evaluate(() => refresh());
   assert.equal(await config.locator('[name=agent_continue]').isDisabled(), true);
@@ -1515,9 +1520,9 @@ test('a delayed configuration save keeps newer continuation drafts and rejects c
   assert.equal(await config.locator('[name=agent_continue]').isDisabled(), true);
 }));
 
-test('prior-crash warnings require explicit confirmation before a single acknowledged configure retry', async () => fixture(async (page, data) => {
+test('own-history crash warnings require explicit confirmation before a single acknowledged configure retry', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
-  data.agentConfigError = {status:409,message:'Previous crashes for gpt-6-luna: agent 8, history /history/8.jsonl. Review before acknowledging.'};
+  data.agentConfigError = {status:409,message:'Previous crashes for gpt-6-luna in your own agent history/replacement lineage: agent 1, history /history/1.jsonl. Review before acknowledging.'};
   await page.reload(); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
@@ -1526,7 +1531,7 @@ test('prior-crash warnings require explicit confirmation before a single acknowl
   await config.locator('[name=agent_continue]').check();
   await config.locator('[name=agent_continuation]').fill('Review new task');
   let confirmations = 0;
-  page.once('dialog', dialog => { confirmations++; const message = dialog.message(); dialog.dismiss(); assert.match(message, /agent 8.*history.*reviewed/is); });
+  page.once('dialog', dialog => { confirmations++; const message = dialog.message(); dialog.dismiss(); assert.match(message, /own agent history\/replacement lineage.*agent 1.*history.*reviewed/is); });
   await config.locator('#save-agent-config').click();
   await page.waitForFunction(() => !document.querySelector('#save-agent-config').disabled);
   assert.equal(data.requests.length, 1);

@@ -1379,7 +1379,7 @@ pub struct LaunchReq {
     pub force: bool,
     /// The launching agent marks itself done in the same step.
     pub done: bool,
-    /// Acknowledge the project's previous failures for the selected model.
+    /// Acknowledge this agent's previous failures when requesting a replacement.
     pub ack_crashes: bool,
 }
 
@@ -1599,10 +1599,6 @@ impl App {
         if req.task.trim().is_empty() {
             return Err(bad("the task is empty"));
         }
-        if by > 0 && !req.ack_crashes {
-            self.check_previous_crashes(st, project, &harness, &model)?;
-        }
-
         // Limits: soft warns, hard refuses agents and needs confirming for the user.
         // An agent handing over with `done` no longer counts.
         if req.done {
@@ -2121,21 +2117,30 @@ impl App {
 
     // ---------- agent self-service ----------
 
-    /// Crash advisories survive successful turns and cleared retry counters.
-    fn check_previous_crashes(&self, st: &St, project: i64, harness: &str, model: &str) -> R<()> {
+    /// Only this agent and its committed replacement predecessors share crash history.
+    /// Successful turns and cleared retry counters do not erase that history.
+    fn check_previous_crashes(&self, st: &St, agent: i64, harness: &str, model: &str) -> R<()> {
+        let project = st.agent(agent)?.project;
         let failures = rows(&st.db,
-            "SELECT e.id,e.agent,e.at,json_extract(e.details,'$.reason') reason FROM events e
-             WHERE e.project=?1 AND e.kind='agent.failed'
+            "WITH RECURSIVE lineage(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT p.id FROM events r JOIN lineage l ON r.agent=l.id
+                   JOIN agents p ON p.id=json_extract(r.details,'$.predecessor') AND p.project=?2
+                 WHERE r.project=?2 AND r.kind='agent.replacement'
+             )
+             SELECT e.id,e.agent,e.at,json_extract(e.details,'$.reason') reason FROM events e
+             WHERE e.project=?2 AND e.agent IN (SELECT id FROM lineage) AND e.kind='agent.failed'
                AND coalesce(json_extract(e.details,'$.harness'),
-                   (SELECT json_extract(t.details,'$.harness') FROM events t WHERE t.agent=e.agent AND t.kind='agent.turn-started' AND t.id<e.id ORDER BY t.id DESC LIMIT 1))=?2
+                   (SELECT json_extract(t.details,'$.harness') FROM events t WHERE t.agent=e.agent AND t.kind='agent.turn-started' AND t.id<e.id ORDER BY t.id DESC LIMIT 1))=?3
                AND coalesce(json_extract(e.details,'$.model'),
-                   (SELECT json_extract(t.details,'$.model') FROM events t WHERE t.agent=e.agent AND t.kind='agent.turn-started' AND t.id<e.id ORDER BY t.id DESC LIMIT 1))=?3
-             ORDER BY e.id DESC LIMIT 3", params![project,harness,model])?;
+                   (SELECT json_extract(t.details,'$.model') FROM events t WHERE t.agent=e.agent AND t.kind='agent.turn-started' AND t.id<e.id ORDER BY t.id DESC LIMIT 1))=?4
+             ORDER BY e.id DESC LIMIT 3", params![agent,project,harness,model])?;
         if failures.is_empty() {
             return Ok(());
         }
         let mut warning = format!(
-            "Previous crashes for {harness}/{model} in this project. Nothing was changed. Review the failure history and reevaluate before selecting it:\n"
+            "Previous crashes for {harness}/{model} in your agent history (including replacement predecessors). Nothing was changed. Review the failure history and reevaluate before selecting it:\n"
         );
         for f in failures {
             let reason: String = f["reason"]
@@ -2272,6 +2277,9 @@ impl App {
             check.done = true;
             let (new, warnings) = self.prepare_launch(&mut st, id, None, None, check, true)?;
             let selected = st.agent(new)?;
+            if !req.ack_crashes {
+                self.check_previous_crashes(&st, id, &selected.harness, &selected.model)?;
+            }
             req.harness = Some(selected.harness);
             req.model = Some(selected.model);
             req.effort = Some(selected.effort);
@@ -2488,7 +2496,7 @@ impl App {
                 .get(&id)
                 .map_or(a.model.as_str(), |p| p.model.as_str());
             if model != running_model && !ack_crashes {
-                self.check_previous_crashes(&st, a.project, &a.harness, model)?;
+                self.check_previous_crashes(&st, id, &a.harness, model)?;
             }
         }
         let text = format!(
@@ -5849,7 +5857,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_guard_uses_actual_running_model_and_retained_project_history() {
+    fn crash_guard_uses_actual_running_model_and_retained_own_history() {
         let app = self_change_app();
         {
             let mut st = app.lock();
@@ -5908,6 +5916,166 @@ mod tests {
         // Staying on the actual running model is not selecting a different model.
         app.configure_agent(1, 1, None, Some("max"), None, false)
             .unwrap();
+    }
+
+    #[test]
+    fn unrelated_agents_and_new_helpers_do_not_inherit_crash_warnings() {
+        let app = self_change_app();
+        {
+            let st = app.lock();
+            st.db.execute("UPDATE agents SET project=1,state='working',model='claude-opus-5',effort='medium'", []).unwrap();
+            st.event(
+                1,
+                Some(1),
+                None,
+                "agent.failed",
+                "acom",
+                json!({"harness":"claude","model":"claude-opus-5-5","reason":"agent one's crash"}),
+            )
+            .unwrap();
+        }
+        app.configure_agent(2, 2, Some("claude-opus-5-5"), None, None, false)
+            .unwrap();
+        let error = app
+            .configure_agent(1, 1, Some("claude-opus-5-5"), None, None, false)
+            .unwrap_err();
+        assert!(error.1.contains("agent one's crash"));
+        let mut st = app.lock();
+        for done in [false, true] {
+            let mut req = replacement_request();
+            req.harness = Some("claude".into());
+            req.model = Some("claude-opus-5-5".into());
+            req.done = done;
+            st.db.execute_batch("SAVEPOINT independent_launch").unwrap();
+            let result = app.prepare_launch(&mut st, 1, None, None, req, false);
+            st.db
+                .execute_batch("ROLLBACK TO independent_launch; RELEASE independent_launch")
+                .unwrap();
+            assert!(
+                result.is_ok(),
+                "new independent launch must not inherit caller crashes: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_history_follows_only_committed_replacement_ancestors_and_survives_restart() {
+        let app = self_change_app();
+        {
+            let st = app.lock();
+            st.db.execute_batch("UPDATE agents SET project=1 WHERE id=2;
+                INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES
+                (3,1,'successor','t','codex','gpt-6-sol','medium','working',1,0),
+                (4,1,'next successor','t','claude','claude-opus-5','medium','working',3,0),
+                (5,1,'independent helper','t','claude','claude-opus-5','medium','working',1,0);").unwrap();
+            st.event(
+                1,
+                Some(1),
+                None,
+                "agent.failed",
+                "acom",
+                json!({"harness":"claude","model":"claude-opus-5-5","reason":"own ancestor crash"}),
+            )
+            .unwrap();
+            st.event(
+                1,
+                Some(2),
+                None,
+                "agent.failed",
+                "acom",
+                json!({"harness":"claude","model":"claude-opus-5-5","reason":"unrelated crash"}),
+            )
+            .unwrap();
+            st.event(
+                1,
+                Some(3),
+                None,
+                "agent.replacement",
+                "acom",
+                json!({"predecessor":1}),
+            )
+            .unwrap();
+            st.event(
+                1,
+                Some(4),
+                None,
+                "agent.replacement",
+                "acom",
+                json!({"predecessor":3}),
+            )
+            .unwrap();
+            st.event(
+                1,
+                Some(4),
+                None,
+                "agent.failed",
+                "acom",
+                json!({"harness":"codex","model":"gpt-6-sol","reason":"descendant crash"}),
+            )
+            .unwrap();
+            // Created/queued metadata is not evidence of a completed replacement.
+            st.event(
+                1,
+                Some(5),
+                None,
+                "agent.created",
+                "agent 1",
+                json!({"predecessor":1}),
+            )
+            .unwrap();
+            st.event(
+                1,
+                Some(5),
+                None,
+                "agent.replacement-queued",
+                "agent 5",
+                json!({"predecessor":1}),
+            )
+            .unwrap();
+            assert!(
+                app.check_previous_crashes(&st, 5, "claude", "claude-opus-5-5")
+                    .is_ok()
+            );
+            assert!(
+                app.check_previous_crashes(&st, 1, "codex", "gpt-6-sol")
+                    .is_ok()
+            );
+        }
+        let mut req = replacement_request();
+        req.harness = Some("claude".into());
+        req.model = Some("claude-opus-5-5".into());
+        let before = rows(&app.lock().db, "SELECT * FROM events ORDER BY id", []).unwrap();
+        let error = app.queue_replacement(3, req.clone()).unwrap_err();
+        assert_eq!(error.0, 409);
+        assert!(error.1.contains("own ancestor crash"));
+        assert!(!error.1.contains("unrelated crash"));
+        assert_eq!(
+            rows(&app.lock().db, "SELECT * FROM events ORDER BY id", []).unwrap(),
+            before
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM agents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert!(!app.lock().agent(3).unwrap().done_req);
+        req.ack_crashes = true;
+        app.queue_replacement(3, req).unwrap();
+        let error = app
+            .configure_agent(4, 4, Some("claude-opus-5-5"), None, None, false)
+            .unwrap_err();
+        assert!(error.1.contains("own ancestor crash"));
+        assert!(!error.1.contains("unrelated crash"));
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        let error = app
+            .check_previous_crashes(&app.lock(), 4, "claude", "claude-opus-5-5")
+            .unwrap_err();
+        assert!(error.1.contains("own ancestor crash"));
+        assert!(!error.1.contains("unrelated crash"));
     }
 
     fn replacement_request() -> LaunchReq {
