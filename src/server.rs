@@ -1,7 +1,7 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    App, Fail, HistoryQuery, LaunchReq, LockMode, PageQuery, R, Settings, acom_home, actor, bad,
+    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, acom_home, actor, bad,
     bounded_record, not_found,
 };
 use crate::harness::catalog;
@@ -443,13 +443,12 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({"queued":true,"warnings":warnings}))
         }
         ("POST", ["agents", a, "pause"]) => {
-            let mode = match b["locks"].as_str() {
-                Some("release") => LockMode::Release,
-                Some("keep") => LockMode::Keep,
-                None => LockMode::Ask,
-                Some(x) => return Err(bad(format!("locks must be release or keep, not {x}"))),
-            };
-            app.pause(id(a)?, mode, &user(b))?;
+            if b.get("locks").is_some() {
+                return Err(bad(
+                    "pause releases locks automatically; the locks option is unsupported",
+                ));
+            }
+            app.pause(id(a)?, &user(b))?;
             J(json!({}))
         }
         ("POST", ["agents", a, "resume"]) => {
@@ -621,14 +620,11 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             let project = int(b, "project")?;
             let name = text(b, "name")?;
             if b.get("expected_holder").is_some() {
-                let holder = int(b, "expected_holder")?;
-                if holder <= 0 {
-                    return Err(bad("expected_holder must be a positive agent ID"));
-                }
-                app.free_frozen(project, &name, holder, &user(b))?;
-            } else {
-                app.free(project, &name, &user(b))?;
+                return Err(bad(
+                    "expected_holder is unsupported; paused agents release their locks automatically",
+                ));
             }
+            app.free(project, &name, &user(b))?;
             J(json!({}))
         }
 

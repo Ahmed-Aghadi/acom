@@ -71,7 +71,7 @@ User commands (they act on the project the current folder is in):
   launch ... [--force]                    Launch an agent in this folder's project (added if
                                           needed); --force confirms past a hard limit
   send --thread <TID> [text]              Post as user
-  pause <ID> [--release-locks|--keep-locks]
+  pause <ID>                              Stop the worker, then release its locks
   pause-all / resume-all
   resume-restart                          Resume restart-paused agents across all projects
   resume <ID,...>
@@ -587,10 +587,6 @@ enum Cmd {
     },
     Pause {
         id: i64,
-        #[arg(long)]
-        release_locks: bool,
-        #[arg(long, conflicts_with = "release_locks")]
-        keep_locks: bool,
     },
     PauseAll,
     ResumeAll,
@@ -1745,11 +1741,8 @@ fn main() {
                             l["holder_name"].as_str().unwrap_or(""),
                             t(&l["acquired_at"])
                         );
-                        if l["frozen"] == 1 {
-                            s += &match l["frozen_left"].as_i64() {
-                                Some(left) => format!(", frozen with {}s left", left),
-                                None => ", frozen".into(),
-                            };
+                        if l["holder_stopping"] == true {
+                            s += ", releasing after worker stops";
                         } else if l["expires_at"].is_i64() {
                             s += &format!(", expires {}", t(&l["expires_at"]));
                         }
@@ -1900,28 +1893,14 @@ fn main() {
                 println!("freed {}", short_label(&name));
             }
         },
-        Cmd::Pause {
-            id,
-            release_locks,
-            keep_locks,
-        } => {
-            let locks = if release_locks {
-                json!("release")
-            } else if keep_locks {
-                json!("keep")
-            } else {
-                Value::Null
-            };
-            post(
-                &format!("/agents/{id}/pause"),
-                user_body(json!({ "locks": locks })),
-            );
-            println!("paused agent {id}");
+        Cmd::Pause { id } => {
+            post(&format!("/agents/{id}/pause"), user_body(json!({})));
+            println!("paused agent {id}; locks release after its old worker stops");
         }
         Cmd::PauseAll => {
             let v = post("/pause-all", user_body(json!({})));
             println!(
-                "paused {} agent(s); their locks are frozen",
+                "paused {} agent(s); locks release after their old workers stop",
                 result_count(&v, "ids")
             );
         }

@@ -14,6 +14,14 @@ const { DatabaseSync } = require('node:sqlite');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
 const startupDiagnostic={type:'item.completed',item:{id:'item_0',type:'error',message:'`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.'}};
+const resumeWarning="Commands may be partial; unsaved work may be lost. Old commands, background tasks and monitors stopped—don't wait for them. Previous locks released; reacquire required locks before protected work.";
+function assertResumeWarning(prompt,guidance) {
+  assert.equal(prompt.split(resumeWarning).length-1,1,'the mandatory interruption warning is delivered exactly once');
+  assert.match(prompt,/\[acom\] Previous turn interrupted[^\n]*\. Resumed at \d\d:\d\d(?: after an error)?\./);
+  const heading=guidance ? `## Guidance\n\n${guidance}` : '## Guidance\n\n';
+  const warningAt=prompt.indexOf(resumeWarning), guidanceAt=prompt.indexOf(heading,warningAt);
+  assert.ok(guidanceAt>warningAt,'mandatory warning comes before custom Guidance');
+}
 
 // These lifecycle tests inspect complete fixture state. Follow the bounded API
 // explicitly; raw envelope and byte-budget assertions live in pagination.cjs.
@@ -668,7 +676,7 @@ process.stdin.on('end', async () => {
     const crashRetry = runs().filter(r=>r.id===crashed.id)[1];
     assert.ok(crashRetry.resume);
     assert.match(crashRetry.prompt, /Resumed at .* after an error/);
-    assert.match(crashRetry.prompt, /Commands may have only partially executed/);
+    assertResumeWarning(crashRetry.prompt,defaults.prompts.resume);
     assert.match(crashRetry.prompt, /Literal \{updates\} resume/);
     assert.match(crashRetry.prompt, /claude weekly unknown \(soft 35%, hard 65%\)/);
     assert.doesNotMatch(crashRetry.prompt, /# acom guide|user changed the limits or rules/);
@@ -986,7 +994,7 @@ process.stdin.on('end', async () => {
     noCap.auto_resume=true; await api('PUT',`/configs/${mine.id}`,{settings:noCap});
     await until(()=>runs().filter(r=>r.id===exhausted.id).length===2,'automatic same-session recovery');
     const recovery=runs().filter(r=>r.id===exhausted.id)[1];
-    assert.ok(recovery.resume); assert.match(recovery.prompt,/Commands may have only partially executed/);
+    assert.ok(recovery.resume); assertResumeWarning(recovery.prompt,defaults.prompts.resume);
     assert.match(recovery.prompt,/Literal \{updates\} resume/);
     assert.match(recovery.prompt,/codex 0% \(no limit\)/);
     assert.ok(recovery.prompt.lastIndexOf('## Limits and rules right now') > recovery.prompt.lastIndexOf('user changed the limits or rules'));
@@ -1119,6 +1127,7 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
   const project=await api('POST','/projects',{path:folder}), other=await api('POST','/projects',{path:otherFolder});
   const config=structuredClone(defaults);
   config.done_closes=false; config.auto_resume=false;
+  config.prompts.resume='PAUSE_CUSTOM_GUIDANCE_WITHOUT_WARNINGS';
   config.allow_agent_model_change=true; config.allow_agent_effort_change=true;
   config.limits.active={soft:null,hard:null};
   for(const provider of Object.keys(config.limits.active_per_harness)) config.limits.active_per_harness[provider]={soft:null,hard:null};
@@ -1247,29 +1256,83 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='wait-expiry').holder,null);
     assert.equal((await view(waiter.id)).state,'working','lease expiry does not end a waiting turn');
 
+    await api('POST','/locks',{project:project.id,name:'usage-released',about:'Usage pauses release held locks after stopping'});
+    await api('POST','/locks/acquire',{agent:waiter.id,name:'usage-released',wait:0,ttl:30});
+    await api('POST',`/hook/${waiter.id}`,{});
     const interrupted=api('POST',`/wait/${waiter.id}`,{timeout:5},409);
     await new Promise(resolve=>setTimeout(resolve,150));
     fs.writeFileSync(subscription,JSON.stringify({rateLimits:{primary:{usedPercent:60,resetsAt:Math.floor(Date.now()/1000)+3600}}}));
     await api('POST','/usage/check',{provider:'codex'});
     await finished(waiter.id,'paused'); await interrupted;
     assert.equal((await view(waiter.id)).pause_reason,'limit','usage limit interrupts the waiting turn, not just its wait');
+    await until(async()=>(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='usage-released').holder===null,'usage pause releases its held lock');
     fs.writeFileSync(subscription,JSON.stringify({rateLimits:{primary:{usedPercent:0,resetsAt:Math.floor(Date.now()/1000)+3600}}}));
     await api('POST','/usage/check',{provider:'codex'});
     await until(async()=>(await api('GET',`/limits?project=${project.id}`)).usage.some(u=>u.provider==='codex'&&u.used_pct===0),'owned fake usage reset');
 
     const idle=await launch('NEXT_TURN_PLAIN idle survives shutdown');
+    await api('POST','/locks',{project:project.id,name:'idle-released',about:'Pausing idle restores state but releases the reservation'});
+    await api('POST','/locks/acquire',{agent:idle.id,name:'idle-released',wait:0,ttl:30});
     fs.writeFileSync(path.join(home,`release-${idle.id}`),''); await finished(idle.id,'idle');
-    const manual=await launch('MEMBERSHIP_HOLD_TEST manual pause survives shutdown');
-    await api('POST','/locks',{project:project.id,name:'manual-frozen',about:'Manual pause must remain untouched'});
-    await api('POST','/locks/acquire',{agent:manual.id,name:'manual-frozen',wait:0,ttl:30});
-    await api('POST',`/agents/${manual.id}/pause`,{locks:'keep'});
+    const contender=await launch('MEMBERSHIP_HOLD_TEST pause-release contender');
+    const manual=await launch('MEMBERSHIP_HOLD_TEST RESTART_ESCAPE_TEST RESTART_LATE_FORK_TEST manual pause survives shutdown');
+    await api('POST','/locks',{project:project.id,name:'manual-released',about:'Manual pauses release their locks'});
+    await api('POST','/locks/acquire',{agent:manual.id,name:'manual-released',wait:0,ttl:2});
+    for(const locks of ['keep','release',null]) {
+      await api('POST',`/agents/${manual.id}/pause`,{locks},400);
+      assert.equal((await view(manual.id)).state,'working','obsolete pause options cannot stop the worker');
+    }
+    await until(()=>fs.existsSync(path.join(home,`restart-escaped-${manual.id}`)),'manual pause escaped tool starts');
+    const manualEscaped=Number(fs.readFileSync(path.join(home,`restart-escaped-${manual.id}`),'utf8'));
+    await api('POST',`/agents/${manual.id}/pause`,{});
+    await until(async()=>(await view(manual.id)).stopping && !alive(captures(manual.id)[0].pid),'stopping stays visible after the native leader exits');
+    await until(()=>fs.existsSync(path.join(home,`restart-late-${manual.id}`)),'manual pause TERM handler creates its owned detached child');
+    const manualLate=Number(fs.readFileSync(path.join(home,`restart-late-${manual.id}`),'utf8'));
+    await new Promise(resolve=>setTimeout(resolve,2200));
+    assert.ok(alive(manualEscaped) && alive(manualLate),'owned TERM-resistant tools remain alive during the protected stopping phase');
+    const stoppingLock=(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='manual-released');
+    assert.equal(stoppingLock.holder,manual.id,'expired TTL cannot reassign a reservation while old tools are stopping');
+    assert.equal(stoppingLock.holder_stopping,true,'lock previews explain that an expired reservation is still being released safely');
+    await api('POST','/locks/acquire',{agent:contender.id,name:'manual-released',wait:0,ttl:5},409);
+    await api('POST','/locks/acquire',{agent:manual.id,name:'manual-released',wait:0,ttl:5},409);
+    await api('POST','/locks/release',{agent:manual.id,name:'manual-released'},409);
+    await api('POST','/locks/free',{project:project.id,name:'manual-released'},409);
+    await api('POST',`/agents/${manual.id}/close`,{},409);
+    let resumeCompleted=false;
+    const pendingResume=api('POST',`/agents/${manual.id}/resume`,{}).then(value=>{resumeCompleted=true;return value;});
+    await new Promise(resolve=>setTimeout(resolve,150));
+    assert.equal(resumeCompleted,false,'Resume waits while the old tools still own the stopping reservation');
+    assert.equal(captures(manual.id).length,1,'Resume cannot overlap a still-stopping old turn');
+    await until(async()=>(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='manual-released').holder===null,'manual pause releases its held lock');
+    assert.equal(alive(manualEscaped),false); assert.equal(alive(manualLate),false);
+    await pendingResume;
+    await until(()=>captures(manual.id).length===2,'Resume starts only after the old tools stopped');
+    assertResumeWarning(captures(manual.id)[1].prompt,config.prompts.resume);
+    assert.equal((await view(manual.id)).stopping,false);
+    await api('POST','/locks/acquire',{agent:contender.id,name:'manual-released',wait:0,ttl:5});
+    await api('POST','/locks/release',{agent:contender.id,name:'manual-released'});
+    await api('POST',`/agents/${manual.id}/pause`,{});
+    await until(async()=>!(await view(manual.id)).stopping,'the resumed manual fixture is paused again without lingering tools');
     const manualBefore=await view(manual.id);
+    await api('POST','/locks',{project:project.id,name:'pause-all-released',about:'Pause all uses the same release policy'});
+    await api('POST','/locks/acquire',{agent:contender.id,name:'pause-all-released',wait:0,ttl:30});
+    const all=await api('POST','/pause-all',{});
+    assert.deepEqual(all.ids.toSorted((a,b)=>a-b),[idle.id,contender.id].toSorted((a,b)=>a-b));
+    await until(async()=>(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='pause-all-released').holder===null,'Pause all releases its held locks');
+    await until(async()=>(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='idle-released').holder===null,'Pause all also releases an idle agent\'s held lease');
+    await api('POST',`/agents/${idle.id}/resume`,{});
+    assert.equal((await view(idle.id)).state,'idle'); assert.equal(captures(idle.id).length,1,'resuming a previously idle agent does not manufacture a provider turn');
+    assert.ok((await api('GET',`/notices/${idle.id}`)).some(note=>note.text.includes('idle-released') && /acquire.*again/i.test(note.text)),'an idle agent retains its hardcoded release/reacquire notice for the next turn');
+    await api('POST',`/agents/${contender.id}/resume`,{});
+    await until(()=>captures(contender.id).length===2,'normal manual/all Resume restarts the interrupted working turn');
+    assertResumeWarning(captures(contender.id)[1].prompt,config.prompts.resume);
+    await api('POST',`/agents/${contender.id}/close`,{});
     const working=await launch('MEMBERSHIP_HOLD_TEST RESTART_ESCAPE_TEST RESTART_LATE_FORK_TEST interrupted continuation');
     const cross=await launch('MEMBERSHIP_HOLD_TEST interrupted replacement',other,'claude');
     await api('POST','/agent-config',{id:working.id,agent:working.id,effort:'high',continuation:'WAIT_RESTART_CANCELLED_CONTINUATION'});
     await api('POST',`/agents/${cross.id}/replacement`,{harness:'codex',model:'gpt-6-luna',effort:'low',task:'WAIT_RESTART_CANCELLED_REPLACEMENT'});
-    await api('POST','/locks',{project:project.id,name:'restart-frozen',about:'Graceful shutdown freezes the remaining TTL'});
-    await api('POST','/locks/acquire',{agent:working.id,name:'restart-frozen',wait:0,ttl:30});
+    await api('POST','/locks',{project:project.id,name:'restart-released',about:'Graceful shutdown releases locks after workers stop'});
+    await api('POST','/locks/acquire',{agent:working.id,name:'restart-released',wait:0,ttl:30});
     await until(()=>fs.existsSync(path.join(home,`restart-escaped-${working.id}`)),'owned escaped fake process starts');
     const escaped=Number(fs.readFileSync(path.join(home,`restart-escaped-${working.id}`),'utf8'));
     foreign=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(working.id),ACOM_URL:'http://127.0.0.1:1'},detached:true,stdio:'ignore'});
@@ -1304,8 +1367,8 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     assert.equal(persisted.find(row=>row.id===manual.id).pause_reason,manualBefore.pause_reason);
     assert.equal(persisted.find(row=>row.id===manual.id).paused_at,manualBefore.paused_at);
     assert.equal(persisted.find(row=>row.id===waiter.id).pause_reason,'limit');
-    const frozen=dbAction(db=>db.prepare('SELECT holder,frozen,frozen_left,expires_at FROM locks WHERE project=? AND name=?').get(project.id,'restart-frozen'));
-    assert.equal(frozen.holder,working.id); assert.equal(frozen.frozen,1); assert.ok(frozen.frozen_left>0); assert.equal(frozen.expires_at,null);
+    const released=dbAction(db=>db.prepare('SELECT holder,frozen,frozen_left,expires_at FROM locks WHERE project=? AND name=?').get(project.id,'restart-released'));
+    assert.equal(released.holder,null); assert.equal(released.frozen,0); assert.equal(released.frozen_left,null); assert.equal(released.expires_at,null);
     const stoppedWait=await shutdownWait;
     assert.ok(stoppedWait.error || [409,503].includes(stoppedWait.status),'shutdown interrupts a foreground wait instead of delivering fake success');
     await start();
@@ -1326,22 +1389,28 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     assert.deepEqual(retryResumed.ids,[cross.id]); assert.deepEqual(retryResumed.errors,[]);
     resumed.ids.push(...retryResumed.ids);
     assert.deepEqual(resumed.ids.toSorted((a,b)=>a-b),[working.id,cross.id].toSorted((a,b)=>a-b),'restart resume is global but excludes manual and usage pauses');
-    assert.ok(resumed.warnings.some(w=>w.includes(String(manual.id))),'retained manual frozen locks are reported');
-    for(const a of [working,cross]) await until(()=>captures(a.id).length===2,`restart-only resume starts ${a.id} once`);
+    assert.deepEqual(resumed.warnings,[],'completed pauses leave no retained-lock warnings');
+    for(const a of [working,cross]) {
+      await until(()=>captures(a.id).length===2,`restart-only resume starts ${a.id} once`);
+      assertResumeWarning(captures(a.id)[1].prompt,config.prompts.resume);
+    }
     assert.doesNotMatch(captures(working.id)[1].prompt,/WAIT_RESTART_CANCELLED_CONTINUATION/);
     assert.doesNotMatch(captures(cross.id)[1].prompt,/WAIT_RESTART_CANCELLED_REPLACEMENT/);
     assert.equal(captures(cross.id)[1].prompt.split(`Recovered delivery #${recovery.delivery_id}`).length-1,1,'committed startup recovers the unacknowledged immutable batch once');
     assert.doesNotMatch(captures(cross.id)[1].prompt,/WAIT_RECOVERED_PRIVATE_CONTENT/);
     assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text),null);
     assert.equal((await view(manual.id)).state,'paused'); assert.equal((await view(waiter.id)).state,'paused');
-    assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='restart-frozen').frozen,0);
+    assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='restart-released').holder,null,'Resume does not reacquire old locks');
+    await api('POST','/locks/acquire',{agent:working.id,name:'restart-released',wait:0,ttl:30});
     await stop('SIGINT');
+    assert.equal(dbAction(db=>db.prepare('SELECT holder FROM locks WHERE project=? AND name=?').get(project.id,'restart-released').holder),null,'SIGINT also releases held locks after stopping workers');
     for(const row of saved().filter(row=>[working.id,cross.id].includes(row.id))) {assert.equal(row.state,'paused');assert.equal(row.pause_reason,'restart');}
     assert.ok(alive(foreign.pid),'SIGINT also preserves the foreign-URL process');
     assert.ok(alive(foreignHome.pid),'SIGINT also preserves the foreign-home process');
     await start();
     assert.match(cli(folder,['resume-restart']),/resumed 2 restart-paused agent/i,'user CLI resumes across projects, not just its current folder');
     for(const a of [working,cross]) await until(()=>captures(a.id).length===3,`CLI restart-only resume starts ${a.id} once`);
+    await api('POST','/locks/acquire',{agent:working.id,name:'restart-released',wait:0,ttl:30});
 
     // Abrupt exit leaves saved working state; boot reconciles owned tools even
     // when a tool belongs to an idle agent, without altering that idle state.
@@ -1352,6 +1421,7 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     assert.equal(saved().find(row=>row.id===working.id).state,'working','abrupt stop deliberately bypasses graceful persistence');
     assert.ok(alive(idleTool.pid));
     await start();
+    assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='restart-released').holder,null,'boot releases an interrupted worker\'s reservation after owned cleanup');
     await until(()=>!alive(idleTool.pid),'boot cleans an owned escaped tool of an idle agent');
     assert.equal((await view(idle.id)).state,'idle');
     assert.equal((await view(manual.id)).pause_reason,'user'); assert.equal((await view(waiter.id)).pause_reason,'limit');
@@ -1462,7 +1532,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   for(const action of ['fail','done','pause','close']) {
     const agent=await launch(`NEXT_TURN_${action==='fail' ? 'FAIL' : action==='done' ? 'DONE' : 'CANCEL'} ${action}`,action==='fail' ? {model:'gpt-6-sol'} : {});
     await configure(agent.id,{effort:'high',continuation:'This cancelled instruction must not run'});
-    if(action==='pause') await api('POST',`/agents/${agent.id}/pause`,{locks:'release'});
+    if(action==='pause') await api('POST',`/agents/${agent.id}/pause`,{});
     else if(action==='close') await api('POST',`/agents/${agent.id}/close`,{});
     else release(agent.id);
     await noFollowup(agent.id,{fail:'crashed',done:'done',pause:'paused',close:'closed'}[action]);
@@ -1679,7 +1749,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   await new Promise(resolve=>setTimeout(resolve,1100));
   assert.equal(captures(capacity.id).length,1);
   assert.equal(captures(capacityTarget).length,0);
-  await api('POST',`/agents/${capacityTarget}/pause`,{locks:'release'});
+  await api('POST',`/agents/${capacityTarget}/pause`,{});
   assert.equal((await view(capacityTarget)).state,'paused');
   assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
   await api('POST',`/agents/${capacityTarget}/resume`,{});
@@ -1713,7 +1783,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
     const before=(await api('GET',`/agents?project=${project.id}`)).length;
     await api('POST',`/agents/${source.id}/replacement`,targetRequest);
     if(action==='restart') { await stop(); await start(); }
-    else if(action==='pause') await api('POST',`/agents/${source.id}/pause`,{locks:'release'});
+    else if(action==='pause') await api('POST',`/agents/${source.id}/pause`,{});
     else if(action==='close') await api('POST',`/agents/${source.id}/close`,{});
     else release(source.id);
     await noFollowup(source.id,{fail:'crashed',done:'done',pause:'paused',close:'closed',restart:'paused'}[action]);

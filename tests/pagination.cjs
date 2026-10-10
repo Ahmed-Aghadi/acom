@@ -61,6 +61,51 @@ async function mock(handler, run) {
   }
 }
 
+test('CLI pause has no lock-preservation options or payload',async t=>{
+  for(const flag of ['--keep-locks','--release-locks']) await t.test(`rejects ${flag}`,async()=>{
+    await mock((_,res)=>{res.writeHead(200,{'Content-Type':'application/json'});res.end('{}');},async fixture=>{
+      const result=await cli(['pause','1',flag],fixture);
+      assert.notEqual(result.status,0); assert.match(result.stderr,/unexpected argument/);
+      assert.deepEqual(fixture.requests,[],'removed options must fail before sending an action');
+    });
+  });
+  await t.test('plain Pause sends no lock mode',async()=>{
+    let body;
+    await mock((req,res)=>{
+      let raw=''; req.on('data',chunk=>raw+=chunk); req.on('end',()=>{
+        body=JSON.parse(raw);res.writeHead(200,{'Content-Type':'application/json'});res.end('{}');
+      });
+    },async fixture=>{
+      const result=await cli(['pause','1'],fixture);
+      assert.equal(result.status,0,result.stderr); assert.match(result.stdout,/locks release after.*worker stops/);
+      assert.equal(Object.hasOwn(body,'locks'),false);
+      assert.deepEqual(fixture.requests,[{method:'POST',url:'/agents/1/pause'}]);
+    });
+  });
+});
+
+test('CLI locks distinguishes stopping reservations from ordinary timed leases',async()=>{
+  for(const holder_stopping of [true,false]) await mock((req,res)=>{
+    req.resume(); res.writeHead(200,{'Content-Type':'application/json'});
+    res.end(JSON.stringify(req.url==='/agents/1/project' ? {project:9} : {
+      items:[{id:3,name:'protected reservation',about:'release only after cleanup',holder:1,holder_name:'fixture',acquired_at:1,expires_at:2,holder_stopping,queue:[]}],
+      has_more:false,next_before:null,next_after:null,total:1,through:3,revision:'owned-fixture'
+    }));
+  },async fixture=>{
+    fixture.env.ACOM_ID='1';
+    const result=await cli(['locks'],fixture);
+    assert.equal(result.status,0,result.stderr); assert.match(result.stdout,/held by agent 1/);
+    if(holder_stopping) {
+      assert.match(result.stdout,/releasing after worker stops/);
+      assert.doesNotMatch(result.stdout,/expires/,'an expired stopping lease is not advertised as ordinarily available');
+    } else {
+      assert.match(result.stdout,/expires/); assert.doesNotMatch(result.stdout,/releasing after worker stops/);
+    }
+    assert.ok(fixture.requests.every(request=>request.method==='GET'));
+    assert.equal(fixture.requests.length,2);
+  });
+});
+
 test('CLI preserves server error details and rejects incomplete successful bodies', async t => {
   for (const [status, body, contentType] of [
     [400, JSON.stringify({ error: 'page cursor conflicts with requested direction 漢' }), 'application/json'],
@@ -477,33 +522,34 @@ test('mutable collection cursors reject changed views and conditional reads stay
         await api('GET', `/agents?project=${project.id}&${query}`, undefined, 400);
       }
     });
-    await t.test('a frozen-lock release rejects malformed or stale confirmed holders',async()=>{
-      const name='guarded resume fixture';
-      await api('POST','/locks',{project:project.id,name,about:'owned frozen-lock confirmation'});
+    await t.test('obsolete lock-preservation inputs are rejected without changing ownership',async()=>{
+      const name='ordinary pause fixture';
+      await api('POST','/locks',{project:project.id,name,about:'pause releases an ordinary timed lease'});
       db(connection=>{
-        connection.prepare("UPDATE agents SET state='paused' WHERE id=1").run();
-        connection.prepare('UPDATE locks SET holder=1,frozen=1,frozen_left=600 WHERE project=? AND name=?').run(project.id,name);
+        connection.prepare("UPDATE agents SET state='idle' WHERE id=1").run();
+        connection.prepare('UPDATE locks SET holder=1,expires_at=?,frozen=0,frozen_left=NULL WHERE project=? AND name=?').run(Math.floor(Date.now()/1000)+600,project.id,name);
       });
       const holder=()=>db(connection=>connection.prepare('SELECT holder FROM locks WHERE project=? AND name=?').get(project.id,name).holder);
       try {
-        for(const expected_holder of [null,'1',0,-1,1.5,false]) {
+        for(const expected_holder of [null,'1',0,-1,1.5,false,1]) {
           await api('POST','/locks/free',{project:project.id,name,expected_holder},400);
           assert.equal(holder(),1);
         }
-        await api('POST','/locks/free',{project:project.id,name,expected_holder:2},409);
-        assert.equal(holder(),1);
-        db(connection=>connection.prepare("UPDATE agents SET state='closed' WHERE id=1").run());
-        await api('POST','/locks/free',{project:project.id,name,expected_holder:1},409);
-        assert.equal(holder(),1);
-        db(connection=>{
-          connection.prepare("UPDATE agents SET state='paused' WHERE id=1").run();
-          connection.prepare('UPDATE locks SET frozen=0 WHERE project=? AND name=?').run(project.id,name);
-        });
-        await api('POST','/locks/free',{project:project.id,name,expected_holder:1},409);
-        assert.equal(holder(),1);
-        db(connection=>connection.prepare('UPDATE locks SET frozen=1 WHERE project=? AND name=?').run(project.id,name));
-        await api('POST','/locks/free',{project:project.id,name,expected_holder:1});
+        for(const locks of ['keep','release',null]) {
+          await api('POST','/agents/1/pause',{locks},400);
+          assert.equal(holder(),1);
+          assert.equal((await api('GET','/agents/1')).state,'idle');
+        }
+        const listed=(await api('GET',`/locks?project=${project.id}`)).items[0];
+        assert.equal(Object.hasOwn(listed,'frozen'),false);
+        assert.equal(Object.hasOwn(listed,'frozen_left'),false);
+        await api('POST','/agents/1/pause',{});
+        await until(()=>holder()===null,'even an idle pause releases after asynchronous cleanup proof');
         assert.equal(holder(),null);
+        assert.equal((await api('GET','/agents/1')).state,'paused');
+        db(connection=>connection.prepare('UPDATE locks SET holder=1,expires_at=? WHERE project=? AND name=?').run(Math.floor(Date.now()/1000)+600,project.id,name));
+        await api('POST','/locks/free',{project:project.id,name});
+        assert.equal(holder(),null,'ordinary explicit user Free remains supported');
       } finally {
         db(connection=>connection.prepare("UPDATE agents SET state='closed',pid=NULL WHERE id=1").run());
       }

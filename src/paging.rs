@@ -121,6 +121,8 @@ fn stub(item: &Value) -> Value {
         "messages",
         "replacement",
         "replacement_pending",
+        "stopping",
+        "holder_stopping",
         "replacement_start_pending",
     ] {
         if let Some(value) = item.get(key).filter(|v| !v.is_null()) {

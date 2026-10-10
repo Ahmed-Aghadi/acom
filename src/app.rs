@@ -467,6 +467,7 @@ pub struct St {
     pub db: Connection,
     pub shutting_down: bool,
     pub waiting_updates: HashSet<i64>,
+    pub stopping_agents: HashSet<i64>,
     /// Lock queues by (project, lock name).
     pub queues: HashMap<(i64, String), Vec<i64>>,
     pub procs: HashMap<i64, Proc>,
@@ -1107,7 +1108,7 @@ impl St {
             out += " (the harness compacts at the hard value)";
         }
         out += &format!(
-            "\nLock TTL: maximum {}s per acquisition or renewal; omitted --ttl uses this maximum. User-frozen pauses stop the TTL clock.",
+            "\nLock TTL: maximum {}s per acquisition or renewal; omitted --ttl uses this maximum. Pausing releases locks after your old worker stops; reacquire before protected work.",
             s.max_lock_ttl_secs
         );
         out += &format!(
@@ -1233,63 +1234,50 @@ impl St {
         Ok(())
     }
 
-    /// Expired TTLs free their locks. Frozen locks never expire.
+    /// A stopping paused worker must not overlap the next holder, even if its
+    /// lease expires during cleanup. Completed pauses release all their locks.
     pub fn expire_locks(&mut self) -> R<bool> {
         let mut s = self.db.prepare(
-            "SELECT project, name FROM locks WHERE holder IS NOT NULL AND frozen=0 AND expires_at <= ?1",
+            "SELECT project, name, holder FROM locks WHERE holder IS NOT NULL AND expires_at <= ?1
+             AND NOT EXISTS(SELECT 1 FROM agents a WHERE a.id=locks.holder AND a.state='paused')",
         )?;
-        let expired: Vec<(i64, String)> = s
-            .query_map([now()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let expired: Vec<(i64, String, i64)> = s
+            .query_map([now()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
         drop(s);
-        for (project, name) in &expired {
+        let expired: Vec<_> = expired
+            .into_iter()
+            .filter(|(_, _, holder)| !self.stopping_agents.contains(holder))
+            .collect();
+        for (project, name, _) in &expired {
             self.release_lock(*project, name, Some("its TTL ran out"))?;
         }
         Ok(!expired.is_empty())
     }
 
-    /// Shorten oversized or legacy untimed leases, including frozen time left.
+    /// Shorten oversized or untimed leases without extending valid leases.
     fn cap_lock_ttls(&self, project: i64, max: u32) -> R<bool> {
         let deadline = now() + i64::from(max);
         let affected = rows(
             &self.db,
             "SELECT name,holder FROM locks WHERE project=?1 AND holder IS NOT NULL AND
-             ((frozen=0 AND (expires_at IS NULL OR expires_at>?2)) OR
-              (frozen=1 AND (frozen_left IS NULL OR frozen_left>?3)))",
-            params![project, deadline, max],
+             (expires_at IS NULL OR expires_at>?2)",
+            params![project, deadline],
         )?;
         for l in &affected {
             let name = l["name"].as_str().unwrap();
             self.db.execute(
-                "UPDATE locks SET expires_at=CASE WHEN frozen=0 THEN ?3 ELSE NULL END,
-                 frozen_left=CASE WHEN frozen=1 THEN ?4 ELSE NULL END WHERE project=?1 AND name=?2",
-                params![project, name, deadline, max],
+                "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
+                params![project, name, deadline],
             )?;
-            self.notice(l["holder"].as_i64().unwrap(),
-                &format!("Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining (frozen clocks stay paused)."))?;
+            self.notice(
+                l["holder"].as_i64().unwrap(),
+                &format!(
+                    "Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining."
+                ),
+            )?;
         }
         Ok(!affected.is_empty())
-    }
-
-    /// Keep an agent's locks while it's paused: stop their TTL clocks.
-    /// A lock whose TTL has already run out is released instead, never frozen.
-    fn freeze_locks(&mut self, agent: i64) -> R<()> {
-        self.expire_locks()?;
-        self.db.execute(
-            "UPDATE locks SET frozen=1, frozen_left=CASE WHEN expires_at IS NULL THEN NULL ELSE expires_at-?2 END,
-             expires_at=NULL WHERE holder=?1 AND frozen=0",
-            params![agent, now()],
-        )?;
-        Ok(())
-    }
-
-    fn unfreeze_locks(&mut self, agent: i64) -> R<()> {
-        self.db.execute(
-            "UPDATE locks SET frozen=0, expires_at=CASE WHEN frozen_left IS NULL THEN NULL ELSE ?2+frozen_left END,
-             frozen_left=NULL WHERE holder=?1 AND frozen=1",
-            params![agent, now()],
-        )?;
-        Ok(())
     }
 
     // ---------- messages ----------
@@ -1531,12 +1519,6 @@ pub struct LaunchReq {
     pub ack_crashes: bool,
 }
 
-pub enum LockMode {
-    Release,
-    Keep,
-    Ask,
-}
-
 pub struct HistoryQuery {
     pub agent: Option<i64>,
     pub thread: Option<i64>,
@@ -1604,43 +1586,31 @@ impl App {
             db,
             shutting_down: false,
             waiting_updates: HashSet::new(),
+            stopping_agents: HashSet::new(),
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
             over_soft: HashSet::new(),
         };
-        // Agents that were mid-turn when the server stopped can't be followed any more.
-        // Treat it like pause all: stop leftovers, keep their locks frozen.
-        let old_tools = run::server_tools(&agent_ids, &previous_url, &home);
-        for r in rows(
+        // No requests are served until old workers stop and paused locks release.
+        let interrupted = rows(
             &st.db,
             "SELECT id, pid, state FROM agents WHERE state='working' OR pid IS NOT NULL",
             [],
-        )? {
+        )?;
+        let groups: Vec<_> = interrupted
+            .iter()
+            .filter_map(|r| Some((r["id"].as_i64()?, u32::try_from(r["pid"].as_i64()?).ok()?)))
+            .collect();
+        for r in interrupted {
             let id = r["id"].as_i64().unwrap();
-            if let Some(pid) = r["pid"].as_i64()
-                && run::is_our_agent_group(pid as u32, id, &previous_url)
-                && old_tools.iter().any(|(owner, tool)| {
-                    *owner == id
-                        && run::is_server_tool(*tool, id, &previous_url, &home)
-                        && unsafe { libc::getpgid(*tool as i32) } == pid as i32
-                })
-            {
-                run::kill_group(pid as u32, libc::SIGKILL);
-            }
             if r["state"] != "working" {
-                // Pause/close saves its state before signalling the process. If
-                // the server stopped before reaping it, clean the old worker
-                // without changing the user's already committed state.
-                st.db
-                    .execute("UPDATE agents SET pid=NULL WHERE id=?1", [id])?;
                 continue;
             }
             st.atomic(|st| {
                 Self::cancel_followups(st,id,"the server restarted during the turn")?;
-                st.freeze_locks(id)?;
                 st.db.execute(
-                    "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2, pid=NULL WHERE id=?1",
+                    "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2 WHERE id=?1",
                     params![id, now()],
                 )?;
                 Ok(())
@@ -1651,15 +1621,24 @@ impl App {
                 &format!("paused agent {id}: the server restarted during its turn"),
             )?;
         }
-        run::kill_server_tools(&old_tools, &previous_url, &home, libc::SIGKILL);
         let exe = std::env::current_exe().map_err(|e| Fail(500, e.to_string()))?;
-        Ok(Arc::new(App {
+        let app = Arc::new(App {
             st: Mutex::new(st),
             cv: Condvar::new(),
             home,
             url,
             exe,
-        }))
+        });
+        run::StopTools::new(&app, &agent_ids, &groups, &previous_url)?.stop(&app)?;
+        app.lock().atomic(|st| {
+            for r in rows(&st.db, "SELECT id FROM agents WHERE state='paused'", [])? {
+                st.release_all(r["id"].as_i64().unwrap(), "you were paused")?;
+            }
+            st.db
+                .execute("UPDATE agents SET pid=NULL WHERE pid IS NOT NULL", [])?;
+            Ok(())
+        })?;
+        Ok(app)
     }
 
     pub fn lock(&self) -> MutexGuard<'_, St> {
@@ -1935,7 +1914,7 @@ impl App {
         if st.shutting_down {
             return Ok(());
         }
-        if st.procs.contains_key(&id) {
+        if st.procs.contains_key(&id) || st.stopping_agents.contains(&id) {
             return Ok(()); // still stopping; turn_ended wakes it if needed
         }
         let a = st.agent(id)?;
@@ -1978,7 +1957,7 @@ impl App {
                 .iter()
                 .any(|c| c.over(c.lim.hard))
             {
-                return self.pause_locked(st, id, LockMode::Release, "limit", "acom");
+                return self.pause_locked(st, id, "limit", "acom");
             }
             return self.wake(st, id, "idle");
         }
@@ -2079,7 +2058,6 @@ impl App {
             // exit must still become a restart pause, not idle or a crash.
             st.atomic(|st| {
                 Self::cancel_followups(st, id, "the server stopped during the turn")?;
-                st.freeze_locks(id)?;
                 st.db.execute("UPDATE agents SET state='paused',pause_reason='restart',pause_from='working',paused_at=?2,pid=NULL WHERE id=?1",params![id,now()])?;
                 st.log_for(id,"acom",&format!("paused agent {id}: the server stopped during its turn"))?;
                 Ok(())
@@ -2177,55 +2155,92 @@ impl App {
 
     // ---------- agent controls (user commands) ----------
 
-    pub fn pause(self: &Arc<Self>, id: i64, locks: LockMode, by: &str) -> R<()> {
+    pub fn pause(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
         let mut st = self.lock();
-        self.pause_locked(&mut st, id, locks, "user", by)
+        self.pause_locked(&mut st, id, "user", by)
     }
 
-    fn pause_locked(
-        self: &Arc<Self>,
-        st: &mut St,
-        id: i64,
-        locks: LockMode,
-        reason: &str,
-        by: &str,
-    ) -> R<()> {
+    fn pause_locked(self: &Arc<Self>, st: &mut St, id: i64, reason: &str, by: &str) -> R<()> {
         let a = st.agent(id)?;
         if !matches!(a.state.as_str(), "working" | "idle" | "done") {
             return Err(conflict(format!("agent {id} is {}", a.state)));
         }
-        let held = st.held_by(id)?;
         st.atomic(|st| {
           if reason != "limit" || a.state != "idle" {
               Self::cancel_followups(st, id, "the agent was paused")?;
-          }
-          match locks {
-            LockMode::Ask if !held.is_empty() => {
-                return Err(conflict(format!(
-                    "agent {id} holds {}: choose whether to release them or keep them frozen",
-                    held.join(", ")
-                )));
-            }
-            LockMode::Release => {
-                st.release_all(id, &format!("you were paused at {}", hhmm(now())))?
-            }
-            _ => st.freeze_locks(id)?,
           }
           st.db.execute(
             "UPDATE agents SET state='paused', pause_reason=?2, pause_from=?3, paused_at=?4 WHERE id=?1",
             params![id, reason, a.state, now()],
           )?;
+          if matches!(reason, "user" | "all") {
+              st.log_for(id, by, &format!("paused agent {id}"))?;
+          }
           Ok(())
         })?;
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
-            run::stop(p.pid);
         }
-        // Limit pauses log their own, more specific line.
-        if matches!(reason, "user" | "all") {
-            st.log_for(id, by, &format!("paused agent {id}"))?;
-        }
+        self.finish_pause(st, id)?;
         self.cv.notify_all();
+        Ok(())
+    }
+
+    /// Stop asynchronously: the process waiter needs this mutex to record exit.
+    fn finish_pause(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+        if st.stopping_agents.contains(&id) {
+            return Ok(());
+        }
+        let groups: Vec<_> = st
+            .procs
+            .get(&id)
+            .map(|p| vec![(id, p.pid)])
+            .unwrap_or_default();
+        st.stopping_agents.insert(id);
+        let app = self.clone();
+        std::thread::spawn(move || {
+            let mut cleanup = None;
+            let mut last_error = None;
+            loop {
+                let stopped = match cleanup.as_mut() {
+                    Some(stop) => run::StopTools::stop(stop, &app),
+                    None => run::StopTools::new(&app, &HashSet::from([id]), &groups, &app.url)
+                        .map(|stop| {
+                            cleanup = Some(stop);
+                        })
+                        .and_then(|_| cleanup.as_mut().unwrap().stop(&app)),
+                };
+                let result = stopped.and_then(|_| {
+                    let mut st = app.lock();
+                    st.atomic(|st| {
+                        st.release_all(id, "you were paused")?;
+                        st.db.execute(
+                            "UPDATE view_revisions SET value=value+1 WHERE name='agents'",
+                            [],
+                        )?;
+                        Ok(())
+                    })?;
+                    st.stopping_agents.remove(&id);
+                    app.cv.notify_all();
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if last_error.as_deref() != Some(e.1.as_str()) {
+                            eprintln!("agent {id}: pause cleanup incomplete; retrying: {}", e.1);
+                            let _ = app.lock().log_for(
+                                id,
+                                "acom",
+                                &format!("agent {id}: pause cleanup incomplete; retrying: {}", e.1),
+                            );
+                            last_error = Some(e.1);
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -2233,7 +2248,11 @@ impl App {
     /// so a new turn never overlaps one that's still stopping.
     fn wait_stopped<'a>(&'a self, mut st: MutexGuard<'a, St>, ids: &[i64]) -> MutexGuard<'a, St> {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while ids.iter().any(|i| st.procs.contains_key(i)) && Instant::now() < deadline {
+        while ids
+            .iter()
+            .any(|i| st.procs.contains_key(i) || st.stopping_agents.contains(i))
+            && Instant::now() < deadline
+        {
             st = self
                 .cv
                 .wait_timeout(st, Duration::from_millis(200))
@@ -2246,16 +2265,16 @@ impl App {
     pub fn resume(self: &Arc<Self>, id: i64, by: &str) -> R<Vec<String>> {
         let mut st = self.wait_stopped(self.lock(), &[id]);
         self.resume_locked(&mut st, id, by)?;
-        // Warn about agents in its project still paused that keep frozen locks.
+        // A failed stop can still reserve locks until cleanup is confirmed.
         let project = st.agent(id)?.project;
         let mut warn = Vec::new();
         for r in rows(
             &st.db,
             "SELECT l.holder h, group_concat(l.name, ', ') n FROM locks l JOIN agents a ON a.id=l.holder
-             WHERE l.frozen=1 AND a.state='paused' AND l.project=?1 GROUP BY l.holder",
+             WHERE a.state='paused' AND l.project=?1 GROUP BY l.holder",
             [project],
         )? {
-            warn.push(format!("agent {} is still paused and holds {}", r["h"], r["n"].as_str().unwrap_or("")));
+            warn.push(format!("agent {} is still stopping and holds {}", r["h"], r["n"].as_str().unwrap_or("")));
         }
         Ok(warn)
     }
@@ -2281,7 +2300,10 @@ impl App {
         if a.state != "paused" && a.state != "crashed" {
             return Err(conflict(format!("agent {id} is {}, not paused", a.state)));
         }
-        if st.procs.contains_key(&id) {
+        if st.procs.contains_key(&id)
+            || st.stopping_agents.contains(&id)
+            || !st.held_by(id)?.is_empty()
+        {
             return Err(conflict(format!(
                 "agent {id} is still stopping; try again in a moment"
             )));
@@ -2290,7 +2312,6 @@ impl App {
             st.db
                 .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
         }
-        st.unfreeze_locks(id)?;
         st.db.execute(
             "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL, seen_model=NULL,done_req=0,rest='idle' WHERE id=?1",
             [id],
@@ -2298,25 +2319,25 @@ impl App {
         st.log_for(id, by, &format!("resumed agent {id}"))?;
         let guidance = st.settings_for(Some(a.project)).prompts.resume;
         let interruption = format!(
-            "[acom] Previous turn interrupted{}: {}. Commands may have only partially executed and unsaved work may be lost. Previous commands, background tasks and monitors are gone: don't wait for them.",
+            "[acom] Previous turn interrupted{}: {}. Resumed at {}{}.\nCommands may be partial; unsaved work may be lost. Old commands, background tasks and monitors stopped—don't wait for them. Previous locks released; reacquire required locks before protected work.",
             a.paused_at
                 .map(|t| format!(" at {}", hhmm(t)))
                 .unwrap_or_default(),
-            a.problem.as_deref().unwrap_or("the process was stopped")
+            a.problem.as_deref().unwrap_or("the process was stopped"),
+            hhmm(now()),
+            if a.state == "crashed" {
+                " after an error"
+            } else {
+                ""
+            },
         );
         if a.state == "crashed" {
-            let prompt = format!(
-                "{interruption}\n[acom] Resumed at {} after an error.\n\n## Guidance\n\n{guidance}",
-                hhmm(now())
-            );
+            let prompt = format!("{interruption}\n\n## Guidance\n\n{guidance}");
             return Ok(Some(prompt));
         }
         let from = a.pause_from.unwrap_or_else(|| "idle".into());
         if from == "working" {
-            let prompt = format!(
-                "{interruption}\n[acom] Resumed at {}.\n\n## Guidance\n\n{guidance}",
-                hhmm(now())
-            );
+            let prompt = format!("{interruption}\n\n## Guidance\n\n{guidance}");
             Ok(Some(prompt))
         } else {
             st.set_state(id, &from)?;
@@ -2335,7 +2356,7 @@ impl App {
         .map(|r| r["id"].as_i64().unwrap())
         .collect();
         for &id in &ids {
-            self.pause_locked(&mut st, id, LockMode::Keep, "all", by)?;
+            self.pause_locked(&mut st, id, "all", by)?;
         }
         Ok(ids)
     }
@@ -2349,7 +2370,7 @@ impl App {
         let mut st = self.wait_stopped(st, &ids);
         let ids: Vec<i64> = ids
             .into_iter()
-            .filter(|i| !st.procs.contains_key(i))
+            .filter(|i| !st.procs.contains_key(i) && !st.stopping_agents.contains(i))
             .collect();
         for &id in &ids {
             self.resume_locked(&mut st, id, by)?;
@@ -2385,11 +2406,11 @@ impl App {
         let warnings: Vec<String> = rows(
             &st.db,
             "SELECT DISTINCT a.id FROM agents a JOIN locks l ON l.holder=a.id
-             WHERE a.state='paused' AND l.frozen=1 ORDER BY a.id",
+             WHERE a.state='paused' ORDER BY a.id",
             [],
         )?
         .iter()
-        .map(|r| format!("paused agent {} still holds frozen locks", r["id"]))
+        .map(|r| format!("agent {} is still stopping and holds locks", r["id"]))
         .collect();
         self.cv.notify_all();
         Ok(json!({"ids":resumed,"errors":errors,"warnings":warnings}))
@@ -2402,13 +2423,12 @@ impl App {
         let agent_ids: HashSet<i64> = rows(&st.db, "SELECT id FROM agents", [])
             .map(|rs| rs.iter().map(|r| r["id"].as_i64().unwrap()).collect())
             .unwrap_or_else(|_| st.procs.keys().copied().collect());
-        let tools = run::server_tools(&agent_ids, &self.url, &self.home);
+        let groups: Vec<_> = st.procs.iter().map(|(&id, p)| (id, p.pid)).collect();
         let saved = st.atomic(|st| {
             let ids = rows(&st.db, "SELECT id FROM agents WHERE state='working' ORDER BY id", [])?;
             for row in ids {
                 let id = row["id"].as_i64().unwrap();
                 Self::cancel_followups(st, id, "the server stopped during the turn")?;
-                st.freeze_locks(id)?;
                 st.db.execute("UPDATE agents SET state='paused',pause_reason='restart',pause_from='working',paused_at=?2 WHERE id=?1", params![id,now()])?;
                 st.log_for(id,"acom",&format!("paused agent {id}: the server stopped during its turn"))?;
             }
@@ -2416,78 +2436,32 @@ impl App {
         });
         // Even if persistence failed, stop the workers. Startup can reconcile
         // their saved working states; they must not continue unattended.
-        let mut signalled_groups = HashSet::new();
-        for (&id, p) in &mut st.procs {
+        for p in st.procs.values_mut() {
             p.stopping = true;
-            if tools.iter().any(|(owner, tool)| {
-                *owner == id
-                    && run::is_server_tool(*tool, id, &self.url, &self.home)
-                    && unsafe { libc::getpgid(*tool as i32) } == p.pid as i32
-            }) {
-                run::kill_group(p.pid, libc::SIGTERM);
-                signalled_groups.insert(p.pid);
-            }
         }
-        let detached: Vec<_> = tools
-            .iter()
-            .copied()
-            .filter(|(_, pid)| {
-                !signalled_groups.contains(&(unsafe { libc::getpgid(*pid as i32) } as u32))
-            })
-            .collect();
-        run::kill_server_tools(&detached, &self.url, &self.home, libc::SIGTERM);
+        st.stopping_agents.extend(&agent_ids);
         self.cv.notify_all();
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while (!st.procs.is_empty()
-            || tools
-                .iter()
-                .any(|(id, pid)| run::is_server_tool(*pid, *id, &self.url, &self.home)))
-            && Instant::now() < deadline
-        {
-            st = self
-                .cv
-                .wait_timeout(st, Duration::from_millis(100))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-        // Include tools forked after the first scan (including TERM handlers).
-        let remaining = run::server_tools(&agent_ids, &self.url, &self.home);
-        for (&id, p) in &st.procs {
-            if remaining.iter().any(|(owner, tool)| {
-                *owner == id
-                    && run::is_server_tool(*tool, id, &self.url, &self.home)
-                    && unsafe { libc::getpgid(*tool as i32) } == p.pid as i32
-            }) {
-                run::kill_group(p.pid, libc::SIGKILL);
+        drop(st);
+        run::StopTools::new(self, &agent_ids, &groups, &self.url)?.stop(self)?;
+        let mut st = self.lock();
+        st.atomic(|st| {
+            for r in rows(&st.db, "SELECT id FROM agents WHERE state='paused'", [])? {
+                st.release_all(r["id"].as_i64().unwrap(), "you were paused")?;
             }
-        }
-        run::kill_server_tools(&remaining, &self.url, &self.home, libc::SIGKILL);
-        let settle = Instant::now() + Duration::from_millis(500);
-        while (!st.procs.is_empty()
-            || remaining
-                .iter()
-                .any(|(id, pid)| run::is_server_tool(*pid, *id, &self.url, &self.home)))
-            && Instant::now() < settle
-        {
-            st = self
-                .cv
-                .wait_timeout(st, Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-        if remaining
-            .iter()
-            .any(|(id, pid)| run::is_server_tool(*pid, *id, &self.url, &self.home))
-        {
-            eprintln!(
-                "some owned agent tools are still stopping; startup will verify cleanup again"
-            );
-        }
+            Ok(())
+        })?;
+        st.stopping_agents.clear();
+        self.cv.notify_all();
         saved
     }
 
     pub fn close(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
         let mut st = self.lock();
+        if st.stopping_agents.contains(&id) {
+            return Err(conflict(
+                "the old worker is still stopping; try again shortly",
+            ));
+        }
         let a = st.agent(id)?;
         if a.state == "replaced" {
             return Err(conflict(
@@ -3636,6 +3610,13 @@ impl App {
             }
         };
         loop {
+            if st.shutting_down || st.stopping_agents.contains(&agent) {
+                leave(&mut st);
+                self.cv.notify_all();
+                return Err(conflict(
+                    "the server or your worker is stopping, so you left the queue",
+                ));
+            }
             // Recheck after each wait: the user may lower the ceiling while queued.
             let max = st.settings_for(Some(project)).max_lock_ttl_secs;
             let ttl = ttl.unwrap_or(u64::from(max));
@@ -3709,6 +3690,11 @@ impl App {
 
     pub fn release(&self, agent: i64, name: &str) -> R<()> {
         let mut st = self.lock();
+        if st.stopping_agents.contains(&agent) {
+            return Err(conflict(
+                "the old worker is still stopping; its locks release after cleanup",
+            ));
+        }
         st.expire_locks()?;
         let project = st.agent(agent)?.project;
         let (holder, _) = Self::lock_row(&st, project, name)?;
@@ -3721,32 +3707,16 @@ impl App {
     }
 
     pub fn free(&self, project: i64, name: &str, by: &str) -> R<()> {
-        self.free_checked(project, name, by, None)
-    }
-
-    pub fn free_frozen(&self, project: i64, name: &str, holder: i64, by: &str) -> R<()> {
-        self.free_checked(project, name, by, Some(holder))
-    }
-
-    fn free_checked(&self, project: i64, name: &str, by: &str, expected: Option<i64>) -> R<()> {
         let mut st = self.lock();
-        if let Some(holder) = expected {
-            let unchanged: bool = st.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM locks l JOIN agents a ON a.id=l.holder
-                 WHERE l.project=?1 AND l.name=?2 AND l.holder=?3 AND l.frozen=1 AND a.state='paused')",
-                params![project, name, holder],
-                |r| r.get(0),
-            )?;
-            if !unchanged {
-                return Err(conflict(
-                    "frozen lock ownership changed; review locks before freeing it",
-                ));
-            }
-        }
         let (holder, _) = Self::lock_row(&st, project, name)?;
         let Some(holder) = holder else {
             return Err(conflict(format!("{name} isn't held")));
         };
+        if st.stopping_agents.contains(&holder) {
+            return Err(conflict(
+                "the old worker is still stopping; its locks release after cleanup",
+            ));
+        }
         st.release_lock(project, name, Some("the user freed it"))?;
         st.log(
             Some(project),
@@ -3763,7 +3733,7 @@ impl App {
         let mut v = rows(
             &st.db,
             "SELECT l.project, l.name, l.about, l.holder, a.name holder_name, a.state holder_state,
-                    l.acquired_at, l.expires_at, l.frozen, l.frozen_left
+                    l.acquired_at, l.expires_at
              FROM locks l LEFT JOIN agents a ON a.id=l.holder
              WHERE ?1 IS NULL OR l.project=?1 ORDER BY l.project, l.name",
             [project],
@@ -3913,7 +3883,7 @@ impl App {
             )?;
         }
         if matches!(a.state.as_str(), "working" | "idle" | "done") {
-            self.pause_locked(&mut st, id, LockMode::Release, why, "acom")?;
+            self.pause_locked(&mut st, id, why, "acom")?;
         }
         st.log_for(id, "acom", &format!("agent {id} {what}: {problem}"))
     }
@@ -4288,7 +4258,7 @@ impl App {
                 }
                 let hard: Vec<_> = checks.iter().filter(|c| c.over(c.lim.hard)).collect();
                 if !hard.is_empty() && matches!(r["state"].as_str(), Some("working" | "idle")) {
-                    self.pause_locked(st, id, LockMode::Release, "limit", "acom")?;
+                    self.pause_locked(st, id, "limit", "acom")?;
                     st.log_for(
                         id,
                         "acom",
@@ -4332,6 +4302,8 @@ impl App {
         for id in &ids {
             let a = st.agent(*id)?;
             if !st.procs.contains_key(id)
+                && !st.stopping_agents.contains(id)
+                && st.held_by(*id)?.is_empty()
                 && st.model_no_room(project, provider, &a.model)?.is_none()
             {
                 self.resume_locked(st, *id, "acom")?;
@@ -4828,7 +4800,7 @@ impl App {
 
     fn lock_sql() -> &'static str {
         "SELECT l.rowid id,l.project,l.name,l.about,l.holder,a.name holder_name,a.state holder_state,
-         l.acquired_at,l.expires_at,l.frozen,l.frozen_left FROM locks l LEFT JOIN agents a ON a.id=l.holder"
+         l.acquired_at,l.expires_at FROM locks l LEFT JOIN agents a ON a.id=l.holder"
     }
 
     fn attach_queue(st: &St, item: &mut Value) {
@@ -4837,6 +4809,12 @@ impl App {
             item["name"].as_str().unwrap().to_string(),
         );
         item["queue"] = json!(st.queues.get(&key).cloned().unwrap_or_default());
+        item["holder_stopping"] = json!(
+            item["holder"]
+                .as_i64()
+                .is_some_and(|id| st.stopping_agents.contains(&id)
+                    || st.procs.get(&id).is_some_and(|p| p.stopping))
+        );
     }
 
     pub fn lock_view(&self, id: i64, project: Option<i64>) -> R<Value> {
@@ -5516,6 +5494,9 @@ impl App {
 
     fn replacement_fields(st: &St, a: &mut Value) -> R<()> {
         let id = a["id"].as_i64().unwrap();
+        a["stopping"] = json!(
+            st.stopping_agents.contains(&id) || st.procs.get(&id).is_some_and(|p| p.stopping)
+        );
         a["replacement_request"]=json!(rows(&st.db,"SELECT json_extract(request,'$.harness') harness,json_extract(request,'$.model') model,blocked FROM agent_handoffs WHERE agent_id=?1",[id])?.pop());
         a["replacement_start"]=json!(rows(&st.db,"SELECT predecessor,attempted,CASE WHEN attempted=1 THEN coalesce(blocked,'Startup attempt interrupted; waiting to record failure') ELSE blocked END blocked FROM agent_starts WHERE agent_id=?1",[id])?.pop());
         a["replacement"]=json!(rows(&st.db,"SELECT json_extract(details,'$.replacement') id FROM events WHERE agent=?1 AND kind='agent.replaced' ORDER BY id DESC LIMIT 1",[id])?.pop().map(|v|v["id"].clone()));
@@ -5934,6 +5915,7 @@ mod tests {
             db,
             shutting_down: false,
             waiting_updates: HashSet::new(),
+            stopping_agents: HashSet::new(),
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
@@ -6024,7 +6006,7 @@ mod tests {
     }
 
     #[test]
-    fn ttl_changes_bound_existing_and_frozen_leases_without_extending_them() {
+    fn ttl_changes_bound_existing_leases_without_extending_them() {
         let app = app_with_two_projects();
         {
             let st = app.lock();
@@ -6050,22 +6032,14 @@ mod tests {
         assert_eq!(lock(&app.lock(), "untimed").1, Some(deadline));
         assert!(lock(&app.lock(), "short").1.unwrap() < deadline);
         assert!(lock(&app.lock(), "other").1.unwrap() > deadline);
-        {
-            let mut st = app.lock();
-            st.freeze_locks(1).unwrap();
-            hold(&st, "legacy-frozen", 1, None);
-            st.db
-                .execute("UPDATE locks SET frozen=1 WHERE name='legacy-frozen'", [])
-                .unwrap();
-        }
         s.max_lock_ttl_secs = 30;
         app.set_project_config(1, None, Some(s.clone()), "user")
             .unwrap();
-        assert_eq!(lock(&app.lock(), "long").3, Some(30));
-        assert_eq!(lock(&app.lock(), "legacy-frozen").3, Some(30));
+        let shortened = lock(&app.lock(), "long").1.unwrap();
+        assert!((now() + 29..=now() + 30).contains(&shortened));
         s.max_lock_ttl_secs = 90;
         app.set_project_config(1, None, Some(s), "user").unwrap();
-        assert_eq!(lock(&app.lock(), "long").3, Some(30));
+        assert_eq!(lock(&app.lock(), "long").1, Some(shortened));
         // A shared-config edit affects only projects using that config.
         let config = app
             .add_config("shared", Settings::default(), "user")
@@ -6078,11 +6052,9 @@ mod tests {
         };
         app.put_config(config, None, shared, "user").unwrap();
         assert!(lock(&app.lock(), "other").1.unwrap() <= now() + 15);
-        assert_eq!(lock(&app.lock(), "long").3, Some(30));
+        assert_eq!(lock(&app.lock(), "long").1, Some(shortened));
         let mut st = app.lock();
         assert!(st.take_updates(1).unwrap().contains("maximum TTL: 30s"));
-        st.unfreeze_locks(1).unwrap();
-        assert!(lock(&st, "legacy-frozen").1.unwrap() <= now() + 30);
         hold(&st, "legacy-running", 1, None);
         drop(st);
         app.tick().unwrap();
@@ -6124,38 +6096,28 @@ mod tests {
     }
 
     #[test]
-    fn freezing_stops_the_ttl_and_resuming_restarts_it() {
-        let mut st = st();
-        hold(&st, "a", 1, Some(now() + 100));
-        hold(&st, "b", 1, None);
-        st.freeze_locks(1).unwrap();
-        let (holder, expires, frozen, left) = lock(&st, "a");
-        assert_eq!((holder, expires, frozen), (Some(1), None, 1));
-        assert!((99..=100).contains(&left.unwrap()));
-        assert_eq!(lock(&st, "b"), (Some(1), None, 1, None));
-
-        // A frozen lock never expires, however long the holder stays paused.
-        st.db
-            .execute("UPDATE locks SET frozen_left=-50 WHERE name='a'", [])
-            .unwrap();
-        assert!(!st.expire_locks().unwrap());
-        assert_eq!(lock(&st, "a").0, Some(1));
-
-        st.db
-            .execute("UPDATE locks SET frozen_left=60 WHERE name='a'", [])
-            .unwrap();
-        st.unfreeze_locks(1).unwrap();
-        let (holder, expires, frozen, left) = lock(&st, "a");
-        assert_eq!((holder, frozen, left), (Some(1), 0, None));
-        assert!((now() + 59..=now() + 60).contains(&expires.unwrap()));
-        assert_eq!(lock(&st, "b"), (Some(1), None, 0, None));
+    fn manual_and_all_pauses_release_locks_without_restoring_ttl() {
+        for all in [false, true] {
+            let app = app_with_two_projects();
+            hold(&app.lock(), "schema", 1, Some(now() + 100));
+            if all {
+                app.pause_all("user").unwrap();
+            } else {
+                app.pause(1, "user").unwrap();
+            }
+            drop(app.wait_stopped(app.lock(), &[1, 2]));
+            assert_eq!(lock(&app.lock(), "schema"), (None, None, 0, None));
+            app.resume(1, "user").unwrap();
+            assert_eq!(app.lock().agent(1).unwrap().state, "idle");
+            assert_eq!(lock(&app.lock(), "schema"), (None, None, 0, None));
+        }
     }
 
     #[test]
-    fn a_lock_already_past_its_ttl_is_released_not_frozen() {
+    fn a_lock_already_past_its_ttl_is_released() {
         let mut st = st();
         hold(&st, "late", 1, Some(now() - 1));
-        st.freeze_locks(1).unwrap();
+        st.expire_locks().unwrap();
         assert_eq!(lock(&st, "late"), (None, None, 0, None));
         let text = st.take_updates(1).unwrap();
         assert!(
@@ -6306,7 +6268,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_preserves_idle_and_existing_pauses_and_freezes_working_locks() {
+    fn shutdown_preserves_pause_reasons_and_releases_paused_locks() {
         let app = app_with_two_projects();
         {
             let st = app.lock();
@@ -6330,7 +6292,7 @@ mod tests {
         assert_eq!(agents[1]["state"], "idle");
         assert_eq!(agents[2]["pause_reason"], "user");
         assert_eq!(agents[3]["pause_reason"], "limit");
-        assert_eq!(lock(&st, "schema").2, 1);
+        assert_eq!(lock(&st, "schema"), (None, None, 0, None));
         assert!(!App::has_handoff(&st, 1).unwrap());
         assert_eq!(
             st.db
@@ -7010,43 +6972,125 @@ mod tests {
     }
 
     #[test]
-    fn resume_lock_confirmation_cannot_free_a_changed_or_active_holder() {
+    fn stopping_locks_cannot_expire_or_be_freed_before_cleanup() {
         let app = app_with_two_projects();
-        app.lock()
-            .db
-            .execute("UPDATE agents SET state='paused'", [])
-            .unwrap();
-        app.new_lock(1, "guarded", "resume confirmation").unwrap();
-        app.lock()
-            .db
-            .execute(
-                "UPDATE locks SET holder=1,frozen=1 WHERE name='guarded'",
-                [],
-            )
-            .unwrap();
-        assert_eq!(app.free_frozen(1, "guarded", 2, "user").unwrap_err().0, 409);
-        app.lock()
-            .db
-            .execute("UPDATE agents SET state='idle' WHERE id=1", [])
-            .unwrap();
-        assert_eq!(app.free_frozen(1, "guarded", 1, "user").unwrap_err().0, 409);
-        app.lock()
-            .db
-            .execute("UPDATE agents SET state='paused' WHERE id=1", [])
-            .unwrap();
-        app.lock()
-            .db
-            .execute("UPDATE locks SET frozen=0 WHERE name='guarded'", [])
-            .unwrap();
-        assert_eq!(app.free_frozen(1, "guarded", 1, "user").unwrap_err().0, 409);
-        app.lock()
-            .db
-            .execute("UPDATE locks SET frozen=1 WHERE name='guarded'", [])
-            .unwrap();
-        app.free_frozen(1, "guarded", 1, "user").unwrap();
+        {
+            let mut st = app.lock();
+            st.db.execute_batch("UPDATE agents SET project=1; UPDATE agents SET state='paused' WHERE id=1; UPDATE agents SET state='working' WHERE id=2;").unwrap();
+            hold(&st, "guarded", 1, Some(now() - 1));
+            st.stopping_agents.insert(1);
+            assert!(!st.expire_locks().unwrap());
+            assert_eq!(app.prepare_resume(&mut st, 1, "user").unwrap_err().0, 409);
+        }
+        assert_eq!(app.acquire(2, "guarded", 0, Some(60)).unwrap_err().0, 409);
+        assert_eq!(app.free(1, "guarded", "user").unwrap_err().0, 409);
+        assert_eq!(app.release(1, "guarded").unwrap_err().0, 409);
+        assert_eq!(app.close(1, "user").unwrap_err().0, 409);
+        assert_eq!(app.agent_view(1).unwrap()["stopping"], true);
+        {
+            let mut st = app.lock();
+            st.atomic(|st| st.release_all(1, "you were paused"))
+                .unwrap();
+            st.stopping_agents.remove(&1);
+        }
         assert!(
-            app.locks_page(Some(1), PageQuery::default()).unwrap()["items"][0]["holder"].is_null()
+            app.acquire(2, "guarded", 0, Some(60))
+                .unwrap()
+                .contains("acquired")
         );
+        assert_eq!(lock(&app.lock(), "guarded").0, Some(2));
+    }
+
+    #[test]
+    fn pause_release_save_failure_keeps_reservation_until_atomic_retry() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db
+                .execute_batch(
+                    "UPDATE agents SET project=1; UPDATE agents SET state='working' WHERE id=2;",
+                )
+                .unwrap();
+            hold(&st, "guarded", 1, Some(now() - 1));
+            st.db.execute_batch("CREATE TRIGGER refuse_release BEFORE UPDATE OF holder ON locks WHEN NEW.holder IS NULL BEGIN SELECT RAISE(ABORT,'release save failed'); END;").unwrap();
+        }
+        app.pause(1, "user").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let st = app.lock();
+            let failed: bool = st.db.query_row("SELECT EXISTS(SELECT 1 FROM activity WHERE what LIKE 'agent 1: pause cleanup incomplete%')",[],|r|r.get(0)).unwrap();
+            if failed {
+                assert!(st.stopping_agents.contains(&1));
+                assert_eq!(lock(&st, "guarded").0, Some(1));
+                break;
+            }
+            drop(st);
+            assert!(
+                Instant::now() < deadline,
+                "release failure was not reported"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.acquire(2, "guarded", 0, Some(60)).unwrap_err().0, 409);
+        assert_eq!(app.free(1, "guarded", "user").unwrap_err().0, 409);
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER refuse_release")
+            .unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        let st = app.lock();
+        assert!(!st.stopping_agents.contains(&1));
+        assert_eq!(lock(&st, "guarded"), (None, None, 0, None));
+        let count: i64 = st.db.query_row("SELECT count(*) FROM notices WHERE agent_id=1 AND text LIKE 'You no longer hold lock `guarded`:%'",[],|r|r.get(0)).unwrap();
+        assert_eq!(
+            count, 1,
+            "failed release must not commit a duplicate notice"
+        );
+    }
+
+    #[test]
+    fn failed_pause_save_still_guards_expiry_and_queued_acquires() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db
+                .execute_batch("UPDATE agents SET project=1,state='working'")
+                .unwrap();
+            hold(&st, "guarded", 1, Some(now() + 60));
+        }
+        let waiting_app = app.clone();
+        let waiter = std::thread::spawn(move || waiting_app.acquire(2, "guarded", 5, Some(60)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut st = app.lock();
+            if st
+                .queues
+                .get(&(1, "guarded".into()))
+                .is_some_and(|q| q.contains(&2))
+            {
+                // A failed shutdown transaction leaves the persisted state working.
+                st.shutting_down = true;
+                st.stopping_agents.insert(1);
+                st.db
+                    .execute("UPDATE locks SET expires_at=?1", [now() - 1])
+                    .unwrap();
+                assert!(!st.expire_locks().unwrap());
+                assert_eq!(lock(&st, "guarded").0, Some(1));
+                app.cv.notify_all();
+                break;
+            }
+            drop(st);
+            assert!(Instant::now() < deadline, "waiter did not queue");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.0, 409);
+        assert!(error.1.contains("stopping"));
+        assert!(app.lock().queues[&(1, "guarded".into())].is_empty());
+        assert_eq!(lock(&app.lock(), "guarded").0, Some(1));
+        app.lock().shutting_down = false;
+        assert_eq!(app.acquire(1, "guarded", 0, Some(60)).unwrap_err().0, 409);
+        assert_eq!(lock(&app.lock(), "guarded").0, Some(1));
     }
 
     #[test]
@@ -7158,7 +7202,7 @@ mod tests {
         for result in [
             app.resume(1, "user").map(|_| ()),
             app.reopen(1, "user"),
-            app.pause(1, LockMode::Release, "user"),
+            app.pause(1, "user"),
             app.close(1, "user"),
             app.configure_agent(1, 0, None, Some("medium"), None, false),
             app.set_group(1, "new"),
@@ -7326,6 +7370,7 @@ mod tests {
         app.tick().unwrap();
         assert_eq!(state(&app, 1).0, "paused");
         assert_eq!(state(&app, 2).0, "idle");
+        drop(app.wait_stopped(app.lock(), &[1]));
         let notices = rows(
             &app.lock().db,
             "SELECT text FROM notices WHERE agent_id=1",
@@ -7484,6 +7529,7 @@ mod tests {
         let app = app_with_two_projects();
         custom(&app, 1, |s| s.limits.usage.clear());
         app.limit_hit(1, "subscription exhausted").unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
         {
             let st = app.lock();
             st.db
@@ -8325,6 +8371,7 @@ mod tests {
         let view = app.agent_view(1).unwrap();
         assert_eq!(view["state"], "paused");
         assert_eq!(view["continuation"]["text"], "continue");
+        drop(app.wait_stopped(app.lock(), &[1]));
         app.close(1, "user").unwrap();
         assert!(app.agent_view(1).unwrap()["continuation"].is_null());
     }
@@ -8750,7 +8797,7 @@ mod tests {
     #[test]
     fn waiting_successor_survives_restart_and_user_pause_close_without_waking_source() {
         let (app, new) = waiting_replacement_app();
-        app.pause(new, LockMode::Keep, "user").unwrap();
+        app.pause(new, "user").unwrap();
         app.tick().unwrap();
         assert_eq!(app.agent_view(new).unwrap()["state"], "paused");
         assert_eq!(
@@ -9144,6 +9191,7 @@ mod tests {
         assert_eq!(state(&app, 1).0, "paused");
         assert_eq!(state(&app, 2).0, "idle");
         assert_eq!(app.lock().used_pct("claude").unwrap(), Some(0.0));
+        drop(app.wait_stopped(app.lock(), &[1]));
         let refresh = |fable: Option<f64>| {
             let mut windows = vec![
                 crate::usage::Window {
@@ -9708,15 +9756,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_resume_commit_preserves_pause_frozen_locks_and_membership() {
+    fn failed_resume_commit_preserves_pause_and_membership_without_restoring_locks() {
         let app = waiting_client_app();
         let (tid, _) = app
             .new_thread(0, Some(1), "paused", &[], true, &["paused".into()])
             .unwrap();
         let mut st = app.lock();
         st.db.execute("UPDATE agents SET state='paused',pause_from='working',pause_reason='user',paused_at=1 WHERE id=1",[]).unwrap();
-        hold(&st, "schema", 1, Some(now() + 60));
-        st.freeze_locks(1).unwrap();
+        st.db.execute("INSERT INTO locks(project,name,about,created_at) VALUES(1,'schema','paused work',0)",[]).unwrap();
         st.notice(1, "still unseen").unwrap();
         let before = rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap();
         defer_commit_failure(&st);
@@ -9726,7 +9773,7 @@ mod tests {
         assert!(st.db.is_autocommit());
         assert_eq!(st.agent(1).unwrap().state, "paused");
         assert_eq!(st.agent(1).unwrap().pause_from.as_deref(), Some("working"));
-        assert_eq!(lock(&st, "schema").2, 1);
+        assert_eq!(lock(&st, "schema"), (None, None, 0, None));
         assert_eq!(
             rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
             before
@@ -9766,7 +9813,7 @@ mod tests {
         }
         let before = app.history(Some(1), history_query()).unwrap();
         assert!(
-            app.pause(1, LockMode::Release, "user")
+            app.pause(1, "user")
                 .unwrap_err()
                 .1
                 .contains("injected membership failure")

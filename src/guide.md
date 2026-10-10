@@ -78,6 +78,7 @@ A lock is a named reservation for work that only one agent should do at a time. 
 - Every acquisition and renewal has a timed expiry. `acom limits` shows the project's maximum TTL (default 900s / 15m). Omitting `--ttl` uses that maximum; `--ttl <duration>` must be positive and no greater than it. You cannot request an indefinite lock.
 - For example, `acom lock acquire <name> --ttl 5m` gives it five minutes if the maximum allows that. The response and `acom locks` show the expiry time. Renew by acquiring again before expiry; use `--ttl` again if you want a shorter lease. Lowering the project's maximum also shortens existing oversized leases, and you're notified.
 - `acom lock release <name>` gives it back. Release locks as soon as you're done with them.
+- Every pause, including a restart-interrupted turn, stops old commands/background tasks and releases held locks. After Resume, acquire needed locks again before protected work.
 - Expiry releases the lock but does not stop you or your commands. Renew before expiry; if you lose the lock, stop protected work and acquire it again before continuing. Check ownership after any interruption.
 - Keep any `--wait` shorter than your shell tool's timeout, or the command is killed while waiting.
 

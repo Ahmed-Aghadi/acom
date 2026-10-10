@@ -167,7 +167,7 @@
     <div class="usage" id="usage"></div>
     <div class="actions">
       <button class="primary" data-open="launch-dialog">Launch</button>
-      <button id="pause-all" title="All projects">Pause all</button>
+      <button id="pause-all" title="All projects; stop processes, then release every held lock">Pause all</button>
       <button id="resume-all" title="All projects">Resume all</button>
       <button id="resume-restart" title="All projects on this machine; only agents paused by a server restart" disabled>Resume restart-paused <span id="restart-paused-count">(checking · all projects)</span></button>
     </div>
@@ -304,22 +304,6 @@
 
   <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
-  <dialog id="pause-dialog" aria-labelledby="pause-title">
-    <form method="dialog">
-      <h2 id="pause-title">Pause agent</h2>
-      <p id="pause-copy"></p>
-      <p class="meta">Keeping locks freezes their TTL clocks. Nobody else can get them until this agent resumes.</p>
-      <div class="dialog-actions"><button value="cancel">Cancel</button><button value="keep">Keep locks frozen</button><button class="primary" value="release">Release locks (recommended)</button></div>
-    </form>
-  </dialog>
-  <dialog id="resume-dialog" aria-labelledby="resume-title">
-    <form method="dialog">
-      <h2 id="resume-title">Resume agent</h2>
-      <p>These other paused agents still hold frozen locks:</p>
-      <div id="resume-copy"></div>
-      <div class="dialog-actions"><button value="cancel">Cancel</button><button value="only">Resume only</button><button class="primary" value="release">Resume and release those locks</button></div>
-    </form>
-  </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
   <script>
@@ -347,9 +331,8 @@
     const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
     const reading = new Set();
     let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null;
-    let projectGeneration = 0;
     const agentTransitions = new Set();
-    let resumingRestart = false;
+    let resumingRestart = false, pausingAll = false;
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -389,12 +372,6 @@
         else setContent(node, value, html);
       }
     });
-    function duration(seconds) {
-      const n = Math.max(0, Number(seconds || 0));
-      if (n >= 3600) return `${Math.ceil(n / 3600)}h`;
-      if (n >= 60) return `${Math.ceil(n / 60)}m`;
-      return `${Math.ceil(n)}s`;
-    }
     async function api(path, options = {}) {
       const reading = !options.method || options.method === 'GET';
       let response, text;
@@ -562,7 +539,6 @@
           state.project = overview.project;
           if (state.project?.truncated) state.project = await record(`/projects/${state.project.id}`);
           if (request !== state.overviewRequest) return;
-          if (state.selectedProject !== (state.project?.id ?? null)) projectGeneration++;
           state.selectedProject = state.project?.id ?? null;
           state.limits = overview.limits; state.url = overview.url;
           state.unreadTotal = overview.unread_total;
@@ -697,22 +673,24 @@
     }
     function agentRow(a) {
       const replacement = replacementSummary(a), starting = a.replacement_start || a.replacement_start_pending;
-      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div><div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
+      const stopping = a.stopping ? '<span class="pill waiting">Stopping</span><div class="meta">Stopping processes before releasing locks.</div>' : '';
+      const disabled = a.stopping || agentTransitions.has(a.id) ? ' disabled' : '';
+      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}<div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
       const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
       const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
-        ? `<button class="small" data-action="pause" data-id="${a.id}">${starting ? 'Pause replacement' : 'Pause'}</button>`
-        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${starting ? 'Resume replacement' : a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${!starting && (a.state === 'crashed' || unavailable) ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
-        : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">${starting ? 'Reopen replacement' : 'Reopen'}</button>` : '';
-      const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}">${starting ? 'Close replacement' : 'Close'}</button>` : '';
+        ? `<button class="small" data-action="pause" data-id="${a.id}" title="Stop processes, then release every held lock"${disabled}>${starting ? 'Pause replacement' : 'Pause'}</button>`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}"${disabled}>${starting ? 'Resume replacement' : a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${!starting && (a.state === 'crashed' || unavailable) ? `<button class="small" data-action="another-model" data-id="${a.id}"${disabled}>Launch another model…</button>` : ''}`
+        : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}"${disabled}>${starting ? 'Reopen replacement' : 'Reopen'}</button>` : '';
+      const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}"${disabled}>${starting ? 'Close replacement' : 'Close'}</button>` : '';
       const waiting = !starting && a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = !starting && a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
       const problem = a.has_problem || problemText ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
       const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta" title="${esc(task)}">${esc(a.status || task)}</div>${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -720,10 +698,10 @@
     function renderLocks() {
       setText($('#lock-count'), `${state.pages.locks?.total ?? state.locks.length} total`);
       if (!state.locks.length) { setHTML($('#locks'), '<div class="empty">No locks</div>'); return; }
-      setHTML($('#locks'), `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => l.truncated ? `<tr><td colspan="6">Lock #${l.id} · Details exceed the preview budget. <button type="button" class="small" data-record="locks" data-record-id="${l.id}">Load full lock</button></td></tr>` : `<tr>
-        <td><code>${esc(l.name)}</code>${l.frozen ? ' <span class="pill paused">frozen</span>' : ''}</td><td>${esc(l.about)}</td>
+      setHTML($('#locks'), `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => l.truncated ? `<tr><td colspan="6">Lock #${l.id}${l.holder_stopping ? ' · Releasing after stop' : ''} · Details exceed the preview budget. <button type="button" class="small" data-record="locks" data-record-id="${l.id}">Load full lock</button></td></tr>` : `<tr>
+        <td><code>${esc(l.name)}</code></td><td>${esc(l.about)}</td>
         <td>${l.holder ? `#${l.holder} ${esc(l.holder_name || '')}` : 'free'}${l.queue?.length ? `<div class="meta">queue: ${l.queue.map(x => `#${x}`).join(', ')}</div>` : ''}</td>
-        <td>${when(l.acquired_at)}</td><td>${l.frozen ? `frozen, ${l.frozen_left == null ? 'no TTL' : `${duration(l.frozen_left)} left`}` : l.expires_at ? when(l.expires_at) : '—'}</td><td>${l.holder ? `<button class="small danger" data-action="free-lock" data-name="${esc(l.name)}">Free</button>` : ''}</td>
+        <td>${when(l.acquired_at)}</td><td>${l.holder_stopping ? 'Releasing after stop' : l.expires_at ? when(l.expires_at) : '—'}</td><td>${l.holder ? `<button class="small danger" data-action="free-lock" data-name="${esc(l.name)}"${l.holder_stopping ? ' disabled title="Processes are still stopping; locks release after cleanup."' : ''}>Free</button>` : ''}</td>
       </tr>`).join('')}</tbody></table>`);
     }
 
@@ -933,7 +911,8 @@
         }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        if (a.stopping) fields.push({key:'stopping',label:'stop cleanup',content:'Stopping processes. Locks are released only after cleanup finishes.'});
         fields.push({key:'running_configuration',label:'current turn',content:a.running_configuration ? `${esc(a.harness)} / ${esc(a.running_configuration.model)} / effort ${esc(a.running_configuration.effort)}` : '— (no running turn)'});
         fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
         const retryStatus = a.retry?.blocked ? `${a.retry.handled ? 'Stopped' : 'Waiting'}: ${esc(a.retry.blocked)}` : a.retry?.replacement ? '' : a.retry?.handled ? 'Retry attempt handled' : 'Pending; requires a configured rule and available limits';
@@ -1085,7 +1064,7 @@
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['claude','seven_day_fable','Claude Fable weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
       $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
-        <h3>Locks</h3><label style="max-width:300px">Maximum lock TTL (seconds) <input type="number" name="max_lock_ttl_secs" min="1" max="4294967295" step="1" required value="${s.max_lock_ttl_secs ?? 900}"></label><p class="meta launch-project">Every acquisition and renewal has a timed expiry; omitted TTL uses this maximum. Larger TTLs are rejected. Lowering the maximum shortens existing leases, including frozen time left; user-frozen clocks still pause.</p>
+        <h3>Locks</h3><label style="max-width:300px">Maximum lock TTL (seconds) <input type="number" name="max_lock_ttl_secs" min="1" max="4294967295" step="1" required value="${s.max_lock_ttl_secs ?? 900}"></label><p class="meta launch-project">Every acquisition and renewal has a timed expiry; omitted TTL uses this maximum. Larger TTLs are rejected. Lowering the maximum shortens existing leases. Every pause stops the agent's processes, then releases its locks.</p>
         <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
         <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
         <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents require explicit Reopen; messages wait in their inbox. Turn this off to let finished agents wake for new messages.</span></label>
@@ -1232,15 +1211,6 @@
       return result;
     }
 
-    function dialogChoice(dialog) {
-      return new Promise(resolve => {
-        dialog.returnValue = 'cancel';
-        openDialog(dialog);
-        const session = dialog._session;
-        dialog.addEventListener('close', () => resolve(dialog._session === session ? dialog.returnValue : 'cancel'), { once: true });
-      });
-    }
-
     function openDialog(dialog) {
       dialog._session = (dialog._session || 0) + 1;
       dialog.showModal();
@@ -1304,75 +1274,13 @@
       root.querySelectorAll('[data-member-row]').forEach(row=>row.hidden=!row.dataset.search.includes(event.target.value.toLowerCase()));
     });
 
-    async function pauseChoice(agent) {
-      if (!agent?.locks?.length) return 'release';
-      $('#pause-copy').textContent = `Agent ${agent.id} holds: ${agent.locks.join(', ')}`;
-      return dialogChoice($('#pause-dialog'));
-    }
-
-    async function lockSnapshot(project, current) {
-      const scope = query('/locks', {project});
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          let page = await api(query(scope, {limit:pageSize, max_bytes:pageBytes})), items = [];
-          const revision = page.revision, through = page.through;
-          while (current()) {
-            for (const lock of page.items) {
-              const full = lock.truncated ? await record(query(`/locks/${lock.id}`, {project}), undefined, current) : lock;
-              if (!current()) return null;
-              items.push(full);
-            }
-            if (!page.has_more) break;
-            const before = page.next_before;
-            if (before == null) throw new Error('Missing lock cursor');
-            page = await api(query(scope, {before, through, revision, limit:pageSize, max_bytes:pageBytes}));
-            if (page.has_more && page.next_before === before) throw new Error('Lock cursor did not advance');
-          }
-          if (!current()) return null;
-          const check = await api(query(scope, {since:revision, limit:pageSize, max_bytes:pageBytes}));
-          if (!current()) return null;
-          if (!check.unchanged) throw Object.assign(new Error('Locks changed while loading. Try again.'), {status:409});
-          return [...new Map(items.map(lock => [lock.id, lock])).values()];
-        } catch (error) { if (!current()) return null; if (error.status !== 409 || attempt === 2) throw error; }
-      }
-    }
-    async function resumeChoice(id, project, current) {
-      const locks = await lockSnapshot(project, current);
-      if (!locks) return {choice:'cancel', frozen:[]};
-      const frozen = locks.filter(lock => lock.frozen && lock.holder_state === 'paused' && Number(lock.holder) !== id);
-      if (!frozen.length) return { choice: 'only', frozen };
-      const groups = new Map();
-      frozen.forEach(lock => {
-        if (!groups.has(lock.holder)) groups.set(lock.holder, []);
-        groups.get(lock.holder).push(lock.name);
-      });
-      $('#resume-copy').innerHTML = [...groups].map(([holder, names]) => `<p><strong>agent ${holder}</strong>: ${names.map(esc).join(', ')}</p>`).join('');
-      return { choice: await dialogChoice($('#resume-dialog')), frozen };
-    }
-
     async function agentTransition(action, id) {
-      if (agentTransitions.has(id)) return;
-      const project = state.selectedProject, generation = projectGeneration;
-      const current = () => project === state.selectedProject && generation === projectGeneration;
-      agentTransitions.add(id); action.disabled = true;
+      if (agentTransitions.has(id) || state.agents.find(agent => agent.id === id)?.stopping) return;
+      agentTransitions.add(id); action.disabled = true; renderAgents();
       try {
-        if (action.dataset.action === 'pause') {
-          const agent = await record(`/agents/${id}`, undefined, current);
-          if (!current() || !agent) return;
-          const locks = await pauseChoice(agent);
-          if (current() && locks !== 'cancel') await mutate(`/agents/${id}/pause`, {locks});
-        } else {
-          const {choice, frozen} = await resumeChoice(id, project, current);
-          if (!current() || choice === 'cancel') return;
-          if (choice === 'release') for (const lock of frozen) {
-            if (!current()) return;
-            await api('/locks/free', {method:'POST', body:JSON.stringify({project:lock.project, name:lock.name, expected_holder:lock.holder})});
-          }
-          if (!current()) return;
-          const result = await mutate(`/agents/${id}/resume`);
-          if (!result.result_truncated && result.warnings?.length) toast(result.warnings.join('\n'));
-        }
-      } finally { agentTransitions.delete(id); action.disabled = false; }
+        const result = await mutate(`/agents/${id}/${action.dataset.action}`);
+        if (!result.result_truncated && result.warnings?.length) toast(result.warnings.join('\n'));
+      } finally { agentTransitions.delete(id); action.disabled = !!state.agents.find(agent => agent.id === id)?.stopping; renderAgents(); }
     }
 
     document.addEventListener('click', async event => {
@@ -1584,6 +1492,7 @@
       if (!action) return;
       try {
         const id = Number(action.dataset.id);
+        if (action.dataset.action !== 'details' && (state.agents.find(agent => agent.id === id)?.stopping || agentTransitions.has(id))) return;
         if (action.dataset.action === 'another-model') {
           const agent=await record(`/agents/${id}`);
           $('#launch-project-select').innerHTML=projectOptions(agent.project);
@@ -1607,12 +1516,18 @@
             await mutate(`/agents/${id}/${action.dataset.action}`);
           }
         } else if (action.dataset.action === 'free-lock') {
+          if (state.locks.find(lock => lock.name === action.dataset.name)?.holder_stopping) return;
           if (confirm(`Free lock “${action.dataset.name}”?`)) await mutate('/locks/free', { project: state.selectedProject, name: action.dataset.name });
         }
       } catch (error) { toast(error.message, true); }
     });
 
-    $('#pause-all').addEventListener('click', async () => { try { if (confirm('Pause all agents in all projects and freeze their locks?')) await mutate('/pause-all'); } catch (e) { toast(e.message, true); } });
+    $('#pause-all').addEventListener('click', async () => {
+      if (pausingAll || !confirm('Pause all agents in all projects, stop their processes, and release every held lock?')) return;
+      pausingAll = true; $('#pause-all').disabled = true;
+      try { await mutate('/pause-all'); } catch (e) { toast(e.message, true); }
+      finally { pausingAll = false; $('#pause-all').disabled = false; }
+    });
     $('#resume-all').addEventListener('click', async () => { try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); } });
     $('#resume-restart').addEventListener('click', async () => {
       if (resumingRestart || !(state.restartPaused > 0)) return;
@@ -1655,7 +1570,6 @@
       if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
       getSelection()?.removeAllRanges();
       state.editor = null;
-      projectGeneration++;
       state.selectedProject = Number(event.target.value);
       state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
@@ -1668,7 +1582,7 @@
       if (!p || !confirm(`Remove project “${p.name}” from acom? Its files will not be deleted.`)) return;
       try {
         await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
-        projectGeneration++; state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread(); await refresh();
+        state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread(); await refresh();
       } catch (error) { toast(error.message, true); }
     });
     $('#settings-form').addEventListener('change', async event => {
@@ -1818,7 +1732,7 @@
         if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
         if (submission.current() && project === state.selectedProject) {
-          projectGeneration++; state.selectedProject = Number(result.id); state.overviewRevision = null; state.editor = null; resetThread();
+          state.selectedProject = Number(result.id); state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
         if (submission.current()) { $('#project-dialog').close(); form.reset(); }

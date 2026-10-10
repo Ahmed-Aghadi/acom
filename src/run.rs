@@ -3,7 +3,7 @@
 use crate::app::{App, Fail, Proc, R, St, now};
 use crate::harness::{self, Event, Launch};
 use rusqlite::params;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -13,7 +13,7 @@ use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn kill_group(pid: u32, sig: i32) {
     unsafe {
@@ -22,6 +22,7 @@ pub fn kill_group(pid: u32, sig: i32) {
 }
 
 /// Whether a PID still belongs to this agent of this server, not a process that reused the number.
+#[cfg(test)]
 pub fn is_our_agent(pid: u32, id: i64, url: &str) -> bool {
     let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
         return false;
@@ -127,6 +128,7 @@ pub fn is_server_tool(pid: u32, id: i64, url: &str, home: &Path) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn kill_server_tools(tools: &[(i64, u32)], url: &str, home: &Path, sig: i32) {
     let address = format!("ACOM_URL={url}");
     let home_marker = home_marker(home);
@@ -140,8 +142,190 @@ pub fn kill_server_tools(tools: &[(i64, u32)], url: &str, home: &Path, sig: i32)
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProcessIdentity {
+    start: u64,
+    group: u32,
+    state: u8,
+}
+
+fn process_identity(pid: u32) -> R<Option<ProcessIdentity>> {
+    let raw = match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Fail(500, format!("can't verify worker PID {pid}: {e}"))),
+    };
+    let text = String::from_utf8_lossy(&raw);
+    let fields: Vec<_> = text
+        .rsplit_once(") ")
+        .map(|(_, tail)| tail.split_whitespace().collect())
+        .unwrap_or_default();
+    let identity = fields
+        .get(19)
+        .and_then(|start| start.parse().ok())
+        .zip(fields.get(2).and_then(|group| group.parse().ok()))
+        .zip(
+            fields
+                .first()
+                .and_then(|state| state.as_bytes().first().copied()),
+        )
+        .map(|((start, group), state)| ProcessIdentity {
+            start,
+            group,
+            state,
+        });
+    identity.map(Some).ok_or_else(|| {
+        Fail(
+            500,
+            format!("can't verify worker PID {pid}: invalid process identity"),
+        )
+    })
+}
+
+/// A retryable stop operation. Call without holding the app mutex. Remembering
+/// start times keeps an exec-time environment gap from looking like an exit.
+pub struct StopTools {
+    ids: HashSet<i64>,
+    groups: Vec<(i64, u32)>,
+    url: String,
+    home: PathBuf,
+    tools: HashMap<(u32, u64), i64>,
+    signalled: HashSet<(u32, u64, i32)>,
+    signalled_groups: HashSet<(u32, i32)>,
+}
+
+impl StopTools {
+    pub fn new(app: &App, ids: &HashSet<i64>, groups: &[(i64, u32)], url: &str) -> R<Self> {
+        let mut stop = Self {
+            ids: ids.clone(),
+            groups: groups.to_vec(),
+            url: url.into(),
+            home: app.home.clone(),
+            tools: HashMap::new(),
+            signalled: HashSet::new(),
+            signalled_groups: HashSet::new(),
+        };
+        stop.capture()?;
+        Ok(stop)
+    }
+
+    fn capture(&mut self) -> R<()> {
+        for (id, pid) in server_tools(&self.ids, &self.url, &self.home) {
+            if let Some(p) = process_identity(pid)?
+                && !matches!(p.state, b'Z' | b'X')
+                && is_server_tool(pid, id, &self.url, &self.home)
+            {
+                self.tools.insert((pid, p.start), id);
+            }
+        }
+        Ok(())
+    }
+
+    fn live(&self, pid: u32, start: u64) -> R<Option<ProcessIdentity>> {
+        Ok(process_identity(pid)?.filter(|p| p.start == start && !matches!(p.state, b'Z' | b'X')))
+    }
+
+    fn signal(&mut self, sig: i32) -> R<()> {
+        let supervisor_group = unsafe { libc::getpgrp() } as u32;
+        for &(id, group) in &self.groups {
+            // A stale root must never authorize signalling the supervisor's own group.
+            if group == 0
+                || group > i32::MAX as u32
+                || group == supervisor_group
+                || self.signalled_groups.contains(&(group, sig))
+            {
+                continue;
+            }
+            let mut members = Vec::new();
+            let mut owned = false;
+            for (&(pid, start), &owner) in &self.tools {
+                if self.live(pid, start)?.is_some_and(|p| p.group == group) {
+                    members.push((pid, start));
+                    owned |= owner == id && is_server_tool(pid, id, &self.url, &self.home);
+                }
+            }
+            if !owned {
+                continue;
+            }
+            signal_worker(-(group as i32), sig)?;
+            self.signalled_groups.insert((group, sig));
+            self.signalled
+                .extend(members.into_iter().map(|(pid, start)| (pid, start, sig)));
+        }
+        for (&(pid, start), &id) in &self.tools {
+            if !self.signalled.contains(&(pid, start, sig))
+                && is_server_tool(pid, id, &self.url, &self.home)
+                && self.live(pid, start)?.is_some()
+            {
+                signal_worker(pid as i32, sig)?;
+                self.signalled.insert((pid, start, sig));
+            }
+        }
+        Ok(())
+    }
+
+    fn pending(&self, app: &App) -> R<bool> {
+        let native_pending = {
+            let st = app.lock();
+            self.ids
+                .iter()
+                .any(|id| st.procs.contains_key(id) && !st.reaped.contains(id))
+        };
+        if native_pending {
+            return Ok(true);
+        }
+        for &(pid, start) in self.tools.keys() {
+            if self.live(pid, start)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn wait(&mut self, app: &App, duration: Duration, sig: i32) -> R<bool> {
+        let deadline = Instant::now() + duration;
+        loop {
+            self.capture()?;
+            self.signal(sig)?;
+            if !self.pending(app)? {
+                // Recheck after a short quiet interval, including late forks.
+                thread::sleep(Duration::from_millis(20));
+                self.capture()?;
+                if !self.pending(app)? {
+                    return Ok(true);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn stop(&mut self, app: &App) -> R<()> {
+        if self.wait(app, Duration::from_secs(6), libc::SIGTERM)?
+            || self.wait(app, Duration::from_millis(500), libc::SIGKILL)?
+        {
+            return Ok(());
+        }
+        Err(Fail(500, "owned workers are still stopping; locks must remain unavailable until cleanup succeeds".into()))
+    }
+}
+
+fn signal_worker(pid: i32, sig: i32) -> R<()> {
+    if unsafe { libc::kill(pid, sig) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(Fail(500, format!("can't stop worker {pid}: {error}")))
+}
+
 /// A reaped leader can leave owned tools in its process group. Validate a live
 /// member of exactly that group before allowing startup to stop its leftovers.
+#[cfg(test)]
 pub fn is_our_agent_group(group: u32, id: i64, url: &str) -> bool {
     if group == 0 || group > i32::MAX as u32 {
         return false;
@@ -757,6 +941,7 @@ mod tests {
             st: Mutex::new(St {
                 db,
                 shutting_down: false,
+                stopping_agents: Default::default(),
                 waiting_updates: Default::default(),
                 queues: Default::default(),
                 procs: [(
@@ -778,6 +963,224 @@ mod tests {
             url: String::new(),
             exe: PathBuf::new(),
         })
+    }
+
+    struct StopWorker(Child);
+    impl Drop for StopWorker {
+        fn drop(&mut self) {
+            kill_group(self.0.id(), libc::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+
+    fn stop_test_app() -> Arc<App> {
+        let mut app = test_app(0);
+        let inner = Arc::get_mut(&mut app).unwrap();
+        inner.url = format!("http://127.0.0.1:65530/stop-{}", harness::new_uuid());
+        std::fs::create_dir_all(&inner.home).unwrap();
+        inner.lock().procs.clear();
+        app
+    }
+
+    fn stop_worker(
+        app: &App,
+        id: i64,
+        url: &str,
+        home: &Path,
+        name: &str,
+        resistant: bool,
+    ) -> StopWorker {
+        let ready = app.home.join(format!("{name}-ready"));
+        let terms = app.home.join(format!("{name}-terms"));
+        let script = if resistant {
+            "trap '' TERM; printf ready > \"$2\"; exec /bin/sleep 30"
+        } else {
+            "trap 'printf t >> \"$1\"; exit' TERM; printf ready > \"$2\"; while :; do /bin/sleep 30; done"
+        };
+        let worker = StopWorker(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script, "stop-worker"])
+                .arg(terms)
+                .arg(&ready)
+                .env("ACOM_ID", id.to_string())
+                .env("ACOM_URL", url)
+                .env("ACOM_HOME", home)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "stop worker did not become ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        worker
+    }
+
+    #[test]
+    fn stop_tools_cleans_group_and_late_detached_tools_without_duplicate_term_or_foreign_signals() {
+        let app = stop_test_app();
+        let mut root = stop_worker(&app, 1, &app.url, &app.home, "root", false);
+        let mut foreign_home = stop_worker(
+            &app,
+            1,
+            &app.url,
+            &app.home.join("foreign"),
+            "foreign-home",
+            false,
+        );
+        let mut foreign_url = stop_worker(
+            &app,
+            1,
+            "http://127.0.0.1:1",
+            &app.home,
+            "foreign-url",
+            false,
+        );
+        let mut unregistered = stop_worker(&app, 2, &app.url, &app.home, "unregistered", false);
+        let mut stop =
+            StopTools::new(&app, &HashSet::from([1]), &[(1, root.0.id())], &app.url).unwrap();
+        let mut detached = stop_worker(&app, 1, &app.url, &app.home, "late-detached", false);
+        stop.stop(&app).unwrap();
+        assert!(root.0.try_wait().unwrap().is_some());
+        assert!(detached.0.try_wait().unwrap().is_some());
+        assert_eq!(
+            std::fs::read_to_string(app.home.join("root-terms")).unwrap(),
+            "t"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.home.join("late-detached-terms")).unwrap(),
+            "t"
+        );
+        assert!(foreign_home.0.try_wait().unwrap().is_none());
+        assert!(foreign_url.0.try_wait().unwrap().is_none());
+        assert!(unregistered.0.try_wait().unwrap().is_none());
+        stop.stop(&app).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(app.home.join("root-terms")).unwrap(),
+            "t"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.home.join("late-detached-terms")).unwrap(),
+            "t"
+        );
+    }
+
+    #[test]
+    fn stop_tools_remembers_live_identity_without_markers_and_rejects_reused_pid_generation() {
+        let app = stop_test_app();
+        let mut worker = stop_worker(
+            &app,
+            1,
+            &app.url,
+            &app.home.join("foreign"),
+            "unmarked-proof",
+            false,
+        );
+        let mut stop = StopTools::new(&app, &HashSet::from([1]), &[], &app.url).unwrap();
+        let pid = worker.0.id();
+        let start = process_identity(pid).unwrap().unwrap().start;
+        // Model a captured worker whose environment markers are now absent.
+        stop.tools.insert((pid, start), 1);
+        assert!(!is_server_tool(pid, 1, &app.url, &app.home));
+        assert!(stop.pending(&app).unwrap());
+        assert!(
+            !stop
+                .wait(&app, Duration::from_millis(30), libc::SIGTERM)
+                .unwrap()
+        );
+        assert!(worker.0.try_wait().unwrap().is_none());
+        assert_eq!(stop.tools.get(&(pid, start)), Some(&1));
+        stop.tools.remove(&(pid, start));
+        stop.tools.insert((pid, start + 1), 1);
+        assert!(!stop.pending(&app).unwrap());
+        stop.signal(libc::SIGKILL).unwrap();
+        assert!(worker.0.try_wait().unwrap().is_none());
+        {
+            let mut st = app.lock();
+            st.procs.insert(
+                1,
+                Proc {
+                    pid,
+                    stopping: true,
+                    model: "m".into(),
+                    effort: "e".into(),
+                    failure: None,
+                },
+            );
+        }
+        assert!(stop.pending(&app).unwrap());
+        app.lock().reaped.insert(1);
+        assert!(!stop.pending(&app).unwrap());
+    }
+
+    #[test]
+    fn stop_tools_force_kills_term_resistant_worker_with_a_bounded_wait() {
+        use std::os::unix::process::ExitStatusExt;
+        let app = stop_test_app();
+        let mut worker = stop_worker(&app, 1, &app.url, &app.home, "resistant", true);
+        let mut stop =
+            StopTools::new(&app, &HashSet::from([1]), &[(1, worker.0.id())], &app.url).unwrap();
+        let started = Instant::now();
+        stop.stop(&app).unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        assert!(started.elapsed() < Duration::from_secs(9));
+        assert!(worker.0.wait().unwrap().signal() == Some(libc::SIGKILL));
+        assert!(!stop.pending(&app).unwrap());
+    }
+
+    #[test]
+    fn stop_tools_never_signals_the_supervisors_group() {
+        struct SingleWorker(Child);
+        impl Drop for SingleWorker {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let app = stop_test_app();
+        let mut worker = SingleWorker(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .env("ACOM_ID", "1")
+                .env("ACOM_URL", &app.url)
+                .env("ACOM_HOME", &app.home)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let supervisor_group = unsafe { libc::getpgrp() } as u32;
+        assert_eq!(
+            process_identity(worker.0.id()).unwrap().unwrap().group,
+            supervisor_group
+        );
+        let mut stop = StopTools::new(
+            &app,
+            &HashSet::from([1]),
+            &[(1, supervisor_group)],
+            &app.url,
+        )
+        .unwrap();
+        stop.stop(&app).unwrap();
+        assert!(worker.0.try_wait().unwrap().is_some());
+        assert!(
+            !stop
+                .signalled_groups
+                .contains(&(supervisor_group, libc::SIGTERM))
+        );
+        assert!(
+            !stop
+                .signalled_groups
+                .contains(&(supervisor_group, libc::SIGKILL))
+        );
     }
 
     #[test]

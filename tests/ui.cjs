@@ -46,7 +46,8 @@ async function fixture(run) {
     if (key === 'projects') return projectRows();
     if (key === 'configs') return configs();
     if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
-    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
+    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,stopping:!!a.stopping,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
+    if (key === 'locks') return (data.locks || []).filter(lock=>lock.project == null || lock.project === project).map((lock,i)=>({id:i+1,...lock,holder_stopping:!!(lock.holder && (lock.holder_stopping || data.agents.find(agent=>agent.id===lock.holder)?.stopping))}));
     return (data[key] || []).filter(row => row.project == null || row.project === project).map((row,i) => ({id:i+1,...row}));
   };
   const revision = (key, project) => hash([key,['projects','configs'].includes(key)?null:project,collection(key,project)]);
@@ -63,7 +64,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','user_member','unread','messages','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','holder_stopping','user_member','unread','messages','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -80,6 +81,10 @@ async function fixture(run) {
     while(low+1<high) {const mid=Math.floor((low+high)/2);if(Buffer.byteLength(JSON.stringify(envelope(mid)))<=budget)low=mid;else high=mid;}
     return envelope(low);
   }
+  const releaseLocks = id => {
+    const agent=data.agents.find(a=>a.id===id); if(agent)agent.locks=[];
+    for(const lock of data.locks || [])if(lock.holder===id)Object.assign(lock,{holder:null,holder_name:null,acquired_at:null,expires_at:null});
+  };
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -183,7 +188,9 @@ async function fixture(run) {
       return send({});
     }
     if (/^\/agents\/\d+\/resume$/.test(req.url)) {
-      Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'working',pause_reason:null,problem:null});
+      const agent=data.agents.find(a => a.id === Number(req.url.split('/')[2]));
+      if(agent.stopping)return send({status:409,error:'Agent is still stopping'});
+      Object.assign(agent, {state:'working',pause_reason:null,problem:null});
       return send({warnings:[]});
     }
     if (req.url === '/resume-restart') {
@@ -194,13 +201,27 @@ async function fixture(run) {
       return send(data.resumeRestartResult || {ids,warnings:data.resumeRestartWarnings || [],errors:eligible.filter(a=>data.resumeRestartFailures?.[a.id]).map(a=>data.resumeRestartFailures[a.id])});
     }
     if (/^\/agents\/\d+\/pause$/.test(req.url)) {
-      Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'paused'});
+      if(Object.hasOwn(body,'locks'))return send({status:400,error:'Pause always releases locks; lock options are unsupported'});
+      if(data.pauseError)return send({status:503,error:data.pauseError});
+      const id=Number(req.url.split('/')[2]);
+      Object.assign(data.agents.find(a => a.id === id), {state:'paused',pause_reason:'user',stopping:!!data.pauseStopping});
+      if(!data.pauseStopping)releaseLocks(id);
       return send({});
+    }
+    if(req.url==='/pause-all') {
+      if(data.pauseAllError)return send({status:503,error:data.pauseAllError});
+      const ids=data.agents.filter(a=>['working','idle','done'].includes(a.state)).map(a=>a.id);
+      for(const id of ids) {
+        Object.assign(data.agents.find(a=>a.id===id),{state:'paused',pause_reason:'all',stopping:!!data.pauseStopping});
+        if(!data.pauseStopping)releaseLocks(id);
+      }
+      return send({ids});
     }
     if (req.url === '/locks/free') {
       const lock=(data.locks || []).find(lock=>lock.project===body.project&&lock.name===body.name);
-      if(body.expected_holder!=null && (!lock || lock.holder!==body.expected_holder || !lock.frozen || lock.holder_state!=='paused')) return send({status:409,error:'Frozen lock holder changed; inspect current state'});
-      if(lock) Object.assign(lock,{holder:null,frozen:false});
+      if(Object.hasOwn(body,'expected_holder'))return send({status:400,error:'Frozen-lock release is unsupported'});
+      if(lock?.holder_stopping || data.agents.find(agent=>agent.id===lock?.holder)?.stopping)return send({status:409,error:'Lock holder is still stopping'});
+      if(lock) Object.assign(lock,{holder:null,holder_name:null,acquired_at:null,expires_at:null});
       return send({});
     }
     if (req.method==='GET' && /^\/agents\/\d+(\/log)?$/.test(pathname)) {
@@ -2127,7 +2148,7 @@ test('mobile locks can scroll every control into view and dialogs and feedback h
   await page.locator('#locks').evaluate(el => { el.scrollLeft = el.scrollWidth; });
   assert.equal(await page.locator('[data-action=free-lock]').evaluate(el => el.getBoundingClientRect().right <= innerWidth), true);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members',usage:'Subscription usage',config:'Save as new config',agent:'Agent',pause:'Pause agent',resume:'Resume agent'};
+  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members',usage:'Subscription usage',config:'Save as new config',agent:'Agent'};
   for (const [id,name] of Object.entries(names)) {
     await page.evaluate(id => openDialog(document.getElementById(id+'-dialog')), id);
     assert.equal(await page.getByRole('dialog', {name,exact:true}).count(), 1);
@@ -2512,76 +2533,169 @@ test('rejoining backfills earlier unread messages in order and a failed middle p
   assert.equal(data.reads[1],6);
 }));
 
-test('explicit Resume resolves every paged and oversized frozen lock without eagerly draining Overview', async () => fixture(async (page,data) => {
+test('Resume is a single agent action without reading or freeing other agents paged locks', async () => fixture(async (page,data) => {
   data.pageLimit=2; data.agents=[{id:1,project:1,name:'Resume worker',state:'paused'}];
-  const longName='Older frozen lock ☃ '.repeat(1300);
-  data.locks=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:i===0?longName:`lock${i+1}`,holder:i===0?2:null,holder_state:i===0?'paused':null,frozen:i===0,about:'Lock purpose'}));
+  const longName='Older active lock ☃ '.repeat(1300);
+  data.locks=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:i===0?longName:`lock${i+1}`,holder:2,about:'Another worker owns this lease',expires_at:Date.now()/1000+60}));
   await manualPolling(page); await reloadPage(page);
   assert.deepEqual(await page.evaluate(()=>state.locks.map(lock=>lock.id)),[6,5]);
   assert.equal(data.getRequests.filter(url=>url.startsWith('/locks?')&&url.includes('before=')).length,0);
-  await page.locator('[data-action=resume]').click(); await page.locator('#resume-dialog').waitFor();
-  assert.equal(await page.locator('#resume-copy').textContent(),`agent 2: ${longName}`);
-  await page.locator('#resume-dialog [value=release]').click();
+  await page.locator('[data-action=resume]').click();
   await page.waitForFunction(()=>state.agents[0]?.state==='working');
-  const free=data.requests.find(request=>request.url==='/locks/free');
-  assert.deepEqual(free.body,{project:1,name:longName,expected_holder:2});
-  assert.equal(data.requests.filter(request=>request.url==='/agents/1/resume').length,1);
-  assert.ok(data.getRequests.some(url=>url.startsWith('/locks/1?project=1&offset=')));
+  assert.deepEqual(data.requests,[{url:'/agents/1/resume',method:'POST',body:{}}]);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/locks?')&&url.includes('before=')).length,0);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/locks/')).length,0,'Resume never hydrates unrelated oversized locks');
+  assert.ok(data.locks.every(lock=>lock.holder===2));
+  assert.equal(await page.locator('#pause-dialog,#resume-dialog').count(),0);
 }));
 
-test('Resume refuses an incomplete lock snapshot and restarts a changed revision before offering the complete choice', async () => fixture(async (page,data) => {
-  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Worker',state:'paused'}];
-  data.locks=Array.from({length:5},(_,i)=>({id:i+1,project:1,name:`lock${i+1}`,holder:i+2,holder_state:'paused',frozen:true}));
+test('Pause retains leases only while verified process cleanup is still stopping and blocks overlapping actions', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Worker',state:'working',locks:['held lease']}];
+  data.locks=[{id:1,project:1,name:'held lease',holder:1,about:'Still being written',expires_at:Date.now()/1000+60}];
+  data.pauseStopping=true;
   await manualPolling(page); await reloadPage(page);
-  const continuation=url=>url.pathname==='/locks'&&url.searchParams.has('before');
-  await page.route(continuation,route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Lock snapshot unavailable'})}));
-  await page.locator('[data-action=resume]').click(); await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Lock snapshot unavailable');
-  assert.equal(await page.locator('#resume-dialog').evaluate(dialog=>dialog.open),false);
-  assert.equal(data.requests.length,0);
-  await page.unroute(continuation);
-  let changed=false;
-  await page.route(continuation,route=>{
-    if(!changed) {changed=true;data.locks.find(lock=>lock.id===1).name='Changed older lock';}
-    return route.continue();
+  await page.locator('[data-action=pause]').click();
+  await page.waitForFunction(()=>state.agents[0]?.stopping && !agentTransitions.size);
+  assert.deepEqual(data.requests,[{url:'/agents/1/pause',method:'POST',body:{}}]);
+  assert.equal(data.locks[0].holder,1,'leases are not freed while owned processes remain alive');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Stopping.*Stopping processes before releasing locks/s);
+  assert.equal(await page.locator('[data-action=resume]').isDisabled(),true);
+  assert.equal(await page.locator('[data-action=close]').isDisabled(),true);
+  assert.equal(await page.locator('[data-action=free-lock]').isDisabled(),true);
+  assert.match(await page.locator('#locks').textContent(),/Releasing after stop/);
+  await page.evaluate(()=>{document.querySelector('[data-action=resume]').click();document.querySelector('[data-action=close]').click();document.querySelector('[data-action=free-lock]').click();return refresh();});
+  assert.equal(data.requests.length,1);
+  await page.locator('[data-action=details]').click();
+  await page.locator('#agent-details dt[data-key=stopping]').waitFor();
+  assert.match(await page.locator('#agent-details dt[data-key=stopping] + dd').textContent(),/Locks are released only after cleanup finishes/);
+  Object.assign(data.agents[0],{stopping:false,locks:[]});
+  Object.assign(data.locks[0],{holder:null,expires_at:null});
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-details dt[data-key=stopping]').count(),0);
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  assert.equal(await page.locator('[data-action=resume]').isEnabled(),true);
+  assert.equal(await page.locator('[data-action=close]').isEnabled(),true);
+  assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Stopping/);
+}));
+
+test('explicit Free uses a plain lease and never sends obsolete paused-lock flags', async () => fixture(async (page,data) => {
+  data.locks=[{id:1,project:1,name:'shared',holder:2,holder_name:'Active worker',acquired_at:1,expires_at:Date.now()/1000+60}];
+  await manualPolling(page); await reloadPage(page);
+  assert.doesNotMatch(await page.locator('#locks').textContent(),/frozen|no TTL/i);
+  page.once('dialog',dialog=>dialog.accept());
+  await page.locator('[data-action=free-lock]').click();
+  await page.waitForFunction(()=>state.locks[0]?.holder===null);
+  assert.deepEqual(data.requests,[{url:'/locks/free',method:'POST',body:{project:1,name:'shared'}}]);
+  await page.evaluate(()=>refresh());
+  assert.equal(data.requests.length,1);
+}));
+
+test('stopping lock holders outside the agent page block Free even through selected stale rows and oversized previews', async () => fixture(async (page,data) => {
+  data.pageLimit=1;
+  data.agents=[{id:1,project:1,name:'Older holder',state:'paused',stopping:true},{id:2,project:1,name:'Newer worker',state:'working'}];
+  data.locks=[{id:1,project:1,name:'protected',holder:1,expires_at:1}];
+  await manualPolling(page); await reloadPage(page);
+  let confirmations=0;
+  page.on('dialog',dialog=>{confirmations++;return dialog.accept();});
+  assert.deepEqual(await page.evaluate(()=>state.agents.map(agent=>agent.id)),[2]);
+  assert.equal(await page.locator('[data-action=free-lock]').isDisabled(),true);
+  assert.match(await page.locator('#locks').textContent(),/Releasing after stop/);
+  data.agents[0].stopping=false; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-action=free-lock]').isEnabled(),true);
+  await page.evaluate(()=>{
+    const range=document.createRange(); range.selectNodeContents(document.querySelector('#locks code'));
+    getSelection().removeAllRanges(); getSelection().addRange(range);
   });
-  await page.locator('[data-action=resume]').click(); await page.locator('#resume-dialog').waitFor();
-  assert.equal(changed,true);
-  assert.match(await page.locator('#resume-copy').textContent(),/Changed older lock/);
-  assert.doesNotMatch(await page.locator('#resume-copy').textContent(),/lock1/);
-  for(const id of [2,3,4,5]) assert.match(await page.locator('#resume-copy').textContent(),new RegExp(`lock${id}`));
-  await page.locator('#resume-dialog [value=cancel]').click();
+  data.agents[0].stopping=true; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-action=free-lock]').isEnabled(),true,'selected old rows remain intact');
+  await page.evaluate(()=>document.querySelector('[data-action=free-lock]').click());
+  assert.equal(confirmations,0,'stopping guards prevent even prompting from stale controls');
+  assert.equal(data.requests.length,0,'the latest lock scalar blocks a stale enabled control');
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-action=free-lock]').isDisabled(),true);
+  data.locks[0].about='Large lock purpose '.repeat(1500); await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>state.locks[0].truncated),true);
+  assert.match(await page.locator('#locks').textContent(),/Lock #1 · Releasing after stop/);
+  await page.locator('[data-record=locks]').click();
+  await page.locator('[data-action=free-lock]').waitFor();
+  assert.equal(await page.locator('[data-action=free-lock]').isDisabled(),true);
   assert.equal(data.requests.length,0);
 }));
 
-test('Resume does not free a frozen lock whose holder changed after the confirmation was shown', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Worker',state:'paused'}];
-  data.locks=[{id:1,project:1,name:'shared',holder:2,holder_state:'paused',frozen:true}];
+test('Free reports a holder that started stopping after confirmation without releasing or automatically retrying', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Holder',state:'working'}];
+  data.locks=[{id:1,project:1,name:'racing lease',holder:1,expires_at:Date.now()/1000+60}];
   await manualPolling(page); await reloadPage(page);
-  await page.locator('[data-action=resume]').click(); await page.locator('#resume-dialog').waitFor();
-  Object.assign(data.locks[0],{holder:3,holder_state:'working',frozen:false});
-  await page.locator('#resume-dialog [value=release]').click();
-  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Frozen lock holder changed'));
-  assert.equal(data.locks[0].holder,3);
-  assert.equal(data.requests.filter(request=>request.url==='/agents/1/resume').length,0);
-  assert.equal(data.requests.filter(request=>request.url==='/locks/free').length,1);
-  assert.equal(data.requests[0].body.expected_holder,2);
+  const held=await holdRequest(page,'**/locks/free');
+  page.once('dialog',dialog=>dialog.accept());
+  await page.locator('[data-action=free-lock]').click(); await held.started;
+  Object.assign(data.agents[0],{state:'paused',stopping:true});
+  held.release(); await held.remove();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Lock holder is still stopping');
+  assert.equal(data.locks[0].holder,1);
+  assert.deepEqual(data.requests,[{url:'/locks/free',method:'POST',body:{project:1,name:'racing lease'}}]);
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-action=free-lock]').isDisabled(),true);
+  assert.equal(data.requests.length,1);
 }));
 
-test('Pause reads current holds on demand and project navigation cancels a delayed lock snapshot', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Worker',state:'working',locks:[]}];
+test('Pause is a single empty-payload action, preserves the current project after a delayed response and never retries errors', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'First worker',state:'working',locks:['first hold']},{id:2,project:2,name:'Other worker',state:'working',locks:['other hold']}];
+  data.locks=[{id:1,project:1,name:'first hold',holder:1},{id:2,project:2,name:'other hold',holder:2}];
   await manualPolling(page); await reloadPage(page);
-  data.agents[0].locks=['new current hold'];
-  await page.locator('[data-action=pause]').click(); await page.locator('#pause-dialog').waitFor();
-  assert.match(await page.locator('#pause-copy').textContent(),/new current hold/);
-  await page.locator('#pause-dialog [value=keep]').click(); await page.waitForFunction(()=>state.agents[0]?.state==='paused');
-  assert.deepEqual(data.requests.find(request=>request.url==='/agents/1/pause').body,{locks:'keep'});
-  const held=await holdRequest(page,url=>url.pathname==='/locks'&&!url.searchParams.has('since'),'GET');
-  await page.locator('[data-action=resume]').click(); await held.started;
+  const held=await holdRequest(page,'**/agents/1/pause');
+  await page.locator('[data-action=pause]').click(); await held.started;
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-action=pause]').isDisabled(),true);
+  await page.evaluate(()=>document.querySelector('[data-action=pause]').click());
   await page.locator('#project-select').selectOption('2');
   held.release(); await held.remove();
   await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0&&agentTransitions.size===0);
-  assert.equal(await page.locator('#resume-dialog').evaluate(dialog=>dialog.open),false);
-  assert.equal(data.requests.filter(request=>request.url==='/agents/1/resume'||request.url==='/locks/free').length,0);
+  assert.deepEqual(data.requests,[{url:'/agents/1/pause',method:'POST',body:{}}]);
+  assert.deepEqual(data.locks.map(lock=>lock.holder),[null,2]);
+  assert.equal(data.agents[1].state,'working');
+  assert.equal(data.detailRequests.length,0,'Pause no longer fetches holds before a choice');
+  data.agents[0].state='working'; data.pauseError='Stop cleanup unavailable';
+  await page.locator('#project-select').selectOption('1'); await page.waitForFunction(()=>state.selectedProject===1&&refreshPending===0);
+  await page.locator('[data-action=pause]').click(); await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Stop cleanup unavailable');
+  await page.evaluate(()=>refresh());
+  assert.equal(data.requests.filter(request=>request.url==='/agents/1/pause').length,2,'one explicit retry is not repeated automatically');
+  assert.equal(data.agents[0].state,'working');
+}));
+
+test('Pause all confirms stop-and-release scope, can be cancelled and stays single-flight through polling', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Working',state:'working'},{id:2,project:2,name:'Idle elsewhere',state:'idle'},{id:3,project:1,name:'Already paused',state:'paused',pause_reason:'user'}];
+  data.locks=[{id:1,project:1,name:'first',holder:1},{id:2,project:2,name:'second',holder:2}];
+  await manualPolling(page); await reloadPage(page);
+  const confirmations=[];
+  page.on('dialog',dialog=>{confirmations.push(dialog.message());return confirmations.length===1?dialog.dismiss():dialog.accept();});
+  await page.locator('#pause-all').click();
+  assert.equal(data.requests.length,0);
+  const held=await holdRequest(page,'**/pause-all');
+  await page.locator('#pause-all').click(); await held.started;
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#pause-all').isDisabled(),true);
+  await page.evaluate(()=>document.querySelector('#pause-all').click());
+  held.release(); await held.remove();
+  await page.waitForFunction(()=>!document.querySelector('#pause-all').disabled);
+  assert.deepEqual(confirmations,Array(2).fill('Pause all agents in all projects, stop their processes, and release every held lock?'));
+  assert.deepEqual(data.requests,[{url:'/pause-all',method:'POST',body:{}}]);
+  assert.ok(data.locks.every(lock=>lock.holder===null));
+  assert.deepEqual(data.agents.map(a=>a.pause_reason),['all','all','user']);
+  await page.locator('[data-page=settings]').click();
+  assert.match(await page.locator('#settings-form').textContent(),/Every pause stops the agent's processes, then releases its locks/);
+  assert.doesNotMatch(await page.locator('body').textContent(),/frozen|freeze|keep locks/i);
+}));
+
+test('bounded stopping previews keep cleanup visible and Details available without restart actions', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Huge worker name '.repeat(2500),state:'paused',pause_reason:'user',stopping:true}];
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(await page.locator('[data-action=resume],[data-action=close]').count(),0);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Stopping.*before releasing locks/s);
+  await page.locator('[data-action=details]').click();
+  await page.locator('#agent-details dt[data-key=stopping]').waitFor();
+  assert.equal(await page.locator('[data-action=resume]').isDisabled(),true);
+  assert.equal(await page.locator('[data-action=close]').isDisabled(),true);
 }));
 
 test('explicit Details hydration restores the action controls of an oversized agent preview without replacing config drafts', async () => fixture(async (page,data) => {
