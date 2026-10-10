@@ -9,7 +9,7 @@ const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 
-test('real Codex model access, tools and same-conversation reopen', { skip: !process.env.ACOM_LIVE_TEST }, async t => {
+test('real Codex model access, tools and same-conversation reopen', { skip: process.env.ACOM_LIVE_TEST !== '1' }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acom-live-'));
   const project = path.join(root, 'project'); fs.mkdirSync(project);
   const probe = net.createServer();
@@ -61,18 +61,25 @@ test('real Codex model access, tools and same-conversation reopen', { skip: !pro
     assert.equal(fs.readFileSync(path.join(project,'proof.txt'),'utf8'),'first-turn\n');
     assert.ok(first.session);
     assert.ok(fs.existsSync(first.conversation_history));
+    const active=await api('/threads',{project:p.id,title:'Live active audience',watch:['active']});
+    assert.deepEqual((await api(`/threads/${active.id}`)).members,[0],'closed agents are outside live active filters');
     const thread=await api('/threads',{project:p.id,title:'Live wake',members:[String(agent.id)]});
     await api('/messages',{thread:thread.id,text:'Read your inbox. Append exactly second-turn\\n to proof.txt with a shell tool, run acom done, then finish. Do not edit anything outside this project or launch helpers.'});
     await new Promise(resolve=>setTimeout(resolve,1500));
     assert.equal((await api(`/agents/${agent.id}`)).state,'closed');
     assert.equal(fs.readFileSync(path.join(project,'proof.txt'),'utf8'),'first-turn\n');
     await api(`/agents/${agent.id}/reopen`,{});
+    assert.ok((await api(`/threads/${active.id}`)).members.includes(agent.id),'reopening reconciles live membership before the turn');
     await until(async()=> (await api(`/agents/${agent.id}`)).turns>=2,'wake started');
     const second=await ended(agent.id);
     assert.equal(second.session,first.session);
     assert.equal(second.model,model);
     assert.equal(fs.readFileSync(path.join(project,'proof.txt'),'utf8'),'first-turn\nsecond-turn\n');
-    t.diagnostic(`${model}: tools, identity/limits, done, no closed wake and same-session reopen passed`);
+    assert.deepEqual((await api(`/threads/${active.id}`)).members,[0]);
+    const history=await api(`/history?project=${p.id}&agent=${agent.id}&thread=${active.id}`);
+    assert.ok(history.events.some(e=>e.kind==='thread.joined'));
+    assert.ok(history.events.some(e=>e.kind==='thread.left'));
+    t.diagnostic(`${model}: tools, identity/limits, done, no closed wake, live membership and same-session reopen passed`);
     const limits=await api('/limits');
     t.diagnostic(JSON.stringify({usage:limits.usage.map(w=>({provider:w.provider,window:w.win,used:w.used_pct,reset:w.resets_at})),checks:limits.checks.map(c=>({provider:c.provider,checked:!!c.checked_at,error:c.error}))}));
   } finally {

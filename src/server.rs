@@ -1,6 +1,8 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
-use crate::app::{App, Fail, LaunchReq, LockMode, R, Settings, acom_home, actor, bad, not_found};
+use crate::app::{
+    App, Fail, HistoryQuery, LaunchReq, LockMode, R, Settings, acom_home, actor, bad, not_found,
+};
 use crate::harness::catalog;
 use serde_json::{Value, json};
 use std::os::fd::AsRawFd;
@@ -353,11 +355,17 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 opt_int(b, "project"),
                 &text(b, "title")?,
                 &list(b, "members"),
-                b["include_user"].as_bool().unwrap_or(true),
+                b["include_user"]
+                    .as_bool()
+                    .unwrap_or_else(|| opt_int(b, "agent").unwrap_or(0) == 0),
+                &list(b, "watch"),
             )?;
             J(json!({ "id": tid, "members": members }))
         }
-        ("GET", ["threads", t]) => J(app.thread(id(t)?)?),
+        ("GET", ["threads", t]) => J(match q.int("agent")? {
+            None => app.thread(id(t)?)?,
+            agent => app.thread_for(id(t)?, agent)?,
+        }),
         ("POST", ["threads", t, "read"]) => {
             if b.get("agent").is_some_and(|a| a.as_i64() != Some(0)) {
                 return Err(bad("only the user can mark a thread read"));
@@ -371,6 +379,9 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
         ("POST", ["threads", t, "members"]) => {
             J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? }))
+        }
+        ("POST", ["threads", t, "members", "remove"]) => {
+            J(json!({ "members": app.remove_members(id(t)?, &list(b, "members"))? }))
         }
         ("POST", ["threads", t, "user"]) => {
             app.user_membership(
@@ -424,7 +435,10 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 .collect();
             J(json!({ "id": mid, "not_woken": not_woken }))
         }
-        ("GET", ["messages", m]) => J(app.message(id(m)?)?),
+        ("GET", ["messages", m]) => J(match q.int("agent")? {
+            None => app.message(id(m)?)?,
+            agent => app.message_for(id(m)?, agent)?,
+        }),
         ("GET", ["inbox", a]) => J(json!(
             app.inbox(id(a)?, q.get("mark").as_deref().unwrap_or("new"))?
         )),
@@ -476,6 +490,20 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["activity"]) => J(json!(
             app.activity(q.int("project")?, q.int("limit")?.unwrap_or(100))?
         )),
+        ("GET", ["history"]) => J(app.history(
+            q.int("project")?,
+            HistoryQuery {
+                agent: q.int("agent")?,
+                thread: q.int("thread")?,
+                lock: q.get("lock"),
+                kind: q.get("kind"),
+                before: q.int("before")?,
+                after: q.int("after")?,
+                limit: q.int("limit")?.unwrap_or(50),
+                max_bytes: q.int("max_bytes")?.unwrap_or(16000),
+            },
+        )?),
+        ("GET", ["history", event]) => J(app.history_event(q.int("project")?, id(event)?)?),
 
         // configs: Default (id 1), saved ones, and each project's choice
         ("GET", ["configs"]) => J(json!(app.configs()?)),

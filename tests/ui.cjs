@@ -34,7 +34,7 @@ async function fixture(run) {
   data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
   const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
-  const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && m.id > (data.reads[t.id] || 0)).length : 0;
+  const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > (data.reads[t.id] || 0)).length : 0;
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -134,6 +134,8 @@ async function fixture(run) {
       return send({...t,last_read:data.reads[t.id] || 0,unread:unread(t)});
     }
     if (req.url === '/messages') {
+      if (data.messageDelay) await new Promise(resolve => setTimeout(resolve, data.messageDelay));
+      if (data.messageFailure) { res.statusCode = 503; return send({error:'Message send failed'}); }
       const t = data.threads.find(t => t.id === body.thread);
       t.members=[...new Set([0,...t.members])];
       t.messages.push({ id: t.messages.length + 1, sender: 0, at: Date.now() / 1000, text: body.text });
@@ -317,6 +319,9 @@ test('settings preserve quoted argument boundaries and reject unclosed quotes', 
   await page.locator('[data-page="settings"]').click();
   const input = page.locator('[data-harness=claude] [name=flags]');
   await input.waitFor();
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
+  await page.locator('[data-prompt-editor] summary').click();
+  await page.locator('[name=prompt_launch]').fill('Changed launch guidance');
   await saveSettings(page);
   assert.deepEqual(data.settings.harnesses.claude.flags, flags);
   const writes = data.requests.length;
@@ -492,6 +497,42 @@ test('config selection alone survives polling and switches without discard confi
   assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
 }));
 
+test('Save reflects semantic settings, names and bindings; reverted edits leave the applied config unchanged', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=settings]').click();
+  const save = page.locator('[form=settings-form]');
+  assert.equal(await save.isDisabled(), true);
+  assert.equal(await page.locator('#config-applied').textContent(), 'Applied configuration: Mine');
+  await page.locator('[data-limit=active] [name=hard]').fill('9');
+  assert.equal(await save.isEnabled(), true);
+  await page.locator('[data-limit=active] [name=hard]').fill('08');
+  assert.equal(await save.isDisabled(), true, 'numeric spelling alone is not a settings change');
+  await page.locator('[name=config_name]').fill('Mine renamed');
+  assert.equal(await save.isEnabled(), true);
+  await page.locator('[name=config_name]').fill(' Mine ');
+  assert.equal(await save.isDisabled(), true, 'names are trimmed by the backend');
+  await page.locator('[name=auto_resume]').uncheck();
+  assert.equal(await save.isEnabled(), true);
+  await page.locator('[name=auto_resume]').check();
+  assert.equal(await save.isDisabled(), true);
+  await page.locator('#config-select').selectOption('1');
+  assert.equal(await save.isEnabled(), true);
+  assert.equal(await page.locator('#config-applied').textContent(), 'Applied configuration: Mine');
+  await page.locator('#config-select').selectOption('2');
+  assert.equal(await save.isDisabled(), true);
+  await page.locator('#add-retry-rule').click();
+  assert.equal(await save.isEnabled(), true);
+  await page.locator('[data-remove-retry]').click();
+  assert.equal(await save.isDisabled(), true);
+  await page.locator('#config-select').selectOption('custom');
+  assert.equal(await save.isEnabled(), true, 'Custom is a real binding change even with matching settings');
+  await page.locator('#config-select').selectOption('2');
+  assert.equal(await save.isDisabled(), true);
+  assert.deepEqual(data.requests, []);
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '2');
+  assert.equal(await save.isDisabled(), true);
+}));
+
 test('Default is read-only, copied settings are editable, and busy restoration preserves read-only controls', async () => fixture(async (page, data) => {
   data.settings.limits.active.hard = 9;
   data.writeDelay = 250;
@@ -653,6 +694,86 @@ test('thread filters distinguish participation; joining, leaving and adding memb
   assert.equal(await page.locator('[data-thread]').count(),1);
 }));
 
+test('live thread creation sends explicit state/group filters, retains user choice and never sends fixed members', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=threads]').click();
+  const cases = [
+    {states:['working'],groups:'',include:true},
+    {states:['idle'],groups:'',include:true},
+    {states:['working','idle'],groups:'review, writing',include:false},
+    {states:['paused','done'],groups:'review',include:true},
+    {states:[],groups:'review',include:true},
+  ];
+  for (const [index, c] of cases.entries()) {
+    await page.locator('[data-open=thread-dialog]').click();
+    await page.locator('#thread-form [name=title]').fill(`Live ${index}`);
+    await page.locator('#thread-mode').selectOption('live');
+    for (const input of await page.locator('[name=watch_state]').all()) await input.setChecked(c.states.includes(await input.inputValue()));
+    await page.locator('[name=watch_groups]').fill(c.groups);
+    await page.locator('[name=include_user]').setChecked(c.include);
+    assert.equal(await page.locator('#thread-fixed-members').isHidden(), true);
+    assert.equal(await page.locator('#thread-form [name=members]').isDisabled(), true);
+    await page.locator('#thread-form button.primary').click();
+    await page.waitForFunction(id => document.querySelector('#message-form')?.dataset.draftThread === String(id), index + 1);
+    const request = data.requests.filter(r => r.url === '/threads').at(-1).body;
+    assert.deepEqual([...request.watch].sort(), [...c.states,...c.groups.split(',').map(g=>g.trim()).filter(Boolean).map(g=>`group:${g}`)].sort());
+    assert.equal(Object.hasOwn(request, 'members'), false);
+    assert.equal(request.include_user, c.include);
+    assert.match(await page.locator('#thread-watch').textContent(), /Live filters:/);
+    assert.equal(await page.locator('#add-thread-members').isHidden(), true);
+    assert.equal(await page.locator('#thread-mode').inputValue(), 'fixed');
+  }
+}));
+
+test('empty live filters are rejected locally and switching back to fixed members drops watch fields', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=threads]').click();
+  await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('#thread-form [name=title]').fill('Chosen members');
+  await page.locator('#thread-mode').selectOption('live');
+  await page.locator('[name=watch_state][value=working]').uncheck();
+  await page.locator('[name=watch_state][value=idle]').uncheck();
+  await page.locator('#thread-form button.primary').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('at least one state or group'));
+  assert.deepEqual(data.requests, []);
+  await page.locator('[name=watch_groups]').fill('review');
+  await page.locator('#thread-mode').selectOption('fixed');
+  await page.locator('#thread-form button.primary').click();
+  await page.locator('#message-form').waitFor();
+  assert.deepEqual(data.requests.find(r => r.url === '/threads').body, {project:1,title:'Chosen members',members:[],include_user:true});
+}));
+
+test('live threads expose escaped membership history and mark outside-membership messages without counting them unread', async () => fixture(async (page, data) => {
+  data.threads = [conversation([{...incoming(1,'Before you joined'),outside_membership:true},{...incoming(2,'Current reply'),membership_unknown:true}], {
+    watch:['working','idle','group:review'],events_more:true,
+    events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'user',details:{reason:'group <review> matched'}}],
+  })];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.evaluate(() => { document.hasFocus = () => false; });
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#thread-history').waitFor();
+  assert.equal(await page.locator('#add-thread-members').isHidden(), true);
+  assert.equal(await page.locator('#thread-membership').textContent(), 'Leave thread');
+  assert.equal(await page.locator('[data-message="1"] .pill').textContent(), 'Outside your membership');
+  assert.match(await page.locator('[data-message="2"] .message-head').textContent(), /Membership at send time unknown/);
+  assert.equal(await page.locator('[data-message="2"] .pill').count(), 0);
+  assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
+  await page.locator('#thread-history summary').click();
+  assert.match(await page.locator('#thread-events').textContent(), /agent 1 joined.*group <review> matched/);
+  assert.match(await page.locator('#thread-events').textContent(), /Earlier membership events are not shown/);
+  assert.equal(await page.locator('#thread-events review').count(), 0);
+  data.threads[0].events.push({id:2,at:2,kind:'thread.left',agent:1,actor:'system',details:{reason:'state changed'}});
+  data.threads[0].members = [0];
+  await page.evaluate(() => refresh());
+  assert.match(await page.locator('#thread-events').textContent(), /agent 1 left.*state changed/);
+  assert.equal(await page.locator('#thread-history').evaluate(el=>el.open), true, 'polling preserves the opened history');
+  await page.evaluate(() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); });
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  assert.equal(data.reads[1], 2);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length, 1);
+  await page.locator('#thread-membership').click();
+  await page.waitForFunction(() => document.querySelector('#thread-membership').textContent === 'Join thread');
+  assert.equal(await page.locator('#add-thread-members').isHidden(), true);
+}));
+
 test('prompt guidance is literal and polling/recovery settings persist in configs',async()=>fixture(async(page,data)=> {
   await page.locator('[data-page=settings]').click();
   await page.locator('[data-prompt-editor] summary').click();
@@ -805,21 +926,95 @@ test('closing a thread keeps membership and read history while future messages s
   assert.equal(await page.locator('[data-message="2"] .message-text').textContent(), 'After closing');
 }));
 
-test('closing a thread confirms before discarding an unsent draft and cancellation keeps it open', async () => fixture(async (page, data) => {
-  data.threads = [conversation([])];
+test('X dismissal preserves separate thread and project drafts across switching and reload without confirmation', async () => fixture(async (page, data) => {
+  data.threads = [conversation([]), conversation([], {id:2,title:'Other thread'}), conversation([], {id:3,project:2,title:'Other project'})];
   await page.reload(); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Keep my draft');
   let confirmations = 0;
-  page.once('dialog', dialog => { confirmations++; assert.match(dialog.message(), /unsent message/); dialog.dismiss(); });
+  page.on('dialog', dialog => { confirmations++; dialog.dismiss(); });
+  assert.equal(await page.getByRole('button',{name:'Close conversation'}).textContent(), '×');
+  await page.locator('[data-thread="2"]').click();
+  await page.waitForFunction(() => document.querySelector('#message-form')?.dataset.draftThread === '2');
+  assert.equal(await page.locator('#message-form textarea').inputValue(), '');
+  await page.locator('#message-form textarea').fill('Second thread draft');
   await page.locator('#close-thread').click();
-  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
-  assert.equal(await page.locator('.thread-row.active').count(), 1);
-  page.once('dialog', dialog => { confirmations++; dialog.accept(); });
-  await page.locator('#close-thread').click();
-  assert.equal(confirmations, 2);
   assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
+  await page.locator('#project-select').selectOption('2');
+  await page.locator('[data-thread="3"]').click();
+  await page.locator('#message-form textarea').fill('Other project draft');
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  await page.locator('[data-thread="3"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Other project draft');
+  await page.locator('#project-select').selectOption('1');
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
+  await page.locator('[data-thread="2"]').click();
+  await page.waitForFunction(() => document.querySelector('#message-form')?.dataset.draftThread === '2');
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Second thread draft');
+  assert.equal(confirmations, 0);
   assert.deepEqual(data.threads[0].members, [0, 1]);
+  assert.equal(data.requests.length, 0);
+}));
+
+test('failed sends keep persistent drafts and successful sends clear only the submitted draft', async () => fixture(async (page, data) => {
+  data.threads = [conversation([])]; data.messageFailure = true;
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Unsent message');
+  await page.locator('#message-form button').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Message send failed');
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Unsent message');
+  data.messageFailure = false;
+  await page.locator('#message-form button').click();
+  await page.waitForFunction(() => document.querySelector('#message-form textarea').value === '');
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), '');
+  assert.equal(data.threads[0].messages[0].text, 'Unsent message');
+}));
+
+test('a delayed successful send preserves newer text even when the pane is closed and reopened', async () => fixture(async (page, data) => {
+  data.threads = [conversation([])]; data.messageDelay = 600;
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Submitted snapshot');
+  const response = page.waitForResponse(r => new URL(r.url()).pathname === '/messages');
+  await page.locator('#message-form button').click();
+  await page.locator('#message-form textarea').fill('Newer draft');
+  await page.locator('#close-thread').click();
+  await response;
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Newer draft');
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Newer draft');
+  assert.deepEqual(data.threads[0].messages.map(m => m.text), ['Submitted snapshot']);
+  const secondResponse = page.waitForResponse(r => new URL(r.url()).pathname === '/messages');
+  await page.locator('#message-form button').click();
+  await page.locator('#message-form textarea').fill('');
+  await page.locator('#message-form textarea').fill('Newer draft');
+  await secondResponse;
+  await page.waitForFunction(() => !document.querySelector('#message-form button').disabled);
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Newer draft', 'new input is retained even if it matches the submitted text');
+}));
+
+test('unavailable browser storage keeps drafts in-tab and reports the persistence limit without breaking the UI', async () => fixture(async (page, data) => {
+  data.threads = [conversation([])];
+  await page.addInitScript(() => Object.defineProperty(window, 'localStorage', {get() {throw new Error('Storage blocked');}}));
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('In-tab draft');
+  assert.match(await page.locator('#toast').textContent(), /browser storage is unavailable/);
+  await page.locator('#close-thread').click();
+  await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'In-tab draft');
+  await page.locator('[data-thread-filter=all]').click();
   assert.equal(data.requests.length, 0);
 }));
 
@@ -1065,7 +1260,7 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
   assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
   assert.equal(await rule.locator('[name=same_model_retries]').inputValue(), '2');
-  await saveSettings(page);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
   assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:2}});
   await rule.locator('[data-remove-retry]').click(); await saveSettings(page);
   assert.deepEqual(data.settings.crash_retries, {});
@@ -1312,7 +1507,7 @@ test('thread identifiers are visible and copyable for references in another conv
   await page.locator('[data-page=threads]').click();
   assert.match(await page.locator('[data-thread="1"] .meta').textContent(), /Thread #1/);
   await page.locator('[data-thread="1"]').click();
-  assert.match(await page.locator('.thread-header .meta').textContent(), /Thread #1/);
+  assert.match(await page.locator('.thread-header > div.meta').textContent(), /Thread #1/);
   await page.locator('#copy-thread').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Copied thread #1');
   assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'thread #1');

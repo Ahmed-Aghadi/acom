@@ -509,6 +509,107 @@ CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, use
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS thread_filters (thread_id INTEGER PRIMARY KEY, states TEXT NOT NULL, groups TEXT NOT NULL, watch TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS member_intervals (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
+  start_after INTEGER NOT NULL, end_after INTEGER);
+CREATE INDEX IF NOT EXISTS intervals_member ON member_intervals(thread_id,agent_id,start_after,end_after);
+CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project INTEGER NOT NULL, at INTEGER NOT NULL,
+  kind TEXT NOT NULL, actor TEXT NOT NULL, agent INTEGER, thread INTEGER, lock TEXT, details TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS events_agent ON events(project,agent,id);
+CREATE INDEX IF NOT EXISTS events_thread ON events(project,thread,id);
+CREATE TABLE IF NOT EXISTS summary_cursors (agent_id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS history_origin (id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL);
+INSERT OR IGNORE INTO history_origin(id,message_id) SELECT 1,coalesce(max(id),0) FROM messages;
+-- Existing current members are retained; earlier membership context is unknown.
+INSERT INTO member_intervals(thread_id,agent_id,start_after)
+  SELECT b.thread_id,b.agent_id,0 FROM members b WHERE NOT EXISTS(
+    SELECT 1 FROM member_intervals i WHERE i.thread_id=b.thread_id AND i.agent_id=b.agent_id);
+
+-- Membership intervals and their events are part of the statement that joins/leaves.
+CREATE TRIGGER IF NOT EXISTS member_joined AFTER INSERT ON members BEGIN
+  INSERT INTO member_intervals(thread_id,agent_id,start_after)
+    VALUES(NEW.thread_id,NEW.agent_id,(SELECT coalesce(max(id),0) FROM messages WHERE thread_id=NEW.thread_id));
+  INSERT INTO events(project,at,kind,actor,agent,thread,details)
+    SELECT project,unixepoch(),'thread.joined','acom',NEW.agent_id,NEW.thread_id,
+      json_object('reason',CASE WHEN NEW.agent_id<>0 AND EXISTS(SELECT 1 FROM thread_filters WHERE thread_id=NEW.thread_id)
+                               THEN 'matched live filters' ELSE 'member added' END)
+    FROM threads WHERE id=NEW.thread_id;
+END;
+CREATE TRIGGER IF NOT EXISTS member_left AFTER DELETE ON members BEGIN
+  UPDATE member_intervals SET end_after=(SELECT coalesce(max(id),0) FROM messages WHERE thread_id=OLD.thread_id)
+    WHERE thread_id=OLD.thread_id AND agent_id=OLD.agent_id AND end_after IS NULL;
+  INSERT INTO events(project,at,kind,actor,agent,thread,details)
+    SELECT project,unixepoch(),'thread.left','acom',OLD.agent_id,OLD.thread_id,
+      json_object('reason',CASE WHEN OLD.agent_id<>0 AND EXISTS(SELECT 1 FROM thread_filters WHERE thread_id=OLD.thread_id)
+                               THEN 'no longer matched live filters' ELSE 'member removed' END)
+    FROM threads WHERE id=OLD.thread_id;
+END;
+
+-- Every state/group write, including recovery and startup writes, reconciles the
+-- live audience in the same SQLite statement. No separate tick can lag behind it.
+CREATE TRIGGER IF NOT EXISTS agent_created AFTER INSERT ON agents BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,details)
+    VALUES(NEW.project,unixepoch(),'agent.created',CASE WHEN NEW.launched_by=0 THEN 'user' ELSE 'agent '||NEW.launched_by END,
+      NEW.id,json_object('state',NEW.state,'group',NEW.grp,'harness',NEW.harness,'model',NEW.model,'effort',NEW.effort));
+  INSERT OR IGNORE INTO members(thread_id,agent_id,last_notified)
+    SELECT t.id,NEW.id,(SELECT coalesce(max(id),0) FROM messages WHERE thread_id=t.id)
+    FROM threads t JOIN thread_filters f ON f.thread_id=t.id WHERE t.project=NEW.project
+      AND EXISTS(SELECT 1 FROM json_each(f.states) WHERE value=NEW.state)
+      AND (json_array_length(f.groups)=0 OR EXISTS(SELECT 1 FROM json_each(f.groups) WHERE value=NEW.grp));
+END;
+CREATE TRIGGER IF NOT EXISTS agent_audience AFTER UPDATE OF state,grp ON agents
+WHEN OLD.state<>NEW.state OR OLD.grp IS NOT NEW.grp BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,details)
+    SELECT NEW.project,unixepoch(),'agent.state','acom',NEW.id,json_object('from',OLD.state,'to',NEW.state)
+    WHERE OLD.state<>NEW.state;
+  INSERT INTO events(project,at,kind,actor,agent,details)
+    SELECT NEW.project,unixepoch(),'agent.group','agent '||NEW.id,NEW.id,json_object('from',OLD.grp,'to',NEW.grp)
+    WHERE OLD.grp IS NOT NEW.grp;
+  DELETE FROM members WHERE agent_id=NEW.id AND thread_id IN (
+    SELECT t.id FROM threads t JOIN thread_filters f ON f.thread_id=t.id WHERE t.project=NEW.project
+      AND NOT (EXISTS(SELECT 1 FROM json_each(f.states) WHERE value=NEW.state)
+        AND (json_array_length(f.groups)=0 OR EXISTS(SELECT 1 FROM json_each(f.groups) WHERE value=NEW.grp))));
+  INSERT OR IGNORE INTO members(thread_id,agent_id,last_notified)
+    SELECT t.id,NEW.id,(SELECT coalesce(max(id),0) FROM messages WHERE thread_id=t.id)
+    FROM threads t JOIN thread_filters f ON f.thread_id=t.id WHERE t.project=NEW.project
+      AND EXISTS(SELECT 1 FROM json_each(f.states) WHERE value=NEW.state)
+      AND (json_array_length(f.groups)=0 OR EXISTS(SELECT 1 FROM json_each(f.groups) WHERE value=NEW.grp));
+END;
+CREATE TRIGGER IF NOT EXISTS agent_status AFTER UPDATE OF status_text ON agents
+WHEN OLD.status_text IS NOT NEW.status_text BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,details)
+    VALUES(NEW.project,unixepoch(),'agent.status','agent '||NEW.id,NEW.id,json_object('from',OLD.status_text,'to',NEW.status_text));
+END;
+CREATE TRIGGER IF NOT EXISTS agent_configured AFTER UPDATE OF model,effort ON agents
+WHEN OLD.model<>NEW.model OR OLD.effort<>NEW.effort BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,details)
+    VALUES(NEW.project,unixepoch(),'agent.configured','acom',NEW.id,
+      json_object('from_model',OLD.model,'model',NEW.model,'from_effort',OLD.effort,'effort',NEW.effort));
+END;
+CREATE TRIGGER IF NOT EXISTS lock_acquired AFTER UPDATE OF holder ON locks
+WHEN NEW.holder IS NOT NULL AND OLD.holder IS NOT NEW.holder BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,lock,details)
+    VALUES(NEW.project,unixepoch(),'lock.acquired','agent '||NEW.holder,NEW.holder,NEW.name,
+      json_object('expires_at',NEW.expires_at));
+END;
+CREATE TRIGGER IF NOT EXISTS lock_created AFTER INSERT ON locks BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,lock,details)
+    VALUES(NEW.project,unixepoch(),'lock.created','acom',NEW.holder,NEW.name,json_object('about',NEW.about));
+END;
+CREATE TRIGGER IF NOT EXISTS lock_released AFTER UPDATE OF holder ON locks
+WHEN OLD.holder IS NOT NULL AND OLD.holder IS NOT NEW.holder BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,lock,details)
+    VALUES(OLD.project,unixepoch(),CASE WHEN OLD.frozen=0 AND OLD.expires_at<=unixepoch() THEN 'lock.expired' ELSE 'lock.released' END,
+      'acom',OLD.holder,OLD.name,json_object('acquired_at',OLD.acquired_at,'expires_at',OLD.expires_at));
+END;
+CREATE TRIGGER IF NOT EXISTS lock_changed AFTER UPDATE OF expires_at,frozen,frozen_left ON locks
+WHEN NEW.holder IS NOT NULL AND OLD.holder=NEW.holder
+  AND (OLD.expires_at IS NOT NEW.expires_at OR OLD.frozen<>NEW.frozen OR OLD.frozen_left IS NOT NEW.frozen_left) BEGIN
+  INSERT INTO events(project,at,kind,actor,agent,lock,details)
+    VALUES(NEW.project,unixepoch(),CASE WHEN OLD.frozen<>NEW.frozen THEN CASE WHEN NEW.frozen=1 THEN 'lock.frozen' ELSE 'lock.unfrozen' END
+      ELSE CASE WHEN NEW.expires_at<OLD.expires_at OR NEW.frozen_left<OLD.frozen_left THEN 'lock.shortened' ELSE 'lock.renewed' END END,
+      'acom',NEW.holder,NEW.name,json_object('expires_at',NEW.expires_at,'frozen_left',NEW.frozen_left));
+END;
 ";
 
 /// Development schemas changed before release; don't serve a half-working old
@@ -613,6 +714,42 @@ pub fn rows(db: &Connection, sql: &str, p: impl rusqlite::Params) -> R<Vec<Value
 }
 
 impl St {
+    /// Commit a related group of writes together, also inside an existing savepoint.
+    fn atomic<T>(&mut self, change: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        self.db.execute_batch("SAVEPOINT change")?;
+        let result = change(self);
+        match result {
+            Ok(value) => {
+                if let Err(e) = self.db.execute_batch("RELEASE change") {
+                    let _ = self.db.execute_batch("ROLLBACK TO change; RELEASE change");
+                    return Err(e.into());
+                }
+                Ok(value)
+            }
+            Err(e) => {
+                self.db
+                    .execute_batch("ROLLBACK TO change; RELEASE change")?;
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn event(
+        &self,
+        project: i64,
+        agent: Option<i64>,
+        thread: Option<i64>,
+        kind: &str,
+        actor: &str,
+        details: Value,
+    ) -> R<()> {
+        self.db.execute(
+            "INSERT INTO events(project,at,kind,actor,agent,thread,details) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![project,now(),kind,actor,agent,thread,details.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// A project's settings: its custom ones, or the saved config it uses.
     /// No project means the Default config.
     pub fn settings_for(&self, project: Option<i64>) -> Settings {
@@ -1071,7 +1208,9 @@ impl St {
     fn pending(&self, agent: i64) -> R<Vec<(i64, i64)>> {
         let mut s = self.db.prepare(
             "SELECT m.id, m.sender FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?1
-             WHERE m.id > b.last_notified AND m.sender != ?1 ORDER BY m.id",
+             WHERE m.id > b.last_notified AND m.sender != ?1
+               AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=?1
+                 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after)) ORDER BY m.id",
         )?;
         let v = s
             .query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1121,6 +1260,59 @@ impl St {
             self.mark_notified(agent)?;
         }
         Ok(lines.join("\n"))
+    }
+
+    /// Nonzero coordination counts only. Consumed with the turn-start transaction,
+    /// so a failed spawn does not acknowledge changes that no agent received.
+    pub fn coordination_summary(&self, agent: i64, full: bool) -> R<String> {
+        let cursor: i64 = self.db.query_row(
+            "SELECT coalesce((SELECT event_id FROM summary_cursors WHERE agent_id=?1),0)",
+            [agent],
+            |r| r.get(0),
+        )?;
+        let latest: i64 = self
+            .db
+            .query_row("SELECT coalesce(max(id),0) FROM events", [], |r| r.get(0))?;
+        let changed: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE agent=?1 AND id>?2
+            AND (kind IN ('thread.joined','thread.left') OR kind LIKE 'lock.%'))",
+            params![agent, cursor],
+            |r| r.get(0),
+        )?;
+        if !full && !changed {
+            return Ok(String::new());
+        }
+        let count = |sql: &str| -> R<i64> {
+            Ok(self
+                .db
+                .query_row(sql, params![agent, cursor], |r| r.get(0))?)
+        };
+        let mut parts = Vec::new();
+        for (label, n) in [
+            ("threads", count("SELECT count(*) FROM members WHERE agent_id=?1 AND ?2>=0")?),
+            ("joined", count("SELECT count(*) FROM events WHERE agent=?1 AND id>?2 AND kind='thread.joined'")?),
+            ("left", count("SELECT count(*) FROM events WHERE agent=?1 AND id>?2 AND kind='thread.left'")?),
+            ("pending", count("SELECT count(*) FROM messages m
+                LEFT JOIN marks k ON k.agent_id=?1 AND k.message_id=m.id WHERE m.sender<>?1 AND coalesce(k.mark,'new')='new'
+                AND ?2>=0 AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=?1
+                  AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))")?),
+            ("locks", count("SELECT count(*) FROM locks WHERE holder=?1 AND ?2>=0")?),
+        ] {
+            if n>0 { parts.push(format!("{label} {n}")); }
+        }
+        self.db.execute(
+            "INSERT INTO summary_cursors(agent_id,event_id) VALUES(?1,?2)
+            ON CONFLICT(agent_id) DO UPDATE SET event_id=excluded.event_id",
+            params![agent, latest],
+        )?;
+        Ok(if parts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "[acom] Coordination: {}. Details: `acom history` / `acom inbox`.",
+                parts.join("; ")
+            )
+        })
     }
 }
 
@@ -1174,6 +1366,17 @@ pub enum LockMode {
     Ask,
 }
 
+pub struct HistoryQuery {
+    pub agent: Option<i64>,
+    pub thread: Option<i64>,
+    pub lock: Option<String>,
+    pub kind: Option<String>,
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+    pub limit: i64,
+    pub max_bytes: i64,
+}
+
 impl App {
     pub fn open(home: PathBuf, url: String) -> R<Arc<App>> {
         std::fs::create_dir_all(home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
@@ -1200,11 +1403,14 @@ impl App {
             {
                 run::kill_group(pid as u32, libc::SIGKILL);
             }
-            st.freeze_locks(id)?;
-            st.db.execute(
-                "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2, pid=NULL WHERE id=?1",
-                params![id, now()],
-            )?;
+            st.atomic(|st| {
+                st.freeze_locks(id)?;
+                st.db.execute(
+                    "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2, pid=NULL WHERE id=?1",
+                    params![id, now()],
+                )?;
+                Ok(())
+            })?;
             st.log_for(
                 id,
                 "acom",
@@ -1465,9 +1671,8 @@ impl App {
             "UPDATE agents SET rest=?2, wake_queued_at=NULL, wake_why=NULL WHERE id=?1",
             params![id, rest],
         )?;
-        let updates = st.take_updates(id)?;
         let guidance = st.settings_for(Some(st.agent(id)?.project)).prompts.wake;
-        let prompt = format!("{updates}\n\n## Guidance\n\n{guidance}");
+        let prompt = format!("## Guidance\n\n{guidance}");
         run::start_turn(self, st, id, &prompt, None)
     }
 
@@ -1533,18 +1738,16 @@ impl App {
         let failure = st.procs.get(&id).and_then(|p| p.failure.clone());
         let stopping = st.procs.get(&id).is_some_and(|p| p.stopping);
         let failed = (!ok || failure.is_some()) && !stopping && a.state == "working";
-        if failed {
-            // Record the running choice before removing it: the row may hold queued changes.
-            st.remember_crash(id, &a)?;
-        }
-        st.procs.remove(&id);
-        st.db.execute(
-            "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
-            params![id, pid],
-        )?;
         if a.state != "working" {
             // Paused or closed by someone: they already set the state.
-            self.maybe_wake(&mut st, id)?;
+            st.db.execute(
+                "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
+                params![id, pid],
+            )?;
+            st.procs.remove(&id);
+            if let Err(e) = self.maybe_wake(&mut st, id) {
+                let _ = st.log_for(id, "acom", &format!("couldn't start agent {id}: {}", e.1));
+            }
             self.cv.notify_all();
             return Ok(());
         }
@@ -1556,31 +1759,53 @@ impl App {
         } else {
             a.rest.as_str()
         };
-        st.db.execute(
-            "UPDATE agents SET done_req=0, rest='idle' WHERE id=?1",
-            [id],
-        )?;
-        st.set_state(id, next)?;
-        if next != "idle" {
-            let why = format!("you became {next}");
-            st.release_all(id, &why)?;
-        }
-        if next == "crashed" {
-            let why = failure
-                .as_deref()
-                .or(error)
-                .unwrap_or("its process exited with an error");
-            st.db
-                .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, why])?;
-            st.log_for(id, "acom", &format!("agent {id} crashed: {why}"))?;
-        } else {
-            st.db
-                .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
-            if a.done_req {
-                st.log_for(id, &who(id), &format!("finished: {next}"))?;
+        st.atomic(|st| {
+            if failed {
+                // Retain the actual running model/effort until all exit writes
+                // commit. A transient database failure can safely be retried.
+                st.remember_crash(id, &a)?;
             }
+            st.db.execute(
+                "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
+                params![id, pid],
+            )?;
+            st.db.execute(
+                "UPDATE agents SET done_req=0, rest='idle' WHERE id=?1",
+                [id],
+            )?;
+            st.set_state(id, next)?;
+            if next != "idle" {
+                st.release_all(id, &format!("you became {next}"))?;
+            }
+            if next == "crashed" {
+                let why = failure
+                    .as_deref()
+                    .or(error)
+                    .unwrap_or("its process exited with an error");
+                st.db
+                    .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, why])?;
+                st.log_for(id, "acom", &format!("agent {id} crashed: {why}"))?;
+                st.event(
+                    a.project,
+                    Some(id),
+                    None,
+                    "agent.failed",
+                    "acom",
+                    json!({"reason":why}),
+                )?;
+            } else {
+                st.db
+                    .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
+                if a.done_req {
+                    st.log_for(id, &who(id), &format!("finished: {next}"))?;
+                }
+            }
+            Ok(())
+        })?;
+        st.procs.remove(&id);
+        if let Err(e) = self.maybe_wake(&mut st, id) {
+            let _ = st.log_for(id, "acom", &format!("couldn't start agent {id}: {}", e.1));
         }
-        self.maybe_wake(&mut st, id)?;
         self.cv.notify_all();
         Ok(())
     }
@@ -1605,7 +1830,8 @@ impl App {
             return Err(conflict(format!("agent {id} is {}", a.state)));
         }
         let held = st.held_by(id)?;
-        match locks {
+        st.atomic(|st| {
+          match locks {
             LockMode::Ask if !held.is_empty() => {
                 return Err(conflict(format!(
                     "agent {id} holds {}: choose whether to release them or keep them frozen",
@@ -1616,11 +1842,13 @@ impl App {
                 st.release_all(id, &format!("you were paused at {}", hhmm(now())))?
             }
             _ => st.freeze_locks(id)?,
-        }
-        st.db.execute(
+          }
+          st.db.execute(
             "UPDATE agents SET state='paused', pause_reason=?2, pause_from=?3, paused_at=?4 WHERE id=?1",
             params![id, reason, a.state, now()],
-        )?;
+          )?;
+          Ok(())
+        })?;
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
             run::stop(p.pid);
@@ -1665,9 +1893,15 @@ impl App {
     }
 
     fn resume_locked(self: &Arc<Self>, st: &mut St, id: i64, by: &str) -> R<()> {
-        match self.prepare_resume(st, id, by)? {
-            Some(prompt) => run::start_turn(self, st, id, &prompt, None),
-            None => self.maybe_wake(st, id),
+        let turn = st.atomic(|st| match self.prepare_resume(st, id, by)? {
+            Some(prompt) => run::prepare_turn(self, st, id, &prompt, None).map(Some),
+            None => Ok(None),
+        })?;
+        if let Some(turn) = turn {
+            run::activate_turn(self, st, id, turn);
+            Ok(())
+        } else {
+            self.maybe_wake(st, id)
         }
     }
 
@@ -1700,18 +1934,16 @@ impl App {
             a.problem.as_deref().unwrap_or("the process was stopped")
         );
         if a.state == "crashed" {
-            let updates = st.take_updates(id)?;
             let prompt = format!(
-                "{interruption}\n[acom] Resumed at {} after an error.\n{updates}\n\n## Guidance\n\n{guidance}",
+                "{interruption}\n[acom] Resumed at {} after an error.\n\n## Guidance\n\n{guidance}",
                 hhmm(now())
             );
             return Ok(Some(prompt));
         }
         let from = a.pause_from.unwrap_or_else(|| "idle".into());
         if from == "working" {
-            let updates = st.take_updates(id)?;
             let prompt = format!(
-                "{interruption}\n[acom] Resumed at {}.\n{updates}\n\n## Guidance\n\n{guidance}",
+                "{interruption}\n[acom] Resumed at {}.\n\n## Guidance\n\n{guidance}",
                 hhmm(now())
             );
             Ok(Some(prompt))
@@ -1765,14 +1997,17 @@ impl App {
         if a.state == "closed" {
             return Err(conflict(format!("agent {id} is already closed")));
         }
+        st.atomic(|st| {
+            st.release_all(id, "you were closed")?;
+            st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, rest='idle' WHERE id=?1", [id])?;
+            st.set_state(id, "closed")?;
+            st.log_for(id, by, &format!("closed agent {id}"))?;
+            Ok(())
+        })?;
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
             run::stop(p.pid);
         }
-        st.release_all(id, "you were closed")?;
-        st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, rest='idle' WHERE id=?1", [id])?;
-        st.set_state(id, "closed")?;
-        st.log_for(id, by, &format!("closed agent {id}"))?;
         self.cv.notify_all();
         Ok(())
     }
@@ -1898,7 +2133,13 @@ impl App {
         if st.agent(id)?.state != "working" {
             return Ok(String::new());
         }
-        st.take_updates(id)
+        let updates = st.take_updates(id)?;
+        let summary = st.coordination_summary(id, false)?;
+        Ok([updates, summary]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     // ---------- threads and messages ----------
@@ -1954,8 +2195,9 @@ impl App {
         title: &str,
         members: &[String],
         include_user: bool,
+        watch: &[String],
     ) -> R<(i64, Vec<i64>)> {
-        let st = self.lock();
+        let mut st = self.lock();
         if title.trim().is_empty() {
             return Err(bad("the thread needs a title"));
         }
@@ -1966,43 +2208,154 @@ impl App {
             st.project(p)?;
             p
         };
-        let mut ids = Self::resolve(&st, project, members)?;
-        if (by > 0 || include_user) && !ids.contains(&by) {
+        let (states, groups, watch) = Self::watch_filters(watch)?;
+        if !watch.is_empty() && !members.is_empty() {
+            return Err(bad("choose fixed members or live filters, not both"));
+        }
+        let mut ids = if watch.is_empty() {
+            Self::resolve(&st, project, members)?
+        } else {
+            rows(&st.db, "SELECT id FROM agents WHERE project=?1
+                AND EXISTS(SELECT 1 FROM json_each(?2) WHERE value=agents.state)
+                AND (json_array_length(?3)=0 OR EXISTS(SELECT 1 FROM json_each(?3) WHERE value=agents.grp)) ORDER BY id",
+                params![project,json!(states).to_string(),json!(groups).to_string()])?
+                .iter().map(|r|r["id"].as_i64().unwrap()).collect()
+        };
+        if watch.is_empty() && by > 0 && !ids.contains(&by) {
             ids.insert(0, by);
         }
-        if ids.is_empty() {
+        if include_user && !ids.contains(&0) {
+            ids.insert(0, 0);
+        }
+        if ids.is_empty() && watch.is_empty() {
             return Err(bad("the thread has no members"));
         }
-        st.db.execute(
-            "INSERT INTO threads(project,title,created_by,created_at) VALUES(?1,?2,?3,?4)",
-            params![project, title.trim(), by, now()],
-        )?;
-        let tid = st.db.last_insert_rowid();
-        for id in &ids {
+        let tid = st.atomic(|st| {
             st.db.execute(
-                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
-                params![tid, id],
+                "INSERT INTO threads(project,title,created_by,created_at) VALUES(?1,?2,?3,?4)",
+                params![project, title.trim(), by, now()],
             )?;
-        }
+            let tid = st.db.last_insert_rowid();
+            if !watch.is_empty() {
+                st.db.execute(
+                    "INSERT INTO thread_filters(thread_id,states,groups,watch) VALUES(?1,?2,?3,?4)",
+                    params![
+                        tid,
+                        json!(states).to_string(),
+                        json!(groups).to_string(),
+                        json!(watch).to_string()
+                    ],
+                )?;
+            }
+            st.event(
+                project,
+                Some(by),
+                Some(tid),
+                "thread.created",
+                &who(by),
+                json!({"title":title.trim(),"watch":watch}),
+            )?;
+            for id in &ids {
+                Self::join_member(st, tid, *id)?;
+            }
+            Ok(tid)
+        })?;
         Ok((tid, ids))
+    }
+
+    fn watch_filters(watch: &[String]) -> R<(Vec<String>, Vec<String>, Vec<String>)> {
+        let mut states = Vec::new();
+        let mut groups = Vec::new();
+        for s in watch.iter().flat_map(|s| s.split(',')).map(str::trim) {
+            if s == "active" {
+                for s in ["working", "idle"] {
+                    if !states.iter().any(|x| x == s) {
+                        states.push(s.to_string());
+                    }
+                }
+            } else if STATES.contains(&s) {
+                if !states.iter().any(|x| x == s) {
+                    states.push(s.to_string());
+                }
+            } else if let Some(g) = s.strip_prefix("group:").filter(|g| !g.trim().is_empty()) {
+                if !groups.iter().any(|x| x == g.trim()) {
+                    groups.push(g.trim().to_string());
+                }
+            } else {
+                return Err(bad(format!(
+                    "invalid live filter {s:?}; use states, active, or group:<name> (not IDs or user)"
+                )));
+            }
+        }
+        if !groups.is_empty() && states.is_empty() {
+            states.extend(["working".into(), "idle".into()]);
+        }
+        let mut normalized = states.clone();
+        normalized.extend(groups.iter().map(|g| format!("group:{g}")));
+        Ok((states, groups, normalized))
+    }
+
+    fn is_live(st: &St, tid: i64) -> R<bool> {
+        Ok(st.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thread_filters WHERE thread_id=?1)",
+            [tid],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn join_member(st: &St, tid: i64, agent: i64) -> R<()> {
+        // Historical messages remain catch-up, never a new notification on join.
+        st.db.execute(
+            "INSERT OR IGNORE INTO members(thread_id,agent_id,last_notified)
+            VALUES(?1,?2,(SELECT coalesce(max(id),0) FROM messages WHERE thread_id=?1))",
+            params![tid, agent],
+        )?;
+        Ok(())
     }
 
     pub fn add_members(self: &Arc<Self>, tid: i64, members: &[String]) -> R<Vec<i64>> {
         let mut st = self.lock();
         let project = Self::thread_project(&st, tid)?;
         let ids = Self::resolve(&st, project, members)?;
-        for id in &ids {
-            st.db.execute(
-                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
-                params![tid, id],
-            )?;
+        if Self::is_live(&st, tid)? && ids.iter().any(|id| *id > 0) {
+            return Err(conflict(
+                "agent membership in this thread is managed by its live filters",
+            ));
         }
-        // Earlier messages count as new for them, so resting members may need waking.
-        for id in &ids {
-            if *id > 0 {
-                self.maybe_wake(&mut st, *id)?;
+        st.atomic(|st| {
+            for id in &ids {
+                Self::join_member(st, tid, *id)?;
             }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    pub fn remove_members(&self, tid: i64, members: &[String]) -> R<Vec<i64>> {
+        let mut st = self.lock();
+        let project = Self::thread_project(&st, tid)?;
+        if members
+            .iter()
+            .flat_map(|s| s.split(','))
+            .any(|s| s.trim() != "user" && s.trim().parse::<i64>().is_err())
+        {
+            return Err(bad("remove members by ID or user, not selectors"));
         }
+        let ids = Self::resolve(&st, project, members)?;
+        if Self::is_live(&st, tid)? && ids.iter().any(|id| *id > 0) {
+            return Err(conflict(
+                "agent membership in this thread is managed by its live filters",
+            ));
+        }
+        st.atomic(|st| {
+            for id in &ids {
+                st.db.execute(
+                    "DELETE FROM members WHERE thread_id=?1 AND agent_id=?2",
+                    params![tid, id],
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(ids)
     }
 
@@ -2010,10 +2363,7 @@ impl App {
         let st = self.lock();
         Self::thread_project(&st, tid)?;
         if joined {
-            st.db.execute(
-                "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,0)",
-                [tid],
-            )?;
+            Self::join_member(&st, tid, 0)?;
         } else {
             st.db.execute(
                 "DELETE FROM members WHERE thread_id=?1 AND agent_id=0",
@@ -2047,22 +2397,15 @@ impl App {
         if sender > 0 && st.agent(sender)?.project != project {
             return Err(bad(format!("thread {tid} is in another project")));
         }
-        st.db.execute(
-            "INSERT OR IGNORE INTO members(thread_id,agent_id) VALUES(?1,?2)",
-            params![tid, sender],
-        )?;
-        st.db.execute(
-            "INSERT INTO messages(thread_id,sender,text,at) VALUES(?1,?2,?3,?4)",
-            params![tid, sender, text, now()],
-        )?;
-        let mid = st.db.last_insert_rowid();
-        if sender > 0 {
-            // You've seen your own message.
-            st.db.execute(
-                "INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,'handled')",
-                params![sender, mid],
-            )?;
-        }
+        let mid = st.atomic(|st| {
+            // Posting cannot override a live audience's eligibility.
+            if sender==0 || !Self::is_live(st,tid)? { Self::join_member(st,tid,sender)?; }
+            st.db.execute("INSERT INTO messages(thread_id,sender,text,at) VALUES(?1,?2,?3,?4)", params![tid, sender, text, now()])?;
+            let mid=st.db.last_insert_rowid();
+            if sender>0 { st.db.execute("INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,'handled')",params![sender,mid])?; }
+            st.event(project,Some(sender),Some(tid),"message.sent",&who(sender),json!({"message":mid}))?;
+            Ok(mid)
+        })?;
         let members: Vec<i64> = rows(
             &st.db,
             "SELECT agent_id a FROM members WHERE thread_id=?1 AND agent_id!=?2 AND agent_id>0 ORDER BY agent_id",
@@ -2071,12 +2414,30 @@ impl App {
         .iter()
         .map(|r| r["a"].as_i64().unwrap())
         .collect();
+        let mut wake_errors = HashMap::new();
         for &m in &members {
-            self.maybe_wake(&mut st, m)?;
+            if let Err(e) = self.maybe_wake(&mut st, m) {
+                wake_errors.insert(m, e.1.clone());
+                let _ = st.log_for(
+                    m,
+                    "acom",
+                    &format!(
+                        "message {mid} delivered, but agent {m} could not start: {}",
+                        e.1
+                    ),
+                );
+            }
         }
         // Tell the sender who won't see it yet, and why.
         let mut not_woken = Vec::new();
         for m in members {
+            if let Some(error) = wake_errors.remove(&m) {
+                not_woken.push((
+                    m,
+                    format!("message saved; couldn't start its turn: {error}"),
+                ));
+                continue;
+            }
             let state = st.agent(m)?.state;
             let why: Option<String> =
                 st.db
@@ -2104,15 +2465,19 @@ impl App {
         let st = self.lock();
         st.agent(agent)?;
         let mark = parse_mark(mark)?;
-        let v = rows(
+        let mut v = rows(
             &st.db,
             "SELECT m.id, m.thread_id thread, t.title, m.sender, m.text, m.at, coalesce(k.mark,'new') mark
-             FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?1
+             FROM messages m
              JOIN threads t ON t.id=m.thread_id
              LEFT JOIN marks k ON k.agent_id=?1 AND k.message_id=m.id
-             WHERE m.sender != ?1 AND coalesce(k.mark,'new')=?2 ORDER BY m.id",
+             WHERE EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=?1)
+               AND m.sender != ?1 AND coalesce(k.mark,'new')=?2 ORDER BY m.id",
             params![agent, mark],
         )?;
+        for m in &mut v {
+            Self::message_context(&st, m, Some(agent))?;
+        }
         if mark == "new" {
             st.mark_notified(agent)?;
         }
@@ -2125,13 +2490,13 @@ impl App {
         let mark = parse_mark(mark)?;
         for id in ids {
             let n: i64 = st.db.query_row(
-                "SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?2
-                 WHERE m.id=?1",
+                "SELECT count(*) FROM messages m JOIN threads t ON t.id=m.thread_id JOIN agents a ON a.project=t.project
+                 WHERE m.id=?1 AND a.id=?2",
                 params![id, agent],
                 |r| r.get(0),
             )?;
             if n == 0 {
-                return Err(not_found(format!("no message {id} in your threads")));
+                return Err(not_found(format!("no message {id} in your project")));
             }
         }
         for id in ids {
@@ -2632,7 +2997,7 @@ impl App {
             .collect::<Vec<_>>()
             .join(", ");
             let task = format!(
-                "{}\n\n## Handoff from agent {id}\n\nCrash recovery from {} / {source}; reason: {}. {attempt_note}; {effort_note}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Related threads: {threads}. You inherit its thread memberships and message marks. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay.",
+                "{}\n\n## Handoff from agent {id}\n\nCrash recovery from {} / {source}; reason: {}. {attempt_note}; {effort_note}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Predecessor's current threads: {threads}. You inherit fixed memberships and message marks; live memberships follow your own state and group. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay.",
                 a.task,
                 a.harness,
                 a.problem.as_deref().unwrap_or("turn failed"),
@@ -2659,7 +3024,17 @@ impl App {
                 "UPDATE agents SET launched_by=?2 WHERE id=?1",
                 params![new, id],
             )?;
-            st.db.execute("INSERT INTO members(thread_id,agent_id,last_notified) SELECT thread_id,?2,last_notified FROM members WHERE agent_id=?1", params![id, new])?;
+            st.db.execute(
+                "UPDATE events SET actor='acom',details=json_set(details,'$.predecessor',?2)
+                WHERE agent=?1 AND kind='agent.created'",
+                params![new, id],
+            )?;
+            st.db.execute(
+                "INSERT OR IGNORE INTO members(thread_id,agent_id,last_notified)
+                SELECT b.thread_id,?2,b.last_notified FROM members b WHERE b.agent_id=?1
+                  AND NOT EXISTS(SELECT 1 FROM thread_filters f WHERE f.thread_id=b.thread_id)",
+                params![id, new],
+            )?;
             st.db.execute("INSERT INTO marks(agent_id,message_id,mark) SELECT ?2,message_id,mark FROM marks WHERE agent_id=?1", params![id, new])?;
             st.db.execute(
                 "INSERT INTO agent_retries(agent_id,source,tried,handled,effort) VALUES(?1,?2,?3,1,?4)",
@@ -3091,7 +3466,9 @@ impl App {
                     (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active,
                     (SELECT count(*) FROM threads t JOIN members b ON b.thread_id=t.id AND b.agent_id=0
                      JOIN messages m ON m.thread_id=t.id LEFT JOIN user_reads r ON r.thread_id=t.id
-                     WHERE t.project=p.id AND m.sender<>0 AND m.id>coalesce(r.message_id,0)) unread
+                     WHERE t.project=p.id AND m.sender<>0 AND m.id>coalesce(r.message_id,0)
+                       AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0
+                         AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))) unread
              FROM projects p LEFT JOIN configs c ON c.id=p.config ORDER BY p.name, p.id",
             [],
         )
@@ -3099,7 +3476,7 @@ impl App {
 
     /// Remove a project that never had agents (e.g. one added by mistake).
     pub fn remove_project(&self, id: i64, by: &str) -> R<()> {
-        let st = self.lock();
+        let mut st = self.lock();
         let (_, path) = st.project(id)?;
         let n: i64 =
             st.db
@@ -3111,10 +3488,23 @@ impl App {
                 "{path} has agents, so it stays; only a project without agents can be removed"
             )));
         }
-        st.db.execute("DELETE FROM locks WHERE project=?1", [id])?;
-        st.db.execute("DELETE FROM projects WHERE id=?1", [id])?;
-        st.log(None, by, &format!("removed project {path}"))?;
-        Ok(())
+        st.atomic(|st| {
+            for sql in [
+                "DELETE FROM marks WHERE message_id IN (SELECT m.id FROM messages m JOIN threads t ON t.id=m.thread_id WHERE t.project=?1)",
+                "DELETE FROM members WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
+                "DELETE FROM member_intervals WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
+                "DELETE FROM user_reads WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
+                "DELETE FROM thread_filters WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
+                "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
+                "DELETE FROM threads WHERE project=?1",
+                "DELETE FROM locks WHERE project=?1",
+                "DELETE FROM events WHERE project=?1",
+                "DELETE FROM activity WHERE project=?1",
+                "DELETE FROM projects WHERE id=?1",
+            ] { st.db.execute(sql,[id])?; }
+            st.log(None,by,&format!("removed project {path}"))?;
+            Ok(())
+        })
     }
 
     // ---------- views ----------
@@ -3170,6 +3560,11 @@ impl App {
             .pop()
         );
         a["limits"] = json!(st.limits_text(Some(project))?);
+        a["threads"] = json!(rows(
+            &st.db,
+            "SELECT t.id,t.title FROM threads t JOIN members b ON b.thread_id=t.id WHERE b.agent_id=?1 ORDER BY t.id",
+            [id]
+        )?);
         a["lost_locks"] = json!(rows(
             &st.db,
             "SELECT at, text FROM notices WHERE agent_id=?1 AND text LIKE 'You no longer hold lock %' ORDER BY id DESC LIMIT 20",
@@ -3199,13 +3594,23 @@ impl App {
                 [t["id"].as_i64()],
             )?;
             t["members"] = json!(ids.iter().map(|r| r["a"].clone()).collect::<Vec<_>>());
+            t["watch"] = Self::thread_watch(&st, t["id"].as_i64().unwrap())?;
         }
         Ok(v)
     }
 
     pub fn thread(&self, tid: i64) -> R<Value> {
+        self.thread_for(tid, Some(0))
+    }
+
+    pub fn thread_for(&self, tid: i64, agent: Option<i64>) -> R<Value> {
         let st = self.lock();
-        Self::thread_project(&st, tid)?;
+        let project = Self::thread_project(&st, tid)?;
+        if let Some(a) = agent.filter(|a| *a > 0)
+            && st.agent(a)?.project != project
+        {
+            return Err(bad("thread is in another project"));
+        }
         let mut t = rows(
             &st.db,
             "SELECT id, project, title, created_by, created_at FROM threads WHERE id=?1",
@@ -3218,11 +3623,25 @@ impl App {
             [tid],
         )?;
         t["members"] = json!(ids.iter().map(|r| r["a"].clone()).collect::<Vec<_>>());
-        t["messages"] = json!(rows(
+        let mut messages = rows(
             &st.db,
-            "SELECT id, sender, text, at FROM messages WHERE thread_id=?1 ORDER BY id",
-            [tid]
-        )?);
+            "SELECT id,thread_id thread, sender, text, at FROM messages WHERE thread_id=?1 ORDER BY id",
+            [tid],
+        )?;
+        for m in &mut messages {
+            Self::message_context(&st, m, agent)?;
+        }
+        t["messages"] = json!(messages);
+        t["watch"] = Self::thread_watch(&st, tid)?;
+        let mut events = Self::event_rows(
+            &st,
+            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left') ORDER BY id DESC LIMIT 51",
+            [tid],
+        )?;
+        t["events_more"] = json!(events.len() > 50);
+        events.truncate(50);
+        events.reverse();
+        t["events"] = json!(events);
         t["last_read"] = json!(Self::user_read_cursor(&st, tid)?);
         t["unread"] = json!(Self::user_unread(&st, tid)?);
         Ok(t)
@@ -3240,7 +3659,9 @@ impl App {
         Ok(st.db.query_row(
             "SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0
              LEFT JOIN user_reads r ON r.thread_id=m.thread_id
-             WHERE m.thread_id=?1 AND m.sender<>0 AND m.id>coalesce(r.message_id,0)",
+             WHERE m.thread_id=?1 AND m.sender<>0 AND m.id>coalesce(r.message_id,0)
+               AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0
+                 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))",
             [tid],
             |r| r.get(0),
         )?)
@@ -3269,14 +3690,163 @@ impl App {
     }
 
     pub fn message(&self, id: i64) -> R<Value> {
+        self.message_for(id, None)
+    }
+
+    pub fn message_for(&self, id: i64, agent: Option<i64>) -> R<Value> {
         let st = self.lock();
-        rows(
+        let mut m=rows(
             &st.db,
             "SELECT m.id, m.thread_id thread, t.title, m.sender, m.text, m.at FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.id=?1",
             [id],
         )?
         .pop()
-        .ok_or_else(|| not_found(format!("no message {id}")))
+        .ok_or_else(|| not_found(format!("no message {id}")))?;
+        if let Some(a) = agent.filter(|a| *a > 0)
+            && st.agent(a)?.project != Self::thread_project(&st, m["thread"].as_i64().unwrap())?
+        {
+            return Err(bad("message is in another project"));
+        }
+        Self::message_context(&st, &mut m, agent)?;
+        Ok(m)
+    }
+
+    fn thread_watch(st: &St, tid: i64) -> R<Value> {
+        let watch: Option<String> = st
+            .db
+            .query_row(
+                "SELECT watch FROM thread_filters WHERE thread_id=?1",
+                [tid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(watch
+            .map(|s| serde_json::from_str(&s).unwrap_or(json!([])))
+            .unwrap_or(json!([])))
+    }
+
+    fn message_context(st: &St, m: &mut Value, agent: Option<i64>) -> R<()> {
+        if let Some(a) = agent {
+            let mid = m["id"].as_i64().unwrap();
+            let tid = m["thread"].as_i64().unwrap();
+            let unknown: bool = st.db.query_row(
+                "SELECT ?1<=(SELECT message_id FROM history_origin WHERE id=1)",
+                [mid],
+                |r| r.get(0),
+            )?;
+            let inside: bool = st.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM member_intervals WHERE thread_id=?1 AND agent_id=?2
+                AND ?3>start_after AND (end_after IS NULL OR ?3<=end_after))",
+                params![tid, a, mid],
+                |r| r.get(0),
+            )?;
+            m["membership_unknown"] = json!(unknown);
+            m["outside_membership"] = json!(!unknown && !inside);
+            if a > 0 {
+                let mark: Option<String> = st
+                    .db
+                    .query_row(
+                        "SELECT mark FROM marks WHERE agent_id=?1 AND message_id=?2",
+                        params![a, mid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                m["mark"] = json!(mark.unwrap_or_else(|| "new".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn event_rows(st: &St, sql: &str, p: impl rusqlite::Params) -> R<Vec<Value>> {
+        let mut events = rows(&st.db, sql, p)?;
+        for e in &mut events {
+            if let Some(s) = e["details"].as_str() {
+                e["details"] =
+                    serde_json::from_str(s).map_err(|_| bad("invalid saved history details"))?;
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn history_event(&self, project: Option<i64>, id: i64) -> R<Value> {
+        let st = self.lock();
+        Self::event_rows(
+            &st,
+            "SELECT * FROM events WHERE id=?1 AND (?2 IS NULL OR project=?2)",
+            params![id, project],
+        )?
+        .pop()
+        .ok_or_else(|| not_found(format!("no history event {id}")))
+    }
+
+    pub fn history(&self, project: Option<i64>, q: HistoryQuery) -> R<Value> {
+        if !(1..=200).contains(&q.limit) || !(512..=65536).contains(&q.max_bytes) {
+            return Err(bad("history limit must be 1–200 and max_bytes 512–65536"));
+        }
+        if q.before.is_some() && q.after.is_some()
+            || q.before.is_some_and(|x| x <= 0)
+            || q.after.is_some_and(|x| x <= 0)
+        {
+            return Err(bad("use one positive before or after event ID"));
+        }
+        let st = self.lock();
+        if let Some(a) = q.agent.filter(|a| *a > 0) {
+            let p = st.agent(a)?.project;
+            if project.is_some_and(|project| project != p) {
+                return Err(bad("agent is in another project"));
+            }
+        }
+        if let Some(t) = q.thread {
+            let p = Self::thread_project(&st, t)?;
+            if project.is_some_and(|project| project != p) {
+                return Err(bad("thread is in another project"));
+            }
+        }
+        let order = if q.after.is_some() { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT * FROM events WHERE (?1 IS NULL OR project=?1) AND (?2 IS NULL OR agent=?2)
+            AND (?3 IS NULL OR thread=?3) AND (?4 IS NULL OR lock=?4) AND (?5 IS NULL OR kind=?5)
+            AND (?6 IS NULL OR id<?6) AND (?7 IS NULL OR id>?7) ORDER BY id {order} LIMIT ?8"
+        );
+        let candidates = Self::event_rows(
+            &st,
+            &sql,
+            params![
+                project,
+                q.agent,
+                q.thread,
+                q.lock,
+                q.kind,
+                q.before,
+                q.after,
+                q.limit + 1
+            ],
+        )?;
+        let envelope = |events: &Vec<Value>, has_more: bool| {
+            let last = events.last().and_then(|e| e["id"].as_i64());
+            json!({"events":events,"has_more":has_more,"next_before":if q.after.is_none(){last}else{None},"next_after":if q.after.is_some(){last}else{None}})
+        };
+        let total = candidates.len();
+        let mut events = Vec::new();
+        for mut e in candidates.into_iter().take(q.limit as usize) {
+            events.push(e.clone());
+            if envelope(&events, true).to_string().len() > q.max_bytes as usize {
+                events.pop();
+                if !events.is_empty() {
+                    break;
+                }
+                // A compact stub always advances the cursor; its full record is
+                // available by ID rather than silently skipped or endlessly retried.
+                e = json!({"id":e["id"],"at":e["at"],"kind":e["kind"],"agent":e["agent"],"thread":e["thread"],"truncated":true});
+                events.push(e);
+                break;
+            }
+        }
+        let response = envelope(&events, events.len() < total);
+        if response.to_string().len() > q.max_bytes as usize {
+            return Err(bad("max_bytes too small for history metadata"));
+        }
+        Ok(response)
     }
 
     /// A project's limits (the Default config's without one), active counts and usage.
@@ -4127,7 +4697,7 @@ mod tests {
                 VALUES(3,1,'peer','task','claude','m','e','closed',0,0);").unwrap();
         }
         let (tid, _) = app
-            .new_thread(0, Some(1), "waiting", &["1".into()], true)
+            .new_thread(0, Some(1), "waiting", &["1".into()], true, &[])
             .unwrap();
         let (_, user) = app.post(0, tid, "user message").unwrap();
         let (_, peer) = app.post(3, tid, "peer message").unwrap();
@@ -4844,7 +5414,7 @@ mod tests {
             );
         });
         let (thread, _) = app
-            .new_thread(0, Some(1), "handoff", &["1".into()], true)
+            .new_thread(0, Some(1), "handoff", &["1".into()], true, &[])
             .unwrap();
         record_test_crash(&app, 1);
         {
@@ -4985,6 +5555,502 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    /// A fake, stdin-gated client: even commit-failure tests cannot reach a provider.
+    fn waiting_client_app() -> Arc<App> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = app_with_two_projects();
+        let bin = app.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let client = bin.join("codex");
+        std::fs::write(&client,"#!/bin/sh\nIFS= read -r task || exit 0\nprintf '%s' \"$task\" > \"$ACOM_HOME/prompt-delivered\"\n").unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::get_mut(&mut app).unwrap().exe = bin.join("acom");
+        let st = app.lock();
+        st.db
+            .execute(
+                "UPDATE projects SET path=?1 WHERE id=1",
+                [app.home.to_string_lossy()],
+            )
+            .unwrap();
+        st.db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol',effort='medium' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        drop(st);
+        app
+    }
+
+    fn defer_commit_failure(st: &St) {
+        st.db.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE commit_parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE commit_gate(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+            CREATE TRIGGER fail_commit AFTER UPDATE OF pid ON agents WHEN NEW.pid IS NOT NULL
+            BEGIN INSERT INTO commit_gate VALUES(1); END;").unwrap();
+    }
+
+    #[test]
+    fn failed_start_commit_reaps_unprompted_child_and_rolls_back_coordination() {
+        let app = waiting_client_app();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "workers", &[], true, &["working".into()])
+            .unwrap();
+        let mut st = app.lock();
+        st.notice(1, "notice survives failed start").unwrap();
+        let before = rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap();
+        defer_commit_failure(&st);
+        let error = run::start_turn(&app, &mut st, 1, "must not execute", None).unwrap_err();
+        assert!(error.1.contains("FOREIGN KEY"));
+        assert!(st.procs.is_empty());
+        assert!(st.db.is_autocommit());
+        assert_eq!(st.agent(1).unwrap().state, "idle");
+        assert!(!app.home.join("prompt-delivered").exists());
+        assert_eq!(
+            rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
+            before
+        );
+        assert_eq!(
+            rows(&st.db, "SELECT * FROM summary_cursors", []).unwrap(),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            rows(&st.db, "SELECT shown FROM notices WHERE agent_id=1", []).unwrap()[0]["shown"],
+            0
+        );
+        assert!(
+            rows(
+                &st.db,
+                "SELECT * FROM member_intervals WHERE thread_id=?1 AND agent_id=1",
+                [tid]
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_resume_commit_preserves_pause_frozen_locks_and_membership() {
+        let app = waiting_client_app();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "paused", &[], true, &["paused".into()])
+            .unwrap();
+        let mut st = app.lock();
+        st.db.execute("UPDATE agents SET state='paused',pause_from='working',pause_reason='user',paused_at=1 WHERE id=1",[]).unwrap();
+        hold(&st, "schema", 1, Some(now() + 60));
+        st.freeze_locks(1).unwrap();
+        st.notice(1, "still unseen").unwrap();
+        let before = rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap();
+        defer_commit_failure(&st);
+        let error = app.resume_locked(&mut st, 1, "user").unwrap_err();
+        assert!(error.1.contains("FOREIGN KEY"));
+        assert!(st.procs.is_empty());
+        assert!(st.db.is_autocommit());
+        assert_eq!(st.agent(1).unwrap().state, "paused");
+        assert_eq!(st.agent(1).unwrap().pause_from.as_deref(), Some("working"));
+        assert_eq!(lock(&st, "schema").2, 1);
+        assert_eq!(
+            rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
+            before
+        );
+        assert_eq!(
+            rows(
+                &st.db,
+                "SELECT agent_id FROM members WHERE thread_id=?1 AND agent_id=1",
+                [tid]
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            rows(&st.db, "SELECT shown FROM notices WHERE agent_id=1", []).unwrap()[0]["shown"],
+            0
+        );
+        assert!(!app.home.join("prompt-delivered").exists());
+    }
+
+    #[test]
+    fn failed_pause_rolls_back_lock_release_state_membership_and_history() {
+        let app = app_with_two_projects();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "active", &[], true, &["active".into()])
+            .unwrap();
+        {
+            let st = app.lock();
+            hold(&st, "schema", 1, Some(now() + 60));
+            st.db
+                .execute_batch(
+                    "CREATE TRIGGER fail_leave BEFORE DELETE ON members WHEN OLD.agent_id=1
+                BEGIN SELECT RAISE(ABORT,'injected membership failure'); END;",
+                )
+                .unwrap();
+        }
+        let before = app.history(Some(1), history_query()).unwrap();
+        assert!(
+            app.pause(1, LockMode::Release, "user")
+                .unwrap_err()
+                .1
+                .contains("injected membership failure")
+        );
+        assert_eq!(app.history(Some(1), history_query()).unwrap(), before);
+        let st = app.lock();
+        assert_eq!(st.agent(1).unwrap().state, "idle");
+        assert_eq!(lock(&st, "schema").0, Some(1));
+        assert!(
+            rows(&st.db, "SELECT * FROM notices", [])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            rows(
+                &st.db,
+                "SELECT agent_id FROM members WHERE thread_id=?1 AND agent_id=1",
+                [tid]
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_exit_keeps_running_snapshot_until_all_exit_writes_commit() {
+        let app = app_with_two_projects();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "active", &[], true, &["active".into()])
+            .unwrap();
+        {
+            let mut st = app.lock();
+            st.set_state(1, "working").unwrap();
+            st.db
+                .execute(
+                    "UPDATE agents SET pid=123,model='queued-model' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            hold(&st, "schema", 1, Some(now() + 60));
+            st.procs.insert(
+                1,
+                Proc {
+                    pid: 123,
+                    stopping: false,
+                    model: "running-model".into(),
+                    effort: "high".into(),
+                    failure: Some("failed turn".into()),
+                },
+            );
+            st.db
+                .execute_batch(
+                    "CREATE TRIGGER fail_leave BEFORE DELETE ON members WHEN OLD.agent_id=1
+                BEGIN SELECT RAISE(ABORT,'injected membership failure'); END;",
+                )
+                .unwrap();
+        }
+        assert!(app.turn_ended(1, 123, false, None).is_err());
+        {
+            let st = app.lock();
+            assert!(st.procs.contains_key(&1));
+            assert_eq!(st.agent(1).unwrap().state, "working");
+            assert_eq!(lock(&st, "schema").0, Some(1));
+            assert!(
+                rows(&st.db, "SELECT * FROM agent_retries", [])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                rows(&st.db, "SELECT pid FROM agents WHERE id=1", []).unwrap()[0]["pid"],
+                123
+            );
+            st.db.execute_batch("DROP TRIGGER fail_leave").unwrap();
+        }
+        app.turn_ended(1, 123, false, None).unwrap();
+        let st = app.lock();
+        assert!(st.procs.is_empty());
+        assert_eq!(st.agent(1).unwrap().state, "crashed");
+        assert_eq!(lock(&st, "schema").0, None);
+        let retry = rows(
+            &st.db,
+            "SELECT source,effort FROM agent_retries WHERE agent_id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(retry[0]["source"], "running-model");
+        assert_eq!(retry[0]["effort"], "high");
+        assert!(
+            rows(
+                &st.db,
+                "SELECT agent_id FROM members WHERE thread_id=?1 AND agent_id=1",
+                [tid]
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    fn history_query() -> HistoryQuery {
+        HistoryQuery {
+            agent: None,
+            thread: None,
+            lock: None,
+            kind: None,
+            before: None,
+            after: None,
+            limit: 50,
+            max_bytes: 16000,
+        }
+    }
+
+    #[test]
+    fn saved_message_receipt_survives_a_failed_recipient_spawn_and_log_write() {
+        let mut app = app_with_two_projects();
+        // An existing directory is not executable, irrespective of inherited PATH.
+        let bin = app.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(bin.join("claude")).unwrap();
+        Arc::get_mut(&mut app).unwrap().exe = bin.join("acom");
+        {
+            let st = app.lock();
+            st.db
+                .execute(
+                    "UPDATE projects SET path=?1 WHERE id=1",
+                    [app.home.to_string_lossy()],
+                )
+                .unwrap();
+            st.db
+                .execute_batch(
+                    "CREATE TRIGGER fail_activity BEFORE INSERT ON activity
+                BEGIN SELECT RAISE(ABORT,'injected logging failure'); END;",
+                )
+                .unwrap();
+        }
+        let (tid, _) = app
+            .new_thread(0, Some(1), "delivery", &["1".into()], true, &[])
+            .unwrap();
+        let (mid, not_woken) = app.post(0, tid, "saved exactly once").unwrap();
+        assert_eq!(not_woken.len(), 1);
+        assert!(not_woken[0].1.contains("couldn't start"));
+        assert_eq!(
+            app.thread(tid).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            app.message_for(mid, Some(1)).unwrap()["outside_membership"],
+            false
+        );
+        assert_eq!(app.inbox(1, "new").unwrap()[0]["id"], mid);
+        assert_eq!(app.lock().agent(1).unwrap().state, "idle");
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn coordination_is_nonzero_and_survives_removal_of_pending_thread() {
+        let app = app_with_two_projects();
+        assert_eq!(app.lock().coordination_summary(1, true).unwrap(), "");
+        app.lock().set_state(1, "working").unwrap();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "worker", &[], false, &["working".into()])
+            .unwrap();
+        let (mid, _) = app.post(0, tid, "pending task").unwrap();
+        let first = app.lock().coordination_summary(1, true).unwrap();
+        assert!(first.contains("threads 1; joined 1; pending 1"));
+        assert!(!first.contains("locks 0"));
+        assert_eq!(app.lock().coordination_summary(1, false).unwrap(), "");
+        app.lock().set_state(1, "idle").unwrap();
+        let second = app.lock().coordination_summary(1, false).unwrap();
+        assert!(second.contains("left 1; pending 1"));
+        assert!(!second.contains("threads 0"));
+        assert_eq!(app.inbox(1, "new").unwrap()[0]["id"], mid);
+        app.set_marks(1, &[mid], "handled").unwrap();
+        assert!(app.inbox(1, "new").unwrap().is_empty());
+        assert_eq!(
+            app.message_for(mid, Some(1)).unwrap()["outside_membership"],
+            false
+        );
+    }
+
+    #[test]
+    fn history_pages_bound_bytes_without_skipping_large_events_or_changing_marks() {
+        let app = app_with_two_projects();
+        let text = "☃".repeat(10000);
+        app.set_status(1, &text).unwrap();
+        let page = app
+            .history(
+                Some(1),
+                HistoryQuery {
+                    agent: Some(1),
+                    max_bytes: 512,
+                    ..history_query()
+                },
+            )
+            .unwrap();
+        assert!(page.to_string().len() <= 512);
+        assert_eq!(page["events"][0]["truncated"], true);
+        let id = page["events"][0]["id"].as_i64().unwrap();
+        assert_eq!(
+            app.history_event(Some(1), id).unwrap()["details"]["to"],
+            text
+        );
+        assert!(app.history_event(Some(2), id).is_err());
+        let next = app
+            .history(
+                Some(1),
+                HistoryQuery {
+                    agent: Some(1),
+                    before: Some(id),
+                    ..history_query()
+                },
+            )
+            .unwrap();
+        assert!(
+            next["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["id"].as_i64().unwrap() < id)
+        );
+        let unchanged = app
+            .history(
+                Some(1),
+                HistoryQuery {
+                    agent: Some(1),
+                    kind: Some("agent.status".into()),
+                    ..history_query()
+                },
+            )
+            .unwrap();
+        app.set_status(1, &text).unwrap();
+        assert_eq!(
+            app.history(
+                Some(1),
+                HistoryQuery {
+                    agent: Some(1),
+                    kind: Some("agent.status".into()),
+                    ..history_query()
+                }
+            )
+            .unwrap(),
+            unchanged
+        );
+    }
+
+    #[test]
+    fn removing_an_agentless_project_removes_its_thread_records_atomically() {
+        let app = app_with_two_projects();
+        let project = app.add_project(app.home.to_str().unwrap(), "user").unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let (tid, _) = app
+            .new_thread(
+                0,
+                Some(project),
+                "empty team",
+                &[],
+                true,
+                &["active".into()],
+            )
+            .unwrap();
+        app.post(0, tid, "note").unwrap();
+        app.new_lock(project, "schema", "purpose").unwrap();
+        app.remove_project(project, "user").unwrap();
+        assert!(app.thread(tid).is_err());
+        assert!(
+            app.history(Some(project), history_query()).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let st = app.lock();
+        for table in [
+            "members",
+            "member_intervals",
+            "user_reads",
+            "thread_filters",
+            "messages",
+        ] {
+            assert!(
+                rows(
+                    &st.db,
+                    &format!("SELECT * FROM {table} WHERE thread_id=?1"),
+                    [tid]
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        assert!(
+            rows(&st.db, "SELECT * FROM locks WHERE project=?1", [project])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn existing_members_and_mine_survive_initializing_history_without_invented_events() {
+        let home = std::env::temp_dir().join(format!("acom-test-{}", crate::harness::new_uuid()));
+        std::fs::create_dir(&home).unwrap();
+        let db = Connection::open(home.join("acom.db")).unwrap();
+        db.execute_batch(
+            SCHEMA
+                .split("CREATE TABLE IF NOT EXISTS thread_filters")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let mine = serde_json::to_string(&Settings::default()).unwrap();
+        db.execute(
+            "INSERT INTO configs(id,name,settings) VALUES(2,'Mine',?1)",
+            [&mine],
+        )
+        .unwrap();
+        db.execute_batch("INSERT INTO projects(id,path,name,created_at,config) VALUES(1,'/p1','p1',0,2);
+            INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(1,1,'a','t','claude','m','e','paused',0,0);
+            INSERT INTO threads VALUES(1,1,'old',0,0);
+            INSERT INTO members VALUES(1,0,10),(1,1,10);
+            INSERT INTO messages VALUES(10,1,0,'old message',0);
+            INSERT INTO marks VALUES(1,10,'handled');").unwrap();
+        drop(db);
+        let app = App::open(home.clone(), "http://127.0.0.1:0".into()).unwrap();
+        let old = app.message_for(10, Some(1)).unwrap();
+        assert_eq!(old["membership_unknown"], true);
+        assert_eq!(old["outside_membership"], false);
+        assert_eq!(old["mark"], "handled");
+        assert!(
+            app.history(Some(1), history_query()).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let (mid, _) = app.post(0, 1, "new message").unwrap();
+        let new = app.message_for(mid, Some(1)).unwrap();
+        assert_eq!(new["membership_unknown"], false);
+        assert_eq!(new["outside_membership"], false);
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT settings FROM configs WHERE name='Mine'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            mine
+        );
+        let before = app.history(Some(1), history_query()).unwrap();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        assert_eq!(app.history(Some(1), history_query()).unwrap(), before);
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM member_intervals", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
         );
     }
 }

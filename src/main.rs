@@ -33,9 +33,13 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
                                           Launch a helper agent; --done also marks you done,
                                           so you hand over without needing a second slot
   threads                                 List threads
-  thread new --title <text> [--members <ID or selector,...>]
+  thread new --title <text> [--members <ID or selector,...> | --watch <states,group:name,...>] [--include-user]
   thread read <TID>                       A thread's full history
   thread add <TID> <ID or selector,...>   Add members
+  thread remove <TID> <IDs,user>          Remove members from a static thread
+  history [ID] [--agent ID | --all-agents] [--thread TID] [--lock name] [--kind kind]
+          [--before ID | --after ID] [--limit N] [--max-bytes N]
+                                          Bounded coordination events; ID reads one event
   send --thread <TID> [text]              Post in a thread (stdin if text is left out)
   inbox [--mark new|in-progress|handled]  Your messages with that mark (default new)
   read <msg ID>                           One message in full
@@ -69,6 +73,83 @@ Durations: 30s, 5m, 1h.
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn thread_watch_and_snapshot_members_cannot_mix() {
+        let cli = Cli::try_parse_from([
+            "acom",
+            "thread",
+            "new",
+            "--title",
+            "team",
+            "--watch",
+            "active,group:parser",
+            "--include-user",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Thread {
+                cmd: ThreadCmd::New {
+                    watch: Some(_),
+                    include_user: true,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "acom",
+                "thread",
+                "new",
+                "--title",
+                "team",
+                "--watch",
+                "active",
+                "--members",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["acom", "thread", "remove", "1", "2,user"]).is_ok());
+    }
+
+    #[test]
+    fn history_defaults_and_cursor_conflicts_are_explicit() {
+        let cli = Cli::try_parse_from(["acom", "history"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::History {
+                agent: None,
+                all_agents: false,
+                limit: 50,
+                max_bytes: 16000,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["acom", "history", "--before", "4", "--after", "1"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "history", "--agent", "2", "--all-agents"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "history", "12"]).is_ok());
+        assert!(Cli::try_parse_from(["acom", "history", "12", "--thread", "1"]).is_err());
+    }
+
+    #[test]
+    fn membership_context_is_separate_from_the_message_mark() {
+        assert_eq!(message_context(&json!({"mark":"new"})), "");
+        assert_eq!(
+            message_context(&json!({"mark":"handled", "outside_membership":true})),
+            "\n[sent while you were not a member]"
+        );
+        assert_eq!(
+            message_context(&json!({"membership_unknown":true, "outside_membership":true})),
+            "\n[membership at send time unknown]"
+        );
+    }
 }
 
 #[derive(Subcommand)]
@@ -136,6 +217,28 @@ enum Cmd {
     Read {
         id: i64,
     },
+    History {
+        #[arg(conflicts_with_all = ["agent", "all_agents", "thread", "lock", "kind", "before", "after", "limit", "max_bytes"])]
+        id: Option<i64>,
+        #[arg(long, conflicts_with = "all_agents")]
+        agent: Option<i64>,
+        #[arg(long)]
+        all_agents: bool,
+        #[arg(long)]
+        thread: Option<i64>,
+        #[arg(long)]
+        lock: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, conflicts_with = "after")]
+        before: Option<i64>,
+        #[arg(long)]
+        after: Option<i64>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[arg(long, default_value_t = 16000)]
+        max_bytes: i64,
+    },
     Mark {
         ids: String,
         mark: String,
@@ -187,13 +290,21 @@ enum ThreadCmd {
     New {
         #[arg(long)]
         title: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "watch")]
         members: Option<String>,
+        #[arg(long)]
+        watch: Option<String>,
+        #[arg(long)]
+        include_user: bool,
     },
     Read {
         id: i64,
     },
     Add {
+        id: i64,
+        members: String,
+    },
+    Remove {
         id: i64,
         members: String,
     },
@@ -385,18 +496,29 @@ fn sender(v: &Value) -> String {
     who(v.as_i64().unwrap_or(0))
 }
 
+fn message_context(m: &Value) -> &'static str {
+    if m["membership_unknown"].as_bool() == Some(true) {
+        "\n[membership at send time unknown]"
+    } else if m["outside_membership"].as_bool() == Some(true) {
+        "\n[sent while you were not a member]"
+    } else {
+        ""
+    }
+}
+
 fn print_message(m: &Value) {
     let mark = m["mark"]
         .as_str()
         .map(|k| format!(" · {k}"))
         .unwrap_or_default();
     println!(
-        "#{} · thread {} \"{}\" · {} · {}{mark}",
+        "#{} · thread {} \"{}\" · {} · {}{mark}{}",
         m["id"],
         m["thread"],
         m["title"].as_str().unwrap_or(""),
         sender(&m["sender"]),
-        t(&m["at"])
+        t(&m["at"]),
+        message_context(m)
     );
     println!("{}\n", m["text"].as_str().unwrap_or(""));
 }
@@ -637,14 +759,28 @@ fn main() {
             }
         }
         Cmd::Thread { cmd } => match cmd {
-            ThreadCmd::New { title, members } => {
+            ThreadCmd::New {
+                title,
+                members,
+                watch,
+                include_user,
+            } => {
                 let members: Vec<String> = members
                     .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                     .unwrap_or_default();
-                let mut b = json!({ "title": title, "members": members });
+                let watch: Vec<String> = watch
+                    .map(|w| w.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default();
+                let mut b = json!({ "title": title, "members": members, "watch": watch });
                 match my_id() {
-                    Some(id) => b["agent"] = json!(id),
-                    None => b["project"] = json!(user_project()),
+                    Some(id) => {
+                        b["agent"] = json!(id);
+                        b["include_user"] = json!(include_user);
+                    }
+                    None => {
+                        b["project"] = json!(user_project());
+                        b["include_user"] = json!(true);
+                    }
                 }
                 let v = post("/threads", b);
                 let m: Vec<String> = v["members"]
@@ -662,7 +798,8 @@ fn main() {
                 println!("thread {} (members {})", v["id"], m.join(", "));
             }
             ThreadCmd::Read { id } => {
-                let th = get(&format!("/threads/{id}"));
+                let context = my_id().map(|a| format!("?agent={a}")).unwrap_or_default();
+                let th = get(&format!("/threads/{id}{context}"));
                 let m: Vec<String> = th["members"]
                     .as_array()
                     .into_iter()
@@ -681,12 +818,26 @@ fn main() {
                     th["title"].as_str().unwrap_or(""),
                     m.join(", ")
                 );
+                for event in th["events"].as_array().into_iter().flatten() {
+                    println!(
+                        "event #{} · {} · {} · {} · {}",
+                        event["id"],
+                        t(&event["at"]),
+                        event["kind"].as_str().unwrap_or(""),
+                        sender(&event["agent"]),
+                        event["details"]["reason"].as_str().unwrap_or("")
+                    );
+                }
+                if th["events_more"].as_bool() == Some(true) {
+                    println!("Older membership events: acom history --thread {id}");
+                }
                 for msg in th["messages"].as_array().into_iter().flatten() {
                     println!(
-                        "#{} · {} · {}\n{}\n",
+                        "#{} · {} · {}{}\n{}\n",
                         msg["id"],
                         sender(&msg["sender"]),
                         t(&msg["at"]),
+                        message_context(msg),
                         msg["text"].as_str().unwrap_or("")
                     );
                 }
@@ -719,6 +870,15 @@ fn main() {
                     })
                     .collect();
                 println!("added {} to thread {id}", m.join(", "));
+            }
+            ThreadCmd::Remove { id, members } => {
+                let members: Vec<String> =
+                    members.split(',').map(|s| s.trim().to_string()).collect();
+                let v = post(
+                    &format!("/threads/{id}/members/remove"),
+                    json!({ "members": members }),
+                );
+                println!("removed {} from thread {id}", v["members"]);
             }
         },
         Cmd::Send { thread, text } => {
@@ -753,7 +913,48 @@ fn main() {
                 );
             }
         }
-        Cmd::Read { id } => print_message(&get(&format!("/messages/{id}"))),
+        Cmd::Read { id } => {
+            let context = my_id().map(|a| format!("?agent={a}")).unwrap_or_default();
+            print_message(&get(&format!("/messages/{id}{context}")));
+        }
+        Cmd::History {
+            id,
+            agent,
+            all_agents,
+            thread,
+            lock,
+            kind,
+            before,
+            after,
+            limit,
+            max_bytes,
+        } => {
+            let mut query = vec![scope()];
+            let path = if let Some(id) = id {
+                format!("/history/{id}")
+            } else {
+                let agent = agent.or_else(|| if all_agents { None } else { my_id() });
+                for (key, value) in [
+                    ("agent", agent),
+                    ("thread", thread),
+                    ("before", before),
+                    ("after", after),
+                    ("limit", Some(limit)),
+                    ("max_bytes", Some(max_bytes)),
+                ] {
+                    if let Some(value) = value {
+                        query.push(format!("{key}={value}"));
+                    }
+                }
+                for (key, value) in [("lock", lock), ("kind", kind)] {
+                    if let Some(value) = value {
+                        query.push(format!("{key}={}", encode(&value)));
+                    }
+                }
+                "/history".into()
+            };
+            println!("{}", get(&format!("{path}?{}", query.join("&"))));
+        }
         Cmd::Mark { ids: list, mark } => {
             post(
                 "/marks",

@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -50,6 +50,28 @@ fn append(path: &PathBuf, line: &str) {
     }
 }
 
+/// A child waiting for its prompt. Until the surrounding transaction commits,
+/// dropping this value stops and reaps it without delivering the task.
+pub(crate) struct PreparedTurn {
+    child: Option<Child>,
+    input: Option<String>,
+    harness: String,
+    model: String,
+    effort: String,
+    resume: bool,
+    turns: i64,
+    err_from: u64,
+}
+
+impl Drop for PreparedTurn {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            kill_group(child.id(), libc::SIGKILL);
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Start one turn of an agent with this prompt. The agent becomes `working`.
 pub fn start_turn(
     app: &Arc<App>,
@@ -58,6 +80,37 @@ pub fn start_turn(
     prompt: &str,
     replaces: Option<i64>,
 ) -> R<()> {
+    st.db.execute_batch("SAVEPOINT turn_preparation")?;
+    let result = prepare_turn(app, st, id, prompt, replaces);
+    match result {
+        Ok(turn) => {
+            if let Err(e) = st.db.execute_batch("RELEASE turn_preparation") {
+                let _ = st
+                    .db
+                    .execute_batch("ROLLBACK TO turn_preparation; RELEASE turn_preparation");
+                return Err(e.into());
+            }
+            activate_turn(app, st, id, turn);
+            Ok(())
+        }
+        Err(e) => {
+            st.db
+                .execute_batch("ROLLBACK TO turn_preparation; RELEASE turn_preparation")?;
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn prepare_turn(
+    app: &Arc<App>,
+    st: &mut St,
+    id: i64,
+    prompt: &str,
+    replaces: Option<i64>,
+) -> R<PreparedTurn> {
+    if st.db.is_autocommit() {
+        return Err(crate::app::bad("turn preparation requires a transaction"));
+    }
     if st.procs.contains_key(&id) {
         return Err(crate::app::conflict(format!(
             "agent {id} is still stopping; try again in a moment"
@@ -80,6 +133,19 @@ pub fn start_turn(
         .get(&a.harness)
         .map(|h| h.flags.clone())
         .unwrap_or_default();
+    // The working transition reconciles live memberships before taking updates
+    // or rendering a prompt. Failed starts roll all of this back, including
+    // notification/history cursors. The mutex also prevents concurrent posts.
+    st.expire_locks()?;
+    st.set_state(id, "working")?;
+    let updates = st.take_updates(id)?;
+    let summary = st.coordination_summary(id, true)?;
+    let prompt = [prompt.to_string(), updates, summary]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = prompt.as_str();
     // Resume only a session the harness actually started. Otherwise this is a fresh
     // session (e.g. the first turn crashed early), which needs the briefing again.
     let resume = started && a.session.is_some();
@@ -119,7 +185,12 @@ pub fn start_turn(
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    #[cfg(not(test))]
     let path = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
+    // Unit fixtures never search the user's PATH: a missing/invalid fake client
+    // must fail rather than fall through to an installed provider client.
+    #[cfg(test)]
+    let path = bin_dir;
     let err_from = std::fs::metadata(log_path(app, id, "err")).map_or(0, |m| m.len());
     let err = OpenOptions::new()
         .create(true)
@@ -158,7 +229,25 @@ pub fn start_turn(
                     "replacement predecessor is not crashed",
                 ));
             }
+            st.event(
+                a.project,
+                Some(old),
+                None,
+                "agent.replaced",
+                "acom",
+                serde_json::json!({"replacement":id}),
+            )?;
+            st.event(
+                a.project,
+                Some(id),
+                None,
+                "agent.replacement",
+                "acom",
+                serde_json::json!({"predecessor":old}),
+            )?;
         }
+        st.event(a.project,Some(id),None,"agent.turn-started","acom",
+            serde_json::json!({"turn":turns+1,"harness":a.harness,"model":a.model,"effort":a.effort}))?;
         st.db.execute_batch("RELEASE turn_start")?;
         Ok(())
     })();
@@ -170,17 +259,39 @@ pub fn start_turn(
         let _ = child.wait();
         return Err(e);
     }
+    Ok(PreparedTurn {
+        child: Some(child),
+        input,
+        harness: a.harness,
+        model: a.model,
+        effort: a.effort,
+        resume,
+        turns,
+        err_from,
+    })
+}
+
+/// Call only after the last enclosing savepoint has committed, under the mutex.
+pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: PreparedTurn) {
+    debug_assert!(st.db.is_autocommit());
+    let mut child = turn.child.take().unwrap();
+    let pid = child.id();
+    let model = std::mem::take(&mut turn.model);
+    let harness = std::mem::take(&mut turn.harness);
+    let resume = turn.resume;
+    let turns = turn.turns;
+    let err_from = turn.err_from;
     st.procs.insert(
         id,
         Proc {
             pid,
             stopping: false,
-            model: a.model.clone(),
-            effort: a.effort.clone(),
+            model: model.clone(),
+            effort: std::mem::take(&mut turn.effort),
             failure: None,
         },
     );
-    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+    if let (Some(text), Some(mut stdin)) = (turn.input.take(), child.stdin.take()) {
         thread::spawn(move || {
             let _ = stdin.write_all(text.as_bytes());
         });
@@ -195,7 +306,6 @@ pub fn start_turn(
     );
 
     let app = app.clone();
-    let harness = a.harness.clone();
     thread::spawn(move || {
         let done = Arc::new(AtomicBool::new(false));
         let side = {
@@ -207,7 +317,7 @@ pub fn start_turn(
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 append(&raw, &line);
                 for ev in harness::parse_line(&harness, &line) {
-                    apply(&app, id, &harness, &a.model, ev);
+                    apply(&app, id, &harness, &model, ev);
                 }
             }
         }
@@ -226,11 +336,15 @@ pub fn start_turn(
                 if ok { "" } else { " (exit with error)" }
             ),
         );
-        if let Err(e) = app.turn_ended(id, pid, ok, exit_error.as_deref()) {
-            eprintln!("agent {id}: {}", e.1);
+        let mut last_error = None;
+        while let Err(e) = app.turn_ended(id, pid, ok, exit_error.as_deref()) {
+            if last_error.as_deref() != Some(e.1.as_str()) {
+                eprintln!("agent {id}: couldn't save turn exit; retrying: {}", e.1);
+                last_error = Some(e.1);
+            }
+            thread::sleep(Duration::from_secs(1));
         }
     });
-    Ok(())
 }
 
 /// Failed/stopped turns must not leave old background tools running into recovery.

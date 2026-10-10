@@ -100,7 +100,8 @@
     .thread-row.active { background: var(--accent-soft); }
     .thread-row strong { display: block; margin-bottom: 3px; }
     .thread-main { display: flex; min-width: 0; flex-direction: column; }
-    .thread-header { padding: 13px 16px; border-bottom: 1px solid var(--line); }
+    .thread-header { position: relative; padding: 13px 48px 13px 16px; border-bottom: 1px solid var(--line); }
+    #close-thread { position: absolute; top: 10px; right: 10px; font-size: 20px; padding: 0 8px; }
     .thread-header h2 { margin: 0 0 3px; font-size: 16px; }
     .messages { flex: 1; min-height: 400px; max-height: 580px; padding: 16px; overflow: auto; }
     .message { max-width: 780px; margin-bottom: 13px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; }
@@ -250,8 +251,20 @@
       <h2>New thread</h2>
       <div class="form-grid">
         <label class="wide">Title <input name="title" required></label>
+        <label class="wide">Membership <select id="thread-mode" name="membership_mode"><option value="fixed">Fixed members</option><option value="live">Live filters</option></select></label>
+        <label class="inline-check wide"><input type="checkbox" name="include_user" checked> Include me in this thread</label>
+        <div class="wide" id="thread-fixed-members">
         <div class="wide" id="thread-member-picker"></div>
         <details class="wide"><summary>Advanced member selectors</summary><label>IDs, states or groups <input name="members" placeholder="1, active, group:review"></label></details>
+        </div>
+        <div class="wide" id="thread-live-filters" hidden>
+          <label>States</label><div class="effort-options">
+            <label><input type="checkbox" name="watch_state" value="working" checked> Working</label><label><input type="checkbox" name="watch_state" value="idle" checked> Idle</label>
+            <label><input type="checkbox" name="watch_state" value="done"> Done</label><label><input type="checkbox" name="watch_state" value="paused"> Paused</label><label><input type="checkbox" name="watch_state" value="crashed"> Crashed</label><label><input type="checkbox" name="watch_state" value="closed"> Closed</label><label><input type="checkbox" name="watch_state" value="replaced"> Replaced</label>
+          </div>
+          <label style="margin-top:12px">Groups (optional, comma-separated) <input name="watch_groups" placeholder="review, writing"></label>
+          <p class="meta launch-project">Membership follows agent state and group changes. Selected states match any; groups further narrow the match. Groups alone use active agents (working or idle). Done agents are not woken. Your own membership is controlled separately.</p>
+        </div>
       </div>
       <div class="dialog-actions"><button type="button" data-close="thread-dialog">Cancel</button><button class="primary" value="default">Create</button></div>
     </form>
@@ -301,7 +314,28 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: localStorage.getItem('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
+    function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
+    function storeValue(key, value) {
+      try { if (value) localStorage.setItem(key, value); else localStorage.removeItem(key); return true; }
+      catch (_) { return false; }
+    }
+    const drafts = new Map();
+    const draftEdits = new Map();
+    const draftKey = (project, thread) => `acom:draft:${project}:${thread}`;
+    function threadDraft(project, thread) {
+      const key = draftKey(project, thread);
+      return drafts.has(key) ? drafts.get(key) : stored(key) || '';
+    }
+    function saveDraft(project, thread, text) {
+      const key = draftKey(project, thread);
+      drafts.set(key, text);
+      if (!storeValue(key, text)) toast('Draft stays in this tab, but browser storage is unavailable. Copy it before closing the browser.', true);
+    }
+    function saveVisibleDraft() {
+      const form = $('#message-form');
+      if (form) saveDraft(form.dataset.draftProject, form.dataset.draftThread, $('[name=text]', form).value);
+    }
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
     const reading = new Set();
     let selectedAgent = null, agentRequest = 0, agentLoading = null;
     const $ = (s, root = document) => root.querySelector(s);
@@ -378,11 +412,13 @@
       const url = new URL(location.href);
       if (p) url.searchParams.set('project', p.id); else url.searchParams.delete('project');
       history.replaceState(null, '', url);
+      if ($('#config-applied')) $('#config-applied').textContent = appliedConfigText();
     }
     function projectOptions(selected) {
       return state.projects.map(p => `<option value="${p.id}" title="${esc(p.path)}" ${p.id === Number(selected) ? 'selected' : ''}>${esc(p.name)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${p.id}` : ''}${p.unread ? ` · ${fmt(p.unread)} unread` : ''}</option>`).join('');
     }
     function resetThread() {
+      saveVisibleDraft();
       state.selectedThread = null; state.thread = null; state.threadRequest++;
       $('#thread-main').innerHTML = '<div class="empty">Select a thread</div>';
     }
@@ -472,7 +508,7 @@
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
     function messageHtml(m) {
-      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''}" data-message="${m.id}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}</span><span>${when(m.at)}</span></div><div class="message-text">${esc(m.text)}</div></div>`;
+      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''}" data-message="${m.id}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span></div><div class="message-text">${esc(m.text)}</div></div>`;
     }
 
     async function refreshThread(showError = true) {
@@ -484,9 +520,11 @@
         if (request !== state.threadRequest || selected !== state.selectedThread) return;
         const sameThread = state.thread?.id === t.id && $('#messages');
         if (!sameThread) {
-          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta"></div><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button><button type="button" id="close-thread">Close thread</button></div><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          saveVisibleDraft();
+          $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Membership history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
-            <form class="composer" id="message-form"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
+            <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
+          $('#message-form textarea').value = threadDraft(t.project, t.id);
           const messages = $('#messages');
           messages.scrollTop = messages.scrollHeight;
           messages.addEventListener('scroll', markThreadRead);
@@ -504,8 +542,16 @@
         }
         $('.thread-header .meta', $('#thread-main')).innerHTML = `Thread #${t.id} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`;
         $('#thread-membership').textContent = t.members?.includes(0) ? 'Leave thread' : 'Join thread';
+        const live = !!t.watch?.length;
+        $('#add-thread-members').hidden = live;
+        $('#thread-watch').hidden = !live;
+        $('#thread-watch').textContent = live ? `Live filters: ${t.watch.join(', ')}. Agent membership updates automatically.` : '';
+        $('#thread-history').hidden = !live && !t.events?.length;
+        const events = [...(t.events || [])].sort((a,b) => a.id - b.id).map(e => `<div class="event"><time>${when(e.at)}</time><div>${who(e.agent)} ${e.kind === 'thread.joined' ? 'joined' : 'left'} · by ${esc(e.actor)}${e.details?.reason ? ` · ${esc(e.details.reason)}` : ''}</div></div>`).join('') || '<p class="meta">No membership changes yet.</p>';
+        const history = events + (t.events_more ? '<p class="meta">Earlier membership events are not shown.</p>' : '');
+        if ($('#thread-events')._content !== history) { $('#thread-events').innerHTML = history; $('#thread-events')._content = history; }
         if (state.thread?.id === t.id) t.last_read = Math.max(t.last_read || 0, state.thread.last_read || 0);
-        t.unread = t.members?.includes(0) ? t.messages.filter(m => m.sender !== 0 && m.id > t.last_read).length : 0;
+        t.unread = t.members?.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > t.last_read).length : 0;
         state.thread = t;
         updateUnread(t.id, t.project, t.unread);
         await markThreadRead();
@@ -536,7 +582,7 @@
         if (state.thread?.id === t.id) {
           state.thread.last_read = Math.max(state.thread.last_read || 0, read.last_read);
           // Messages can arrive after the snapshot or while this request is pending.
-          state.thread.unread = Math.max(read.unread, state.thread.messages.filter(m => m.sender !== 0 && m.id > state.thread.last_read).length);
+          state.thread.unread = Math.max(read.unread, state.thread.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > state.thread.last_read).length);
           $('#thread-read-error').hidden = true;
           updateUnread(t.id, t.project, state.thread.unread);
         }
@@ -613,6 +659,11 @@
       state.editor = { project, config, settings: structuredClone(s), signature, dirty: false, pending: false };
       renderSettings();
     }
+    function appliedConfigText() {
+      if (!state.project) return 'No project selected.';
+      const name = state.project.config == null ? 'Custom' : state.configs.find(c => c.id === state.project.config)?.name || `#${state.project.config}`;
+      return `Applied configuration: ${name}`;
+    }
     function renderSettings() {
       const s = state.editor?.settings;
       if (!s) return;
@@ -621,8 +672,7 @@
         const p = state.projects.find(p => p.id === id);
         return p ? `${p.name} (#${id})` : `#${id}`;
       });
-      const binding = state.editor.project == null ? 'Configuration' : 'This project uses';
-      const configControls = `<div class="form-grid"><label>${binding} <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
+      const configControls = `<p class="launch-project" id="config-applied">${esc(appliedConfigText())}</p><div class="form-grid"><label>Select configuration <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
         ${config && config.id !== 1 ? `<label>Config name <input name="config_name" value="${esc(config.name)}" required></label>` : '<span></span>'}</div>
         <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. ${config.id === 1 ? 'Default is read-only. Copy it with Save as new config, or choose Custom for this project.' : `Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.`}` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}${state.editor.pending ? ' Selection is not applied yet; Save applies it to this project.' : ''}</p>
         <div class="actions"><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 1 ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
@@ -654,6 +704,9 @@
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
       $('#retry-rules').querySelectorAll('[data-retry-rule]').forEach(root => syncRetryChoices(root));
+      try { state.editor.baseline = settingsFingerprint(collectSettings()); } catch (_) { state.editor.baseline = null; }
+      state.editor.formBaseline = settingsFormFingerprint();
+      state.editor.name = config?.name || '';
       setSettingsControls();
     }
 
@@ -853,9 +906,8 @@
         try { await mutate('/usage/check', {provider:checkUsage.dataset.checkUsage}); toast('Usage check scheduled'); } catch(error) {toast(error.message,true);} return;
       }
       const threadFilter = event.target.closest('[data-thread-filter]');
-      if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; localStorage.setItem('thread-filter',state.threadFilter); renderThreads(); return; }
+      if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; storeValue('thread-filter',state.threadFilter); renderThreads(); return; }
       if (event.target.closest('#close-thread')) {
-        if ($('#message-form textarea')?.value && !confirm('Discard your unsent message and close this thread?')) return;
         resetThread(); renderThreads(); return;
       }
       if(event.target.closest('#thread-membership')) {
@@ -900,18 +952,18 @@
           const existing = [...root.querySelectorAll('[name=allowed_model]')].find(x => x.value === id);
           if (existing) existing.checked = true;
           else $('.model-options', root).insertAdjacentHTML('beforeend', modelCheckbox(root.dataset.harness, id, true));
-          input.value = ''; syncHarnessChoices(root);
+          input.value = ''; syncHarnessChoices(root); updateSettingsDirty();
         } catch (error) { toast(error.message, true); }
         return;
       }
       if (event.target.closest('#add-retry-rule')) {
         $('#retry-rules').insertAdjacentHTML('beforeend', retryRule());
         syncRetryChoices($('#retry-rules').lastElementChild);
-        state.editor.dirty = true;
+        updateSettingsDirty();
         return;
       }
       if (event.target.closest('[data-remove-retry]')) {
-        event.target.closest('[data-retry-rule]').remove(); state.editor.dirty = true; return;
+        event.target.closest('[data-retry-rule]').remove(); updateSettingsDirty(); return;
       }
       const saveAgentConfig = event.target.closest('#save-agent-config');
       if (saveAgentConfig) {
@@ -935,7 +987,10 @@
           setLaunchProject();
         }
         if (open.dataset.open === 'thread-dialog' && !state.project) { toast('Add a project first.', true); return; }
-        if (open.dataset.open === 'thread-dialog') memberPicker($('#thread-member-picker'),[],true);
+        if (open.dataset.open === 'thread-dialog') {
+          if ($('#thread-member-picker').dataset.project !== String(state.selectedProject)) $('#thread-form [name=include_user]').checked = true;
+          memberPicker($('#thread-member-picker')); syncThreadMode();
+        }
         document.getElementById(open.dataset.open).showModal();
         return;
       }
@@ -1033,18 +1088,19 @@
         state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: false, pending: !!state.project && config !== state.project.config };
         renderSettings(); return;
       }
-      if (state.editor) state.editor.dirty = true;
       const retry = event.target.closest('[data-retry-rule]');
-      if (retry) { syncRetryChoices(retry, event.target.name === 'retry_harness'); return; }
+      if (retry) { syncRetryChoices(retry, event.target.name === 'retry_harness'); updateSettingsDirty(); return; }
       const root = event.target.closest('[data-harness]');
-      if (!root) return;
-      if (['allowed_model', 'allowed_effort'].includes(event.target.name)) syncHarnessChoices(root);
-      if (event.target.name === 'model') { showCustom(event.target, $('[data-custom-default]', root)); syncDefaultEfforts(root); }
+      if (root) {
+        if (['allowed_model', 'allowed_effort'].includes(event.target.name)) syncHarnessChoices(root);
+        if (event.target.name === 'model') { showCustom(event.target, $('[data-custom-default]', root)); syncDefaultEfforts(root); }
+      }
+      updateSettingsDirty();
     });
     $('#settings-form').addEventListener('input', event => {
-      if (state.editor && event.target.id !== 'config-select') state.editor.dirty = true;
       const retry = event.target.closest('[data-retry-rule]');
       if (retry && ['retry_custom_source', 'retry_custom_model'].includes(event.target.name)) syncRetryChoices(retry);
+      if (event.target.id !== 'config-select') updateSettingsDirty();
     });
     $('#agent-config').addEventListener('change', event => {
       const root = $('#agent-config'), model = $('[name=agent_model]', root);
@@ -1110,13 +1166,25 @@
       const data = new FormData(form);
       if (button) button.disabled = true;
       try {
-        const result = await mutate('/threads', { project: state.selectedProject, title: data.get('title'), members: [...data.getAll('member'),...splitList(data.get('members') || '')], include_user: data.has('include_user') });
-        $('#thread-dialog').close(); form.reset();
-        if(!data.has('include_user')) {state.threadFilter='all';localStorage.setItem('thread-filter','all');renderThreads();}
+        const membership = $('#thread-mode').value === 'live' ? {watch:[...data.getAll('watch_state'), ...splitList(data.get('watch_groups') || '').map(group => `group:${group}`)]} : {members:[...data.getAll('member'),...splitList(data.get('members') || '')]};
+        if (membership.watch && !membership.watch.length) throw new Error('Choose at least one state or group for live filters.');
+        const result = await mutate('/threads', { project: state.selectedProject, title: data.get('title'), ...membership, include_user: data.has('include_user') });
+        $('#thread-dialog').close(); form.reset(); syncThreadMode();
+        if(!data.has('include_user')) {state.threadFilter='all';storeValue('thread-filter','all');renderThreads();}
         state.selectedThread = Number(result.id ?? result.thread_id); await refreshThread();
       } catch (error) { toast(error.message, true); }
       finally { if (button) button.disabled = false; }
     });
+
+    function syncThreadMode() {
+      const live = $('#thread-mode').value === 'live';
+      for (const [id, disabled] of [['thread-fixed-members',live],['thread-live-filters',!live]]) {
+        const root = document.getElementById(id);
+        root.hidden = disabled;
+        root.querySelectorAll('input, button').forEach(el => el.disabled = disabled);
+      }
+    }
+    $('#thread-mode').addEventListener('change', syncThreadMode);
 
     $('#folder-hidden').addEventListener('change',()=>browseFolder(state.folder?.path));
     $('#folder-form').addEventListener('submit', async event=> {
@@ -1152,12 +1220,28 @@
     document.addEventListener('submit', async event => {
       if (event.target.id !== 'message-form') return;
       event.preventDefault();
-      const text = new FormData(event.target).get('text');
+      const form = event.target, button = $('button', form);
+      const { draftProject: project, draftThread: thread } = form.dataset, text = $('[name=text]', form).value;
+      const key = draftKey(project, thread), edits = draftEdits.get(key) || 0;
+      saveDraft(project, thread, text);
+      button.disabled = true;
       try {
-        const result = await mutate('/messages', { thread: state.selectedThread, text });
-        event.target.reset(); await refreshThread();
+        const result = await api('/messages', { method: 'POST', body: JSON.stringify({ thread: Number(thread), text }) });
+        const unchanged = (draftEdits.get(key) || 0) === edits && threadDraft(project, thread) === text;
+        if (unchanged) saveDraft(project, thread, '');
+        const current = $('#message-form');
+        if (unchanged && current?.dataset.draftProject === project && current.dataset.draftThread === thread && $('[name=text]', current).value === text) current.reset();
+        await refresh();
         if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}.`).join('\n'));
       } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    });
+    document.addEventListener('input', event => {
+      if (event.target.matches('#message-form textarea')) {
+        const form = event.target.form, key = draftKey(form.dataset.draftProject, form.dataset.draftThread);
+        draftEdits.set(key, (draftEdits.get(key) || 0) + 1);
+        saveVisibleDraft();
+      }
     });
 
     function collectSettings() {
@@ -1205,10 +1289,28 @@
       next.prompts = Object.fromEntries(['launch','wake','resume'].map(name=>[name,$(`[name=prompt_${name}]`,form).value]));
       return next;
     }
+    function settingsFingerprint(value) {
+      return JSON.stringify(value, (key, v) => {
+        if (Array.isArray(v)) return ['models', 'efforts'].includes(key) ? [...v].sort() : v;
+        return v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v;
+      });
+    }
+    function settingsFormFingerprint() {
+      return JSON.stringify([...new FormData($('#settings-form'))].filter(([name]) => !['add_model', 'config_name'].includes(name)));
+    }
+    function updateSettingsDirty() {
+      if (!state.editor) return;
+      try { state.editor.dirty = settingsFingerprint(collectSettings()) !== state.editor.baseline; }
+      catch (_) { state.editor.dirty = settingsFormFingerprint() !== state.editor.formBaseline; }
+      const name = $('[name=config_name]', $('#settings-form'))?.value.trim();
+      state.editor.dirty ||= name != null && name !== state.editor.name;
+      state.editor.pending = !!state.project && state.editor.config !== state.project.config;
+      setSettingsControls();
+    }
     function setSettingsControls() {
       const busy = state.saving, readOnly = state.editor?.config === 1;
       $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (readOnly && !['config-select','save-config-as'].includes(el.id)));
-      $('[form="settings-form"]').disabled = busy || (readOnly && !state.editor?.pending);
+      $('[form="settings-form"]').disabled = busy || !(state.editor?.dirty || state.editor?.pending);
       const config = state.configs.find(c => c.id === state.editor?.config);
       if ($('#remove-config')) $('#remove-config').disabled = busy || !!config?.projects.length;
     }
@@ -1232,8 +1334,8 @@
           const result = await api('/configs', { method: 'POST', body: JSON.stringify({ name, settings: next }) });
           config = result.id;
         } else if (config != null && config !== 1) {
-          const rename = $('[name=config_name]', $('#settings-form'))?.value;
-          if (JSON.stringify(next) !== JSON.stringify(editor.settings) || (rename != null && rename !== state.configs.find(c => c.id === config)?.name)) {
+          const rename = $('[name=config_name]', $('#settings-form'))?.value.trim();
+          if (settingsFingerprint(next) !== editor.baseline || (rename != null && rename !== editor.name)) {
             await api(`/configs/${config}`, { method: 'PUT', body: JSON.stringify({ settings: next, ...(rename == null ? {} : { name: rename }) }) });
           }
         }

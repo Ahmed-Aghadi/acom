@@ -61,7 +61,11 @@ process.stdin.on('end', async () => {
   const model = args[args.indexOf(claude ? '--model' : '-m') + 1];
   const previous=fs.existsSync(path.join(process.env.ACOM_HOME,'runs.jsonl')) ? fs.readFileSync(path.join(process.env.ACOM_HOME,'runs.jsonl'),'utf8').split('\\n').slice(0,-1).map(JSON.parse).filter(r=>r.id===id) : [];
   const task=previous[0]?.prompt || prompt;
-  fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume }) + '\\n');
+  const membership_snapshot=task.includes('MEMBERSHIP_HOLD_TEST') || task.includes('Project B defaults') ? {
+    state:(await fetch(process.env.ACOM_URL+'/agents/'+id).then(r=>r.json())).state,
+    threads:(await fetch(process.env.ACOM_URL+'/threads?agent='+id).then(r=>r.json())).map(t=>t.id)
+  } : undefined;
+  fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume, membership_snapshot }) + '\\n');
   const session = claude ? args[args.indexOf(resume?'--resume':'--session-id')+1] : resume ? args.at(-2) : crypto.randomUUID();
   console.log(JSON.stringify(claude ? {type:'system',subtype:'init',session_id:session} : { type: 'thread.started', thread_id: session }));
   const sessions=path.join(process.env.CODEX_HOME,'sessions','2026','10','08'); fs.mkdirSync(sessions,{recursive:true});
@@ -86,6 +90,10 @@ process.stdin.on('end', async () => {
     const configured=await fetch(process.env.ACOM_URL+'/agent-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,agent:id,model:'gpt-6-luna',effort:'high'})});
     if(!configured.ok) {process.exitCode=1;return;}
     console.log(JSON.stringify({type:'response.created',response:{model}}));
+  }
+  if (task.includes('MEMBERSHIP_HOLD_TEST')) {
+    const released=path.join(process.env.ACOM_HOME,'release-'+id);
+    while(!fs.existsSync(released)) await new Promise(resolve=>setTimeout(resolve,25));
   }
   await fetch(process.env.ACOM_URL + '/hook/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   await new Promise(resolve => setTimeout(resolve, 2000));
@@ -208,12 +216,13 @@ process.stdin.on('end', async () => {
     const duplicate = spawnSync(binary, ['serve', '--port', String(port + 1)], { env, encoding: 'utf8' });
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already running/);
+    const lifecycleProject=await lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults});
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
     const boundedLocks=structuredClone(defaults); boundedLocks.max_lock_ttl_secs=60;
     await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
     const one = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'First project' });
     const two = await api('POST', '/agents', { project: b.id, harness: 'codex', model: 'custom-id', task: 'Second project' });
-    await until(() => runs().length >= 2, 'both harnesses started');
+    await until(() => [one.id,two.id].every(id=>runs().some(r=>r.id===id)), 'both harnesses started');
     for (const [agent, project] of [[one.id, first], [two.id, second]]) {
       const run = runs().find(r => r.id === agent);
       assert.equal(run.cwd, project);
@@ -514,6 +523,8 @@ process.stdin.on('end', async () => {
     // starts a fresh native session, and leaves an inspectable replaced predecessor.
     retryConfig.crash_retries['gpt-6-sol']={harness:'claude',model:'claude-sonnet-5-5'};
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
+    const handoffActive=await api('POST','/threads',{project:a.id,title:'Dynamic handoff active',watch:['active','group:reviewers'],include_user:false});
+    const handoffFailed=await api('POST','/threads',{project:a.id,title:'Dynamic handoff failures',watch:['crashed','group:reviewers'],include_user:false});
     const handoff=await api('POST','/agents',{project:a.id,harness:'codex',effort:'high',task:'HANDOFF_TEST',group:'reviewers'});
     await api('POST','/agent-config',{id:handoff.id,effort:'low'});
     const handoffThread=await api('POST','/threads',{project:a.id,title:'Inherited task',members:[String(handoff.id)]});
@@ -523,6 +534,10 @@ process.stdin.on('end', async () => {
     const replacement=handed.retry.replacement;
     await until(()=>runs().some(r=>r.id===replacement),'replacement launched');
     const replacementRun=runs().find(r=>r.id===replacement);
+    const replacementHistory=await api('GET',`/history?project=${a.id}&agent=${replacement}&kind=agent.created`);
+    assert.equal(replacementHistory.events.length,1);
+    assert.equal(replacementHistory.events[0].actor,'acom','automatic replacement creation is not attributed to the user');
+    assert.equal(replacementHistory.events[0].details.predecessor,handoff.id);
     assert.equal(replacementRun.harness,'claude'); assert.equal(replacementRun.resume,false);
     assert.equal(replacementRun.args[replacementRun.args.indexOf('--effort')+1],'high');
     assert.equal((await api('GET',`/agents/${replacement}`)).effort,'high');
@@ -531,10 +546,13 @@ process.stdin.on('end', async () => {
     assert.match(replacementRun.prompt,new RegExp(`launched by agent ${handoff.id}`));
     assert.match(replacementRun.prompt,new RegExp(`thread #${handoffThread.id}`));
     assert.equal((await api('GET',`/agents/${replacement}`)).group,'reviewers');
+    assert.deepEqual((await api('GET',`/threads/${handoffActive.id}`)).members,[replacement],'the committed replacement joins its live audience, not the predecessor');
+    assert.deepEqual((await api('GET',`/threads/${handoffFailed.id}`)).members,[],'derived crashed membership is not inherited as a static pin');
     assert.ok((await api('GET',`/threads/${handoffThread.id}`)).members.includes(replacement));
     assert.ok((await api('GET',`/inbox/${replacement}?mark=in-progress`)).some(m=>m.id===handoffMessage.id));
     assert.doesNotMatch(replacementRun.prompt,/respect provider policies|evade refusal|prohibited work/i);
     await finished(replacement);
+    assert.deepEqual((await api('GET',`/threads/${handoffActive.id}`)).members,[],'finished replacement leaves the live active audience');
     const predecessor=await api('GET',`/agents/${handoff.id}`);
     assert.equal(predecessor.state,'replaced');
     for(const action of ['resume','reopen','pause','close']) await api('POST',`/agents/${handoff.id}/${action}`,{},409);
@@ -683,10 +701,18 @@ process.stdin.on('end', async () => {
     const configThread = await api('POST', '/threads', { project: a.id, title: 'Changed rules', members: [String(scopedA.id)] });
     await api('POST', '/messages', { thread: configThread.id, text: 'Wait for project A slot' });
     assert.ok((await api('GET', `/agents/${scopedA.id}`)).wake_queued_at);
-    const otherThread = await api('POST', '/threads', { project: b.id, title: 'Independent wake', members: [String(scopedB.id)] });
+    const otherThread = await api('POST', '/threads', { project: b.id, title: 'Independent done-only wake', watch: ['done'] });
     await api('POST', '/messages', { thread: otherThread.id, text: 'Use project B slot' });
     await until(() => runs().filter(r => r.id === scopedB.id).length === 2, 'project B wakes despite blocked project A');
-    assert.match(runs().filter(r=>r.id===scopedB.id)[1].prompt, /## Limits and rules right now/);
+    const doneWake=runs().filter(r=>r.id===scopedB.id)[1];
+    assert.match(doneWake.prompt, /## Limits and rules right now/);
+    const doneCoordination=doneWake.prompt.split('\n').find(line=>line.startsWith('[acom] Coordination:'));
+    assert.match(doneCoordination,/\bleft 1\b/,'done-only membership leaves before the wake prompt is rendered');
+    assert.match(doneCoordination,/\bpending 1\b/,'the triggering message remains pending after leaving its audience');
+    assert.doesNotMatch(doneCoordination,/\bthreads [1-9]/,'summary describes the current working audience rather than the old done audience');
+    assert.equal(doneWake.membership_snapshot.state,'working');
+    assert.ok(!doneWake.membership_snapshot.threads.includes(otherThread.id));
+    assert.deepEqual((await api('GET',`/threads/${otherThread.id}`)).members,[0]);
     assert.equal((await api('GET', `/agents/${scopedA.id}`)).state, 'done');
     await finished(blocker.id, 'done');
     await until(() => runs().filter(r => r.id === scopedA.id).length === 2, 'project A wakes when its slot clears');
@@ -722,7 +748,7 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET', '/configs')).find(c => c.id === saved.id).projects, [a.id, b.id]);
     for (const p of [a.id, b.id]) await api('PUT', `/projects/${p}/config`, { config: mine.id });
     await api('POST', `/configs/${saved.id}/remove`, {});
-    assert.equal((await api('GET', '/projects')).length, 2);
+    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,lifecycleProject.id].sort((a,b)=>a-b));
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
     assert.equal(fs.existsSync(path.join(second, '.acom')), false);
     assert.equal(stderr, '');
@@ -731,6 +757,183 @@ process.stdin.on('end', async () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults}) {
+  const folder=path.join(root,'lifecycle'); fs.mkdirSync(folder);
+  const project=await api('POST','/projects',{path:folder});
+  const config=structuredClone(defaults); config.done_closes=false; config.auto_resume=false;
+  await api('PUT',`/projects/${project.id}/config`,{custom:config});
+  const active=await api('POST','/threads',{project:project.id,title:'Live active audience',watch:['active']});
+  const grouped=await api('POST','/threads',{project:project.id,title:'Live group audience',watch:['group:blue'],include_user:false});
+  const combined=await api('POST','/threads',{project:project.id,title:'States and groups',watch:['working','idle','group:blue','group:green'],include_user:false});
+  const done=await api('POST','/threads',{project:project.id,title:'Done audience',watch:['done'],include_user:false});
+  const paused=await api('POST','/threads',{project:project.id,title:'Paused audience',watch:['paused'],include_user:false});
+  const members=async thread=>(await api('GET',`/threads/${thread.id}`)).members;
+  const history=(query='')=>api('GET',`/history?project=${project.id}${query}`);
+  assert.deepEqual(await members(active),[0]);
+  for(const thread of [grouped,combined,done,paused]) assert.deepEqual(await members(thread),[]);
+  for(const watch of [['user'],['123'],['unknown'],['group:']]) {
+    await api('POST','/threads',{project:project.id,title:'Invalid watch',watch},400);
+  }
+  await api('POST','/threads',{project:project.id,title:'Conflicting members',members:['active'],watch:['active']},400);
+  const before=await api('POST','/messages',{thread:active.id,text:'Before the first membership'});
+  const agent=await api('POST','/agents',{project:project.id,harness:'codex',group:'blue',task:'MEMBERSHIP_HOLD_TEST'});
+  await until(()=>runs().some(r=>r.id===agent.id),'held lifecycle turn starts');
+  const firstRun=runs().find(r=>r.id===agent.id);
+  assert.equal(firstRun.membership_snapshot.state,'working','task input is delivered only after the working state commits');
+  for(const thread of [active,grouped,combined]) assert.ok(firstRun.membership_snapshot.threads.includes(thread.id),'the committed membership is visible when the task reaches the harness');
+  assert.match(firstRun.prompt,/\[acom\] Coordination:/,'launch receives compact coordination context');
+  assert.deepEqual(await members(active),[0,agent.id]);
+  for(const route of [`/threads/${active.id}/members`,`/threads/${active.id}/members/remove`]) {
+    await api('POST',route,{members:[String(agent.id)]},409);
+    assert.deepEqual(await members(active),[0,agent.id],'live membership cannot be manually pinned or removed');
+  }
+  for(const thread of [grouped,combined]) assert.deepEqual(await members(thread),[agent.id]);
+  assert.deepEqual(await members(done),[]);
+  const fixed=await api('POST','/threads',{project:project.id,title:'Fixed membership intervals',members:[String(agent.id)],include_user:false});
+  const fixedInside=await api('POST','/messages',{thread:fixed.id,text:'Inside fixed membership'});
+  await api('POST',`/threads/${fixed.id}/members/remove`,{members:[String(agent.id)]});
+  assert.deepEqual(await members(fixed),[0]);
+  const fixedGap=await api('POST','/messages',{thread:fixed.id,text:'Between fixed memberships'});
+  await api('POST',`/threads/${fixed.id}/members`,{members:[String(agent.id)]});
+  assert.deepEqual(await members(fixed),[0,agent.id]);
+  await api('POST',`/threads/${fixed.id}/members/remove`,{members:['active']},400);
+  const fixedInbox=await api('GET',`/inbox/${agent.id}?mark=new`);
+  assert.equal(fixedInbox.find(m=>m.id===fixedInside.id)?.outside_membership,false);
+  assert.equal(fixedInbox.find(m=>m.id===fixedGap.id)?.outside_membership,true);
+  const fixedHistory=await history(`&thread=${fixed.id}&limit=200`);
+  await api('POST',`/threads/${fixed.id}/members`,{members:[String(agent.id)]});
+  assert.deepEqual(await history(`&thread=${fixed.id}&limit=200`),fixedHistory,'re-adding an existing member creates no event or interval');
+  const unpinned=await api('POST','/threads',{agent:agent.id,title:'Creator is not pinned',watch:['done'],include_user:false});
+  assert.deepEqual(await members(unpinned),[],'creating a live thread never pins the creator');
+  const inside=await api('POST','/messages',{thread:active.id,text:'During active membership'});
+  await api('POST',`/agents/${agent.id}/group`,{group:'red'});
+  assert.deepEqual(await members(grouped),[]);
+  assert.deepEqual(await members(combined),[],'groups constrain the OR of watched states');
+  assert.deepEqual(await members(active),[0,agent.id]);
+  const groupGap=await api('POST','/messages',{thread:grouped.id,text:'While outside the group'});
+  await api('POST',`/agents/${agent.id}/group`,{group:'green'});
+  assert.deepEqual(await members(grouped),[0]);
+  assert.deepEqual(await members(combined),[agent.id],'groups combine with OR');
+  await api('POST',`/agents/${agent.id}/group`,{group:'blue'});
+  assert.deepEqual(await members(grouped),[0,agent.id]);
+  const groupInside=await api('POST','/messages',{thread:grouped.id,text:'After rejoining the group'});
+  await api('POST',`/agents/${agent.id}/done`,{});
+  assert.equal((await api('GET',`/agents/${agent.id}`)).state,'working');
+  assert.deepEqual(await members(active),[0,agent.id],'done request is not a state transition until the process finishes');
+  fs.writeFileSync(path.join(home,`release-${agent.id}`),'');
+  await finished(agent.id,'done');
+  for(const thread of [active,grouped,combined]) assert.ok(!(await members(thread)).includes(agent.id));
+  for(const thread of [done,unpinned]) assert.deepEqual(await members(thread),[agent.id]);
+  const gap=await api('POST','/messages',{thread:active.id,text:'While resting outside active membership'});
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  assert.equal(runs().filter(r=>r.id===agent.id).length,1,'live active audience never wakes a done agent');
+  const restingInbox=await api('GET',`/inbox/${agent.id}?mark=new`);
+  assert.equal(restingInbox.filter(m=>m.id===inside.id).length,1,'previously delivered messages remain inspectable after leaving');
+  assert.equal(restingInbox.find(m=>m.id===gap.id)?.outside_membership,true);
+  await api('POST','/messages',{agent:agent.id,thread:active.id,text:'Outside-filter sender does not pin itself'});
+  assert.deepEqual(await members(active),[0],'an outside-filter post does not join its sender');
+  await api('POST',`/agents/${agent.id}/close`,{});
+  await api('POST',`/agents/${agent.id}/reopen`,{});
+  assert.equal((await api('GET',`/agents/${agent.id}`)).state,'idle','outside-interval catch-up does not force a new turn on rejoin');
+  const afterRejoin=await api('POST','/messages',{thread:active.id,text:'New delivery after explicit rejoin'});
+  await until(()=>runs().filter(r=>r.id===agent.id).length===2,'explicit rejoin turn starts');
+  const rejoinRun=runs().filter(r=>r.id===agent.id)[1];
+  assert.ok(rejoinRun.membership_snapshot.threads.includes(active.id));
+  assert.match(rejoinRun.prompt,/\[acom\] Coordination:/,'rejoin receives a fresh coordination summary');
+  assert.deepEqual(await members(active),[0,agent.id]);
+  const inbox=await api('GET',`/inbox/${agent.id}?mark=new`);
+  for(const [message,outside] of [[before,true],[inside,false],[gap,true],[groupGap,true],[groupInside,false],[afterRejoin,false]]) {
+    assert.equal(inbox.find(m=>m.id===message.id)?.outside_membership,outside,`message ${message.id} records its membership interval`);
+    const detail=await api('GET',`/messages/${message.id}?agent=${agent.id}`);
+    assert.equal(detail.outside_membership,outside);
+  }
+  assert.match(cli(folder,['inbox'],{ACOM_ID:String(agent.id)}),/Before the first membership/);
+  await finished(agent.id,'done');
+
+  // Restarts must reconcile paused membership once, not create duplicate joins.
+  const held=await api('POST','/agents',{project:project.id,harness:'codex',group:'blue',task:'MEMBERSHIP_HOLD_TEST restart'});
+  await until(()=>runs().some(r=>r.id===held.id),'restart lifecycle turn starts');
+  await api('POST','/locks',{project:project.id,name:'history-lock',about:'Structured lock events'});
+  await api('POST','/locks/acquire',{agent:held.id,name:'history-lock',wait:0,ttl:30});
+  await api('POST','/locks/release',{agent:held.id,name:'history-lock'});
+  await stop(); await start();
+  assert.equal((await api('GET',`/agents/${held.id}`)).state,'paused');
+  assert.ok(!(await members(active)).includes(held.id));
+  assert.deepEqual(await members(paused),[held.id]);
+  const afterPause=(await history()).events;
+  await stop(); await start();
+  assert.deepEqual((await history()).events,afterPause,'unchanged restart does not duplicate lifecycle or membership events');
+  await api('POST',`/agents/${held.id}/resume`,{});
+  await until(()=>runs().filter(r=>r.id===held.id).length===2,'paused lifecycle turn resumes');
+  assert.deepEqual(await members(paused),[]);
+  assert.ok((await members(active)).includes(held.id));
+  fs.writeFileSync(path.join(home,`release-${held.id}`),'');
+  await finished(held.id,'done');
+
+  // Both traversal directions use exclusive, stable event cursors.
+  const all=[]; let beforeCursor;
+  for(let pageCount=0;pageCount<200;pageCount++) {
+    const page=await history(`&limit=3${beforeCursor ? `&before=${beforeCursor}` : ''}`);
+    assert.ok(Buffer.byteLength(JSON.stringify(page))<=16000);
+    assert.ok(page.events.length<=3);
+    for(const event of page.events) {
+      assert.ok(event.project===project.id || event.project===null);
+      if(all.length) assert.ok(event.id<all.at(-1).id,'backward cursor never repeats or skips ordering');
+      all.push(event);
+    }
+    if(!page.has_more) break;
+    assert.equal(page.next_before,page.events.at(-1).id);
+    beforeCursor=page.next_before;
+  }
+  assert.ok(all.length>10,'lifecycle and membership changes have structured history');
+  const ascending=[all.at(-1)]; let afterCursor=ascending[0].id;
+  for(let pageCount=0;pageCount<200;pageCount++) {
+    const page=await history(`&after=${afterCursor}&limit=4`);
+    for(const event of page.events) {
+      assert.ok(event.id>afterCursor);
+      if(ascending.length) assert.ok(event.id>ascending.at(-1).id);
+      ascending.push(event);
+    }
+    if(!page.has_more) break;
+    assert.equal(page.next_after,page.events.at(-1).id);
+    afterCursor=page.next_after;
+  }
+  assert.deepEqual(ascending.map(e=>e.id),all.map(e=>e.id).reverse(),'forward and backward history traverse the same complete event set');
+  for(const query of ['&limit=0','&limit=201','&max_bytes=511','&max_bytes=65537','&before=1&after=2']) await api('GET',`/history?project=${project.id}${query}`,null,400);
+  const selected=all.find(e=>e.agent===agent.id);
+  assert.ok(selected);
+  assert.equal((await api('GET',`/history/${selected.id}?project=${project.id}`)).id,selected.id);
+  const agentHistory=await history(`&agent=${agent.id}&limit=200`);
+  assert.ok(agentHistory.events.length>0);
+  assert.ok(agentHistory.events.every(e=>e.agent===agent.id));
+  const threadHistory=await history(`&thread=${active.id}&limit=200`);
+  assert.ok(threadHistory.events.length>0);
+  assert.ok(threadHistory.events.every(e=>e.thread===active.id));
+  const lockHistory=await history('&lock=history-lock&limit=200');
+  assert.ok(lockHistory.events.length>=2);
+  assert.ok(lockHistory.events.every(e=>e.lock==='history-lock'));
+  const kindHistory=await history(`&kind=${encodeURIComponent(selected.kind)}&limit=200`);
+  assert.ok(kindHistory.events.length>0);
+  assert.ok(kindHistory.events.every(e=>e.kind===selected.kind));
+  const stable=await history(`&agent=${agent.id}&limit=200`);
+  await api('POST',`/agents/${agent.id}/group`,{group:'blue'});
+  assert.deepEqual(await history(`&agent=${agent.id}&limit=200`),stable,'a no-op group change emits no event');
+  const longStatus='Status details '+ 'x'.repeat(4000);
+  await api('POST',`/agents/${agent.id}/status`,{text:longStatus});
+  const bounded=await history(`&agent=${agent.id}&limit=1&max_bytes=512`);
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded))<=512,'the byte budget covers the entire history response');
+  assert.equal(bounded.events.length,1,'an oversized newest event still advances the cursor');
+  assert.equal(bounded.events[0].truncated,true);
+  assert.equal(bounded.next_before,bounded.events[0].id);
+  const full=await api('GET',`/history/${bounded.events[0].id}?project=${project.id}`);
+  assert.ok(JSON.stringify(full).includes(longStatus),'single-event lookup retains unabridged detail');
+  for(const id of [agent.id,held.id]) await api('POST',`/agents/${id}/close`,{});
+  const activeMessages=(await api('GET',`/threads/${active.id}`)).messages;
+  await api('POST',`/threads/${active.id}/read`,{message:activeMessages.at(-1).id});
+  await api('POST',`/projects/${project.id}/remove`,{},409);
+  return project;
+}
 
 async function browserMessageChecks(url, api, project, agent, thread, home) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -837,7 +1040,7 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     await page.locator('#thread-form [name=title]').fill('Browser notes');
     await page.locator('#thread-form button.primary').click();
     await page.locator('#thread-membership').waitFor();
-    assert.match(await page.locator('.thread-header .meta').textContent(),/Thread #\d+/);
+    assert.match(await page.locator('.thread-header .meta').first().textContent(),/Thread #\d+/);
     assert.equal(await page.locator('#thread-membership').textContent(),'Leave thread');
     await page.locator('#thread-membership').click();
     await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread');
