@@ -22,7 +22,7 @@ Live-thread filters determine whether you're a member first: `active` means only
 
 Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
 
-While you work, `[acom]` notices may appear after tool calls: new messages, limits reached, or a lock you lost. Message notices give counts/senders, not content; read them with `acom inbox`. Turn-start and membership/lock summaries show only nonzero counts: current threads/held locks, joins/leaves since your previous summary, and pending delivered messages. Use `acom history` for event details.
+While you work, `[acom]` notices may appear after tool calls: new messages, limits reached, or a lock you lost. Message notices give counts/senders, not content; read them with `acom inbox`. `acom notices` pages retained notices; a shortened notice includes its ID for `acom notices <ID>`. Turn-start and membership/lock summaries show only nonzero counts: current threads/held locks, joins/leaves since your previous summary, and pending delivered messages. Use `acom history` for event details.
 
 ## Threads
 
@@ -33,7 +33,7 @@ A thread is a conversation with a title and members, all from your project. Any 
 - `acom thread new --title "parser work" --watch active,group:parser` creates a live thread. State choices are combined with OR, then AND with the selected groups; group-only watches default to active. Membership follows state/group changes. IDs and `user` are not watch filters; `--include-user` adds the user separately. An agent creator joins only if it matches. `--members` and `--watch` cannot be combined.
 - `acom thread add <TID> <IDs or selectors>` and `acom thread remove <TID> <IDs,user>` change static membership. Live agent membership is not manually editable. Include `done` in a live watch if its messages should wake done agents. A done-only watcher leaves when waking into working, but keeps the delivered message in its inbox; it does not become catch-up.
 - `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin; no input flag is needed.
-- `acom threads` lists threads; `acom thread read <TID>` shows one in full.
+- `acom threads` lists threads; `acom thread read <TID>` shows a bounded message page. `acom thread details <TID>` reads its metadata.
 - Reference a conversation as `thread #<TID>` so other agents can find it with `acom thread read`.
 
 To message the user, include `user` in a static thread's members, or use `--include-user` for a live thread. Creating a thread alone sends no message. For long messages:
@@ -45,6 +45,8 @@ EOF
 ```
 
 A successful send prints `sent #<message ID> to thread <TID>`. Check that receipt before claiming you sent a message.
+
+If a successful command says its response contains samples only, use `acom receipt <ID>` for the saved full result. This is a read; repeating the action is unnecessary. If the CLI warns that an action may have completed, inspect current state before retrying it.
 
 ## Your messages
 
@@ -58,7 +60,11 @@ Leaving a thread does not erase its messages or your marks; inbox bookkeeping re
 - `acom mark <IDs> in-progress|handled|new` changes marks. Leave a message `new` to come back to it later.
 - `acom read <msg ID>` shows one message.
 
-`acom history` returns bounded JSON coordination events for your agent, not the provider transcript. Use `--all-agents` for your project, or filter by `--agent <ID>`, `--thread <TID>`, `--lock <name>` or `--kind <kind>`. Control response size with `--limit` and `--max-bytes`. Page with either `--before <event ID>` or `--after <event ID>` (exclusive); follow `next_before` / `next_after` while `has_more` is true. `acom history <event ID>` reads a full event, including one returned as a `truncated` stub.
+`acom history` returns bounded JSON coordination events for your agent, not the provider transcript. Use `--all-agents` for your project, or filter by `--agent <ID>`, `--thread <TID>`, `--lock <name>` or `--kind <kind>`. Control response size with `--limit` and `--max-bytes`. Page with either `--before <event ID>` or `--after <event ID>` (exclusive); follow `next_before` / `next_after` while `has_more` is true. `acom history <event ID>` reads one event, including one returned as a `truncated` stub.
+
+List, thread and inbox reads default to 50 records and 16,000 JSON bytes; maxima are 200 records and 65,536 bytes. Follow the printed continuation command, keeping its `--through` and `--revision`. `--before` reads older IDs and `--after` newer IDs, exclusively; `--after 0` starts from the oldest. Inbox reads start with the oldest outstanding messages. A changed mutable list rejects an old revision: restart without its cursor. Receiving only one page does not mean you have seen every pending message.
+
+A `truncated` item has not delivered its full content. Read it by ID (`read`, `agent`, `thread details`, `lock read` or `history`), then follow its `--offset` and `--version` hint. Chunk responses contain `chunk`, `next_offset` and `has_more`; concatenate the chunk strings to recover the JSON record. Offsets are UTF-8 bytes, not character counts. If the version changes, discard partial content and start again at offset 0. Omitted and truncated inbox messages are not acknowledged; message marks still require explicit `acom mark`.
 
 ## Locks
 
@@ -145,6 +151,6 @@ When your task is finished, run `acom done` and then end your turn. This frees y
 
 ## Commands
 
-Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|add|remove`, `send`, `inbox`, `read`, `history`, `mark`, `locks`, `lock new|acquire|release`. Run `acom --help` for details.
+Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|details|add|remove`, `send`, `inbox`, `read`, `history`, `notices`, `receipt`, `mark`, `locks`, `lock new|read|acquire|release`. Run `acom --help` for details.
 
 User commands are for the user only: agents never run `serve`, `pause`, `pause-all`, `resume`, `resume-all`, `close`, `reopen` or `lock free`, and never use `launch --force`.

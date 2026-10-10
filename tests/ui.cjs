@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 
 const catalog = {
@@ -27,21 +28,67 @@ function settings() {
     prompts: { launch:'Launch guidance', wake:'Wake guidance', resume:'Resume guidance' },
   };
 }
+const reloadPage = async page => {
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
+};
 
 async function fixture(run) {
-  const data = { settings: settings(), agents: [], threads: [], reads: {}, agentLogs: {}, detailRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
+  const data = { settings: settings(), agents: [], threads: [], reads: {}, agentLogs: {}, detailRequests: [], getRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
   data.configs = [{ id: 1, name: 'Default', settings: settings() }, { id: 2, name: 'Mine', settings: data.settings }];
   data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
   const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
   const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > (data.reads[t.id] || 0)).length : 0;
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,16);
+  const projectRows = () => data.projects.map(p => ({...p, agents:data.agents.filter(a => a.project === p.id).length, active:data.agents.filter(a => a.project === p.id && ['working','idle'].includes(a.state)).length, unread:data.threads.filter(t => t.project === p.id).reduce((n,t) => n + unread(t),0)}));
+  const collection = (key, project) => {
+    if (key === 'projects') return projectRows();
+    if (key === 'configs') return configs();
+    if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
+    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
+    return (data[key] || []).filter(row => row.project == null || row.project === project).map((row,i) => ({id:i+1,...row}));
+  };
+  const revision = (key, project) => hash([key,['projects','configs'].includes(key)?null:project,collection(key,project)]);
+  function paged(rows, params, rev, snapshot = true) {
+    const limit = Math.min(Number(params.get('limit') || 50),data.pageLimit || 200), budget = Number(params.get('max_bytes') || 16000);
+    if (snapshot && params.has('revision') && params.get('revision') !== rev) return {error:'collection changed; restart paging',status:409};
+    if (params.get('since') === rev) return {unchanged:true,revision:rev};
+    const through = params.has('through') ? Number(params.get('through')) : Math.max(0,...rows.map(row => row.id));
+    const visible = rows.filter(row => row.id <= through), ascending = params.has('after');
+    const candidates = visible.filter(row => (!params.has('before') || row.id < Number(params.get('before'))) && (!ascending || row.id > Number(params.get('after')))).sort((a,b) => ascending ? a.id-b.id : b.id-a.id);
+    const envelope = items => ({items,has_more:items.length<candidates.length,next_before:ascending ? null : items.at(-1)?.id ?? null,next_after:ascending ? items.at(-1)?.id ?? null : null,through,revision:rev,total:visible.length});
+    const items=[];
+    for (const row of candidates.slice(0,limit)) {
+      items.push(row);
+      if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
+        items.pop();
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','user_member','unread','messages'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        break;
+      }
+    }
+    return envelope(items);
+  }
+  function bounded(value, params) {
+    const text=JSON.stringify(value), bytes=Buffer.byteLength(text), budget=Number(params.get('max_bytes') || 16000), version=hash(value);
+    if (!params.has('offset')) return bytes <= budget ? value : {id:value.id,truncated:true,total_bytes:bytes,next_offset:0,version,format:'json'};
+    const offset=Number(params.get('offset'));
+    if (params.has('version') && params.get('version') !== version) return {error:'record changed; restart reading',status:409};
+    const remaining=Buffer.from(text).subarray(offset).toString('utf8'), chars=Array.from(remaining);
+    const envelope = count => {const chunk=chars.slice(0,count).join(''),end=offset+Buffer.byteLength(chunk);return {chunk,offset,next_offset:end,total_bytes:bytes,has_more:end<bytes,version,format:'json'};};
+    let low=0,high=chars.length+1;
+    while(low+1<high) {const mid=Math.floor((low+high)/2);if(Buffer.byteLength(JSON.stringify(envelope(mid)))<=budget)low=mid;else high=mid;}
+    return envelope(low);
+  }
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = raw ? JSON.parse(raw) : null;
+    const url = new URL(req.url,'http://localhost'), pathname = url.pathname, params = url.searchParams;
+    if(req.method==='GET') data.getRequests.push(req.url);
     if (req.method !== 'GET') data.requests.push({ url: req.url, method: req.method, body });
     res.setHeader('Content-Type', 'application/json');
-    const send = value => res.end(JSON.stringify(value));
+    const send = value => {if(value?.status && value?.error)res.statusCode=value.status;res.end(JSON.stringify(value));};
     if (new URL(req.url, 'http://localhost').pathname === '/') {
       res.setHeader('Content-Type', 'text/html');
       return res.end(fs.readFileSync(path.join(__dirname, '../src/ui.html')));
@@ -50,13 +97,36 @@ async function fixture(run) {
       const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
       const project = data.projects.find(p => p.id === id) || data.projects[0] || null;
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
-      return send({ ...data, projects: data.projects.map(p => ({ ...p, unread: data.threads.filter(t => t.project === p.id).reduce((n, t) => n + unread(t), 0) })), configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length, unread: unread(t) })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: data.locks || [], activity: data.activity || [], limits: { usage: data.usage || [], checks:data.checks || [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
+      const revisions = Object.fromEntries(['projects','configs','agents','threads','locks','activity'].map(key => [key,revision(key,project?.id)]));
+      revisions.settings=hash([data.projects,configs()]);
+      const rev=hash([revisions,data.usage,data.checks]);
+      if(params.get('since')===rev) return send({unchanged:true,revision:rev});
+      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
     }
+    if(req.method==='GET' && pathname==='/catalog') return send(bounded(catalog,params));
+    if(req.method==='GET' && pathname==='/settings') {
+      const id=Number(params.get('project')),project=data.projects.find(p=>p.id===id);
+      if(data.delays?.[id])await new Promise(resolve=>setTimeout(resolve,data.delays[id]));
+      return send(bounded(effective(project),params));
+    }
+    if(req.method==='GET' && /^\/(projects|configs|agents|threads|locks|activity)$/.test(pathname)) {
+      const key=pathname.slice(1),project=Number(params.get('project')) || data.projects[0]?.id;
+      return send(paged(collection(key,project),params,revision(key,project),key!=='activity'));
+    }
+    if(req.method==='GET' && /^\/(projects|configs|locks|activity)\/\d+$/.test(pathname)) {
+      const [key,id]=pathname.slice(1).split('/'),project=Number(params.get('project')) || data.projects[0]?.id;
+      return send(bounded(collection(key,project).find(row=>row.id===Number(id)),params));
+    }
+    if(req.method==='GET' && /^\/receipts\/\d+$/.test(pathname))return send(bounded(data.receipts[Number(pathname.split('/')[2])],params));
     if(req.url.startsWith('/folders')) {
       if(req.method==='GET') {
         const p=new URL(req.url,'http://localhost').searchParams.get('path') || '/home/example';
         if(!data.folders[p]) {res.statusCode=400;return send({error:'Cannot open folder'});}
-        return send(data.folders[p]);
+        const folder=data.folders[p], rev=hash(folder);
+        if(params.has('revision') && params.get('revision')!==rev)return send({status:409,error:'folder listing changed'});
+        const key=e=>`${e.directory?'d':'f'}:${e.name}`,all=[...folder.entries].sort((a,b)=>key(a).localeCompare(key(b))),candidates=all.filter(e=>!params.has('after') || key(e)>params.get('after'));
+        const entries=candidates.slice(0,Math.min(Number(params.get('limit') || 50),data.pageLimit || 200));
+        return send({...folder,entries,has_more:entries.length<candidates.length,next_after:entries.length?key(entries.at(-1)):null,revision:rev,total:all.length});
       }
       if(!body.name || body.name.includes('/') || body.name==='..') {res.statusCode=400;return send({error:'Give a folder name, not a path'});}
       const p=body.parent+'/'+body.name;
@@ -98,7 +168,7 @@ async function fixture(run) {
     }
     if (req.url === '/agents') {
       if (data.hardLimit && !body.force) { res.statusCode = 409; return send({ error: 'hard limit reached: confirm to continue' }); }
-      return send({ id: 1, warnings: [] });
+      return send(data.launchResult || { id: 1, warnings: [] });
     }
     if (req.url === '/agent-config') {
       if (data.agentConfigError && !body.ack_crashes) {
@@ -115,10 +185,34 @@ async function fixture(run) {
       Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'working',pause_reason:null,problem:null});
       return send({warnings:[]});
     }
-    if (/^\/agents\/\d+(\/log\?lines=100)?$/.test(req.url)) {
-      const id = Number(req.url.split('/')[2]);
+    if (/^\/agents\/\d+\/pause$/.test(req.url)) {
+      Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'paused'});
+      return send({});
+    }
+    if (req.url === '/locks/free') {
+      const lock=(data.locks || []).find(lock=>lock.project===body.project&&lock.name===body.name);
+      if(body.expected_holder!=null && (!lock || lock.holder!==body.expected_holder || !lock.frozen || lock.holder_state!=='paused')) return send({status:409,error:'Frozen lock holder changed; inspect current state'});
+      if(lock) Object.assign(lock,{holder:null,frozen:false});
+      return send({});
+    }
+    if (req.method==='GET' && /^\/agents\/\d+(\/log)?$/.test(pathname)) {
+      const id = Number(pathname.split('/')[2]);
       data.detailRequests.push(req.url);
-      const value = req.url.includes('/log') ? { lines: [...(data.agentLogs[id] || [])] } : { ...data.agents.find(a => a.id === id) };
+      let value;
+      if(pathname.endsWith('/log')) {
+        const text=(data.agentLogs[id] || []).join('\n'), raw=Buffer.from(text), total=raw.length, version=data.logVersions?.[id] || `log:${id}`,rev=hash([version,text]);
+        if(params.has('version') && params.get('version')!==version)return send({status:409,error:'log changed'});
+        if(Number(params.get('after'))>total)return send({status:409,error:'log truncated'});
+        if(params.get('since')===rev && (!params.has('after') || Number(params.get('after'))===total))return send({unchanged:true,revision:rev,version,next_after:total,total_bytes:total});
+        const ceiling=params.has('through')?Math.min(total,Number(params.get('through'))):total;
+        let start=params.has('after')?Number(params.get('after')):0,end=params.has('before')?Number(params.get('before')):ceiling;
+        if(!params.has('after') && !params.has('before'))start=total-Buffer.byteLength(text.split('\n').slice(-Number(params.get('lines') || 100)).join('\n'));
+        const budget=Number(params.get('max_bytes') || 16000)-400;
+        if(params.has('after'))end=Math.min(ceiling,start+budget);else start=Math.max(start,end-budget);
+        while(start<end && (raw[start]&0xc0)===0x80)start++;
+        while(end>start && end<total && (raw[end]&0xc0)===0x80)end--;
+        value={text:raw.subarray(start,end).toString('utf8'),start,end,total_bytes:ceiling,next_before:start,next_after:end,has_more:params.has('after')?end<ceiling:start>0,eof:end===ceiling,version,revision:rev,start_partial:false,end_partial:false};
+      } else value=bounded({...data.agents.find(a=>a.id===id)},params);
       if (data.detailDelay) await new Promise(resolve => setTimeout(resolve, data.detailDelay));
       if (data.detailFailure) { res.statusCode = 503; return send({ error: 'Offline' }); }
       return send(value);
@@ -129,7 +223,16 @@ async function fixture(run) {
       return send({ id: t.id });
     }
     if (req.url.startsWith('/threads/')) {
-      const t=data.threads.find(t=>t.id===Number(req.url.split('/')[2]));
+      const t=data.threads.find(t=>t.id===Number(pathname.split('/')[2]));
+      if(req.method==='GET') {
+        const metadata={...t,messages:undefined,last_read:data.reads[t.id] || 0,unread:unread(t),latest_message:Math.max(0,...t.messages.map(m=>m.id)),first_unread:unread(t)>0?t.messages.find(m=>m.sender!==0&&!m.outside_membership&&m.id>(data.reads[t.id] || 0)).id:null};
+        if(pathname.endsWith('/metadata'))return send(bounded(metadata,params));
+        const p=new URLSearchParams(params),first=t.messages.find(m=>m.sender!==0 && !m.outside_membership && m.id>(data.reads[t.id] || 0)),catchup=!p.has('before')&&!p.has('after')&&unread(t)>0;
+        if(catchup)p.set('after',first.id-1);
+        const messages=paged(t.messages,p,hash([t.messages,data.reads[t.id]]),false);
+        if(pathname.endsWith('/messages'))return send({...messages,catchup});
+        return send(bounded({...metadata,messages,catchup},params));
+      }
       if(req.url.endsWith('/read')) {
         if(data.readDelay) await new Promise(resolve => setTimeout(resolve, data.readDelay));
         if(data.readFailure) {res.statusCode=503;return send({error:'Offline'});}
@@ -148,6 +251,7 @@ async function fixture(run) {
       t.messages.push({ id: t.messages.length + 1, sender: 0, at: Date.now() / 1000, text: body.text });
       return send({});
     }
+    if(req.method==='GET' && /^\/messages\/\d+$/.test(pathname))return send(bounded(data.threads.flatMap(t=>t.messages).find(m=>m.id===Number(pathname.split('/')[2])),params));
     res.statusCode = 404; send({ error: 'not found' });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -242,7 +346,7 @@ test('model/effort selections and custom defaults persist; polling preserves dra
   await saveSettings(page);
   assert.equal(data.settings.harnesses.codex.model, 'gpt-future');
   assert.ok(data.settings.harnesses.codex.models.includes('gpt-future'));
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page="settings"]').click();
   await root.locator('[name=model] option[value="gpt-future"]').waitFor({ state: 'attached' });
   assert.equal(await root.locator('[name=model]').inputValue(), 'gpt-future');
@@ -265,7 +369,7 @@ test('custom launch uses the full ID without mutating settings', async () => fix
 
 test('project switching isolates threads; launch can target a different project', async () => fixture(async (page, data) => {
   data.threads.push({ id: 1, project: 1, title: 'First project', members: [], messages: [] });
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page="threads"]').click();
   await page.locator('[data-thread-filter=all]').click();
   await page.locator('[data-thread="1"]').click();
@@ -283,14 +387,14 @@ test('project switching isolates threads; launch can target a different project'
   await page.locator('#launch-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#launch-dialog').open);
   assert.equal(data.requests.at(-1).body.project, 1);
-  await page.reload();
+  await reloadPage(page);
   await page.waitForFunction(() => document.querySelector('#project-select').value === '2');
   assert.equal(await page.locator('#project-path').textContent(), '/projects/other');
 }));
 
 test('empty project list prompts for a folder; add and remove never delete files', async () => fixture(async (page, data) => {
   data.projects = [];
-  await page.reload();
+  await reloadPage(page);
   await page.waitForFunction(() => document.querySelector('#project-select').disabled);
   await openLaunch(page);
   assert.equal(await page.locator('#project-dialog').isVisible(), true);
@@ -322,7 +426,7 @@ test('launch effort choices follow the selected model capabilities', async () =>
 test('settings preserve quoted argument boundaries and reject unclosed quotes', async () => fixture(async (page, data) => {
   const flags = ['--allowedTools', 'Bash(cargo *)', '--config', 'key="quoted"', 'back\\slash'];
   data.settings.harnesses.claude.flags = flags;
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page="settings"]').click();
   const input = page.locator('[data-harness=claude] [name=flags]');
   await input.waitFor();
@@ -353,7 +457,7 @@ test('project and model strings are text, not injected markup', async () => fixt
   const id = 'x"><img/src=x/onerror=window.pwned=1>';
   data.settings.harnesses.codex.models.push(id);
   data.projects[0].name = '<img src=x onerror=window.pwned=1>';
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page="settings"]').click();
   const root = page.locator('[data-harness=codex]');
   await root.locator('.model-picker summary').click();
@@ -369,7 +473,7 @@ test('replacement, limit and crash reasons remain visible with matching controls
     { id: 2, name: 'Limit agent', project: 1, state: 'paused', pause_reason: 'limit', problem: 'Usage limit reached' },
     { id: 3, name: 'Crash agent', project: 1, state: 'crashed', problem: 'Stream disconnected' },
   ];
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-agent="1"]').waitFor();
   assert.equal(await page.locator('[data-agent="1"] .problem').textContent(), 'Previous crash: Prior stream failure <example>');
   assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
@@ -381,7 +485,7 @@ test('replacement, limit and crash reasons remain visible with matching controls
 test('project identity and settings fit a narrow screen', async () => fixture(async (page, data) => {
   data.projects[0].path = '/projects/' + 'long-folder-name-'.repeat(10);
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page=settings]').click();
   await page.locator('[data-harness=codex]').waitFor();
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
@@ -405,7 +509,7 @@ test('shared edits name affected projects; Custom starts from Default and stays 
   assert.equal(data.projects[1].config, null);
   assert.equal(data.projects[1].custom.limits.active.hard, 2);
   assert.equal(data.settings.limits.active.hard, 10);
-  await page.reload(); await page.locator('[data-page=settings]').click();
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
   await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'custom');
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '2');
   await page.locator('#project-select').selectOption('1');
@@ -544,7 +648,7 @@ test('Default is read-only, copied settings are editable, and busy restoration p
   data.settings.limits.active.hard = 9;
   data.writeDelay = 250;
   const originalDefault = structuredClone(data.configs[0].settings);
-  await page.reload(); await page.locator('[data-page=settings]').click();
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
   await page.locator('#config-select').selectOption('1');
   assert.match(await page.locator('#config-scope').textContent(), /Default is read-only.*Selection is not applied yet/);
   assert.equal(await page.locator('#config-select').isEnabled(), true);
@@ -594,7 +698,7 @@ test('launch loads the target project defaults and ignores stale target response
 }));
 
 test('without projects Default is read-only while Mine and copied configs remain editable', async () => fixture(async (page, data) => {
-  data.projects = []; await page.reload();
+  data.projects = []; await reloadPage(page);
   await page.locator('[data-page=settings]').click();
   assert.equal(await page.locator('[data-limit=active] [name=hard]').isDisabled(), true);
   assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
@@ -661,7 +765,7 @@ test('folder browsing starts at home, navigates, creates and chooses a new folde
 
 test('thread member picker is searchable and supports active/all selections without typing IDs',async()=>fixture(async(page,data)=> {
   data.agents=[{id:1,project:1,name:'Reviewer',state:'working',harness:'codex',model:'gpt-6-luna'}, {id:2,project:1,name:'Writer',state:'paused',harness:'claude',model:'claude-sonnet-5-5'}];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-form [name=title]').fill('Easy members');
   await page.locator('[data-member-pick=active]').click();
@@ -679,7 +783,7 @@ test('thread member picker is searchable and supports active/all selections with
 test('thread filters distinguish participation; joining, leaving and adding members work',async()=>fixture(async(page,data)=> {
   data.agents=[{id:1,project:1,name:'One',state:'idle'},{id:2,project:1,name:'Two',state:'paused'}];
   data.threads=[{id:1,project:1,title:'Mine',members:[0,1],messages:[]},{id:2,project:1,title:'Agents talking',members:[1],messages:[]}];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('[data-thread]').count(),1);
   await page.locator('[data-thread-filter=all]').click();
   assert.equal(await page.locator('[data-thread]').count(),2);
@@ -753,12 +857,13 @@ test('live threads expose escaped membership history and mark outside-membership
     watch:['working','idle','group:review'],events_more:true,
     events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'user',details:{reason:'group <review> matched'}}],
   })];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.evaluate(() => { document.hasFocus = () => false; });
   await page.locator('[data-thread="1"]').click();
   await page.locator('#thread-history').waitFor();
   assert.equal(await page.locator('#add-thread-members').isHidden(), true);
   assert.equal(await page.locator('#thread-membership').textContent(), 'Leave thread');
+  await page.locator('#thread-older').click();
   assert.equal(await page.locator('[data-message="1"] .pill').textContent(), 'Outside your membership');
   assert.match(await page.locator('[data-message="2"] .message-head').textContent(), /Membership at send time unknown/);
   assert.equal(await page.locator('[data-message="2"] .pill').count(), 0);
@@ -788,7 +893,7 @@ test('prompt guidance is literal and polling/recovery settings persist in config
   await page.locator('[name=prompt_resume]').fill(text);
   await page.locator('[name=usage_poll_secs]').fill('45');
   await page.locator('[name=auto_resume]').uncheck();
-  await saveSettings(page); await page.reload(); await page.locator('[data-page=settings]').click();
+  await saveSettings(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
   await page.locator('[data-prompt-editor] summary').click();
   assert.equal(await page.locator('[name=prompt_resume]').inputValue(),text);
   assert.equal(data.settings.prompts.resume,text);
@@ -800,7 +905,7 @@ test('usage details show expired readings as unconfirmed and offer a status chec
   data.settings.limits.usage={codex:{soft:null,hard:null}};
   data.usage=[{provider:'codex',win:'primary',used_pct:100,resets_at:Math.floor(Date.now()/1000)-60}];
   data.checks=[{provider:'codex',checked_at:1,next_check:Math.floor(Date.now()/1000)+30,error:'Provider unavailable'}];
-  await page.reload(); await page.locator('[data-usage=codex]').click();
+  await reloadPage(page); await page.locator('[data-usage=codex]').click();
   assert.match(await page.locator('#usage-details').textContent(),/100%.*awaiting confirmation/s);
   assert.match(await page.locator('#usage-details').textContent(),/Provider unavailable/);
   await page.locator('[data-check-usage=codex]').click();
@@ -810,7 +915,7 @@ test('usage details show expired readings as unconfirmed and offer a status chec
 
 test('a previously rejected model has an explicit warning and no silent replacement',async()=>fixture(async(page,data)=> {
   data.agents=[{id:1,project:1,state:'crashed',harness:'codex',model:'gpt-6.1-sol',problem:'Model not supported with this account'}];
-  await page.reload(); await openLaunch(page); await page.locator('#launch-harness').selectOption('codex');
+  await reloadPage(page); await openLaunch(page); await page.locator('#launch-harness').selectOption('codex');
   assert.equal(await page.locator('#launch-model').inputValue(),'gpt-6.1-sol');
   assert.match(await page.locator('#launch-model-warning').textContent(),/previous launch rejected/);
   await page.locator('#launch-model').selectOption('gpt-6-luna');
@@ -820,9 +925,10 @@ test('a previously rejected model has an explicit warning and no silent replacem
 
 test('model errors offer an explicit alternative launch while retaining the original agent',async()=>fixture(async(page,data)=> {
   data.agents=[{id:1,project:1,name:'Unavailable',state:'crashed',harness:'codex',model:'gpt-6.1-sol',task:'Original task',problem:'Model not supported with this account'}];
-  await page.reload();
+  await reloadPage(page);
   assert.equal(await page.locator('[data-action=resume]').textContent(),'Retry same model');
   await page.locator('[data-action=another-model]').click();
+  await page.waitForFunction(() => document.querySelector('#launch-form [name=task]').value === 'Original task');
   assert.equal(await page.locator('#launch-form [name=task]').inputValue(),'Original task');
   assert.equal(await page.locator('#launch-harness').inputValue(),'codex');
   await page.locator('#launch-model').selectOption('gpt-6-luna');
@@ -838,13 +944,14 @@ test('generic crashed turns offer same-model retry and explicit alternative with
     {id:2,project:1,name:'Quota pause',state:'paused',pause_reason:'limit',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
     {id:3,project:1,name:'Manual pause',state:'paused',pause_reason:'user',harness:'claude',model:'claude-opus-5-5',effort:'medium'},
   ];
-  await page.reload();
+  await reloadPage(page);
   const crash = page.locator('[data-agent="1"]');
   assert.equal(await crash.locator('[data-action=resume]').textContent(), 'Retry same model');
   assert.equal(await crash.locator('[data-action=another-model]').textContent(), 'Launch another model…');
   assert.equal(await page.locator('[data-agent="2"] [data-action=resume]').textContent(), 'Resume');
   assert.equal(await page.locator('[data-agent="3"] [data-action=resume]').textContent(), 'Resume');
   await crash.locator('[data-action=another-model]').click();
+  await page.waitForFunction(() => document.querySelector('#launch-form [name=task]').value === 'Continue the original task');
   assert.equal(await page.locator('#launch-harness').inputValue(), 'codex');
   assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'Continue the original task');
   assert.equal(data.requests.length, 0, 'opening an alternative does not relaunch or rewrite the original');
@@ -857,7 +964,7 @@ test('generic crashed turns offer same-model retry and explicit alternative with
 
 test('cancelling member selection preserves a draft only within its project',async()=>fixture(async(page,data)=> {
   data.agents=[{id:1,project:1,name:'First',state:'working'},{id:2,project:2,name:'Second',state:'idle'}];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('[name=member][value="1"]').check();
   await page.locator('[name=include_user]').uncheck();
@@ -882,7 +989,7 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
     conversation([incoming(3)], { id: 2, project: 2 }),
     conversation([incoming(4)], { id: 3, members: [1] }),
   ];
-  await page.reload();
+  await reloadPage(page);
   await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '2 unread');
   await page.setViewportSize({width:375,height:800});
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
@@ -895,7 +1002,7 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
   await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '1 unread');
   assert.equal(data.reads[1], 2);
   assert.equal(await page.locator('.thread-row').count(), 0);
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('.thread-row').count(), 0);
   assert.equal(data.reads[2], undefined);
@@ -908,7 +1015,7 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
 
 test('closing a thread keeps membership and read history while future messages stay unread until reopened', async () => fixture(async (page, data) => {
   data.threads = [conversation([incoming(1)])];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
   assert.equal(data.reads[1], 1);
@@ -935,7 +1042,7 @@ test('closing a thread keeps membership and read history while future messages s
 
 test('X dismissal preserves separate thread and project drafts across switching and reload without confirmation', async () => fixture(async (page, data) => {
   data.threads = [conversation([]), conversation([], {id:2,title:'Other thread'}), conversation([], {id:3,project:2,title:'Other project'})];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Keep my draft');
   let confirmations = 0;
@@ -952,7 +1059,7 @@ test('X dismissal preserves separate thread and project drafts across switching 
   await page.locator('#project-select').selectOption('2');
   await page.locator('[data-thread="3"]').click();
   await page.locator('#message-form textarea').fill('Other project draft');
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
   await page.locator('[data-thread="3"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Other project draft');
@@ -969,18 +1076,18 @@ test('X dismissal preserves separate thread and project drafts across switching 
 
 test('failed sends keep persistent drafts and successful sends clear only the submitted draft', async () => fixture(async (page, data) => {
   data.threads = [conversation([])]; data.messageFailure = true;
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Unsent message');
   await page.locator('#message-form button').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Message send failed');
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Unsent message');
   data.messageFailure = false;
   await page.locator('#message-form button').click();
   await page.waitForFunction(() => document.querySelector('#message-form textarea').value === '');
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), '');
   assert.equal(data.threads[0].messages[0].text, 'Unsent message');
@@ -988,7 +1095,7 @@ test('failed sends keep persistent drafts and successful sends clear only the su
 
 test('a delayed successful send preserves newer text even when the pane is closed and reopened', async () => fixture(async (page, data) => {
   data.threads = [conversation([])]; data.messageDelay = 600;
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Submitted snapshot');
   const response = page.waitForResponse(r => new URL(r.url()).pathname === '/messages');
@@ -998,7 +1105,7 @@ test('a delayed successful send preserves newer text even when the pane is close
   await response;
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Newer draft');
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Newer draft');
   assert.deepEqual(data.threads[0].messages.map(m => m.text), ['Submitted snapshot']);
@@ -1014,7 +1121,7 @@ test('a delayed successful send preserves newer text even when the pane is close
 test('unavailable browser storage keeps drafts in-tab and reports the persistence limit without breaking the UI', async () => fixture(async (page, data) => {
   data.threads = [conversation([])];
   await page.addInitScript(() => Object.defineProperty(window, 'localStorage', {get() {throw new Error('Storage blocked');}}));
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('In-tab draft');
   assert.match(await page.locator('#toast').textContent(), /browser storage is unavailable/);
@@ -1027,20 +1134,21 @@ test('unavailable browser storage keeps drafts in-tab and reports the persistenc
 
 test('a pending thread fetch cannot reopen or auto-read a thread after Close', async () => fixture(async (page, data) => {
   data.threads = [conversation([incoming(1)])];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
   let release;
   const gate = new Promise(resolve => { release = resolve; });
-  await page.route('**/threads/1', async route => { await gate; await route.continue(); });
+  const threadPattern = /\/threads\/1\/messages(?:\?|$)/;
+  await page.route(threadPattern, async route => { await gate; await route.continue(); });
   data.threads[0].messages.push(incoming(2, 'While fetch was pending'));
-  const pending = page.waitForRequest(r => new URL(r.url()).pathname === '/threads/1');
+  const pending = page.waitForRequest(r => new URL(r.url()).pathname === '/threads/1/messages');
   await page.evaluate(() => { window.pendingThread = refreshThread(); });
   await pending;
   await page.locator('#close-thread').click();
   release();
   await page.evaluate(async () => { await window.pendingThread; });
-  await page.unroute('**/threads/1');
+  await page.unroute(threadPattern);
   await page.evaluate(() => refresh());
   assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
   assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
@@ -1051,7 +1159,7 @@ test('a pending thread fetch cannot reopen or auto-read a thread after Close', a
 
 test('background, other pages and dialogs do not clear unread messages', async () => fixture(async (page, data) => {
   data.threads = [conversation([])];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Keep my draft');
   await page.evaluate(() => { document.hasFocus = () => false; });
@@ -1086,7 +1194,7 @@ test('background, other pages and dialogs do not clear unread messages', async (
 test('scrolling history leaves new messages unread until jumping to latest', async () => fixture(async (page, data) => {
   data.threads = [conversation(Array.from({ length: 30 }, (_, i) => incoming(i + 1, 'History\n'.repeat(4))))];
   data.reads[1] = 30;
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Unsent reply');
   await page.locator('#messages').evaluate(el => { el.scrollTop = 100; });
@@ -1106,7 +1214,7 @@ test('scrolling history leaves new messages unread until jumping to latest', asy
 
 test('a failed read acknowledgement keeps badges and retries without losing the draft', async () => fixture(async (page, data) => {
   data.threads = [conversation([incoming(1)])]; data.readFailure = true;
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#thread-read-error').waitFor();
   assert.equal(data.reads[1], undefined);
@@ -1120,7 +1228,7 @@ test('a failed read acknowledgement keeps badges and retries without losing the 
 
 test('a delayed read acknowledgement cannot clear a reply absent from its snapshot', async () => fixture(async (page, data) => {
   data.threads = [conversation([incoming(1)])]; data.readDelay = 800;
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   const ack = page.waitForRequest(r => r.url().endsWith('/read'));
   await page.locator('[data-thread="1"]').click(); await ack;
   await page.evaluate(() => { document.hasFocus = () => false; });
@@ -1139,7 +1247,7 @@ test('a delayed read acknowledgement cannot clear a reply absent from its snapsh
 test('open details update status and logs, preserve history scroll and recover from errors', async () => fixture(async (page, data) => {
   data.agents = [{ id: 1, project: 1, name: 'Worker', state: 'working', status: 'Starting', locks: [], lost_locks: [] }];
   data.agentLogs[1] = Array.from({ length: 80 }, (_, i) => `Line ${i}`);
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
   assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight < 20), true);
   await page.locator('#agent-log').evaluate(el => { el.scrollTop = 35; });
@@ -1167,7 +1275,7 @@ test('open details update status and logs, preserve history scroll and recover f
 test('closing pending details and opening another agent ignores old responses', async () => fixture(async (page, data) => {
   data.agents = [1, 2].map(id => ({ id, project: 1, name: `Worker ${id}`, state: 'working' }));
   data.agentLogs = { 1: ['Old log'], 2: ['New log'] };
-  await page.reload(); data.detailDelay = 1000;
+  await reloadPage(page); data.detailDelay = 1000;
   await page.locator('[data-action=details][data-id="1"]').click();
   await page.locator('#agent-dialog button[value=cancel]').click();
   data.detailDelay = 0;
@@ -1188,7 +1296,7 @@ test('closing pending details and opening another agent ignores old responses', 
 test('Claude windows display and save independent thresholds, including older saved configs', async () => fixture(async (page, data) => {
   data.settings.limits.usage.claude = {soft:50,hard:90};
   data.usage = [{provider:'claude',win:'five_hour',used_pct:60,resets_at:Date.now()/1000+3600},{provider:'claude',win:'seven_day',used_pct:95,resets_at:Date.now()/1000+86400}];
-  await page.reload();
+  await reloadPage(page);
   assert.match(await page.locator('[data-window=five_hour] .meter-label').textContent(), /5-hour.*60%/);
   assert.match(await page.locator('[data-window=seven_day] .meter-label').textContent(), /Weekly.*95%/);
   assert.equal(await page.locator('[data-window=five_hour] .fill.warn').count(), 1);
@@ -1205,7 +1313,7 @@ test('Claude windows display and save independent thresholds, including older sa
   assert.deepEqual(data.settings.limits.usage.claude_five_hour, {soft:20,hard:80});
   assert.deepEqual(data.settings.limits.usage.claude_seven_day, {soft:75,hard:85});
   assert.equal(data.settings.limits.usage.claude, undefined);
-  await page.reload(); await page.locator('[data-page=settings]').click();
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
   assert.equal(await weekly.locator('[name=hard]').inputValue(), '85');
   data.usage = [data.usage[0]];
   await page.evaluate(() => refresh());
@@ -1216,7 +1324,7 @@ test('Claude windows display and save independent thresholds, including older sa
 
 test('maximum lock TTL is required, positive and persists; older settings get a finite default', async () => fixture(async (page, data) => {
   delete data.settings.max_lock_ttl_secs;
-  await page.reload();
+  await reloadPage(page);
   await page.locator('[data-page=settings]').click();
   const ttl = page.locator('[name=max_lock_ttl_secs]');
   assert.equal(await ttl.inputValue(), '900');
@@ -1232,7 +1340,7 @@ test('maximum lock TTL is required, positive and persists; older settings get a 
   assert.equal(await ttl.inputValue(), '120');
   await saveSettings(page);
   assert.equal(data.settings.max_lock_ttl_secs, 120);
-  await page.reload(); await page.locator('[data-page=settings]').click();
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
   assert.equal(await ttl.inputValue(), '120');
 }));
 
@@ -1263,7 +1371,7 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   assert.equal(data.settings.allow_agent_model_change, true);
   assert.equal(data.settings.allow_agent_effort_change, false);
   assert.deepEqual(data.settings.crash_retries, {'claude-opus-5-5':{harness:'codex',model:'gpt-6-luna',same_model_retries:2}});
-  await page.reload(); await page.locator('[data-page=settings]').click();
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'gpt-6-luna');
   assert.equal(await rule.locator('[name=retry_effort]').count(), 0);
   assert.equal(await rule.locator('[name=same_model_retries]').inputValue(), '2');
@@ -1363,7 +1471,7 @@ test('retry rules support custom IDs and reject duplicate source models without 
   await harness.locator('[data-add-model]').click();
   await saveSettings(page);
   assert.equal(data.settings.crash_retries['future-source'].model, 'future-target');
-  await page.reload(); await page.locator('[data-page=settings]').click();
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
   assert.equal(await rule.locator('[name=retry_source]').inputValue(), 'future-source');
   assert.equal(await rule.locator('[name=retry_model]').inputValue(), 'future-target');
   await page.locator('#add-retry-rule').click();
@@ -1379,7 +1487,7 @@ test('retry rules support custom IDs and reject duplicate source models without 
 test('Fable weekly usage has an independent meter and no inherited legacy threshold', async () => fixture(async (page, data) => {
   data.settings.limits.usage.claude = {soft:50,hard:90};
   data.usage = [{provider:'claude',win:'seven_day_fable',used_pct:80,resets_at:Date.now()/1000+86400}];
-  await page.reload();
+  await reloadPage(page);
   assert.match(await page.locator('[data-window=seven_day_fable] .meter-label').textContent(), /Fable weekly.*80%/);
   assert.equal(await page.locator('[data-window=seven_day_fable] .fill.warn').count(), 0);
   await page.locator('[data-window=seven_day_fable]').click();
@@ -1400,7 +1508,7 @@ test('Fable weekly usage has an independent meter and no inherited legacy thresh
 
 test('agent details preserve model drafts while polling and save provider-fixed next-turn changes', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'ultra'}];
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
   assert.match(await config.textContent(), /current turn is not interrupted/);
@@ -1424,7 +1532,7 @@ test('agent details preserve model drafts while polling and save provider-fixed 
 
 test('details distinguish the actual running configuration from next-turn choices without clearing selections', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6-luna',effort:'max',running_configuration:{model:'gpt-6.1-sol',effort:'ultra'}}];
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const details = page.locator('#agent-details');
   const current = details.locator('dt[data-key=running_configuration] + dd');
   await current.waitFor();
@@ -1455,7 +1563,7 @@ test('details distinguish the actual running configuration from next-turn choice
 
 test('continuation is an explicit working-agent opt-in and its pending instruction and blocked reason are visible safely', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
   assert.equal(await config.locator('[name=agent_continue]').isChecked(), false);
@@ -1498,7 +1606,7 @@ test('continuation is an explicit working-agent opt-in and its pending instructi
 test('a delayed configuration save keeps newer continuation drafts and rejects continuation after the turn stops', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   data.agentConfigDelay = 500;
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
   await config.locator('[name=agent_continue]').check();
@@ -1523,7 +1631,7 @@ test('a delayed configuration save keeps newer continuation drafts and rejects c
 test('own-history crash warnings require explicit confirmation before a single acknowledged configure retry', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   data.agentConfigError = {status:409,message:'Previous crashes for gpt-6-luna in your own agent history/replacement lineage: agent 1, history /history/1.jsonl. Review before acknowledging.'};
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
   await config.locator('[name=agent_model]').selectOption('gpt-6-luna');
@@ -1550,7 +1658,7 @@ test('own-history crash warnings require explicit confirmation before a single a
 
 test('configure errors outside the specific HTTP409 prior-crash warning never prompt or retry', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
   let confirmations = 0;
@@ -1568,7 +1676,7 @@ test('configure errors outside the specific HTTP409 prior-crash warning never pr
 
 test('agent details expose pending, blocked and replacement retry status safely', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'crashed',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null,same_model_attempts:1,effort:'medium',eligible_at:Date.now()/1000+120}}];
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   const details = page.locator('#agent-details');
   await details.locator('dt[data-key=retry]').waitFor();
   assert.match(await details.textContent(), /crash recovery.*Same-model retries: 1.*effort medium.*Pending; requires a configured rule/);
@@ -1598,7 +1706,7 @@ test('details show queued cross-provider replacements and link the explicit succ
     {id:2,project:1,name:'Old recovery target',state:'closed',harness:'claude',model:'claude-haiku-5-5',effort:'medium'},
     {id:3,project:1,name:'Successor',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
   ];
-  await page.reload(); await page.locator('[data-agent="1"] [data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-agent="1"] [data-action=details]').click();
   const details = page.locator('#agent-details');
   await details.locator('dt[data-key=replacement_request]').waitFor();
   assert.match(await details.textContent(), /pending replacement.*claude \/ claude-sonnet-5-5.*current turn succeeds/s);
@@ -1627,7 +1735,7 @@ test('replaced agents expose history and replacement details without restart or 
     {id:2,project:1,name:'Replacement',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
   ];
   data.agentLogs[1] = ['Retained predecessor history'];
-  await page.reload();
+  await reloadPage(page);
   assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
   await page.locator('[data-agent="1"] [data-action=details]').click();
   await page.locator('#agent-details dt[data-key=replacement]').waitFor();
@@ -1650,7 +1758,7 @@ test('details polling preserves selected task text and defers selected log updat
   const task = `Don't replace this "task" <text> while counters change.`;
   data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',task,fresh_in:1}];
   data.agentLogs[1] = Array.from({length:80}, (_,i) => `Line ${i}`);
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.locator('#agent-config [name=agent_model]').selectOption('gpt-6-luna');
   await page.locator('#agent-config [name=agent_effort]').selectOption('max');
   await page.evaluate(() => {
@@ -1695,7 +1803,7 @@ test('polling preserves project-path selection and unchanged overview nodes whil
   data.agents = [{id:1,project:1,name:'Worker',state:'working',task:'Review "quotes" & escapes',status:'Starting'}];
   data.locks = [{name:'src/<file>',about:'Edit "quotes"',holder:1,holder_name:'Worker',acquired_at:1}];
   data.activity = [{at:1,actor:'user',what:'Initial activity'}];
-  await page.reload();
+  await reloadPage(page);
   const selected = await selectText(page, '#project-path');
   await page.evaluate(() => {
     window.overviewNodes = ['#project-path','#agents .agent','#locks tbody tr','#activity .event','#usage .meter'].map(selector=>document.querySelector(selector));
@@ -1730,11 +1838,11 @@ test('selected agent, lock and activity regions defer only their changes and flu
   data.agents = [{id:1,project:1,name:'Worker',state:'working',status:'Initial status'}];
   data.locks = [{name:'src/main',about:'Initial purpose',holder:1,acquired_at:1}];
   data.activity = [{at:1,actor:'user',what:'Initial activity'}];
-  await page.reload();
+  await reloadPage(page);
   const cases = [
     {selector:'#agents .agent .meta[title]',root:'#agents',change:()=>{data.agents[0].status='Changed status';},latest:()=>{data.agents[0].status='Latest status';},expected:'Latest status'},
     {selector:'#locks tbody tr td:nth-child(2)',root:'#locks',change:()=>{data.locks[0].about='Changed purpose';},latest:()=>{data.locks[0].about='Latest purpose';},expected:'Latest purpose'},
-    {selector:'#activity .event > div',root:'#activity',change:()=>{data.activity[0].what='Changed activity';},latest:()=>{data.activity[0].what='Latest activity';},expected:'Latest activity'},
+    {selector:'#activity .event > div',root:'#activity',change:()=>{data.activity.push({at:40,actor:'acom',what:'Changed activity'});},latest:()=>{data.activity.push({at:41,actor:'acom',what:'Latest activity'});},expected:'Latest activity'},
   ];
   for (const [index, c] of cases.entries()) {
     const selected = await selectText(page, c.selector);
@@ -1754,7 +1862,7 @@ test('selected agent, lock and activity regions defer only their changes and flu
 
 test('thread list, header and membership-history selections survive polling while new messages and drafts remain live', async () => fixture(async (page, data) => {
   data.threads = [conversation([], {events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'acom',details:{reason:'Initial join'}}]})];
-  await page.reload(); await page.locator('[data-page=threads]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Keep draft');
   await page.locator('#thread-history summary').click();
@@ -1786,7 +1894,7 @@ test('thread list, header and membership-history selections survive polling whil
 
 test('thread identifiers are visible and copyable for references in another conversation', async () => fixture(async (page, data) => {
   data.threads = [conversation([]),conversation([], {id:2,title:'Follow-up'})];
-  await page.reload(); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await reloadPage(page); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   await page.locator('[data-page=threads]').click();
   assert.match(await page.locator('[data-thread="1"] .meta').textContent(), /Thread #1/);
   await page.locator('[data-thread="1"]').click();
@@ -1803,7 +1911,7 @@ test('thread identifiers are visible and copyable for references in another conv
 
 test('agent details expose native history and output paths; closed behavior is explained', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'closed',harness:'claude',conversation_history:'/home/example/.claude/projects/-work/session.jsonl',output_log:'/home/example/.acom/logs/1.jsonl'}];
-  await page.reload(); await page.locator('[data-action=details]').click();
+  await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.waitForFunction(() => document.querySelector('#agent-details').textContent.includes('conversation history'));
   assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.claude\/projects\/-work\/session.jsonl/);
   assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.acom\/logs\/1.jsonl/);
@@ -1827,7 +1935,7 @@ async function holdRequest(page, pattern, method = 'POST') {
 
 test('slow overview requests commit without overlapping polls discarding every response', async () => fixture(async (page, data) => {
   data.delays = {1:2400};
-  await page.reload();
+  await reloadPage(page);
   await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live', null, {timeout:6000});
   assert.equal(await page.locator('#project-path').textContent(), '/projects/example');
   data.delays = {};
@@ -1856,10 +1964,10 @@ test('a stalled GET times out and polling recovers while pending read acknowledg
 
 test('switching threads removes old controls immediately and closing the loading pane keeps drafts', async () => fixture(async (page, data) => {
   data.threads = [conversation([], {title:'First conversation'}), conversation([], {id:2,title:'Second conversation',members:[1]})];
-  await page.reload(); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread-filter=all]').click();
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread-filter=all]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('First draft');
-  const next = await holdRequest(page, '**/threads/2', 'GET');
+  const next = await holdRequest(page, /\/threads\/2\/messages(?:\?|$)/, 'GET');
   await page.locator('[data-thread="2"]').click(); await next.started;
   assert.match(await page.locator('#thread-main').textContent(), /Thread #2.*Loading conversation/s);
   for (const selector of ['#message-form','#thread-membership','#add-thread-members','#copy-thread']) assert.equal(await page.locator(selector).count(), 0);
@@ -1877,7 +1985,7 @@ test('switching threads removes old controls immediately and closing the loading
 
 test('polling restores focus to updated controls and removes actions that no longer apply', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'working',status:'Starting',locks:[]}];
-  await page.reload(); await page.locator('[data-action=details]').focus();
+  await reloadPage(page); await page.locator('[data-action=details]').focus();
   data.agents[0].state = 'idle'; data.agents[0].status = 'Finished this turn';
   await page.waitForFunction(() => document.querySelector('#agents').textContent.includes('Finished this turn'));
   assert.equal(await page.locator('[data-action=details]').evaluate(el => document.activeElement === el), true);
@@ -2004,7 +2112,7 @@ test('late config and member saves preserve newer dialog input', async () => fix
 
 test('mobile locks can scroll every control into view and dialogs and feedback have accessible names', async () => fixture(async (page, data) => {
   data.locks = [{name:'write-lock',project:1,about:'Editing important shared content',holder:1,holder_name:'Worker',acquired_at:1,expires_at:Date.now()/1000+600,queue:[2,3]}];
-  await page.setViewportSize({width:390,height:844}); await page.reload(); await page.locator('[data-action=free-lock]').waitFor();
+  await page.setViewportSize({width:390,height:844}); await reloadPage(page); await page.locator('[data-action=free-lock]').waitFor();
   assert.equal(await page.locator('#locks').evaluate(el => getComputedStyle(el).overflowX), 'auto');
   await page.locator('#locks').evaluate(el => { el.scrollLeft = el.scrollWidth; });
   assert.equal(await page.locator('[data-action=free-lock]').evaluate(el => el.getBoundingClientRect().right <= innerWidth), true);
@@ -2042,4 +2150,463 @@ test('active views and filters and each limit input expose their context to assi
   for (const name of ['Active agents soft limit','Active agents hard limit','Claude weekly subscription % soft limit','Claude weekly subscription % hard limit','Context tokens soft limit','Context tokens hard limit']) {
     assert.equal(await page.getByRole('spinbutton', {name,exact:true}).count(), 1);
   }
+}));
+
+const manualPolling = async page => page.addInitScript(() => { window.setInterval = () => 0; });
+const messageIds = page => page.locator('[data-message]').evaluateAll(nodes => nodes.map(node => Number(node.dataset.message)));
+
+test('initial unread paging drains a fixed high-water before acknowledging, and later arrivals remain unread', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.threads=[conversation(Array.from({length:9},(_,i)=>incoming(i+1)))]; data.reads[1]=3;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
+  const middle=await holdRequest(page,/\/threads\/1\/messages\?after=5(?:&|$)/,'GET');
+  await page.locator('[data-thread="1"]').click(); await middle.started;
+  assert.deepEqual(await messageIds(page),[4,5]);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0,'an incomplete catch-up is not acknowledged');
+  data.threads[0].messages.push(incoming(10,'Arrived outside the pinned snapshot'));
+  middle.release(); await middle.remove();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew && !state.thread.resume);
+  await page.waitForFunction(()=>state.thread.last_read===9);
+  assert.deepEqual(await messageIds(page),[4,5,6,7,8,9]);
+  assert.equal(data.reads[1],9); assert.match(await page.locator('#unread-total').textContent(),/1 unread/);
+  await page.evaluate(()=>refresh());
+  await page.waitForFunction(()=>state.thread.last_read===10);
+  assert.deepEqual(await messageIds(page),[4,5,6,7,8,9,10]);
+  assert.equal(data.reads[1],10);
+}));
+
+test('incremental paging deduplicates overlapping boundaries and resumes after a failed middle page', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  let failed=false;
+  await page.route(/\/threads\/1\/messages\?after=/,async route=>{
+    const after=Number(new URL(route.request().url()).searchParams.get('after'));
+    if(after===2&&!failed) {failed=true;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Temporary page failure'})});}
+    const response=await route.fetch(),body=await response.json();
+    if(after>0&&body.items.length)body.items.unshift(data.threads[0].messages.find(m=>m.id===after));
+    await route.fulfill({response,json:body});
+  });
+  data.threads[0].messages.push(...Array.from({length:7},(_,i)=>incoming(i+1)));
+  await page.evaluate(()=>refresh());
+  assert.deepEqual(await messageIds(page),[1,2]);
+  assert.equal(await page.evaluate(()=>state.thread.resume.after),2);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
+  await page.evaluate(()=>refresh());
+  await page.waitForFunction(()=>state.thread.last_read===7);
+  assert.deepEqual(await messageIds(page),[1,2,3,4,5,6,7]);
+  await page.evaluate(()=>refresh());
+  assert.deepEqual(await messageIds(page),[1,2,3,4,5,6,7]);
+  assert.equal(await page.locator('#thread-catchup').textContent(),'');
+}));
+
+test('loading older messages preserves the visible anchor, selection and draft without duplicates', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.threads=[conversation(Array.from({length:6},(_,i)=>incoming(i+1,`Message ${i+1}\n${'Long history line\n'.repeat(35)}`)))]; data.reads[1]=6;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  assert.deepEqual(await messageIds(page),[5,6]);
+  await page.locator('#message-form textarea').fill('Keep this draft');
+  await page.locator('#messages').evaluate(el=>{el.scrollTop=10;});
+  const selected=await selectText(page,'[data-message="5"] .message-text');
+  const top=await page.locator('[data-message="5"]').evaluate(el=>el.getBoundingClientRect().top);
+  await page.evaluate(()=>olderMessages());
+  assert.deepEqual(await messageIds(page),[3,4,5,6]);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-message="5"] .message-text')===window.selectedNode),true);
+  assert.ok(Math.abs(await page.locator('[data-message="5"]').evaluate(el=>el.getBoundingClientRect().top)-top)<2);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this draft');
+  await page.evaluate(()=>{getSelection().removeAllRanges();return olderMessages();});
+  assert.deepEqual(await messageIds(page),[1,2,3,4,5,6]);
+  assert.equal(await page.locator('#thread-older').isHidden(),true);
+}));
+
+test('an old incremental page cannot replace a newly selected conversation or its draft', async () => fixture(async (page,data) => {
+  data.threads=[conversation([incoming(1)]),conversation([incoming(2)],{id:2,title:'Second'})]; data.reads={1:1,2:2};
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('First draft');
+  const pending=await holdRequest(page,/\/threads\/1\/messages\?after=1(?:&|$)/,'GET');
+  data.threads[0].messages.push(incoming(3)); await page.evaluate(()=>{window.pendingDelta=refresh();}); await pending.started;
+  await page.locator('[data-thread="2"]').click(); await page.locator('#message-form[data-draft-thread="2"]').waitFor();
+  await page.locator('#message-form textarea').fill('Second draft');
+  pending.release(); await pending.remove(); await page.evaluate(()=>window.pendingDelta);
+  assert.deepEqual(await messageIds(page),[2]); assert.equal(await page.evaluate(()=>state.thread.id),2);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Second draft');
+  await page.locator('[data-thread="1"]').click(); await page.locator('#message-form[data-draft-thread="1"]').waitFor();
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'First draft');
+}));
+
+test('paged project, config and member selectors expose omitted choices and All means every agent', async () => fixture(async (page,data) => {
+  data.pageLimit=2;
+  data.projects=Array.from({length:6},(_,i)=>({id:i+1,name:`Project ${i+1}`,path:`/projects/${i+1}`,config:2}));
+  data.configs.push(...[3,4,5,6].map(id=>({id,name:`Config ${id}`,settings:settings()})));
+  data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:`Agent ${i+1}`,state:i%2?'closed':'working'}));
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(await page.locator('#project-select').inputValue(),'1','the selected project stays reachable outside the first page');
+  while(await page.locator('.project-banner [data-more=projects]').isVisible()) {await page.locator('.project-banner [data-more=projects]').click();await page.waitForFunction(()=>!state.pages.projects.pending);}
+  assert.equal(await page.locator('#project-select option').count(),6);
+  await page.locator('[data-page=settings]').click();
+  while(await page.locator('#settings-form [data-more=configs]').isVisible()) {await page.locator('#settings-form [data-more=configs]').click();await page.waitForFunction(()=>!state.pages.configs.pending);}
+  await page.locator('#config-select').selectOption('3'); await page.waitForFunction(()=>state.editor.config===3);
+  assert.equal(await page.locator('[name=config_name]').inputValue(),'Config 3');
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('#thread-member-picker [data-member-pick=all]').click();
+  await page.waitForFunction(()=>document.querySelectorAll('#thread-member-picker [name=member]:checked').length===6);
+  await page.locator('#thread-member-picker [data-member-pick=active]').click();
+  assert.deepEqual(await page.locator('#thread-member-picker [name=member]:checked').evaluateAll(nodes=>nodes.map(n=>Number(n.value))),[1,3,5]);
+}));
+
+test('a mutable collection changing during Load more restarts a consistent window without stale or duplicate rows', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:`Agent ${i+1}`,state:'working'}));
+  await manualPolling(page); await reloadPage(page);
+  const pending=await holdRequest(page,url=>url.pathname==='/agents'&&url.searchParams.get('before')==='5','GET');
+  await page.locator('#page-overview [data-more=agents]').click(); await pending.started;
+  data.agents=data.agents.filter(a=>a.id!==5); data.agents.find(a=>a.id===2).name='Updated agent 2';
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>document.querySelectorAll('[data-agent]').length===5);
+  assert.deepEqual(await page.locator('[data-agent]').evaluateAll(nodes=>nodes.map(n=>Number(n.dataset.agent))),[6,4,3,2,1]);
+  assert.match(await page.locator('[data-agent="2"]').textContent(),/Updated agent 2/);
+  assert.equal(await page.locator('#agent-count').textContent(),'5 total');
+}));
+
+test('oversized UTF-8 message and config chunks stay lossless and incomplete text is not acknowledged', async () => fixture(async (page,data) => {
+  const text='☃"\\\n😀'.repeat(5000);
+  data.settings.prompts.launch=text;
+  data.threads=[conversation([incoming(1,text)])];
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('[data-page=settings]').click();
+  assert.equal(await page.locator('[name=prompt_launch]').inputValue(),text);
+  await page.locator('[data-page=threads]').click();
+  const pending=await holdRequest(page,url=>url.pathname==='/messages/1'&&Number(url.searchParams.get('offset'))>0,'GET');
+  await page.locator('[data-thread="1"]').click(); await pending.started;
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>state.thread?.last_read===1);
+  assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),text);
+  assert.equal(await page.locator('[data-message]').count(),1);
+  assert.ok(data.getRequests.some(url=>url.startsWith('/configs/2?offset=')));
+  assert.ok(data.getRequests.some(url=>url.startsWith('/messages/1?agent=0&offset=')));
+}));
+
+test('unchanged polls use only slim Overview and message deltas; activity updates incrementally and metadata stays cached', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.threads=[conversation([incoming(1)])]; data.reads[1]=1;
+  data.activity=[{id:1,at:1,actor:'user',what:'Old event'}];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  const catalogs=data.getRequests.filter(url=>url==='/catalog').length;
+  let start=data.getRequests.length;
+  await page.evaluate(()=>refresh()); await page.evaluate(()=>refresh());
+  const paths=data.getRequests.slice(start).map(url=>new URL(url,'http://localhost').pathname);
+  assert.deepEqual(paths,['/overview','/threads/1/messages','/overview','/threads/1/messages']);
+  data.activity.push(...[2,3,4,5,6].map(id=>({id,at:id,actor:'acom',what:`Event ${id}`})));
+  start=data.getRequests.length; await page.evaluate(()=>refresh());
+  const activity=data.getRequests.slice(start).filter(url=>url.startsWith('/activity?'));
+  assert.deepEqual(activity.map(url=>Number(new URL(url,'http://localhost').searchParams.get('after'))),[1,3,5]);
+  assert.match(await page.locator('#activity').textContent(),/Event 6/);
+  assert.equal(new Set(await page.evaluate(()=>state.activity.map(e=>e.id))).size,await page.evaluate(()=>state.activity.length));
+  assert.equal(data.getRequests.filter(url=>url==='/catalog').length,catalogs);
+  await openLaunch(page);
+  await page.waitForFunction(()=>!document.querySelector('#launch-form button.primary').disabled);
+  assert.ok(data.getRequests.at(-1).startsWith('/settings?project=1'));
+}));
+
+test('a large disconnected activity burst fetches only the retained latest window and keeps older history reachable', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.activity=[{id:1,at:1,actor:'acom',what:'Initial event'}];
+  await manualPolling(page); await reloadPage(page);
+  data.activity.push(...Array.from({length:1000},(_,i)=>({id:i+2,at:i+2,actor:'acom',what:`Event ${i+2}`})));
+  const start=data.getRequests.length; await page.evaluate(()=>refresh());
+  const requests=data.getRequests.slice(start).filter(url=>url.startsWith('/activity?'));
+  assert.ok(requests.length<=26,`bounded latest-window requests, got ${requests.length}`);
+  assert.deepEqual(await page.evaluate(()=>state.activity.map(e=>e.id)),Array.from({length:50},(_,i)=>1001-i));
+  assert.equal(await page.locator('[data-more=activity]').isVisible(),true);
+  await page.locator('[data-more=activity]').click(); await page.waitForFunction(()=>!state.pages.activity.pending);
+  assert.deepEqual(await page.evaluate(()=>state.activity.slice(-2).map(e=>e.id)),[951,950]);
+}));
+
+test('selected configs outside the current page refresh external edits without clearing an unsaved editor', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.configs.push(...[3,4,5,6,7,8].map(id=>({id,name:`Config ${id}`,settings:settings()})));
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
+  assert.equal(await page.locator('#config-select').inputValue(),'2');
+  data.settings.max_lock_ttl_secs=1234; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'1234');
+  await page.locator('[name=max_lock_ttl_secs]').fill('4321');
+  data.settings.max_lock_ttl_secs=1222; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'4321');
+  assert.equal(await page.evaluate(()=>state.settings.max_lock_ttl_secs),1222);
+}));
+
+test('changed record versions restart chunk hydration instead of stitching old and new settings', async () => fixture(async (page,data) => {
+  const old='Old ☃ instruction\n'.repeat(2000),fresh='New 😀 instruction\n'.repeat(2000);
+  data.settings.prompts.launch=old;
+  let changed=false;
+  await page.route(url=>url.pathname==='/configs/2'&&Number(url.searchParams.get('offset'))>0,async route=>{
+    if(!changed) {changed=true;data.settings.prompts.launch=fresh;}
+    await route.continue();
+  });
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
+  assert.equal(changed,true);
+  assert.equal(await page.locator('[name=prompt_launch]').inputValue(),fresh);
+  assert.equal(await page.evaluate(()=>state.editor.settings.prompts.launch),fresh);
+}));
+
+test('folder paging reaches every entry and restarts when the listing changes during continuation', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.folders['/home/example'].entries=Array.from({length:6},(_,i)=>({name:`folder${i+1}`,path:`/home/example/folder${i+1}`,directory:true}));
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-open=project-dialog]').click(); await page.locator('#browse-project').click();
+  assert.equal(await page.locator('#folder-list [data-folder]').count(),2);
+  const pending=await holdRequest(page,url=>url.pathname==='/folders'&&url.searchParams.has('after'),'GET');
+  await page.locator('#folder-more').click(); await pending.started;
+  data.folders['/home/example'].entries.push({name:'folder7',path:'/home/example/folder7',directory:true});
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>document.querySelector('#folder-error').textContent.includes('Reloaded its first page'));
+  while(await page.locator('#folder-more').isVisible()) {await page.locator('#folder-more').click();await page.waitForFunction(()=>!document.querySelector('#folder-more').disabled);}
+  assert.deepEqual(await page.locator('#folder-list [data-folder]').evaluateAll(nodes=>nodes.map(n=>n.dataset.folder)),Array.from({length:7},(_,i)=>`/home/example/folder${i+1}`));
+}));
+
+test('bounded log tails load older content, append deltas once and recover from rotation', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Worker',state:'working'}];
+  data.agentLogs[1]=Array.from({length:300},(_,i)=>`Log line ${i}`);
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
+  await page.waitForFunction(()=>document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
+  assert.ok((await page.locator('#agent-log').textContent()).startsWith('Log line 200'));
+  await page.locator('#log-older').click(); await page.waitForFunction(()=>document.querySelector('#agent-log').textContent.startsWith('Log line 0'));
+  data.agentLogs[1].push('New activity'); const start=data.getRequests.length;
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-log').textContent(),data.agentLogs[1].join('\n'));
+  assert.ok(data.getRequests.slice(start).some(url=>url.startsWith('/agents/1/log?after=')));
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-log').textContent(),data.agentLogs[1].join('\n'));
+  data.logVersions={1:'rotated'}; data.agentLogs[1]=['Replacement log'];
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-log').textContent(),'Replacement log');
+  assert.equal(await page.locator('#log-older').isHidden(),true);
+}));
+
+test('truncated mutation results expose lossless receipts and receipt failures remain completed actions', async () => fixture(async (page,data) => {
+  const warnings=Array.from({length:100},(_,i)=>`Warning ${i}: ${'Detailed reason '.repeat(30)}`);
+  data.launchResult={id:1,result_truncated:true,counts:{warnings:100},warnings:warnings.slice(0,1),receipt_event:7};
+  data.receipts={7:{id:7,details:{response:{id:1,warnings}}}};
+  await manualPolling(page); await reloadPage(page); await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Launch once');
+  await page.locator('#launch-form button.primary').click(); await page.waitForFunction(()=>!document.querySelector('#launch-dialog').open);
+  assert.match(await page.locator('#result-notice').textContent(),/Action completed.*warnings: 100/);
+  await page.locator('#result-notice [data-record=receipts]').click();
+  await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('Warning 99:'));
+  const receipt=JSON.parse(await page.locator('#record-content').textContent());
+  assert.deepEqual(receipt.details.response.warnings,warnings);
+  await page.locator('#record-dialog button').click();
+  data.launchResult={id:2,result_truncated:true,counts:{warnings:100},receipt_error:'Action completed, receipt storage unavailable'};
+  await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Another explicit launch');
+  await page.locator('#launch-form button.primary').click(); await page.waitForFunction(()=>!document.querySelector('#launch-dialog').open);
+  assert.match(await page.locator('#result-notice').textContent(),/Action completed.*Inspect current state before retrying/);
+  assert.equal(data.requests.filter(r=>r.url==='/agents').length,2,'no automatic mutation retry');
+}));
+
+test('malformed success responses retain the conversation and its cursor until a valid page arrives', async () => fixture(async (page,data) => {
+  data.threads=[conversation([incoming(1)])]; data.reads[1]=1;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  await page.locator('#message-form textarea').fill('Keep draft through protocol failure');
+  data.threads[0].messages.push(incoming(2));
+  const matcher=/\/threads\/1\/messages\?after=/;
+  for(const body of ['', '{', '[]', 'null', '"not an object"']) {
+    await page.route(matcher,route=>route.fulfill({status:200,contentType:'application/json',body}));
+    await page.evaluate(()=>refresh());
+    assert.deepEqual(await messageIds(page),[1]);
+    assert.equal(await page.evaluate(()=>state.thread.messages.at(-1).id),1);
+    assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep draft through protocol failure');
+    assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
+    await page.unroute(matcher);
+  }
+  await page.evaluate(()=>refresh()); await page.waitForFunction(()=>state.thread.last_read===2);
+  assert.deepEqual(await messageIds(page),[1,2]);
+}));
+
+test('a malformed mutation receipt does not claim success or automatically repeat a potentially completed action', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page); await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Explicit launch');
+  await page.route('**/agents',async route=>{
+    if(route.request().method()!=='POST')return route.continue();
+    await route.fetch();
+    await route.fulfill({status:200,contentType:'application/json',body:'{'});
+  });
+  await page.locator('#launch-form button.primary').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Inspect current state before retrying'));
+  assert.equal(await page.locator('#launch-dialog').evaluate(dialog=>dialog.open),true);
+  assert.equal(await page.locator('#launch-form [name=task]').inputValue(),'Explicit launch');
+  assert.match(await page.locator('#toast').textContent(),/Invalid server response.*may have completed/);
+  assert.equal(await page.locator('#result-notice').isHidden(),true);
+  assert.equal(data.requests.filter(r=>r.url==='/agents').length,1);
+}));
+
+test('oversized thread summaries retain exact participation and unread filters without inventing missing member details', async () => fixture(async (page,data) => {
+  const title='Long thread title ☃ '.repeat(1800);
+  data.threads=[conversation([incoming(1)],{title})]; data.readFailure=true;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
+  for(const filter of ['mine','unread','all']) {
+    await page.locator(`[data-thread-filter=${filter}]`).click();
+    const row=page.locator('[data-thread="1"]');
+    assert.equal(await row.count(),1);
+    assert.match(await row.textContent(),/You’re a member.*1 messages.*Member list exceeds the preview budget/);
+    assert.doesNotMatch(await row.textContent(),/Agent-only|no members/);
+  }
+  await page.locator('[data-thread-filter=agents]').click(); assert.equal(await page.locator('[data-thread="1"]').count(),0);
+  await page.locator('[data-thread-filter=unread]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  assert.equal(await page.locator('.thread-header h2').textContent(),title);
+  assert.deepEqual(await messageIds(page),[1]);
+}));
+
+test('chunked oversized outside-membership messages keep their context and do not become unread arrivals', async () => fixture(async (page,data) => {
+  const text='Outside membership 😀 '.repeat(2000);
+  data.threads=[conversation([incoming(1)])]; data.reads[1]=1;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  data.threads[0].messages.push({...incoming(2,text),outside_membership:true});
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-message="2"] .message-text').textContent(),text);
+  assert.match(await page.locator('[data-message="2"] .message-head').textContent(),/Outside your membership/);
+  assert.equal(await page.evaluate(()=>state.thread.unread),0);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
+  assert.ok(data.getRequests.some(url=>url.startsWith('/messages/2?agent=0&offset=')));
+}));
+
+test('rejoining backfills earlier unread messages in order and a failed middle page cannot acknowledge unseen history', async () => fixture(async (page,data) => {
+  data.pageLimit=2;
+  data.threads=[conversation(Array.from({length:6},(_,i)=>incoming(i+1,`Message ${i+1}\n${'Long retained history\n'.repeat(25)}`)),{members:[1]})];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread-filter=all]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
+  assert.deepEqual(await messageIds(page),[5,6]);
+  await page.locator('#message-form textarea').fill('Retain rejoin draft');
+  await page.locator('#messages').evaluate(node=>{node.scrollTop=10;});
+  const selected=await selectText(page,'[data-message="5"] .message-text');
+  const top=await page.locator('[data-message="5"]').evaluate(node=>node.getBoundingClientRect().top-node.parentElement.getBoundingClientRect().top);
+  const held=await holdRequest(page,/\/threads\/1\/messages\?after=2(?:&|$)/,'GET');
+  let failed=false;
+  await page.route(/\/threads\/1\/messages\?after=2(?:&|$)/,route=>{
+    if(!failed) {failed=true;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Backfill temporarily unavailable'})});}
+    return route.fallback();
+  });
+  await page.locator('#thread-membership').click();
+  await page.waitForFunction(()=>state.thread?.resume?.after===2 && !state.thread.loadingNew);
+  assert.deepEqual(await messageIds(page),[1,2,5,6]);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-message="5"] .message-text')===window.selectedNode),true);
+  const afterTop=await page.locator('[data-message="5"]').evaluate(node=>node.getBoundingClientRect().top-node.parentElement.getBoundingClientRect().top);
+  assert.ok(Math.abs(afterTop-top)<2,`retained anchor moved from ${top} to ${afterTop}`);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retain rejoin draft');
+  await page.evaluate(()=>{window.retryBackfill=refresh();}); await held.started;
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
+  held.release(); await held.remove(); await page.evaluate(()=>window.retryBackfill);
+  assert.deepEqual(await messageIds(page),[1,2,3,4,5,6]);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0,'the reader is still viewing the retained anchor, not the latest message');
+  await page.evaluate(()=>{getSelection().removeAllRanges();const messages=document.querySelector('#messages');messages.scrollTop=messages.scrollHeight;return markThreadRead();});
+  assert.equal(data.reads[1],6);
+}));
+
+test('explicit Resume resolves every paged and oversized frozen lock without eagerly draining Overview', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Resume worker',state:'paused'}];
+  const longName='Older frozen lock ☃ '.repeat(1300);
+  data.locks=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:i===0?longName:`lock${i+1}`,holder:i===0?2:null,holder_state:i===0?'paused':null,frozen:i===0,about:'Lock purpose'}));
+  await manualPolling(page); await reloadPage(page);
+  assert.deepEqual(await page.evaluate(()=>state.locks.map(lock=>lock.id)),[6,5]);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/locks?')&&url.includes('before=')).length,0);
+  await page.locator('[data-action=resume]').click(); await page.locator('#resume-dialog').waitFor();
+  assert.equal(await page.locator('#resume-copy').textContent(),`agent 2: ${longName}`);
+  await page.locator('#resume-dialog [value=release]').click();
+  await page.waitForFunction(()=>state.agents[0]?.state==='working');
+  const free=data.requests.find(request=>request.url==='/locks/free');
+  assert.deepEqual(free.body,{project:1,name:longName,expected_holder:2});
+  assert.equal(data.requests.filter(request=>request.url==='/agents/1/resume').length,1);
+  assert.ok(data.getRequests.some(url=>url.startsWith('/locks/1?project=1&offset=')));
+}));
+
+test('Resume refuses an incomplete lock snapshot and restarts a changed revision before offering the complete choice', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Worker',state:'paused'}];
+  data.locks=Array.from({length:5},(_,i)=>({id:i+1,project:1,name:`lock${i+1}`,holder:i+2,holder_state:'paused',frozen:true}));
+  await manualPolling(page); await reloadPage(page);
+  const continuation=url=>url.pathname==='/locks'&&url.searchParams.has('before');
+  await page.route(continuation,route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Lock snapshot unavailable'})}));
+  await page.locator('[data-action=resume]').click(); await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Lock snapshot unavailable');
+  assert.equal(await page.locator('#resume-dialog').evaluate(dialog=>dialog.open),false);
+  assert.equal(data.requests.length,0);
+  await page.unroute(continuation);
+  let changed=false;
+  await page.route(continuation,route=>{
+    if(!changed) {changed=true;data.locks.find(lock=>lock.id===1).name='Changed older lock';}
+    return route.continue();
+  });
+  await page.locator('[data-action=resume]').click(); await page.locator('#resume-dialog').waitFor();
+  assert.equal(changed,true);
+  assert.match(await page.locator('#resume-copy').textContent(),/Changed older lock/);
+  assert.doesNotMatch(await page.locator('#resume-copy').textContent(),/lock1/);
+  for(const id of [2,3,4,5]) assert.match(await page.locator('#resume-copy').textContent(),new RegExp(`lock${id}`));
+  await page.locator('#resume-dialog [value=cancel]').click();
+  assert.equal(data.requests.length,0);
+}));
+
+test('Resume does not free a frozen lock whose holder changed after the confirmation was shown', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Worker',state:'paused'}];
+  data.locks=[{id:1,project:1,name:'shared',holder:2,holder_state:'paused',frozen:true}];
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('[data-action=resume]').click(); await page.locator('#resume-dialog').waitFor();
+  Object.assign(data.locks[0],{holder:3,holder_state:'working',frozen:false});
+  await page.locator('#resume-dialog [value=release]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Frozen lock holder changed'));
+  assert.equal(data.locks[0].holder,3);
+  assert.equal(data.requests.filter(request=>request.url==='/agents/1/resume').length,0);
+  assert.equal(data.requests.filter(request=>request.url==='/locks/free').length,1);
+  assert.equal(data.requests[0].body.expected_holder,2);
+}));
+
+test('Pause reads current holds on demand and project navigation cancels a delayed lock snapshot', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Worker',state:'working',locks:[]}];
+  await manualPolling(page); await reloadPage(page);
+  data.agents[0].locks=['new current hold'];
+  await page.locator('[data-action=pause]').click(); await page.locator('#pause-dialog').waitFor();
+  assert.match(await page.locator('#pause-copy').textContent(),/new current hold/);
+  await page.locator('#pause-dialog [value=keep]').click(); await page.waitForFunction(()=>state.agents[0]?.state==='paused');
+  assert.deepEqual(data.requests.find(request=>request.url==='/agents/1/pause').body,{locks:'keep'});
+  const held=await holdRequest(page,url=>url.pathname==='/locks'&&!url.searchParams.has('since'),'GET');
+  await page.locator('[data-action=resume]').click(); await held.started;
+  await page.locator('#project-select').selectOption('2');
+  held.release(); await held.remove();
+  await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0&&agentTransitions.size===0);
+  assert.equal(await page.locator('#resume-dialog').evaluate(dialog=>dialog.open),false);
+  assert.equal(data.requests.filter(request=>request.url==='/agents/1/resume'||request.url==='/locks/free').length,0);
+}));
+
+test('explicit Details hydration restores the action controls of an oversized agent preview without replacing config drafts', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Large agent name ☃ '.repeat(1500),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',task:'Full task',locks:[]}];
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(await page.locator('[data-action=pause]').count(),0);
+  await page.locator('[data-action=details]').click();
+  await page.waitForFunction(()=>document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
+  assert.equal(await page.locator('[data-action=pause]').count(),1);
+  const model=page.locator('#agent-config [name=agent_model]');
+  await model.selectOption('gpt-6-luna');
+  await page.evaluate(()=>refresh());
+  assert.equal(await model.inputValue(),'gpt-6-luna');
+  assert.equal(await page.locator('[data-action=close]').count(),1);
+}));
+
+test('oversized selector previews retain unique ID labels and hydrate only the chosen config or project', async () => fixture(async (page,data) => {
+  const large='Long preview ☃ '.repeat(1800);
+  const custom=settings(); custom.prompts.launch=large;
+  data.configs.push({id:3,name:'Large config',settings:custom});
+  data.projects.push({id:3,name:large,path:'/projects/large',config:2});
+  data.agents=[{id:1,project:1,name:large,state:'working',harness:'codex',model:'gpt-6.1-sol'}];
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('#project-select option[value="3"]').textContent(),/^Project #3/);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/projects/3')||url.startsWith('/configs/3')).length,0);
+  await page.locator('[data-page=settings]').click();
+  assert.equal(await page.locator('#config-select option[value="3"]').textContent(),'Config #3');
+  await page.locator('#config-select').selectOption('3'); await page.waitForFunction(()=>state.editor.config===3);
+  assert.equal(await page.locator('[name=config_name]').inputValue(),'Large config');
+  assert.equal(await page.locator('[name=prompt_launch]').inputValue(),large);
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
+  assert.match(await page.locator('#thread-member-picker [data-member-row]').textContent(),/Agent #1.*working.*Details exceed the preview budget/);
+  assert.doesNotMatch(await page.locator('#thread-member-picker').textContent(),/undefined/);
+  await page.locator('#thread-dialog [data-close=thread-dialog]').click();
+  page.once('dialog',dialog=>dialog.accept());
+  await page.locator('#project-select').selectOption('3');
+  await page.waitForFunction(()=>state.selectedProject===3&&refreshPending===0);
+  assert.equal(await page.locator('#project-path').textContent(),'/projects/large');
+  assert.ok(data.getRequests.some(url=>url.startsWith('/projects/3?offset=')||url.startsWith('/overview?project=3&offset=')));
 }));

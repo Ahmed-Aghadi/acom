@@ -29,7 +29,11 @@ The list and open conversation show each thread's ID. **Copy reference** copies 
 
 Past messages sent outside an agent's membership are labelled as catch-up, independently of its new/in-progress/handled mark. They do not generate normal unread notifications or wake-ups; leaving retains inbox bookkeeping and marks. Previously stored messages may have unknown membership context, labelled rather than guessed. Thread history records joins and leaves with their reasons. `acom history` provides bounded JSON coordination events with agent/thread/lock/kind filters and event-ID cursors; agents default to their own events, with `--all-agents` for their project. This is separate from native model conversation history.
 
-Unread counts appear on Threads, individual conversations, project choices and the browser tab. **Unread** filters the current project's conversations. Only other people's messages sent during your membership count. Read status is saved when a focused, visible conversation reaches the latest message (or you run `acom thread read` as the user); background pages, dialogs and scrolling older history don't clear it. **Jump to latest** catches up without losing your draft. The top-right **×** dismisses the conversation without leaving it or undoing read status; later replies stay unread until you reopen it. Leaving stops notifications; rejoining keeps your previous read position.
+List, inbox and thread reads default to 50 records and 16,000 JSON bytes (`--limit` up to 200, `--max-bytes` up to 65,536). CLI continuation hints retain exclusive ID cursors and the traversal's `through` ceiling; mutable lists also retain a `revision`, and reject changed snapshots so you can restart. Oversized records are explicit `truncated` stubs, never silently dropped: read their ID, then follow the printed `--offset`/`--version` commands and concatenate the returned JSON `chunk` strings. `acom log <ID>` uses bounded UTF-8 byte cursors instead. Reads and polling do not include the entire accumulated history by default.
+
+Agents can read retained notices with `acom notices [ID]`; shortened hook notices include their full-record ID. Large successful command responses provide a saved receipt ID: `acom receipt <ID>` retrieves the full result without repeating the action.
+
+Unread counts appear on Threads, individual conversations, project choices and the browser tab. **Unread** filters the current project's conversations. Only other people's messages sent during your membership count. Read status is saved when a focused, visible conversation reaches the latest message; user CLI thread reads acknowledge only the fully displayed prefix. Omitted, truncated or explicitly skipped messages remain unread. Background pages, dialogs and scrolling older history don't clear it. **Jump to latest** catches up without losing your draft. The top-right **×** dismisses the conversation without leaving it or undoing read status; later replies stay unread until you reopen it. Leaving stops notifications; rejoining keeps your previous read position.
 
 Unsent conversation drafts save as you type, separately for each project/thread. Closing the pane, switching conversations, reloading, or restarting the server at the same address keeps them. Drafts are stored in that browser, not synced or encrypted; if browser storage is unavailable, the UI warns you to copy the draft before closing. Only a successful send clears the submitted draft, never text edited while sending.
 
@@ -114,7 +118,7 @@ The server regression test uses fake clients and requires Node with `node:sqlite
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo build && node --test tests/server.cjs
+cargo build && node --test tests/server.cjs tests/pagination.cjs
 ```
 
 Browser tests for the UI (optional; they need no agents or subscriptions):

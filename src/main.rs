@@ -1,11 +1,12 @@
 mod app;
 mod harness;
+mod paging;
 mod run;
 mod server;
 mod usage;
 
 use app::{GUIDE, MODELS, hhmm, who};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Read;
 use std::process::exit;
@@ -36,7 +37,8 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
                                           --replace queues a terminal cross-provider handoff
   threads                                 List threads
   thread new --title <text> [--members <ID or selector,...> | --watch <states,group:name,...>] [--include-user]
-  thread read <TID>                       A thread's full history
+  thread read <TID>                       A bounded page of thread messages
+  thread details <TID>                   Thread metadata, without message bodies
   thread add <TID> <ID or selector,...>   Add members
   thread remove <TID> <IDs,user>          Remove members from a static thread
   history [ID] [--agent ID | --all-agents] [--thread TID] [--lock name] [--kind kind]
@@ -44,9 +46,11 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
                                           Bounded coordination events; ID reads one event
   send --thread <TID> [text]              Post in a thread (stdin if text is left out)
   inbox [--mark new|in-progress|handled]  Your messages with that mark (default new)
-  read <msg ID>                           One message in full
+  notices [ID]                            Retained notices / one full notice
+  read <msg ID>                           One bounded message record
   mark <msg ID,...> new|in-progress|handled
   locks                                   List locks
+  lock read <ID>                          One lock's details
   lock new <name> --about <text>          Create a lock
   lock acquire <name> [--wait <dur>] [--ttl <dur>]
                                           TTL defaults to the project's maximum; larger TTLs fail
@@ -55,6 +59,12 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
 User commands (they act on the project the current folder is in):
   serve [--port N]                        Run the server (default port 7400; data in ~/.acom)
   projects                                List projects
+  project read <ID>                       One project's details
+  receipt <ID>                            Full saved command result; never repeats the action
+  activity [ID]                           Recent activity / one full activity record
+  configs / config <ID>                  Config summaries / one config's details
+  log <ID> [--before BYTE | --after BYTE] [--through BYTE] [--version V] [--since R]
+           [--lines N] [--max-bytes N]    Lossless bounded agent log chunks (JSON)
   project add [path]                      Add a folder as a project (default: this folder)
   project remove <ID>                     Remove a project that has no agents
   launch ... [--force]                    Launch an agent in this folder's project (added if
@@ -68,6 +78,15 @@ User commands (they act on the project the current folder is in):
 
 Selectors: active, working, idle, paused, done, closed, crashed, replaced, group:<name>.
 Durations: 30s, 5m, 1h.
+
+Lists (agents, threads, inbox, notices, locks, projects, activity, configs, thread read):
+  [--before ID | --after ID] [--through ID] [--revision R] [--since R]
+  [--limit N] [--max-bytes N]            Defaults: 50 items, 16000 JSON bytes.
+  Continue with the printed cursor, through and revision; changed snapshots fail visibly.
+Details (me, agent, read, notice ID, config, project read, lock read, receipt, limits, history ID):
+  [--offset BYTE] [--version V] [--max-bytes N]
+  Oversized records print a stub. Offset mode returns JSON chunks; retain the version.
+Limits: 1–200 items (log lines), 512–65536 JSON bytes; no automatic all-page drain.
 ";
 
 #[derive(Parser)]
@@ -201,6 +220,147 @@ mod cli_tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn growing_read_commands_share_explicit_page_and_chunk_options() {
+        for command in [
+            "agents", "threads", "inbox", "notices", "locks", "projects", "activity", "configs",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "acom",
+                    command,
+                    "--after",
+                    "0",
+                    "--through",
+                    "130",
+                    "--revision",
+                    "snapshot",
+                    "--limit",
+                    "3",
+                    "--max-bytes",
+                    "2048"
+                ])
+                .is_ok()
+            );
+            for (flag, value) in [
+                ("--limit", "0"),
+                ("--limit", "201"),
+                ("--max-bytes", "511"),
+                ("--max-bytes", "65537"),
+            ] {
+                assert!(Cli::try_parse_from(["acom", command, flag, value]).is_err());
+            }
+            assert!(
+                Cli::try_parse_from(["acom", command, "--before", "4", "--after", "1"]).is_err()
+            );
+        }
+        for args in [
+            vec!["acom", "read", "1", "--offset", "0", "--max-bytes", "512"],
+            vec!["acom", "agent", "1", "--offset", "4", "--version", "v"],
+            vec![
+                "acom",
+                "history",
+                "1",
+                "--offset",
+                "0",
+                "--max-bytes",
+                "2048",
+            ],
+            vec!["acom", "activity", "1", "--offset", "0"],
+            vec![
+                "acom", "thread", "read", "1", "--after", "0", "--offset", "0",
+            ],
+            vec!["acom", "thread", "details", "1", "--offset", "0"],
+            vec!["acom", "project", "read", "1", "--offset", "0"],
+            vec!["acom", "lock", "read", "1", "--offset", "0"],
+            vec!["acom", "log", "1", "--after", "0", "--lines", "200"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+    }
+}
+
+#[derive(Args)]
+struct PageArgs {
+    #[arg(long, conflicts_with = "after", value_parser = clap::value_parser!(i64).range(1..))]
+    before: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    after: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    through: Option<i64>,
+    #[arg(long)]
+    revision: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(i64).range(1..=200))]
+    limit: i64,
+    #[arg(long, default_value_t = 16000, value_parser = clap::value_parser!(i64).range(512..=65536))]
+    max_bytes: i64,
+}
+
+impl PageArgs {
+    fn query(&self) -> String {
+        let mut query = vec![format!("limit={}&max_bytes={}", self.limit, self.max_bytes)];
+        for (key, value) in [
+            ("before", self.before),
+            ("after", self.after),
+            ("through", self.through),
+        ] {
+            if let Some(value) = value {
+                query.push(format!("{key}={value}"));
+            }
+        }
+        for (key, value) in [("revision", &self.revision), ("since", &self.since)] {
+            if let Some(value) = value {
+                query.push(format!("{key}={}", encode(value)));
+            }
+        }
+        query.join("&")
+    }
+
+    fn selection_flags(&self) -> String {
+        let mut flags = String::new();
+        for (key, value) in [
+            ("before", self.before),
+            ("after", self.after),
+            ("through", self.through),
+        ] {
+            if let Some(value) = value {
+                flags += &format!(" --{key} {value}");
+            }
+        }
+        for (key, value) in [("revision", &self.revision), ("since", &self.since)] {
+            if let Some(value) = value {
+                flags += &format!(" --{key} {}", shell_word(value));
+            }
+        }
+        flags += &format!(" --limit {}", self.limit);
+        flags
+    }
+}
+
+#[derive(Args)]
+struct RecordArgs {
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    offset: Option<i64>,
+    #[arg(long)]
+    version: Option<String>,
+    #[arg(long, default_value_t = 16000, value_parser = clap::value_parser!(i64).range(512..=65536))]
+    max_bytes: i64,
+}
+
+impl RecordArgs {
+    fn query(&self) -> String {
+        let mut query = format!("max_bytes={}", self.max_bytes);
+        if let Some(offset) = self.offset {
+            query += &format!("&offset={offset}");
+        }
+        if let Some(version) = &self.version {
+            query += &format!("&version={}", encode(version));
+        }
+        query
+    }
 }
 
 #[derive(Subcommand)]
@@ -221,8 +381,14 @@ enum Cmd {
         #[arg(long)]
         ack_crashes: bool,
     },
-    Me,
-    Limits,
+    Me {
+        #[command(flatten)]
+        record: RecordArgs,
+    },
+    Limits {
+        #[command(flatten)]
+        record: RecordArgs,
+    },
     Status {
         text: Vec<String>,
     },
@@ -233,9 +399,13 @@ enum Cmd {
     Agents {
         #[arg(long)]
         group: Option<String>,
+        #[command(flatten)]
+        page: PageArgs,
     },
     Agent {
         id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
     },
     Launch {
         #[arg(long)]
@@ -259,7 +429,10 @@ enum Cmd {
         #[arg(long)]
         ack_crashes: bool,
     },
-    Threads,
+    Threads {
+        #[command(flatten)]
+        page: PageArgs,
+    },
     Thread {
         #[command(subcommand)]
         cmd: ThreadCmd,
@@ -272,12 +445,16 @@ enum Cmd {
     Inbox {
         #[arg(long, default_value = "new")]
         mark: String,
+        #[command(flatten)]
+        page: PageArgs,
     },
     Read {
         id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
     },
     History {
-        #[arg(conflicts_with_all = ["agent", "all_agents", "thread", "lock", "kind", "before", "after", "limit", "max_bytes"])]
+        #[arg(conflicts_with_all = ["agent", "all_agents", "thread", "lock", "kind", "before", "after", "limit"])]
         id: Option<i64>,
         #[arg(long, conflicts_with = "all_agents")]
         agent: Option<i64>,
@@ -297,12 +474,70 @@ enum Cmd {
         limit: i64,
         #[arg(long, default_value_t = 16000)]
         max_bytes: i64,
+        #[arg(long, requires = "id", value_parser = clap::value_parser!(i64).range(0..))]
+        offset: Option<i64>,
+        #[arg(long, requires = "id")]
+        version: Option<String>,
     },
     Mark {
         ids: String,
         mark: String,
     },
-    Locks,
+    Locks {
+        #[command(flatten)]
+        page: PageArgs,
+    },
+    Activity {
+        #[arg(conflicts_with_all = ["before","after","through","revision","since","limit"])]
+        id: Option<i64>,
+        #[command(flatten)]
+        page: PageArgs,
+        #[arg(long, requires = "id", value_parser = clap::value_parser!(i64).range(0..))]
+        offset: Option<i64>,
+        #[arg(long, requires = "id")]
+        version: Option<String>,
+    },
+    Configs {
+        #[command(flatten)]
+        page: PageArgs,
+    },
+    Config {
+        id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
+    },
+    Receipt {
+        id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
+    },
+    Notices {
+        #[arg(conflicts_with_all = ["before","after","through","revision","since","limit"])]
+        id: Option<i64>,
+        #[command(flatten)]
+        page: PageArgs,
+        #[arg(long, requires = "id", value_parser = clap::value_parser!(i64).range(0..))]
+        offset: Option<i64>,
+        #[arg(long, requires = "id")]
+        version: Option<String>,
+    },
+    Log {
+        id: i64,
+        #[arg(long, conflicts_with = "after", value_parser = clap::value_parser!(i64).range(0..))]
+        before: Option<i64>,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        after: Option<i64>,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        through: Option<i64>,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(i64).range(1..=200))]
+        lines: i64,
+        #[arg(long, default_value_t = 16000, value_parser = clap::value_parser!(i64).range(512..=65536))]
+        max_bytes: i64,
+    },
     Lock {
         #[command(subcommand)]
         cmd: LockCmd,
@@ -329,7 +564,10 @@ enum Cmd {
     Reopen {
         id: i64,
     },
-    Projects,
+    Projects {
+        #[command(flatten)]
+        page: PageArgs,
+    },
     Project {
         #[command(subcommand)]
         cmd: ProjectCmd,
@@ -340,8 +578,17 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
-    Add { path: Option<String> },
-    Remove { id: i64 },
+    Add {
+        path: Option<String>,
+    },
+    Remove {
+        id: i64,
+    },
+    Read {
+        id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +605,17 @@ enum ThreadCmd {
     },
     Read {
         id: i64,
+        #[command(flatten)]
+        page: PageArgs,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        offset: Option<i64>,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    Details {
+        id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
     },
     Add {
         id: i64,
@@ -371,6 +629,11 @@ enum ThreadCmd {
 
 #[derive(Subcommand)]
 enum LockCmd {
+    Read {
+        id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
+    },
     New {
         name: String,
         #[arg(long)]
@@ -417,7 +680,25 @@ fn me() -> i64 {
 }
 
 fn call(method: &str, path: &str, body: Option<Value>) -> Value {
-    request(method, path, body).unwrap_or_else(|(_, msg)| die(&msg))
+    let value = request(method, path, body).unwrap_or_else(|(status, msg)| {
+        if method != "GET" && status == 0 {
+            die(&format!(
+                "{msg}. The action may have completed. Inspect current state before retrying."
+            ));
+        }
+        die(&msg)
+    });
+    if value["result_truncated"] == true {
+        if let Some(id) = value["receipt_event"].as_i64() {
+            eprintln!(
+                "Action completed; response contains samples only. Full result: acom receipt {id}"
+            );
+        }
+        if let Some(error) = value["receipt_error"].as_str() {
+            eprintln!("{error}");
+        }
+    }
+    value
 }
 
 /// One API call; an error status comes back as (status, message).
@@ -442,17 +723,34 @@ fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value, (u16,
                 .send(b.as_bytes())
         }
     };
-    let mut res = res.unwrap_or_else(|e| {
-        die(&format!(
-            "can't reach the acom server at {}: {e}",
-            base_url()
-        ))
-    });
+    let mut res = res.map_err(|e| {
+        (
+            0,
+            format!("can't reach the acom server at {}: {e}", base_url()),
+        )
+    })?;
     let status = res.status().as_u16();
-    let text = res.body_mut().read_to_string().unwrap_or_default();
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let text = res.body_mut().read_to_string().map_err(|e| {
+        (
+            0,
+            format!("can't read the acom response (HTTP {status}): {e}"),
+        )
+    })?;
+    let v: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) if status >= 400 => return Err((status, text)),
+        Err(e) => {
+            return Err((
+                0,
+                format!("invalid JSON in the acom response (HTTP {status}): {e}"),
+            ));
+        }
+    };
     if status >= 400 {
         return Err((status, v["error"].as_str().unwrap_or(&text).to_string()));
+    }
+    if !v.is_object() {
+        return Err((0, "invalid acom response: expected a JSON object".into()));
     }
     Ok(v)
 }
@@ -465,9 +763,22 @@ fn cwd() -> String {
 
 /// The project the current folder is in, if any.
 fn project_here() -> Option<i64> {
-    request("GET", &format!("/projects?path={}", encode(&cwd())), None)
-        .ok()
-        .and_then(|p| p["id"].as_i64())
+    match request("GET", &format!("/projects?path={}", encode(&cwd())), None) {
+        Ok(project) => {
+            if project["truncated"] == true {
+                die(
+                    "project lookup exceeds the response budget; read its details with `acom project read <ID>`",
+                );
+            }
+            Some(
+                project["id"]
+                    .as_i64()
+                    .unwrap_or_else(|| die("invalid project lookup response")),
+            )
+        }
+        Err((404, _)) => None,
+        Err((_, message)) => die(&message),
+    }
 }
 
 /// For user commands that act on a project: the one the current folder is in.
@@ -481,7 +792,11 @@ fn user_project() -> i64 {
 /// current folder, or every project when the folder isn't in one.
 fn scope() -> String {
     let project = match my_id() {
-        Some(id) => get(&format!("/agents/{id}"))["project"].as_i64(),
+        Some(id) => Some(
+            get(&format!("/agents/{id}/project"))["project"]
+                .as_i64()
+                .unwrap_or_else(|| die("invalid agent project response")),
+        ),
         None => project_here(),
     };
     project.map(|p| format!("project={p}")).unwrap_or_default()
@@ -549,6 +864,92 @@ fn text_or_stdin(words: Vec<String>) -> String {
 
 fn t(v: &Value) -> String {
     v.as_i64().map(hhmm).unwrap_or_else(|| "-".into())
+}
+
+fn shell_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn short_label(s: &str) -> String {
+    let mut chars = s.chars();
+    let mut label: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        label.push_str("… [label truncated]");
+    }
+    label
+}
+
+fn page_items(v: &Value) -> &[Value] {
+    if v["unchanged"] == true {
+        return &[];
+    }
+    v["items"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| die("invalid page response: missing items"))
+}
+
+fn result_count(v: &Value, key: &str) -> usize {
+    v["counts"][key]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| v[key].as_array().map_or(0, Vec::len))
+}
+
+fn page_hint(v: &Value, args: &PageArgs, command: &str) {
+    if v["unchanged"] == true {
+        println!("unchanged");
+    }
+    if v["has_more"] != true {
+        return;
+    }
+    let (key, cursor) = if let Some(n) = v["next_after"].as_i64() {
+        ("after", n)
+    } else if let Some(n) = v["next_before"].as_i64() {
+        ("before", n)
+    } else {
+        die("invalid page response: missing continuation cursor")
+    };
+    let mut next = format!(
+        "{command} --{key} {cursor} --limit {} --max-bytes {}",
+        args.limit, args.max_bytes
+    );
+    if let Some(n) = v["through"].as_i64() {
+        next += &format!(" --through {n}");
+    }
+    if let Some(revision) = v["revision"].as_str() {
+        next += &format!(" --revision {}", shell_word(revision));
+    }
+    println!("More available: {next}");
+}
+
+fn record_output(v: &Value, args: &RecordArgs, command: &str) -> bool {
+    if args.offset.is_some() || v["truncated"] == true {
+        println!("{v}");
+        if args.offset.is_none()
+            && let Some(next) = v["next_offset"].as_i64()
+        {
+            let mut hint = format!("{command} --offset {next} --max-bytes {}", args.max_bytes);
+            if let Some(version) = v["version"].as_str() {
+                hint += &format!(" --version {}", shell_word(version));
+            }
+            println!("Continue record: {hint}");
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn item_truncated(v: &Value, command: &str) -> bool {
+    if v["truncated"] != true {
+        return false;
+    }
+    println!(
+        "#{}, record exceeds this page's byte budget; details: {command}",
+        v["id"]
+    );
+    true
 }
 
 fn sender(v: &Value) -> String {
@@ -768,13 +1169,18 @@ fn main() {
                 );
             }
         }
-        Cmd::Me => print_agent(&get(&format!("/agents/{}", me()))),
-        Cmd::Limits => println!(
-            "{}",
-            get(&format!("/limits?{}", scope()))["text"]
-                .as_str()
-                .unwrap_or("")
-        ),
+        Cmd::Me { record } => {
+            let a = get(&format!("/agents/{}?{}", me(), record.query()));
+            if !record_output(&a, &record, "acom me") {
+                print_agent(&a);
+            }
+        }
+        Cmd::Limits { record } => {
+            let value = get(&format!("/limits?{}&{}", scope(), record.query()));
+            if !record_output(&value, &record, "acom limits") {
+                println!("{}", value["text"].as_str().unwrap_or(""));
+            }
+        }
         Cmd::Status { text } => {
             post(
                 &format!("/agents/{}/status", me()),
@@ -784,24 +1190,33 @@ fn main() {
         }
         Cmd::Group { name } => {
             post(&format!("/agents/{}/group", me()), json!({ "group": name }));
-            println!("group set to {name}");
+            println!("group set to {}", short_label(&name));
         }
         Cmd::Done => {
             post(&format!("/agents/{}/done", me()), json!({}));
             println!("marked done; end your turn now");
         }
-        Cmd::Agents { group } => {
-            let mut path = format!("/agents?{}", scope());
+        Cmd::Agents { group, page } => {
+            let mut path = format!("/agents?{}&{}", scope(), page.query());
+            let mut command = "acom agents".to_string();
             if let Some(g) = group {
                 path += &format!("&group={}", encode(&g));
+                command += &format!(" --group {}", shell_word(&g));
             }
-            for a in get(&path).as_array().into_iter().flatten() {
-                print_agent_line(a);
+            let result = get(&path);
+            for a in page_items(&result) {
+                if !item_truncated(a, &format!("acom agent {}", a["id"])) {
+                    print_agent_line(a);
+                }
             }
+            page_hint(&result, &page, &command);
         }
-        Cmd::Agent { id } => {
-            let context = my_id().map(|a| format!("?agent={a}")).unwrap_or_default();
-            print_agent(&get(&format!("/agents/{id}{context}")));
+        Cmd::Agent { id, record } => {
+            let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
+            let result = get(&format!("/agents/{id}?{context}{}", record.query()));
+            if !record_output(&result, &record, &format!("acom agent {id}")) {
+                print_agent(&result);
+            }
         }
         Cmd::Launch {
             task,
@@ -849,12 +1264,12 @@ fn main() {
                 println!("{}", w.as_str().unwrap_or(""));
             }
         }
-        Cmd::Threads => {
-            for th in get(&format!("/threads?{}", scope()))
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
+        Cmd::Threads { page } => {
+            let result = get(&format!("/threads?{}&{}", scope(), page.query()));
+            for th in page_items(&result) {
+                if item_truncated(th, &format!("acom thread read {}", th["id"])) {
+                    continue;
+                }
                 let members: Vec<String> = th["members"]
                     .as_array()
                     .into_iter()
@@ -876,6 +1291,7 @@ fn main() {
                     t(&th["last_at"])
                 );
             }
+            page_hint(&result, &page, "acom threads");
         }
         Cmd::Thread { cmd } => match cmd {
             ThreadCmd::New {
@@ -914,11 +1330,53 @@ fn main() {
                         }
                     })
                     .collect();
-                println!("thread {} (members {})", v["id"], m.join(", "));
+                if v["result_truncated"] == true {
+                    println!(
+                        "thread {} ({} members; sample {})",
+                        v["id"],
+                        result_count(&v, "members"),
+                        m.join(", ")
+                    );
+                } else {
+                    println!("thread {} (members {})", v["id"], m.join(", "));
+                }
             }
-            ThreadCmd::Read { id } => {
-                let context = my_id().map(|a| format!("?agent={a}")).unwrap_or_default();
-                let th = get(&format!("/threads/{id}{context}"));
+            ThreadCmd::Details { id, record } => {
+                let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
+                let result = get(&format!(
+                    "/threads/{id}/metadata?{context}{}",
+                    record.query()
+                ));
+                if !record_output(&result, &record, &format!("acom thread details {id}")) {
+                    println!("{result}");
+                }
+            }
+            ThreadCmd::Read {
+                id,
+                page,
+                offset,
+                version,
+            } => {
+                let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
+                let mut query = page.query();
+                if let Some(offset) = offset {
+                    query += &format!("&offset={offset}");
+                }
+                if let Some(version) = &version {
+                    query += &format!("&version={}", encode(version));
+                }
+                let th = get(&format!("/threads/{id}?{context}{query}"));
+                if record_output(
+                    &th,
+                    &RecordArgs {
+                        offset,
+                        version,
+                        max_bytes: page.max_bytes,
+                    },
+                    &format!("acom thread read {id}{}", page.selection_flags()),
+                ) {
+                    return;
+                }
                 let m: Vec<String> = th["members"]
                     .as_array()
                     .into_iter()
@@ -950,7 +1408,12 @@ fn main() {
                 if th["events_more"].as_bool() == Some(true) {
                     println!("Older membership events: acom history --thread {id}");
                 }
-                for msg in th["messages"].as_array().into_iter().flatten() {
+                let mut messages = page_items(&th["messages"]).to_vec();
+                messages.sort_by_key(|m| m["id"].as_i64());
+                for msg in &messages {
+                    if item_truncated(msg, &format!("acom read {}", msg["id"])) {
+                        continue;
+                    }
                     println!(
                         "#{} · {} · {}{}\n{}\n",
                         msg["id"],
@@ -960,8 +1423,16 @@ fn main() {
                         msg["text"].as_str().unwrap_or("")
                     );
                 }
+                page_hint(&th["messages"], &page, &format!("acom thread read {id}"));
                 if my_id().unwrap_or(0) == 0
-                    && let Some(last) = th["messages"].as_array().and_then(|m| m.last())
+                    && page.before.is_none()
+                    && page.after.is_none_or(|after| {
+                        th["last_read"].as_i64().is_some_and(|read| after <= read)
+                    })
+                    && let Some(last) = messages
+                        .iter()
+                        .take_while(|m| m["truncated"] != true)
+                        .last()
                 {
                     post(
                         &format!("/threads/{id}/read"),
@@ -988,7 +1459,15 @@ fn main() {
                         }
                     })
                     .collect();
-                println!("added {} to thread {id}", m.join(", "));
+                if v["result_truncated"] == true {
+                    println!(
+                        "added {} members to thread {id}; sample {}",
+                        result_count(&v, "members"),
+                        m.join(", ")
+                    );
+                } else {
+                    println!("added {} to thread {id}", m.join(", "));
+                }
             }
             ThreadCmd::Remove { id, members } => {
                 let members: Vec<String> =
@@ -997,7 +1476,15 @@ fn main() {
                     &format!("/threads/{id}/members/remove"),
                     json!({ "members": members }),
                 );
-                println!("removed {} from thread {id}", v["members"]);
+                if v["result_truncated"] == true {
+                    println!(
+                        "removed {} members from thread {id}; sample {}",
+                        result_count(&v, "members"),
+                        v["members"]
+                    );
+                } else {
+                    println!("removed {} from thread {id}", v["members"]);
+                }
             }
         },
         Cmd::Send { thread, text } => {
@@ -1017,24 +1504,39 @@ fn main() {
                 );
             }
         }
-        Cmd::Inbox { mark } => {
-            let msgs = get(&format!("/inbox/{}?mark={mark}", me()));
-            let msgs = msgs.as_array().cloned().unwrap_or_default();
-            if msgs.is_empty() {
+        Cmd::Inbox { mark, page } => {
+            let result = get(&format!(
+                "/inbox/{}?mark={}&{}",
+                me(),
+                encode(&mark),
+                page.query()
+            ));
+            let msgs = page_items(&result);
+            if msgs.is_empty() && result["unchanged"] != true {
                 println!("no {mark} messages");
             }
-            for m in &msgs {
-                print_message(m);
+            for m in msgs {
+                if !item_truncated(m, &format!("acom read {}", m["id"])) {
+                    print_message(m);
+                }
             }
+            page_hint(
+                &result,
+                &page,
+                &format!("acom inbox --mark {}", shell_word(&mark)),
+            );
             if !msgs.is_empty() && mark == "new" {
                 println!(
                     "Mark them with `acom mark <IDs> in-progress` or `handled` once you've dealt with them."
                 );
             }
         }
-        Cmd::Read { id } => {
-            let context = my_id().map(|a| format!("?agent={a}")).unwrap_or_default();
-            print_message(&get(&format!("/messages/{id}{context}")));
+        Cmd::Read { id, record } => {
+            let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
+            let result = get(&format!("/messages/{id}?{context}{}", record.query()));
+            if !record_output(&result, &record, &format!("acom read {id}")) {
+                print_message(&result);
+            }
         }
         Cmd::History {
             id,
@@ -1047,9 +1549,18 @@ fn main() {
             after,
             limit,
             max_bytes,
+            offset,
+            version,
         } => {
             let mut query = vec![scope()];
             let path = if let Some(id) = id {
+                query.push(format!("max_bytes={max_bytes}"));
+                if let Some(offset) = offset {
+                    query.push(format!("offset={offset}"));
+                }
+                if let Some(version) = &version {
+                    query.push(format!("version={}", encode(version)));
+                }
                 format!("/history/{id}")
             } else {
                 let agent = agent.or_else(|| if all_agents { None } else { my_id() });
@@ -1072,23 +1583,40 @@ fn main() {
                 }
                 "/history".into()
             };
-            println!("{}", get(&format!("{path}?{}", query.join("&"))));
+            let result = get(&format!("{path}?{}", query.join("&")));
+            if let Some(id) = id {
+                if !record_output(
+                    &result,
+                    &RecordArgs {
+                        offset,
+                        version,
+                        max_bytes,
+                    },
+                    &format!("acom history {id}"),
+                ) {
+                    println!("{result}");
+                }
+            } else {
+                println!("{result}");
+            }
         }
         Cmd::Mark { ids: list, mark } => {
+            let selected = ids(&list);
             post(
                 "/marks",
-                json!({ "agent": me(), "ids": ids(&list), "mark": mark }),
+                json!({ "agent": me(), "ids": selected, "mark": mark }),
             );
-            println!("marked {list} {mark}");
+            println!("marked {} message(s) {mark}", selected.len());
         }
-        Cmd::Locks => {
-            for l in get(&format!("/locks?{}", scope()))
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
+        Cmd::Locks { page } => {
+            let result = get(&format!("/locks?{}&{}", scope(), page.query()));
+            for l in page_items(&result) {
+                if item_truncated(l, &format!("acom lock read {}", l["id"])) {
+                    continue;
+                }
                 println!(
-                    "{} · {}",
+                    "#{} {} · {}",
+                    l["id"],
                     l["name"].as_str().unwrap_or(""),
                     l["about"].as_str().unwrap_or("")
                 );
@@ -1121,8 +1649,105 @@ fn main() {
                     println!("    queue: {}", q.join(", "));
                 }
             }
+            page_hint(&result, &page, "acom locks");
+        }
+        Cmd::Activity {
+            id,
+            page,
+            offset,
+            version,
+        } => {
+            if let Some(id) = id {
+                let args = RecordArgs {
+                    offset,
+                    version,
+                    max_bytes: page.max_bytes,
+                };
+                let result = get(&format!("/activity/{id}?{}&{}", scope(), args.query()));
+                if !record_output(&result, &args, &format!("acom activity {id}")) {
+                    println!("{result}");
+                }
+            } else {
+                let result = get(&format!("/activity?{}&{}", scope(), page.query()));
+                println!("{result}");
+                page_hint(&result, &page, "acom activity");
+            }
+        }
+        Cmd::Configs { page } => {
+            let result = get(&format!("/configs?{}", page.query()));
+            println!("{result}");
+            page_hint(&result, &page, "acom configs");
+        }
+        Cmd::Config { id, record } => {
+            let result = get(&format!("/configs/{id}?{}", record.query()));
+            if !record_output(&result, &record, &format!("acom config {id}")) {
+                println!("{result}");
+            }
+        }
+        Cmd::Receipt { id, record } => {
+            let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
+            let result = get(&format!("/receipts/{id}?{context}{}", record.query()));
+            if !record_output(&result, &record, &format!("acom receipt {id}")) {
+                println!("{result}");
+            }
+        }
+        Cmd::Notices {
+            id,
+            page,
+            offset,
+            version,
+        } => {
+            let agent = me();
+            if let Some(id) = id {
+                let args = RecordArgs {
+                    offset,
+                    version,
+                    max_bytes: page.max_bytes,
+                };
+                let result = get(&format!("/notices/{agent}/{id}?{}", args.query()));
+                if !record_output(&result, &args, &format!("acom notices {id}")) {
+                    println!("{result}");
+                }
+            } else {
+                let result = get(&format!("/notices/{agent}?{}", page.query()));
+                println!("{result}");
+                page_hint(&result, &page, "acom notices");
+            }
+        }
+        Cmd::Log {
+            id,
+            before,
+            after,
+            through,
+            version,
+            since,
+            lines,
+            max_bytes,
+        } => {
+            let mut query = format!("lines={lines}&max_bytes={max_bytes}");
+            for (key, value) in [("before", before), ("after", after), ("through", through)] {
+                if let Some(value) = value {
+                    query += &format!("&{key}={value}");
+                }
+            }
+            for (key, value) in [("version", version), ("since", since)] {
+                if let Some(value) = value {
+                    query += &format!("&{key}={}", encode(&value));
+                }
+            }
+            if let Some(actor) = my_id() {
+                query += &format!("&agent={actor}");
+            }
+            // JSON preserves every byte of a partial line and all continuation metadata.
+            println!("{}", get(&format!("/agents/{id}/log?{query}")));
         }
         Cmd::Lock { cmd } => match cmd {
+            LockCmd::Read { id, record } => {
+                let result = get(&format!("/locks/{id}?{}&{}", scope(), record.query()));
+                if !record_output(&result, &record, &format!("acom lock read {id}")) {
+                    println!("{result}");
+                }
+            }
             LockCmd::New { name, about } => {
                 let mut b = json!({ "name": name, "about": about });
                 match my_id() {
@@ -1130,7 +1755,7 @@ fn main() {
                     None => b["project"] = json!(user_project()),
                 }
                 post("/locks", b);
-                println!("created lock {name}");
+                println!("created lock {}", short_label(&name));
             }
             LockCmd::Acquire { name, wait, ttl } => {
                 let b = json!({
@@ -1138,21 +1763,24 @@ fn main() {
                     "wait": wait.as_deref().map(duration).unwrap_or(0),
                     "ttl": ttl.as_deref().map(duration),
                 });
+                let result = post("/locks/acquire", b);
                 println!(
                     "{}",
-                    post("/locks/acquire", b)["result"].as_str().unwrap_or("")
+                    result["result"]
+                        .as_str()
+                        .unwrap_or("lock operation completed; see the full saved receipt")
                 );
             }
             LockCmd::Release { name } => {
                 post("/locks/release", json!({ "agent": me(), "name": name }));
-                println!("released {name}");
+                println!("released {}", short_label(&name));
             }
             LockCmd::Free { name } => {
                 post(
                     "/locks/free",
                     user_body(json!({ "project": user_project(), "name": name })),
                 );
-                println!("freed {name}");
+                println!("freed {}", short_label(&name));
             }
         },
         Cmd::Pause {
@@ -1177,15 +1805,12 @@ fn main() {
             let v = post("/pause-all", user_body(json!({})));
             println!(
                 "paused {} agent(s); their locks are frozen",
-                v["ids"].as_array().map(|a| a.len()).unwrap_or(0)
+                result_count(&v, "ids")
             );
         }
         Cmd::ResumeAll => {
             let v = post("/resume-all", user_body(json!({})));
-            println!(
-                "resumed {} agent(s)",
-                v["ids"].as_array().map(|a| a.len()).unwrap_or(0)
-            );
+            println!("resumed {} agent(s)", result_count(&v, "ids"));
         }
         Cmd::Resume { ids: list } => {
             for id in ids(&list) {
@@ -1204,8 +1829,12 @@ fn main() {
             post(&format!("/agents/{id}/reopen"), user_body(json!({})));
             println!("reopened agent {id}");
         }
-        Cmd::Projects => {
-            for p in get("/projects").as_array().into_iter().flatten() {
+        Cmd::Projects { page } => {
+            let result = get(&format!("/projects?{}", page.query()));
+            for p in page_items(&result) {
+                if item_truncated(p, &format!("acom project read {}", p["id"])) {
+                    continue;
+                }
                 println!(
                     "{:>3}  {} · {} · {} agents, {} active",
                     p["id"],
@@ -1215,8 +1844,15 @@ fn main() {
                     p["active"]
                 );
             }
+            page_hint(&result, &page, "acom projects");
         }
         Cmd::Project { cmd } => match cmd {
+            ProjectCmd::Read { id, record } => {
+                let result = get(&format!("/projects/{id}?{}", record.query()));
+                if !record_output(&result, &record, &format!("acom project read {id}")) {
+                    println!("{result}");
+                }
+            }
             ProjectCmd::Add { path } => {
                 let path = path.unwrap_or_else(cwd);
                 let path = std::path::Path::new(&path);

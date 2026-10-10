@@ -12,6 +12,93 @@ const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
 const startupDiagnostic={type:'item.completed',item:{id:'item_0',type:'error',message:'`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.'}};
 
+// These lifecycle tests inspect complete fixture state. Follow the bounded API
+// explicitly; raw envelope and byte-budget assertions live in pagination.cjs.
+async function fixtureRead(base, method, route, body, status=200) {
+  const requested = new URL(route, base);
+  const read = async (url, method='GET', body, status=200) => {
+    const response = await fetch(url, {method, headers:{'Content-Type':'application/json'}, ...(body === undefined || body === null ? {} : {body:JSON.stringify(body)})});
+    const value = await response.json();
+    assert.equal(response.status, status, `${method} ${url}: ${JSON.stringify(value)}`);
+    return value;
+  };
+  let value = await read(requested, method, body, status);
+  if (method !== 'GET' || status !== 200) return value;
+  const fullRecord = async (url, value) => {
+    if (!value.truncated || value.next_offset !== 0) return value;
+    let offset=0, serialized='';
+    for (let count=0; count<10000; count++) {
+      const next = new URL(url);
+      next.searchParams.set('offset', offset);
+      next.searchParams.set('version', value.version);
+      next.searchParams.set('max_bytes', 65536);
+      const chunk = await read(next);
+      serialized += chunk.chunk;
+      if (!chunk.has_more) return JSON.parse(serialized);
+      assert.ok(chunk.next_offset > offset, 'record chunks must advance');
+      offset = chunk.next_offset;
+    }
+    throw Error('record traversal did not terminate');
+  };
+  value = await fullRecord(requested, value);
+  if (Array.isArray(value.items)) {
+    const items = [...value.items];
+    let page=value;
+    while (page.has_more) {
+      const next = new URL(requested);
+      const direction = page.next_after == null ? 'before' : 'after';
+      next.searchParams.delete(direction === 'before' ? 'after' : 'before');
+      next.searchParams.set(direction, page[`next_${direction}`]);
+      next.searchParams.set('through', value.through);
+      next.searchParams.set('revision', value.revision);
+      page = await read(next);
+      assert.ok(page.items.length > 0, 'collection pages must advance');
+      items.push(...page.items);
+    }
+    const collection=requested.pathname.split('/')[1];
+    for (let index=0; index<items.length; index++) {
+      if (!items[index].truncated) continue;
+      const detail = new URL(collection === 'inbox' ? `/messages/${items[index].id}` : `/${collection}/${items[index].id}`, base);
+      const agent=requested.searchParams.get('agent') || (collection === 'inbox' ? requested.pathname.split('/')[2] : null);
+      if (agent !== null) detail.searchParams.set('agent',agent);
+      items[index]=await fullRecord(detail,await read(detail));
+    }
+    return items.sort((a,b)=>a.id-b.id);
+  }
+  if (/^\/threads\/\d+$/.test(requested.pathname) && value.messages?.items) {
+    const next = new URL(requested);
+    next.searchParams.delete('before'); next.searchParams.set('after',0);
+    next.searchParams.set('limit',200); next.searchParams.set('max_bytes',65536);
+    let page=(await read(next)).messages;
+    const messages=[...page.items], through=page.through;
+    while (page.has_more) {
+      next.searchParams.set('after',page.next_after); next.searchParams.set('through',through);
+      page=(await read(next)).messages;
+      assert.ok(page.items.length > 0, 'message pages must advance');
+      messages.push(...page.items);
+    }
+    for (let index=0; index<messages.length; index++) {
+      if (!messages[index].truncated) continue;
+      const detail = new URL(`/messages/${messages[index].id}`,base);
+      if (requested.searchParams.has('agent')) detail.searchParams.set('agent',requested.searchParams.get('agent'));
+      messages[index]=await fullRecord(detail,await read(detail));
+    }
+    value.messages=messages;
+  }
+  if (/^\/agents\/\d+\/log$/.test(requested.pathname)) value.lines=value.text.split('\n').filter(Boolean);
+  if (requested.pathname === '/overview' && !value.unchanged) {
+    const project=value.project?.id;
+    const scope=project == null ? '' : `?project=${project}`;
+    const [projects,agents,threads,locks,configs,settings]=await Promise.all([
+      fixtureRead(base,'GET','/projects'), fixtureRead(base,'GET','/agents'+scope),
+      fixtureRead(base,'GET','/threads'+scope), fixtureRead(base,'GET','/locks'+scope),
+      fixtureRead(base,'GET','/configs'), fixtureRead(base,'GET','/settings'+scope),
+    ]);
+    Object.assign(value,{projects,agents,threads,locks,configs,settings});
+  }
+  return value;
+}
+
 async function until(check, label, timeout = 10000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -31,6 +118,8 @@ async function freePort() {
 }
 
 test('CLI paths and agent details use caller context; negative API actors cannot write', async () => {
+  const executableDir=path.dirname(fs.realpathSync(binary));
+  for(const client of ['codex','claude']) assert.equal(fs.existsSync(path.join(executableDir,client)),false,`${client} must not shadow the empty fixture PATH`);
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'acom-caller-context-'));
   const home=path.join(root,'state'), serverCwd=path.join(root,'server'), clientCwd=path.join(root,'client');
   const emptyBin=path.join(root,'empty-bin');
@@ -40,10 +129,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
   const url=`http://127.0.0.1:${await freePort()}`;
   const server=spawn(binary,['serve','--port',new URL(url).port],{cwd:serverCwd,env,stdio:['ignore','ignore','pipe']});
   let errors=''; server.stderr.on('data',chunk=>errors+=chunk);
-  const api=async(method,route,body,status=200)=>{
-    const res=await fetch(url+route,{method,headers:{'Content-Type':'application/json'},...(body ? {body:JSON.stringify(body)} : {})});
-    const value=await res.json(); assert.equal(res.status,status,JSON.stringify(value)); return value;
-  };
+  const api=(method,route,body,status=200)=>fixtureRead(url,method,route,body,status);
   const cli=(args,extra={})=>spawnSync(binary,args,{cwd:clientCwd,env:{...env,...extra},encoding:'utf8'});
   try {
     await until(async()=>{
@@ -140,7 +226,7 @@ process.stdin.on('end', async () => {
   const task=previous[0]?.prompt || prompt;
   const membership_snapshot=task.includes('MEMBERSHIP_HOLD_TEST') || task.includes('NEXT_TURN_') || task.includes('Project B defaults') ? {
     state:(await fetch(process.env.ACOM_URL+'/agents/'+id).then(r=>r.json())).state,
-    threads:(await fetch(process.env.ACOM_URL+'/threads?agent='+id).then(r=>r.json())).map(t=>t.id)
+    threads:(await fetch(process.env.ACOM_URL+'/threads?agent='+id).then(r=>r.json())).items.map(t=>t.id)
   } : undefined;
   fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume, membership_snapshot }) + '\\n');
   const session = claude ? args[args.indexOf(resume?'--resume':'--session-id')+1] : resume ? args.at(-2) : crypto.randomUUID();
@@ -168,7 +254,7 @@ process.stdin.on('end', async () => {
     } else {
       if(task.includes('NEXT_TURN_FAIL_OWN_HISTORY') && previous.length%2===1) while(!fs.existsSync(path.join(process.env.ACOM_HOME,'release-'+id+'-'+previous.length))) await new Promise(resolve=>setTimeout(resolve,25));
       const inbox=await fetch(process.env.ACOM_URL+'/inbox/'+id+'?mark=new').then(r=>r.json());
-      const ids=inbox.filter(m=>!m.outside_membership).map(m=>m.id);
+      const ids=inbox.items.filter(m=>!m.outside_membership).map(m=>m.id);
       if(ids.length) await fetch(process.env.ACOM_URL+'/marks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:id,ids,mark:'handled'})});
     }
     if(previous.length && !(task.includes('NEXT_TURN_FAIL_OWN_HISTORY') && previous.length%2===1) || task.includes('NEXT_TURN_DONE')) {
@@ -204,6 +290,10 @@ process.stdin.on('end', async () => {
     const released=path.join(process.env.ACOM_HOME,'release-'+id);
     while(!fs.existsSync(released)) await new Promise(resolve=>setTimeout(resolve,25));
   }
+  if(previous.length===0 && task.includes('INITIAL_LOCK_HOLD_TEST')) {
+    const released=path.join(process.env.ACOM_HOME,'release-'+id);
+    while(!fs.existsSync(released)) await new Promise(resolve=>setTimeout(resolve,25));
+  }
   await fetch(process.env.ACOM_URL + '/hook/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   await new Promise(resolve => setTimeout(resolve, 2000));
   await fetch(process.env.ACOM_URL + '/agents/' + id + '/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
@@ -234,12 +324,7 @@ process.stdin.on('end', async () => {
       server.kill('SIGTERM'); await exited;
     }
   };
-  const api = async (method, route, body, status = 200) => {
-    const res = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
-    const result = await res.json();
-    assert.equal(res.status, status, `${method} ${route}: ${JSON.stringify(result)}`);
-    return result;
-  };
+  const api = (method,route,body,status=200)=>fixtureRead(url,method,route,body,status);
   const cli = (cwd, args, extra = {}, input) => {
     const result = spawnSync(binary, args, { cwd, env: { ...env, ...extra }, encoding: 'utf8', input });
     assert.equal(result.status, 0, result.stderr);
@@ -328,8 +413,8 @@ process.stdin.on('end', async () => {
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
     const boundedLocks=structuredClone(defaults); boundedLocks.max_lock_ttl_secs=60;
     await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
-    const one = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'First project' });
-    const two = await api('POST', '/agents', { project: b.id, harness: 'codex', model: 'custom-id', task: 'Second project' });
+    const one = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'First project INITIAL_LOCK_HOLD_TEST' });
+    const two = await api('POST', '/agents', { project: b.id, harness: 'codex', model: 'custom-id', task: 'Second project INITIAL_LOCK_HOLD_TEST' });
     await until(() => [one.id,two.id].every(id=>runs().some(r=>r.id===id)), 'both harnesses started');
     for (const [agent, project] of [[one.id, first], [two.id, second]]) {
       const run = runs().find(r => r.id === agent);
@@ -376,6 +461,7 @@ process.stdin.on('end', async () => {
     const thread = await api('POST', '/threads', { project: a.id, title: 'Review', members: [String(one.id)] });
     await api('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 400);
     await api('POST', `/projects/${a.id}/remove`, {}, 409);
+    for(const id of [one.id,two.id]) fs.writeFileSync(path.join(home,'release-'+id),'');
     await finished(one.id); await finished(two.id);
     const cliThread=await api('POST','/threads',{project:a.id,title:'CLI stdin delivery',members:[]});
     const actor={ACOM_ID:String(one.id),ACOM_URL:url};
@@ -800,7 +886,8 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[]);
     await api('POST','/messages',{thread:solo.id,text:'Posting joins me again'});
     assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[0]);
-    await api('GET', '/settings', null, 404);
+    assert.deepEqual(await api('GET','/settings'),builtin.settings);
+    await api('GET','/not-a-route',null,404);
     await api('POST', '/configs/1/remove', {}, 409);
     await api('POST', '/configs', { name: '  ', settings: defaults }, 400);
     await api('POST', '/configs', { name: 'Default', settings: defaults }, 409);

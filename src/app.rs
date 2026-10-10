@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::paging::fingerprint;
+pub use crate::paging::{PageQuery, bounded_record};
+
 pub const GUIDE: &str = include_str!("guide.md");
 pub const MODELS: &str = include_str!("models.md");
 pub const STATES: [&str; 7] = [
@@ -507,6 +510,8 @@ CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, 
   holder INTEGER, acquired_at INTEGER, expires_at INTEGER, frozen INTEGER NOT NULL DEFAULT 0, frozen_left INTEGER,
   PRIMARY KEY (project, name));
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS notices_agent ON notices(agent_id,id);
+CREATE INDEX IF NOT EXISTS notices_delivery ON notices(agent_id,shown,id);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
@@ -614,7 +619,65 @@ WHEN NEW.holder IS NOT NULL AND OLD.holder=NEW.holder
       ELSE CASE WHEN NEW.expires_at<OLD.expires_at OR NEW.frozen_left<OLD.frozen_left THEN 'lock.shortened' ELSE 'lock.renewed' END END,
       'acom',NEW.holder,NEW.name,json_object('expires_at',NEW.expires_at,'frozen_left',NEW.frozen_left));
 END;
+CREATE TABLE IF NOT EXISTS view_revisions (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+INSERT OR IGNORE INTO view_revisions VALUES('epoch',0);
+CREATE TABLE IF NOT EXISTS view_ids (name TEXT PRIMARY KEY, id INTEGER NOT NULL);
+INSERT OR IGNORE INTO view_ids SELECT 'activity',coalesce(max(id),0) FROM activity;
+INSERT OR IGNORE INTO view_ids SELECT 'messages',coalesce(max(id),0) FROM messages;
+INSERT OR IGNORE INTO view_ids SELECT 'threads',coalesce(max(id),0) FROM threads;
+INSERT OR IGNORE INTO view_ids SELECT 'locks',coalesce(max(rowid),0) FROM locks;
+INSERT OR IGNORE INTO view_ids SELECT 'notices',coalesce(max(id),0) FROM notices;
 ";
+
+// Revision counters participate in the same SQLite transaction as their rows,
+// including external writes. No-op updates do not invalidate a snapshot.
+fn initialize_views(db: &Connection) -> R<()> {
+    for table in [
+        "projects",
+        "configs",
+        "agents",
+        "threads",
+        "messages",
+        "members",
+        "member_intervals",
+        "thread_filters",
+        "user_reads",
+        "marks",
+        "locks",
+        "activity",
+        "events",
+        "usage",
+        "usage_checks",
+        "notices",
+    ] {
+        db.execute("INSERT OR IGNORE INTO view_revisions VALUES(?1,0)", [table])?;
+        let columns: Vec<String> = rows(db, &format!("PRAGMA table_info({table})"), [])?
+            .into_iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect();
+        let changed = columns
+            .iter()
+            .map(|column| format!("OLD.\"{column}\" IS NOT NEW.\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            let when = if operation == "UPDATE" {
+                format!("WHEN {changed}")
+            } else {
+                String::new()
+            };
+            db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS view_{table}_{operation} AFTER {operation} ON {table} {when} BEGIN UPDATE view_revisions SET value=value+1 WHERE name='{table}'; END;"))?;
+        }
+    }
+    for table in ["activity", "messages", "threads", "locks", "notices"] {
+        db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS view_id_{table} AFTER INSERT ON {table} BEGIN UPDATE view_ids SET id=max(id,NEW.rowid) WHERE name='{table}'; END;"))?;
+    }
+    db.execute(
+        "UPDATE view_revisions SET value=value+1 WHERE name='epoch'",
+        [],
+    )?;
+    Ok(())
+}
 
 /// Development schemas changed before release; don't serve a half-working old
 /// database or alter its records. Starting with a separate ACOM_HOME is safe.
@@ -842,7 +905,7 @@ impl St {
     /// Record an activity line, for one project or (None) for all of them.
     pub fn log(&self, project: Option<i64>, actor: &str, what: &str) -> R<()> {
         self.db.execute(
-            "INSERT INTO activity(project,at,actor,what) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO activity(id,project,at,actor,what) VALUES((SELECT max((SELECT id FROM view_ids WHERE name='activity'),coalesce(max(id),0))+1 FROM activity),?1,?2,?3,?4)",
             params![project, now(), actor, what],
         )?;
         Ok(())
@@ -856,7 +919,7 @@ impl St {
 
     pub fn notice(&self, agent: i64, text: &str) -> R<()> {
         self.db.execute(
-            "INSERT INTO notices(agent_id,text,at) VALUES(?1,?2,?3)",
+            "INSERT INTO notices(id,agent_id,text,at) VALUES((SELECT max((SELECT id FROM view_ids WHERE name='notices'),coalesce(max(id),0))+1 FROM notices),?1,?2,?3)",
             params![agent, text, now()],
         )?;
         Ok(())
@@ -1253,28 +1316,61 @@ impl St {
         let mut lines = Vec::new();
         let mut s = self
             .db
-            .prepare("SELECT id, text FROM notices WHERE agent_id=?1 AND shown=0 ORDER BY id")?;
-        let notes: Vec<(i64, String)> = s
-            .query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .prepare("SELECT id,substr(text,1,600),length(text)>600 FROM notices WHERE agent_id=?1 AND shown=0 ORDER BY id LIMIT 25")?;
+        let notes: Vec<(i64, String, bool)> = s
+            .query_map([agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
         drop(s);
-        for (id, text) in notes {
-            lines.push(format!("[acom] {text}"));
+        for (id, text, truncated) in notes {
+            lines.push(if truncated {format!("[acom] {text}… [Notice #{id} shortened; read `acom notices {id}` for the full notice.]")}else{format!("[acom] {text}")});
+            if json!({"text":lines.join("\n")}).to_string().len() > 10000 {
+                lines.pop();
+                break;
+            }
             self.db
                 .execute("UPDATE notices SET shown=1 WHERE id=?1", [id])?;
         }
-        let msgs = self.pending(agent)?;
-        if !msgs.is_empty() {
-            let mut senders: Vec<i64> = Vec::new();
-            for (_, s) in &msgs {
-                if !senders.contains(s) {
-                    senders.push(*s);
-                }
+        let left: i64 = self.db.query_row(
+            "SELECT count(*) FROM notices WHERE agent_id=?1 AND shown=0",
+            [agent],
+            |r| r.get(0),
+        )?;
+        if left > 0 {
+            lines.push(format!("[acom] {left} more notices waiting. Read `acom notices`; further hooks also deliver them."));
+        }
+        let eligible="FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?1
+            WHERE m.id>b.last_notified AND m.sender<>?1 AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id
+             AND i.agent_id=?1 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))";
+        let count: i64 =
+            self.db
+                .query_row(&format!("SELECT count(*) {eligible}"), [agent], |r| {
+                    r.get(0)
+                })?;
+        if count > 0 {
+            let first = rows(
+                &self.db,
+                &format!(
+                    "SELECT m.sender id,min(m.id) first_seen {eligible} GROUP BY m.sender ORDER BY first_seen LIMIT 7"
+                ),
+                [agent],
+            )?;
+            let mut senders: Vec<i64> = first.iter().map(|v| v["id"].as_i64().unwrap()).collect();
+            if senders.len() > 6 {
+                senders.truncate(5);
+                let mut last = rows(
+                    &self.db,
+                    &format!(
+                        "SELECT m.sender id,min(m.id) first_seen {eligible} GROUP BY m.sender ORDER BY first_seen DESC LIMIT 2"
+                    ),
+                    [agent],
+                )?;
+                last.reverse();
+                senders.extend(last.iter().map(|v| v["id"].as_i64().unwrap()));
             }
             lines.push(format!(
                 "[acom] {} new message{} from {}. Read them with `acom inbox` when you're ready.",
-                msgs.len(),
-                if msgs.len() == 1 { "" } else { "s" },
+                count,
+                if count == 1 { "" } else { "s" },
                 sender_list(&senders)
             ));
             self.mark_notified(agent)?;
@@ -1400,12 +1496,29 @@ pub struct HistoryQuery {
     pub max_bytes: i64,
 }
 
+struct SelectedPage {
+    unchanged: Option<Value>,
+    items: Vec<Value>,
+    through: i64,
+    total: i64,
+    revision: String,
+}
+impl SelectedPage {
+    fn finish(self, q: &PageQuery) -> R<Value> {
+        match self.unchanged {
+            Some(value) => Ok(value),
+            None => q.finish(self.items, self.total, self.through, &self.revision),
+        }
+    }
+}
+
 impl App {
     pub fn open(home: PathBuf, url: String) -> R<Arc<App>> {
         std::fs::create_dir_all(home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
         let db = Connection::open(home.join("acom.db"))?;
         check_stored_schema(&db)?;
         db.execute_batch(SCHEMA)?;
+        initialize_views(&db)?;
         db.execute("UPDATE usage_checks SET in_flight=0", [])?;
         let mut st = St {
             db,
@@ -2691,7 +2804,7 @@ impl App {
         }
         let tid = st.atomic(|st| {
             st.db.execute(
-                "INSERT INTO threads(project,title,created_by,created_at) VALUES(?1,?2,?3,?4)",
+                "INSERT INTO threads(id,project,title,created_by,created_at) VALUES((SELECT max((SELECT id FROM view_ids WHERE name='threads'),coalesce(max(id),0))+1 FROM threads),?1,?2,?3,?4)",
                 params![project, title.trim(), by, now()],
             )?;
             let tid = st.db.last_insert_rowid();
@@ -2859,7 +2972,7 @@ impl App {
         let mid = st.atomic(|st| {
             // Posting cannot override a live audience's eligibility.
             if sender==0 || !Self::is_live(st,tid)? { Self::join_member(st,tid,sender)?; }
-            st.db.execute("INSERT INTO messages(thread_id,sender,text,at) VALUES(?1,?2,?3,?4)", params![tid, sender, text, now()])?;
+            st.db.execute("INSERT INTO messages(id,thread_id,sender,text,at) VALUES((SELECT max((SELECT id FROM view_ids WHERE name='messages'),coalesce(max(id),0))+1 FROM messages),?1,?2,?3,?4)", params![tid, sender, text, now()])?;
             let mid=st.db.last_insert_rowid();
             if sender>0 { st.db.execute("INSERT OR REPLACE INTO marks(agent_id,message_id,mark) VALUES(?1,?2,'handled')",params![sender,mid])?; }
             st.event(project,Some(sender),Some(tid),"message.sent",&who(sender),json!({"message":mid}))?;
@@ -2920,6 +3033,7 @@ impl App {
         Ok((mid, not_woken))
     }
 
+    #[cfg(test)]
     pub fn inbox(&self, agent: i64, mark: &str) -> R<Vec<Value>> {
         let st = self.lock();
         st.agent(agent)?;
@@ -2976,7 +3090,7 @@ impl App {
             return Err(bad("a lock name is non-empty text on one line"));
         }
         let n = st.db.execute(
-            "INSERT OR IGNORE INTO locks(project,name,about,created_at) VALUES(?1,?2,?3,?4)",
+            "INSERT OR IGNORE INTO locks(rowid,project,name,about,created_at) VALUES((SELECT max((SELECT id FROM view_ids WHERE name='locks'),coalesce(max(rowid),0))+1 FROM locks),?1,?2,?3,?4)",
             params![project, name, about, now()],
         )?;
         if n == 0 {
@@ -3098,7 +3212,28 @@ impl App {
     }
 
     pub fn free(&self, project: i64, name: &str, by: &str) -> R<()> {
+        self.free_checked(project, name, by, None)
+    }
+
+    pub fn free_frozen(&self, project: i64, name: &str, holder: i64, by: &str) -> R<()> {
+        self.free_checked(project, name, by, Some(holder))
+    }
+
+    fn free_checked(&self, project: i64, name: &str, by: &str, expected: Option<i64>) -> R<()> {
         let mut st = self.lock();
+        if let Some(holder) = expected {
+            let unchanged: bool = st.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM locks l JOIN agents a ON a.id=l.holder
+                 WHERE l.project=?1 AND l.name=?2 AND l.holder=?3 AND l.frozen=1 AND a.state='paused')",
+                params![project, name, holder],
+                |r| r.get(0),
+            )?;
+            if !unchanged {
+                return Err(conflict(
+                    "frozen lock ownership changed; review locks before freeing it",
+                ));
+            }
+        }
         let (holder, _) = Self::lock_row(&st, project, name)?;
         let Some(holder) = holder else {
             return Err(conflict(format!("{name} isn't held")));
@@ -3113,6 +3248,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn locks(&self, project: Option<i64>) -> R<Vec<Value>> {
         let st = self.lock();
         let mut v = rows(
@@ -3706,6 +3842,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn configs(&self) -> R<Vec<Value>> {
         let st = self.lock();
         let mut v = vec![json!({"id":1,"name":"Default","settings":Settings::default()})];
@@ -3921,6 +4058,7 @@ impl App {
         )))
     }
 
+    #[cfg(test)]
     pub fn projects(&self) -> R<Vec<Value>> {
         let st = self.lock();
         rows(
@@ -3973,13 +4111,781 @@ impl App {
         })
     }
 
+    // ---------- bounded views ----------
+
+    fn view_revision(&self, st: &St, tables: &[&str], scope: &str) -> R<String> {
+        let mut parts = vec![self.home.to_string_lossy().into_owned(), scope.to_string()];
+        for name in std::iter::once(&"epoch").chain(tables.iter()) {
+            let value: i64 = st.db.query_row(
+                "SELECT value FROM view_revisions WHERE name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            parts.push(format!("{name}:{value}"));
+        }
+        Ok(fingerprint(parts))
+    }
+
+    #[allow(clippy::too_many_arguments)] // SQL bindings and snapshot scope stay explicit.
+    fn select_page(
+        &self,
+        st: &St,
+        q: &PageQuery,
+        tables: &[&str],
+        scope: &str,
+        sql: &str,
+        args: &[rusqlite::types::Value],
+        snapshot: bool,
+    ) -> R<SelectedPage> {
+        q.validate()?;
+        let revision = self.view_revision(st, tables, scope)?;
+        let unchanged = if snapshot {
+            q.snapshot(&revision)?
+        } else {
+            q.since
+                .as_deref()
+                .filter(|v| *v == revision)
+                .map(|_| json!({"unchanged":true,"revision":revision}))
+        };
+        if let Some(value) = unchanged {
+            return Ok(SelectedPage {
+                unchanged: Some(value),
+                items: vec![],
+                through: 0,
+                total: 0,
+                revision,
+            });
+        }
+        let ceiling = q
+            .through
+            .map(|id| format!("WHERE id<={id}"))
+            .unwrap_or_default();
+        let (latest, total): (i64, i64) = st.db.query_row(
+            &format!("SELECT coalesce(max(id),0),count(*) FROM ({sql}) {ceiling}"),
+            rusqlite::params_from_iter(args),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let through = q.through.unwrap_or(latest);
+        let before = q
+            .before
+            .map(|id| format!(" AND id<{id}"))
+            .unwrap_or_default();
+        let after = q
+            .after
+            .map(|id| format!(" AND id>{id}"))
+            .unwrap_or_default();
+        let order = if q.ascending() { "ASC" } else { "DESC" };
+        let items = rows(
+            &st.db,
+            &format!(
+                "SELECT * FROM ({sql}) WHERE id<={through}{before}{after} ORDER BY id {order} LIMIT {}",
+                q.limit + 1
+            ),
+            rusqlite::params_from_iter(args),
+        )?;
+        Ok(SelectedPage {
+            unchanged: None,
+            items,
+            through,
+            total,
+            revision,
+        })
+    }
+
+    fn project_sql() -> &'static str {
+        "SELECT p.id,p.name,p.path,CASE WHEN p.custom IS NULL THEN p.config END config,
+          CASE WHEN p.custom IS NOT NULL THEN 'Custom' WHEN p.config=1 THEN 'Default' ELSE c.name END config_name,
+          (SELECT count(*) FROM agents a WHERE a.project=p.id) agents,
+          (SELECT count(*) FROM agents a WHERE a.project=p.id AND a.state IN ('working','idle')) active,
+          (SELECT count(*) FROM threads t JOIN members b ON b.thread_id=t.id AND b.agent_id=0 JOIN messages m ON m.thread_id=t.id
+           LEFT JOIN user_reads r ON r.thread_id=t.id WHERE t.project=p.id AND m.sender<>0 AND m.id>coalesce(r.message_id,0)
+           AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after
+             AND (i.end_after IS NULL OR m.id<=i.end_after))) unread
+         FROM projects p LEFT JOIN configs c ON c.id=p.config"
+    }
+
+    pub fn project_view(&self, id: i64) -> R<Value> {
+        rows(
+            &self.lock().db,
+            &format!("{} WHERE p.id=?1", Self::project_sql()),
+            [id],
+        )?
+        .pop()
+        .ok_or_else(|| not_found(format!("no project {id}")))
+    }
+
+    pub fn projects_page(&self, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        self.select_page(
+            &st,
+            &q,
+            &[
+                "projects",
+                "configs",
+                "agents",
+                "threads",
+                "messages",
+                "members",
+                "member_intervals",
+                "user_reads",
+            ],
+            "projects",
+            Self::project_sql(),
+            &[],
+            true,
+        )?
+        .finish(&q)
+    }
+
+    pub fn agents_page(&self, project: Option<i64>, group: Option<&str>, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        let sql="SELECT id,project,name,grp \"group\",harness,model,effort,state,status_text status,substr(task,1,400) task_preview,
+          substr(problem,1,400) problem_preview,problem IS NOT NULL has_problem,
+          (lower(problem) LIKE '%model%not supported%' OR lower(problem) LIKE '%model%not available%'
+           OR lower(problem) LIKE '%model%not found%' OR lower(problem) LIKE '%not supported%account%') model_unavailable,launched_by,launched_at,
+          pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,turns,ended_at,wake_queued_at,wake_why wake_reason
+          FROM agents WHERE (?1 IS NULL OR project=?1) AND (?2 IS NULL OR grp=?2)";
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &["agents", "locks"],
+            &format!("agents:{project:?}:{group:?}"),
+            sql,
+            &[project.into(), group.map(str::to_string).into()],
+            true,
+        )?;
+        for item in &mut page.items {
+            item["locks"] = json!(st.held_by(item["id"].as_i64().unwrap())?);
+        }
+        page.finish(&q)
+    }
+
+    pub fn threads_page(&self, project: Option<i64>, agent: Option<i64>, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        let sql="SELECT t.id,t.project,t.title,t.created_by,t.created_at,
+          (SELECT count(*) FROM messages m WHERE m.thread_id=t.id) messages,
+          (SELECT max(at) FROM messages m WHERE m.thread_id=t.id) last_at
+          FROM threads t WHERE (?1 IS NULL OR t.project=?1) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM members b WHERE b.thread_id=t.id AND b.agent_id=?2))";
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &[
+                "threads",
+                "messages",
+                "members",
+                "thread_filters",
+                "user_reads",
+                "member_intervals",
+            ],
+            &format!("threads:{project:?}:{agent:?}"),
+            sql,
+            &[project.into(), agent.into()],
+            true,
+        )?;
+        for item in &mut page.items {
+            let tid = item["id"].as_i64().unwrap();
+            item["unread"] = json!(Self::user_unread(&st, tid)?);
+            let ids = rows(
+                &st.db,
+                "SELECT agent_id id FROM members WHERE thread_id=?1 ORDER BY agent_id",
+                [tid],
+            )?;
+            item["members"] = json!(ids.iter().map(|v| v["id"].clone()).collect::<Vec<_>>());
+            item["user_member"] = json!(ids.iter().any(|v| v["id"] == 0));
+            item["watch"] = Self::thread_watch(&st, tid)?;
+        }
+        page.finish(&q)
+    }
+
+    fn lock_sql() -> &'static str {
+        "SELECT l.rowid id,l.project,l.name,l.about,l.holder,a.name holder_name,a.state holder_state,
+         l.acquired_at,l.expires_at,l.frozen,l.frozen_left FROM locks l LEFT JOIN agents a ON a.id=l.holder"
+    }
+
+    fn attach_queue(st: &St, item: &mut Value) {
+        let key = (
+            item["project"].as_i64().unwrap(),
+            item["name"].as_str().unwrap().to_string(),
+        );
+        item["queue"] = json!(st.queues.get(&key).cloned().unwrap_or_default());
+    }
+
+    pub fn lock_view(&self, id: i64, project: Option<i64>) -> R<Value> {
+        let st = self.lock();
+        let mut item = rows(
+            &st.db,
+            &format!(
+                "{} WHERE l.rowid=?1 AND (?2 IS NULL OR l.project=?2)",
+                Self::lock_sql()
+            ),
+            params![id, project],
+        )?
+        .pop()
+        .ok_or_else(|| not_found(format!("no lock {id}")))?;
+        Self::attach_queue(&st, &mut item);
+        Ok(item)
+    }
+
+    pub fn locks_page(&self, project: Option<i64>, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &["locks", "agents"],
+            &format!(
+                "locks:{project:?}:{}",
+                fingerprint(format!("{:?}", st.queues))
+            ),
+            &format!("{} WHERE ?1 IS NULL OR l.project=?1", Self::lock_sql()),
+            &[project.into()],
+            true,
+        )?;
+        for item in &mut page.items {
+            Self::attach_queue(&st, item);
+        }
+        page.finish(&q)
+    }
+
+    fn config_locked(st: &St, id: i64) -> R<Value> {
+        let mut c = if id == 1 {
+            json!({"id":1,"name":"Default","settings":Settings::default()})
+        } else {
+            let mut c = rows(
+                &st.db,
+                "SELECT id,name,settings FROM configs WHERE id=?1",
+                [id],
+            )?
+            .pop()
+            .ok_or_else(|| not_found(format!("no config {id}")))?;
+            c["settings"] = serde_json::from_str(c["settings"].as_str().unwrap())
+                .map_err(|_| bad("invalid saved settings"))?;
+            c
+        };
+        c["projects"] = json!(
+            rows(
+                &st.db,
+                "SELECT id FROM projects WHERE config=?1 AND custom IS NULL ORDER BY id",
+                [id]
+            )?
+            .iter()
+            .map(|r| r["id"].clone())
+            .collect::<Vec<_>>()
+        );
+        Ok(c)
+    }
+
+    pub fn config_view(&self, id: i64) -> R<Value> {
+        Self::config_locked(&self.lock(), id)
+    }
+
+    pub fn configs_page(&self, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        let sql = "SELECT 1 id,'Default' name UNION ALL SELECT id,name FROM configs";
+        let mut page =
+            self.select_page(&st, &q, &["configs", "projects"], "configs", sql, &[], true)?;
+        for item in &mut page.items {
+            *item = Self::config_locked(&st, item["id"].as_i64().unwrap())?;
+        }
+        page.finish(&q)
+    }
+
+    pub fn activity_page(&self, project: Option<i64>, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &["activity"],
+            &format!("activity:{project:?}"),
+            "SELECT id,project,at,actor,CASE WHEN length(CAST(what AS BLOB))>?2 THEN NULL ELSE what END what,
+             length(CAST(what AS BLOB))>?2 truncated FROM activity WHERE ?1 IS NULL OR project IS NULL OR project=?1",
+            &[project.into(), q.max_bytes.into()],
+            false,
+        )?;
+        for item in &mut page.items {
+            if item["truncated"] == 0 {
+                item.as_object_mut().unwrap().remove("truncated");
+            } else {
+                item["truncated"] = json!(true);
+            }
+        }
+        page.finish(&q)
+    }
+
+    pub fn activity_view(&self, id: i64, project: Option<i64>) -> R<Value> {
+        rows(&self.lock().db,"SELECT id,project,at,actor,what FROM activity WHERE id=?1 AND (?2 IS NULL OR project IS NULL OR project=?2)",params![id,project])?.pop().ok_or_else(||not_found(format!("no activity {id}")))
+    }
+
+    pub fn notices_page(&self, agent: i64, q: PageQuery) -> R<Value> {
+        let st = self.lock();
+        st.agent(agent)?;
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &["notices"],
+            &format!("notices:{agent}"),
+            "SELECT id,CASE WHEN length(CAST(text AS BLOB))>?2 THEN NULL ELSE text END text,
+             shown,length(CAST(text AS BLOB))>?2 truncated FROM notices WHERE agent_id=?1",
+            &[agent.into(), q.max_bytes.into()],
+            false,
+        )?;
+        for item in &mut page.items {
+            if item["truncated"] == 0 {
+                item.as_object_mut().unwrap().remove("truncated");
+            } else {
+                item["truncated"] = json!(true);
+            }
+        }
+        page.finish(&q)
+    }
+
+    pub fn notice_view(&self, agent: i64, id: i64) -> R<Value> {
+        let st = self.lock();
+        st.agent(agent)?;
+        rows(
+            &st.db,
+            "SELECT id,text,shown FROM notices WHERE agent_id=?1 AND id=?2",
+            params![agent, id],
+        )?
+        .pop()
+        .ok_or_else(|| not_found(format!("no notice {id} for agent {agent}")))
+    }
+
+    pub fn receipt_view(&self, id: i64, agent: Option<i64>) -> R<Value> {
+        let st = self.lock();
+        let project = agent
+            .filter(|a| *a > 0)
+            .map(|a| st.agent(a).map(|a| a.project))
+            .transpose()?;
+        Self::event_rows(&st,"SELECT * FROM events WHERE id=?1 AND kind='command.receipt' AND (?2 IS NULL OR project=?2)",params![id,project])?.pop().ok_or_else(||not_found(format!("no receipt {id}")))
+    }
+
+    /// A large mutation result is retained, not truncated into a receipt that
+    /// encourages replaying a successful command. Only reads retrieve details.
+    pub fn compact_receipt(
+        &self,
+        value: Value,
+        agent: Option<i64>,
+        project: Option<i64>,
+        thread: Option<i64>,
+    ) -> Value {
+        if value.to_string().len() <= 16000 {
+            return value;
+        }
+        let st = self.lock();
+        let project = project
+            .or_else(|| {
+                agent
+                    .filter(|a| *a > 0)
+                    .and_then(|a| st.agent(a).ok().map(|a| a.project))
+            })
+            .or_else(|| thread.and_then(|t| Self::thread_project(&st, t).ok()));
+        let mut result = json!({"result_truncated":true,"counts":{}});
+        for (key, item) in value.as_object().into_iter().flatten() {
+            if let Some(items) = item.as_array() {
+                result["counts"][key] = json!(items.len());
+                // Samples are explicit; complete warnings and recipient results
+                // remain in the immutable event, even if one item alone is huge.
+                let mut sample = Vec::new();
+                for item in items.iter().take(10) {
+                    sample.push(item.clone());
+                    if json!(sample).to_string().len() > 1024 {
+                        sample.pop();
+                        break;
+                    }
+                }
+                result[key] = json!(sample);
+            } else if item.to_string().len() < 1024 {
+                result[key] = item.clone();
+            }
+        }
+        let global = project.is_none();
+        let project = project.or_else(|| {
+            st.db
+                .query_row("SELECT id FROM projects ORDER BY id LIMIT 1", [], |r| {
+                    r.get(0)
+                })
+                .ok()
+        });
+        let stored = project
+            .ok_or_else(|| bad("receipt project unavailable"))
+            .and_then(|p| {
+                st.event(
+                    p,
+                    agent,
+                    thread,
+                    "command.receipt",
+                    &who(agent.unwrap_or(0)),
+                    json!({"response":value,"global":global}),
+                )?;
+                Ok(st.db.last_insert_rowid())
+            });
+        match stored {
+            Ok(id) => result["receipt_event"] = json!(id),
+            Err(error) => {
+                result["receipt_error"] = json!(format!(
+                    "Action completed, but its full receipt could not be saved: {}. Inspect current state before any retry.",
+                    error.1.chars().take(300).collect::<String>()
+                ))
+            }
+        }
+        result
+    }
+
+    pub fn overview(&self, project: Option<i64>, since: Option<&str>) -> R<Value> {
+        let st = self.lock();
+        let current = if let Some(id) = project {
+            rows(
+                &st.db,
+                &format!("{} WHERE p.id=?1", Self::project_sql()),
+                [id],
+            )?
+            .pop()
+        } else {
+            None
+        };
+        let current = match current {
+            Some(p) => Some(p),
+            None => rows(
+                &st.db,
+                &format!("{} ORDER BY p.name,p.id LIMIT 1", Self::project_sql()),
+                [],
+            )?
+            .pop(),
+        };
+        let pid = current.as_ref().and_then(|p| p["id"].as_i64());
+        let mut revisions = serde_json::Map::new();
+        for (name, tables) in [
+            (
+                "projects",
+                vec![
+                    "projects",
+                    "configs",
+                    "agents",
+                    "threads",
+                    "messages",
+                    "members",
+                    "member_intervals",
+                    "user_reads",
+                ],
+            ),
+            ("configs", vec!["configs", "projects"]),
+            ("settings", vec!["configs", "projects"]),
+            ("agents", vec!["agents", "locks"]),
+            (
+                "threads",
+                vec![
+                    "threads",
+                    "messages",
+                    "members",
+                    "thread_filters",
+                    "user_reads",
+                    "member_intervals",
+                ],
+            ),
+            ("locks", vec!["locks", "agents"]),
+            ("activity", vec!["activity"]),
+        ] {
+            let scope = match name {
+                "projects" | "configs" => name.to_string(),
+                "agents" => format!("agents:{pid:?}:None"),
+                "threads" => format!("threads:{pid:?}:None"),
+                "locks" => format!("locks:{pid:?}:{}", fingerprint(format!("{:?}", st.queues))),
+                "activity" => format!("activity:{pid:?}"),
+                _ => format!("{name}:{pid:?}"),
+            };
+            revisions.insert(
+                name.into(),
+                json!(self.view_revision(&st, &tables, &scope)?),
+            );
+        }
+        let revision = self.view_revision(
+            &st,
+            &[
+                "projects",
+                "configs",
+                "agents",
+                "threads",
+                "messages",
+                "members",
+                "member_intervals",
+                "user_reads",
+                "locks",
+                "activity",
+                "usage",
+                "usage_checks",
+            ],
+            &format!(
+                "overview:{project:?}:{}",
+                fingerprint(format!("{:?}", st.queues))
+            ),
+        )?;
+        if since == Some(revision.as_str()) {
+            return Ok(json!({"unchanged":true,"revision":revision}));
+        }
+        let unread_total:i64=st.db.query_row("SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0 LEFT JOIN user_reads r ON r.thread_id=m.thread_id WHERE m.sender<>0 AND m.id>coalesce(r.message_id,0) AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))",[],|r|r.get(0))?;
+        let s = st.settings_for(pid);
+        let (total, per) = st.active_counts(pid)?;
+        let limits = json!({"limits":s.limits,"active":{"total":total,"per_harness":per},"usage":rows(&st.db,"SELECT provider,win,used_pct,resets_at,at FROM usage ORDER BY provider,win",[])?,"checks":rows(&st.db,"SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider",[])?,"text":st.limits_text(pid)?});
+        Ok(
+            json!({"url":self.url,"project":current,"unread_total":unread_total,"limits":limits,"revisions":revisions,"revision":revision}),
+        )
+    }
+
+    pub fn thread_page(&self, tid: i64, agent: Option<i64>, mut q: PageQuery) -> R<Value> {
+        q.validate()?;
+        let st = self.lock();
+        let project = Self::thread_project(&st, tid)?;
+        let actor = agent.unwrap_or(0);
+        if actor > 0 && st.agent(actor)?.project != project {
+            return Err(bad("thread is in another project"));
+        }
+        let mut t = rows(
+            &st.db,
+            "SELECT id,project,title,created_by,created_at FROM threads WHERE id=?1",
+            [tid],
+        )?
+        .remove(0);
+        t["members"] = json!(
+            rows(
+                &st.db,
+                "SELECT agent_id id FROM members WHERE thread_id=?1 ORDER BY agent_id",
+                [tid]
+            )?
+            .iter()
+            .map(|v| v["id"].clone())
+            .collect::<Vec<_>>()
+        );
+        t["watch"] = Self::thread_watch(&st, tid)?;
+        let read = Self::user_read_cursor(&st, tid)?;
+        let latest: i64 = st.db.query_row(
+            "SELECT coalesce(max(id),0) FROM messages WHERE thread_id=?1",
+            [tid],
+            |r| r.get(0),
+        )?;
+        t["latest_message"] = json!(latest);
+        t["last_read"] = json!(read);
+        t["unread"] = json!(Self::user_unread(&st, tid)?);
+        let first_unread: Option<i64> = if actor == 0 {
+            st.db.query_row("SELECT min(m.id) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0 WHERE m.thread_id=?1 AND m.sender<>0 AND m.id>?2 AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))",params![tid,read],|r|r.get(0))?
+        } else {
+            None
+        };
+        let catchup = q.before.is_none() && q.after.is_none() && first_unread.is_some();
+        let since = q.since.take();
+        if catchup {
+            q.after = Some(first_unread.unwrap() - 1);
+        }
+        let sql = format!(
+            "SELECT id,thread_id thread,sender,at,CASE WHEN length(CAST(text AS BLOB))>{} THEN NULL ELSE text END text,length(CAST(text AS BLOB))>{} truncated FROM messages WHERE thread_id=?1",
+            q.max_bytes, q.max_bytes
+        );
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &[
+                "messages",
+                "members",
+                "member_intervals",
+                "user_reads",
+                "marks",
+            ],
+            &format!("messages:{tid}:{actor}"),
+            &sql,
+            &[tid.into()],
+            false,
+        )?;
+        if since.as_deref() == Some(page.revision.as_str()) {
+            page.unchanged = Some(json!({"unchanged":true,"revision":page.revision}));
+            page.items.clear();
+        }
+        for item in &mut page.items {
+            if item["truncated"] == 0 {
+                item.as_object_mut().unwrap().remove("truncated");
+            } else {
+                item["truncated"] = json!(true);
+            }
+            Self::message_context(&st, item, Some(actor))?;
+        }
+        t["messages"] = page.finish(&q)?;
+        t["catchup"] = json!(catchup);
+        let mut events = Self::event_rows(
+            &st,
+            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left') ORDER BY id DESC LIMIT 51",
+            [tid],
+        )?;
+        t["events_more"] = json!(events.len() > 50);
+        events.truncate(50);
+        events.reverse();
+        t["events"] = json!(events);
+        Ok(t)
+    }
+
+    pub fn messages_page(&self, tid: i64, agent: Option<i64>, q: PageQuery) -> R<Value> {
+        q.validate()?;
+        let st = self.lock();
+        let project = Self::thread_project(&st, tid)?;
+        let actor = agent.unwrap_or(0);
+        if actor > 0 && st.agent(actor)?.project != project {
+            return Err(bad("thread is in another project"));
+        }
+        let sql = format!(
+            "SELECT id,thread_id thread,sender,at,CASE WHEN length(CAST(text AS BLOB))>{} THEN NULL ELSE text END text,length(CAST(text AS BLOB))>{} truncated FROM messages WHERE thread_id=?1",
+            q.max_bytes, q.max_bytes
+        );
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &[
+                "messages",
+                "members",
+                "member_intervals",
+                "user_reads",
+                "marks",
+            ],
+            &format!("messages:{tid}:{actor}"),
+            &sql,
+            &[tid.into()],
+            false,
+        )?;
+        for item in &mut page.items {
+            if item["truncated"] == 0 {
+                item.as_object_mut().unwrap().remove("truncated");
+            } else {
+                item["truncated"] = json!(true);
+            }
+            Self::message_context(&st, item, Some(actor))?;
+        }
+        page.finish(&q)
+    }
+
+    pub fn thread_metadata(&self, tid: i64, agent: Option<i64>) -> R<Value> {
+        let st = self.lock();
+        let project = Self::thread_project(&st, tid)?;
+        if let Some(a) = agent.filter(|a| *a > 0)
+            && st.agent(a)?.project != project
+        {
+            return Err(bad("thread is in another project"));
+        }
+        let mut t = rows(
+            &st.db,
+            "SELECT id,project,title,created_by,created_at FROM threads WHERE id=?1",
+            [tid],
+        )?
+        .remove(0);
+        t["members"] = json!(
+            rows(
+                &st.db,
+                "SELECT agent_id id FROM members WHERE thread_id=?1 ORDER BY agent_id",
+                [tid]
+            )?
+            .iter()
+            .map(|v| v["id"].clone())
+            .collect::<Vec<_>>()
+        );
+        t["watch"] = Self::thread_watch(&st, tid)?;
+        let mut events = Self::event_rows(
+            &st,
+            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left') ORDER BY id DESC LIMIT 51",
+            [tid],
+        )?;
+        t["events_more"] = json!(events.len() > 50);
+        events.truncate(50);
+        events.reverse();
+        t["events"] = json!(events);
+        let read = Self::user_read_cursor(&st, tid)?;
+        t["last_read"] = json!(read);
+        t["unread"] = json!(Self::user_unread(&st, tid)?);
+        t["latest_message"] = json!(st.db.query_row(
+            "SELECT coalesce(max(id),0) FROM messages WHERE thread_id=?1",
+            [tid],
+            |r| r.get::<_, i64>(0)
+        )?);
+        t["first_unread"]=json!(st.db.query_row("SELECT min(m.id) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0 WHERE m.thread_id=?1 AND m.sender<>0 AND m.id>?2 AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))",params![tid,read],|r|r.get::<_,Option<i64>>(0))?);
+        Ok(t)
+    }
+
+    pub fn inbox_page(&self, agent: i64, mark: &str, mut q: PageQuery) -> R<Value> {
+        q.validate()?;
+        let st = self.lock();
+        st.agent(agent)?;
+        let mark = parse_mark(mark)?;
+        let revision = self.view_revision(
+            &st,
+            &["messages", "marks", "member_intervals"],
+            &format!("inbox:{agent}:{mark}"),
+        )?;
+        if let Some(unchanged) = q.snapshot(&revision)? {
+            return Ok(unchanged);
+        }
+        q.since = None;
+        // Inbox starts at the oldest item so a bounded default cannot hide an
+        // earlier outstanding task. Zero is an internal initial cursor only.
+        if q.before.is_none() && q.after.is_none() {
+            q.after = Some(0);
+        }
+        let sql=format!("SELECT m.id,m.thread_id thread,t.title,m.sender,m.at,coalesce(k.mark,'new') mark,
+            CASE WHEN length(CAST(m.text AS BLOB))>{} THEN NULL ELSE m.text END text,length(CAST(m.text AS BLOB))>{} truncated
+            FROM messages m JOIN threads t ON t.id=m.thread_id LEFT JOIN marks k ON k.agent_id=?1 AND k.message_id=m.id
+            WHERE EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=?1)
+              AND m.sender<>?1 AND coalesce(k.mark,'new')=?2",q.max_bytes,q.max_bytes);
+        let mut page = self.select_page(
+            &st,
+            &q,
+            &["messages", "marks", "member_intervals"],
+            &format!("inbox:{agent}:{mark}"),
+            &sql,
+            &[agent.into(), mark.to_string().into()],
+            true,
+        )?;
+        for item in &mut page.items {
+            if item["truncated"] == 0 {
+                item.as_object_mut().unwrap().remove("truncated");
+            } else {
+                item["truncated"] = json!(true);
+            }
+            Self::message_context(&st, item, Some(agent))?;
+        }
+        let result = page.finish(&q)?;
+        if mark == "new" {
+            let delivered: Vec<&Value> = result["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| m["truncated"] != true && m["outside_membership"] != true)
+                .collect();
+            let ids = delivered
+                .iter()
+                .map(|m| m["id"].as_i64().unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !ids.is_empty() {
+                let mut throughs = BTreeMap::new();
+                for m in delivered {
+                    let mid = m["id"].as_i64().unwrap();
+                    let tid = m["thread"].as_i64().unwrap();
+                    throughs
+                        .entry(tid)
+                        .and_modify(|v: &mut i64| *v = (*v).max(mid))
+                        .or_insert(mid);
+                }
+                for (tid, through) in throughs {
+                    let gap:Option<i64>=st.db.query_row(&format!("SELECT min(m.id) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=?1 WHERE m.thread_id=?2 AND m.sender<>?1 AND m.id>b.last_notified AND m.id<=?3 AND m.id NOT IN ({ids}) AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=?1 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))"),params![agent,tid,through],|r|r.get(0))?;
+                    st.db.execute("UPDATE members SET last_notified=max(last_notified,?3) WHERE agent_id=?1 AND thread_id=?2",params![agent,tid,gap.map_or(through,|id|id-1)])?;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     // ---------- views ----------
 
+    #[cfg(test)]
     pub fn agents(&self, project: Option<i64>, group: Option<&str>) -> R<Vec<Value>> {
         let st = self.lock();
         Self::agents_locked(&st, project, group)
     }
 
+    #[cfg(test)]
     fn agents_locked(st: &St, project: Option<i64>, group: Option<&str>) -> R<Vec<Value>> {
         let mut v = rows(
             &st.db,
@@ -3997,6 +4903,7 @@ impl App {
         Ok(v)
     }
 
+    #[cfg(test)]
     pub fn agent_view(&self, id: i64) -> R<Value> {
         self.agent_view_for(id, None)
     }
@@ -4009,10 +4916,10 @@ impl App {
         {
             return Err(bad("agent is in another project"));
         }
-        let mut a = Self::agents_locked(&st, Some(project), None)?
-            .into_iter()
-            .find(|a| a["id"] == id)
-            .unwrap();
+        let mut a = rows(&st.db,"SELECT id,project,name,grp \"group\",task,harness,model,effort,state,status_text status,
+            session_id session,launched_by,launched_at,pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,
+            turns,ended_at,wake_queued_at,wake_why wake_reason,problem FROM agents WHERE id=?1",[id])?.remove(0);
+        a["locks"] = json!(st.held_by(id)?);
         let (name, path) = st.project(project)?;
         a["project_name"] = json!(name);
         a["project_path"] = json!(path);
@@ -4063,6 +4970,7 @@ impl App {
         Ok(a)
     }
 
+    #[cfg(test)]
     pub fn threads(&self, project: Option<i64>, agent: Option<i64>) -> R<Vec<Value>> {
         let st = self.lock();
         let mut v = rows(
@@ -4089,10 +4997,12 @@ impl App {
         Ok(v)
     }
 
+    #[cfg(test)]
     pub fn thread(&self, tid: i64) -> R<Value> {
         self.thread_for(tid, Some(0))
     }
 
+    #[cfg(test)]
     pub fn thread_for(&self, tid: i64, agent: Option<i64>) -> R<Value> {
         let st = self.lock();
         let project = Self::thread_project(&st, tid)?;
@@ -4179,10 +5089,6 @@ impl App {
         )
     }
 
-    pub fn message(&self, id: i64) -> R<Value> {
-        self.message_for(id, None)
-    }
-
     pub fn message_for(&self, id: i64, agent: Option<i64>) -> R<Value> {
         let st = self.lock();
         let mut m=rows(
@@ -4197,7 +5103,7 @@ impl App {
         {
             return Err(bad("message is in another project"));
         }
-        Self::message_context(&st, &mut m, agent)?;
+        Self::message_context(&st, &mut m, Some(agent.unwrap_or(0)))?;
         Ok(m)
     }
 
@@ -4356,17 +5262,6 @@ impl App {
             "checks": rows(&st.db, "SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider", [])?,
             "text": st.limits_text(project)?,
         }))
-    }
-
-    /// Recent activity for a project (with the lines about all projects), or for everything.
-    pub fn activity(&self, project: Option<i64>, limit: i64) -> R<Vec<Value>> {
-        let st = self.lock();
-        rows(
-            &st.db,
-            "SELECT id, project, at, actor, what FROM activity
-             WHERE ?1 IS NULL OR project IS NULL OR project=?1 ORDER BY id DESC LIMIT ?2",
-            params![project, limit],
-        )
     }
 
     pub fn settings(&self, project: Option<i64>) -> Settings {
@@ -4852,6 +5747,318 @@ mod tests {
                 .unwrap();
         }
         app
+    }
+
+    #[test]
+    fn view_revisions_are_atomic_and_include_quiet_changes() {
+        let app = app_with_two_projects();
+        let initial = app
+            .agents_page(Some(1), None, PageQuery::default())
+            .unwrap();
+        {
+            let mut st = app.lock();
+            st.db
+                .execute("UPDATE agents SET task=task WHERE id=1", [])
+                .unwrap();
+            let failed: R<()> = st.atomic(|st| {
+                st.db
+                    .execute("UPDATE agents SET context=context+1 WHERE id=1", [])?;
+                Err(bad("rollback fixture"))
+            });
+            assert!(failed.is_err());
+        }
+        let revision = initial["revision"].as_str().unwrap().to_owned();
+        assert_eq!(
+            app.agents_page(Some(1), None, PageQuery::default())
+                .unwrap()["revision"],
+            revision
+        );
+        app.lock()
+            .db
+            .execute("UPDATE agents SET context=context+1 WHERE id=1", [])
+            .unwrap();
+        assert_eq!(
+            app.agents_page(
+                Some(1),
+                None,
+                PageQuery {
+                    revision: Some(revision),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err()
+            .0,
+            409
+        );
+        assert_eq!(
+            app.overview(Some(1), None).unwrap()["revisions"]["agents"],
+            app.agents_page(Some(1), None, PageQuery::default())
+                .unwrap()["revision"]
+        );
+        let locks = app.locks_page(Some(1), PageQuery::default()).unwrap();
+        app.lock().queues.insert((1, "waiting".into()), vec![1]);
+        let queued = app.locks_page(Some(1), PageQuery::default()).unwrap();
+        assert_ne!(locks["revision"], queued["revision"]);
+        assert_eq!(
+            app.overview(Some(1), None).unwrap()["revisions"]["locks"],
+            queued["revision"]
+        );
+    }
+
+    #[test]
+    fn paged_ids_do_not_reuse_deleted_high_water_marks_after_restart() {
+        let app = app_with_two_projects();
+        // Never wake a real client: only the user belongs to these threads.
+        let (thread, _) = app.new_thread(0, Some(1), "first", &[], true, &[]).unwrap();
+        let (message, _) = app.post(0, thread, "first").unwrap();
+        app.new_lock(1, "first", "first").unwrap();
+        {
+            let st = app.lock();
+            st.log(Some(1), "user", "first").unwrap();
+            st.notice(1, "first").unwrap();
+            // External high IDs are also recorded by the allocator triggers.
+            st.db
+                .execute("INSERT INTO activity VALUES(900,1,0,'user','external')", [])
+                .unwrap();
+            st.db.execute_batch("DELETE FROM messages; DELETE FROM threads; DELETE FROM locks; DELETE FROM activity; DELETE FROM notices;").unwrap();
+        }
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        let (next_thread, _) = app.new_thread(0, Some(1), "next", &[], true, &[]).unwrap();
+        let (next_message, _) = app.post(0, next_thread, "next").unwrap();
+        app.new_lock(1, "next", "next").unwrap();
+        assert!(next_thread > thread);
+        assert!(next_message > message);
+        assert!(
+            app.locks_page(Some(1), PageQuery::default()).unwrap()["items"][0]["id"]
+                .as_i64()
+                .unwrap()
+                > 1
+        );
+        let st = app.lock();
+        st.log(Some(1), "user", "next").unwrap();
+        st.notice(1, "next").unwrap();
+        assert!(
+            st.db
+                .query_row("SELECT max(id) FROM activity", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 900
+        );
+        assert!(
+            st.db
+                .query_row("SELECT max(id) FROM notices", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 1
+        );
+    }
+
+    #[test]
+    fn bounded_notices_remain_recoverable_and_undelivered_notices_wait() {
+        let app = app_with_two_projects();
+        let original = "☃\\\"\n😀".repeat(3000);
+        {
+            let st = app.lock();
+            st.notice(1, &original).unwrap();
+            for _ in 0..35 {
+                st.notice(1, &"\\\"".repeat(300)).unwrap();
+            }
+        }
+        let first = app.lock().take_updates(1).unwrap();
+        assert!(json!({"text":first}).to_string().len() < 11000);
+        assert!(first.contains("Notice #1 shortened"));
+        assert!(first.contains("more notices waiting"));
+        assert_eq!(app.notice_view(1, 1).unwrap()["text"], original);
+        assert_eq!(app.notice_view(2, 1).unwrap_err().0, 404);
+        let page = app
+            .notices_page(
+                1,
+                PageQuery {
+                    after: Some(0),
+                    max_bytes: 512,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(page.to_string().len() <= 512);
+        assert_eq!(page["items"][0]["id"], 1);
+        assert_eq!(page["items"][0]["truncated"], true);
+        assert!(
+            !app.lock()
+                .take_updates(1)
+                .unwrap()
+                .contains("Notice #1 shortened")
+        );
+        for _ in 0..10 {
+            app.lock().take_updates(1).unwrap();
+        }
+        assert!(app.lock().take_updates(1).unwrap().is_empty());
+        assert_eq!(
+            app.notices_page(1, PageQuery::default()).unwrap()["total"],
+            36
+        );
+    }
+
+    #[test]
+    fn compact_receipts_preserve_results_without_replaying_actions() {
+        let app = app_with_two_projects();
+        let original = json!({"id":42,"warnings":vec!["☃".repeat(1000);100],"queued":true});
+        let result = app.compact_receipt(original.clone(), Some(1), None, None);
+        assert!(result.to_string().len() < 16000);
+        assert_eq!(result["id"], 42);
+        assert_eq!(result["counts"]["warnings"], 100);
+        let id = result["receipt_event"].as_i64().unwrap();
+        assert_eq!(
+            app.receipt_view(id, Some(1)).unwrap()["details"]["response"],
+            original
+        );
+        assert_eq!(app.receipt_view(id, Some(2)).unwrap_err().0, 404);
+        app.lock().db.execute_batch("CREATE TRIGGER receipt_test_failure BEFORE INSERT ON events WHEN NEW.kind='command.receipt' BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;").unwrap();
+        let failed = app.compact_receipt(original, Some(1), None, None);
+        assert!(
+            failed["receipt_error"]
+                .as_str()
+                .unwrap()
+                .contains("Action completed")
+        );
+        assert!(failed["receipt_event"].is_null());
+        assert_eq!(failed["id"], 42);
+    }
+
+    #[test]
+    fn unread_thread_since_and_inbox_snapshot_do_not_acknowledge_omissions() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='closed'", [])
+            .unwrap();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "paging", &["1".into()], true, &[])
+            .unwrap();
+        app.post(1, tid, "unread user message").unwrap();
+        let initial = app.thread_page(tid, None, PageQuery::default()).unwrap();
+        let same = app
+            .thread_page(
+                tid,
+                None,
+                PageQuery {
+                    since: initial["messages"]["revision"].as_str().map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(same["messages"]["unchanged"], true);
+        assert_eq!(same["unread"], 1);
+        for text in ["first", "second"] {
+            app.post(0, tid, text).unwrap();
+        }
+        let inbox = app
+            .inbox_page(
+                1,
+                "new",
+                PageQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let continuation = PageQuery {
+            after: inbox["next_after"].as_i64(),
+            through: inbox["through"].as_i64(),
+            revision: inbox["revision"].as_str().map(str::to_string),
+            limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            app.inbox_page(1, "new", continuation.clone()).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mid = inbox["items"][0]["id"].as_i64().unwrap();
+        app.lock()
+            .db
+            .execute("INSERT INTO marks VALUES(1,?1,'handled')", [mid])
+            .unwrap();
+        assert_eq!(app.inbox_page(1, "new", continuation).unwrap_err().0, 409);
+    }
+
+    #[test]
+    fn oversized_message_details_preserve_default_user_membership_context() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='closed'", [])
+            .unwrap();
+        let (tid, _) = app
+            .new_thread(0, Some(1), "catch-up", &["1".into()], true, &[])
+            .unwrap();
+        app.user_membership(tid, false).unwrap();
+        let (outside, _) = app.post(1, tid, &"☃".repeat(2000)).unwrap();
+        app.user_membership(tid, true).unwrap();
+        let (inside, _) = app.post(1, tid, "new unread message").unwrap();
+        let page = app
+            .messages_page(
+                tid,
+                None,
+                PageQuery {
+                    after: Some(0),
+                    max_bytes: 512,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page["items"][0]["truncated"], true);
+        assert_eq!(
+            app.message_for(outside, None).unwrap()["outside_membership"],
+            true
+        );
+        assert_eq!(
+            app.message_for(inside, None).unwrap()["outside_membership"],
+            false
+        );
+        assert_eq!(app.thread_metadata(tid, None).unwrap()["unread"], 1);
+    }
+
+    #[test]
+    fn resume_lock_confirmation_cannot_free_a_changed_or_active_holder() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='paused'", [])
+            .unwrap();
+        app.new_lock(1, "guarded", "resume confirmation").unwrap();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE locks SET holder=1,frozen=1 WHERE name='guarded'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(app.free_frozen(1, "guarded", 2, "user").unwrap_err().0, 409);
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='idle' WHERE id=1", [])
+            .unwrap();
+        assert_eq!(app.free_frozen(1, "guarded", 1, "user").unwrap_err().0, 409);
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='paused' WHERE id=1", [])
+            .unwrap();
+        app.lock()
+            .db
+            .execute("UPDATE locks SET frozen=0 WHERE name='guarded'", [])
+            .unwrap();
+        assert_eq!(app.free_frozen(1, "guarded", 1, "user").unwrap_err().0, 409);
+        app.lock()
+            .db
+            .execute("UPDATE locks SET frozen=1 WHERE name='guarded'", [])
+            .unwrap();
+        app.free_frozen(1, "guarded", 1, "user").unwrap();
+        assert!(
+            app.locks_page(Some(1), PageQuery::default()).unwrap()["items"][0]["holder"].is_null()
+        );
     }
 
     #[test]

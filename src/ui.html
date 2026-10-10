@@ -108,7 +108,7 @@
     .message { max-width: 780px; margin-bottom: 13px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; }
     .message.user { margin-left: auto; background: var(--accent-soft); }
     .message-head { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 5px; color: var(--muted); font-size: 11px; }
-    .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message-text, .record-text { white-space: pre-wrap; overflow-wrap: anywhere; }
     .composer { display: flex; gap: 9px; padding: 12px; border-top: 1px solid var(--line); }
     .composer textarea { flex: 1; min-height: 58px; resize: vertical; }
     input, select, textarea { width: 100%; padding: 8px 9px; border: 1px solid #c9c5ba; border-radius: 7px; background: white; color: var(--ink); }
@@ -173,12 +173,13 @@
   </header>
 
   <main>
-    <div class="project-banner"><label>Project <select id="project-select" aria-label="Project"></select></label><code id="project-path">Connecting…</code><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button><span class="meta" id="project-url"></span></div>
+    <div class="project-banner"><label>Project <select id="project-select" aria-label="Project"></select></label><button class="small" data-more="projects" hidden>More projects</button><code id="project-path">Connecting…</code><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button><span class="meta" id="project-url"></span></div>
     <nav>
       <button class="active" data-page="overview" aria-current="page">Overview</button>
       <button data-page="threads">Threads <span id="unread-total" class="pill unread" hidden></span></button>
       <button data-page="settings">Settings</button>
     </nav>
+    <p class="launch-project" id="result-notice" role="status" hidden></p>
 
     <section class="page active" id="page-overview">
       <div class="grid">
@@ -186,15 +187,18 @@
           <section class="panel">
             <div class="panel-head"><h2>Agents</h2><span class="count" id="agent-count"></span></div>
             <div id="agents"></div>
+            <button class="small" data-more="agents" hidden>Load more agents</button>
           </section>
           <section class="panel">
             <div class="panel-head"><h2>Locks</h2><span class="count" id="lock-count"></span></div>
             <div id="locks"></div>
+            <button class="small" data-more="locks" hidden>Load more locks</button>
           </section>
         </div>
         <section class="panel">
           <div class="panel-head"><h2>Activity</h2></div>
           <div class="activity" id="activity"></div>
+          <button class="small" data-more="activity" hidden>Load older activity</button>
         </section>
       </div>
     </section>
@@ -205,6 +209,7 @@
           <div class="panel-head"><h2>Threads</h2><span class="count" id="thread-count"></span><button class="small" data-open="thread-dialog">New</button></div>
           <div class="filter-actions"><button class="small" data-thread-filter="mine">Mine</button><button class="small" data-thread-filter="unread">Unread</button><button class="small" data-thread-filter="all">All</button><button class="small" data-thread-filter="agents">Agent-only</button></div>
           <div id="thread-list"></div>
+          <button class="small" data-more="threads" hidden>Load more threads</button>
         </div>
         <div class="thread-main" id="thread-main"><div class="empty">Select a thread</div></div>
       </section>
@@ -222,6 +227,7 @@
     <form method="dialog" id="launch-form">
       <h2 id="launch-title">Launch agent</h2>
       <p class="meta launch-project" id="launch-project"></p>
+      <button type="button" class="small" data-more="projects" hidden>More projects</button>
       <p class="meta launch-project">Model catalogs are not access checks. If your account rejects a model, choose another explicitly; acom never silently substitutes it.</p>
       <p class="inline-error" id="launch-model-warning" hidden></p>
       <div class="form-grid">
@@ -276,7 +282,7 @@
     <div class="actions"><button type="button" id="folder-home">Home</button><button type="button" id="folder-up">Up</button></div>
     <p class="launch-project"><code id="folder-path"></code></p>
     <label class="inline-check"><input type="checkbox" id="folder-hidden"> Show hidden files</label>
-    <div class="folder-list" id="folder-list"></div><p class="inline-error" id="folder-error" role="alert"></p>
+    <div class="folder-list" id="folder-list"></div><button type="button" class="small" id="folder-more" hidden>Load more entries</button><p class="inline-error" id="folder-error" role="alert"></p>
     <div class="custom-model-row"><label>New folder name <input name="name" placeholder="optional"></label><button type="submit">Create folder</button></div>
     <div class="dialog-actions"><button type="button" data-close="folder-dialog">Cancel</button><button type="button" class="primary" id="folder-use">Use this folder</button></div>
   </form></dialog>
@@ -295,7 +301,8 @@
     </form>
   </dialog>
 
-  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <dialog id="pause-dialog" aria-labelledby="pause-title">
     <form method="dialog">
       <h2 id="pause-title">Pause agent</h2>
@@ -336,9 +343,11 @@
       const form = $('#message-form');
       if (form) saveDraft(form.dataset.draftProject, form.dataset.draftThread, $('[name=text]', form).value);
     }
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, thread: null, selectedThread: null, threadRequest: 0 };
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
     const reading = new Set();
-    let selectedAgent = null, agentRequest = 0, agentLoading = null;
+    let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null;
+    let projectGeneration = 0;
+    const agentTransitions = new Set();
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -383,15 +392,144 @@
       return `${Math.ceil(n)}s`;
     }
     async function api(path, options = {}) {
-      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...(!options.method || options.method === 'GET' ? {signal:AbortSignal.timeout(15000)} : {}), ...options });
-      const text = await response.text();
-      let body = text;
-      try { body = text ? JSON.parse(text) : {}; } catch (_) {}
+      const reading = !options.method || options.method === 'GET';
+      let response, text;
+      try {
+        response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...(reading ? {signal:AbortSignal.timeout(15000)} : {}), ...options });
+        text = await response.text();
+      } catch (error) {
+        if (reading) throw error;
+        throw new Error(`Response unavailable. The action may have completed. Inspect current state before retrying. ${error.message}`);
+      }
+      let body;
+      try { body = JSON.parse(text); } catch (_) {}
       if (!response.ok) {
         const error = new Error(body?.error || text || `${response.status} ${response.statusText}`);
         error.status = response.status; throw error;
       }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new Error(reading ? 'Invalid server response: expected a JSON object.' : 'Invalid server response. The action may have completed. Inspect current state before retrying.');
+      }
+      if (body?.result_truncated) {
+        const counts = Object.entries(body.counts || {}).map(([key, count]) => `${key.replaceAll('_',' ')}: ${fmt(count)}`).join(' · ');
+        const notice = $('#result-notice'); notice.hidden = false;
+        setHTML(notice, `Action completed. ${esc(counts)} ${body.receipt_event ? `<button type="button" class="small" data-record="receipts" data-record-id="${body.receipt_event}">Result details</button>` : `Full result details could not be saved. Inspect current state before retrying. ${esc(body.receipt_error || '')}`}`);
+      }
       return body;
+    }
+    const pageSize = 50, pageBytes = 16000;
+    function query(path, values) {
+      const url = new URL(path, location.href);
+      for (const [key, value] of Object.entries(values)) if (value != null) url.searchParams.set(key, value);
+      return url.pathname + url.search;
+    }
+    async function record(path, value, current = () => true) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (!current()) return null;
+        const first = value ?? await api(path);
+        if (!first.truncated) return first;
+        let offset = 0, text = '', version = first.version;
+        try {
+          while (current()) {
+            const part = await api(query(path, {offset, version, max_bytes:pageBytes}));
+            if (!current()) return null;
+            if (part.format !== 'json' || typeof part.chunk !== 'string' || part.offset !== offset) throw new Error('Invalid detail page');
+            text += part.chunk; version = part.version;
+            if (!part.has_more) return JSON.parse(text);
+            if (!(part.next_offset > offset)) throw new Error('Detail cursor did not advance');
+            offset = part.next_offset;
+          }
+          return null;
+        } catch (error) { if (error.status !== 409 || attempt === 2) throw error; value = null; }
+      }
+    }
+    function collectionPath(key, project = state.selectedProject) {
+      return query(`/${key}`, {project:['agents','threads','locks','activity'].includes(key) ? project : null});
+    }
+    async function loadCollection(key, more = false) {
+      const scope = collectionPath(key), page = state.pages[key] ||= {scope, items:[], loaded:0};
+      if (page.scope !== scope) { state.pages[key] = {scope, items:[], loaded:0}; return loadCollection(key, more); }
+      if (!more && page.revision && state.revisions?.[key] === page.revision) return;
+      if (page.pending) { await page.pending; return more ? loadCollection(key, true) : undefined; }
+      const current = () => state.pages[key] === page && collectionPath(key) === scope;
+      page.pending = (async () => {
+        if (key === 'activity' && page.revision && !more) {
+          let after = page.next_after || 0, through = null, revision = null, incoming = [], next;
+          const windowSize = Math.max(page.loaded, pageSize);
+          do {
+            next = await api(query(scope, {after, through, limit:pageSize, max_bytes:pageBytes}));
+            if (!current() || next.unchanged) return;
+            revision ||= next.revision; through ??= next.through;
+            incoming.push(...next.items);
+            if (next.total - page.total > windowSize || (incoming.length >= windowSize && next.has_more)) {
+              next = await api(query(scope, {limit:pageSize, max_bytes:pageBytes}));
+              if (!current()) return;
+              revision = next.revision; through = next.through; incoming = [...next.items];
+              while (next.has_more && incoming.length < windowSize) {
+                const before = next.next_before;
+                next = await api(query(scope, {before, through, limit:pageSize, max_bytes:pageBytes}));
+                if (!current()) return;
+                if (next.has_more && next.next_before === before) throw new Error('Activity cursor did not advance');
+                incoming.push(...next.items);
+              }
+              after = Math.max(0, ...incoming.map(item => item.id));
+              break;
+            }
+            if (next.has_more && !(next.next_after > after)) throw new Error('Activity cursor did not advance');
+            after = next.next_after ?? after;
+          } while (next.has_more);
+          const items = [...new Map([...page.items, ...incoming].map(item => [item.id, item])).values()].sort((a,b) => b.id - a.id).slice(0, windowSize);
+          Object.assign(page, next, {items, loaded:items.length, revision, next_after:after, next_before:items.at(-1)?.id, has_more:next.total > items.length});
+          state.activity = items; return;
+        }
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const direct = more && page.has_more && attempt === 0;
+            let next = await api(query(scope, {limit:pageSize, max_bytes:pageBytes,
+              ...(direct ? {before:page.next_before, through:page.through, revision:page.revision} : {since:!more ? page.revision : null})}));
+            if (!current() || next.unchanged) return;
+            let items = direct ? [...page.items, ...next.items] : [...next.items];
+            const target = direct ? items.length : Math.max(page.loaded, more ? page.loaded + pageSize : 0);
+            while (next.has_more && items.length < target) {
+              const before = next.next_before;
+              if (before == null) throw new Error('Missing collection cursor');
+              next = await api(query(scope, {before, through:next.through, revision:next.revision, limit:pageSize, max_bytes:pageBytes}));
+              if (!current()) return;
+              if (next.has_more && next.next_before === before) throw new Error('Collection cursor did not advance');
+              items.push(...next.items);
+            }
+            items = [...new Map(items.map(item => [item.id, item])).values()];
+            const changed = page.revision !== next.revision;
+            Object.assign(page, next, {items, loaded:items.length});
+            if (key === 'activity') { page.next_after = Math.max(0, ...items.map(item => item.id)); page.next_before = items.at(-1)?.id; }
+            if (key === 'configs') {
+              const wanted = [state.editor?.config, state.project?.config];
+              for (const config of state.configs) if (wanted.includes(config.id) && !items.some(item => item.id === config.id)) {
+                const retained = {...config}; if (changed) delete retained.settings;
+                items = [...items, retained];
+              }
+            }
+            state[key] = items;
+            return;
+          } catch (error) { if (!current()) return; if (error.status !== 409 || attempt === 2) throw error; }
+        }
+      })();
+      try { await page.pending; }
+      finally { page.pending = null; updatePaging(); }
+    }
+    function updatePaging() {
+      document.querySelectorAll('[data-more]').forEach(button => {
+        const page = state.pages[button.dataset.more];
+        button.hidden = !page?.has_more; button.disabled = !!page?.pending;
+      });
+    }
+    async function configSettings(id) {
+      const config = state.configs.find(c => c.id === id);
+      if (config?.settings) return config.settings;
+      const full = await record(`/configs/${id}`);
+      if (config) { Object.assign(config, full); delete config.truncated; }
+      else state.configs.push(full);
+      return full.settings;
     }
 
     function toast(message, error = false) {
@@ -414,16 +552,38 @@
       let healthy = false;
       const request = ++state.overviewRequest;
       try {
-        const overview = await api(`/overview${state.selectedProject ? `?project=${state.selectedProject}` : ''}`);
+        const overview = await record(query('/overview', {project:state.selectedProject, since:state.overviewRevision}));
         if (request !== state.overviewRequest) return;
-        for (const key of ['agents', 'threads', 'locks', 'activity', 'limits']) state[key] = overview[key];
-        state.settings = overview.settings;
-        state.configs = overview.configs || [];
-        state.catalog = overview.model_catalog || {};
-        state.projects = overview.projects || [];
-        state.project = overview.project;
-        state.selectedProject = overview.project?.id ?? null;
-        state.url = overview.url;
+        if (!overview.unchanged) {
+          state.project = overview.project;
+          if (state.project?.truncated) state.project = await record(`/projects/${state.project.id}`);
+          if (request !== state.overviewRequest) return;
+          if (state.selectedProject !== (state.project?.id ?? null)) projectGeneration++;
+          state.selectedProject = state.project?.id ?? null;
+          state.limits = overview.limits; state.url = overview.url;
+          state.unreadTotal = overview.unread_total;
+          state.overviewRevision = overview.revision;
+          state.revisions = overview.revisions;
+        }
+        await Promise.all(['projects','configs','agents','threads','locks','activity'].map(key => loadCollection(key)));
+        if (request !== state.overviewRequest) return;
+        for (const id of new Set([state.editor?.config, state.project?.config].filter(id => id != null))) {
+          if (!state.configs.find(c => c.id === id)?.settings) await configSettings(id);
+          if (request !== state.overviewRequest) return;
+        }
+        if (state.project && !state.projects.some(p => p.id === state.project.id)) state.projects = [...state.projects, state.project];
+        if (!Object.keys(state.catalog).length) state.catalog = await record('/catalog');
+        const settingsRevision = `${state.selectedProject}:${state.revisions?.settings}`;
+        if (settingsRevision !== state.settingsRevision) {
+          const config = state.project ? state.project.config : 1;
+          const settings = config == null ? await record(query('/settings', {project:state.selectedProject})) : await configSettings(config);
+          if (request !== state.overviewRequest) return;
+          state.settings = settings; state.settingsRevision = settingsRevision;
+        }
+        if (state.project?.config != null && !state.configs.find(c => c.id === state.project.config)?.settings) {
+          await configSettings(state.project.config);
+        }
+        if (request !== state.overviewRequest) return;
         healthy = true;
       } catch (_) {}
       if (request !== state.overviewRequest) return;
@@ -437,28 +597,29 @@
       ]);
     }
 
-    function render() { renderProject(); renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); }
+    function render() { renderProject(); renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); updatePaging(); }
 
     function renderProject() {
       const p = state.project;
+      if (p && !state.projects.some(project => project.id === p.id)) state.projects = [...state.projects, p];
       setHTML($('#project-select'), state.projects.length ? projectOptions(state.selectedProject) : '<option>No projects yet</option>');
       $('#project-select').disabled = state.saving || !state.projects.length;
-      setText($('#project-path'), p?.path || 'Add a project folder to get started');
+      setText($('#project-path'), p?.path || (p?.truncated ? 'Loading project details…' : 'Add a project folder to get started'));
       setText($('#project-url'), state.url || '');
-      $('#remove-project').disabled = state.saving || !p || state.agents.length > 0;
+      $('#remove-project').disabled = state.saving || !p || p.truncated || (p.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
       $('#remove-project').title = state.agents.length ? 'Projects with agents cannot be removed' : 'Remove the registration, not files';
-      const unread = state.projects.reduce((n, p) => n + (p.unread || 0), 0);
+      const unread = state.unreadTotal ?? state.projects.reduce((n, p) => n + (p.unread || 0), 0);
       $('#unread-total').hidden = !unread;
       setText($('#unread-total'), `${fmt(unread)} unread`);
       $('[data-page=threads]').title = 'Unread messages across all projects; choose a project to view its threads';
-      document.title = `${unread ? `(${unread}) ` : ''}${p ? `${p.name} · acom` : 'acom'}`;
+      document.title = `${unread ? `(${unread}) ` : ''}${p ? `${p.name || `Project #${p.id}`} · acom` : 'acom'}`;
       const url = new URL(location.href);
       if (p) url.searchParams.set('project', p.id); else url.searchParams.delete('project');
       history.replaceState(null, '', url);
       setText($('#config-applied'), appliedConfigText());
     }
     function projectOptions(selected) {
-      return state.projects.map(p => `<option value="${p.id}" title="${esc(p.path)}" ${p.id === Number(selected) ? 'selected' : ''}>${esc(p.name)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${p.id}` : ''}${p.unread ? ` · ${fmt(p.unread)} unread` : ''}</option>`).join('');
+      return state.projects.map(p => `<option value="${p.id}" title="${esc(p.path)}" ${p.id === Number(selected) ? 'selected' : ''}>${esc(p.name || `Project #${p.id}`)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${p.id}` : ''}${p.unread ? ` · ${fmt(p.unread)} unread` : ''}</option>`).join('');
     }
     function resetThread() {
       saveVisibleDraft();
@@ -502,7 +663,7 @@
 
     function renderAgents() {
       const root = $('#agents');
-      setText($('#agent-count'), `${state.agents.length} total`);
+      setText($('#agent-count'), `${state.pages.agents?.total ?? state.agents.length} total`);
       if (!state.agents.length) { setHTML(root, '<div class="empty">No agents yet</div>'); return; }
       const groups = new Map();
       state.agents.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
@@ -510,8 +671,10 @@
     }
 
     function agentRow(a) {
+      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div><div class="meta">Details exceed the preview budget.</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
-      const unavailable = /model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '');
+      const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
+      const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
         ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
         : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${a.state === 'crashed' || unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
@@ -519,19 +682,19 @@
       const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
       const waiting = a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
-      const problem = a.problem ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(a.problem)}</div>` : '';
+      const problem = a.has_problem || problemText ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
       const recovery = a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta" title="${esc(a.task)}">${esc(a.status || a.task)}</div>${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta" title="${esc(task)}">${esc(a.status || task)}</div>${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
 
     function renderLocks() {
-      setText($('#lock-count'), `${state.locks.length} total`);
+      setText($('#lock-count'), `${state.pages.locks?.total ?? state.locks.length} total`);
       if (!state.locks.length) { setHTML($('#locks'), '<div class="empty">No locks</div>'); return; }
-      setHTML($('#locks'), `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => `<tr>
+      setHTML($('#locks'), `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => l.truncated ? `<tr><td colspan="6">Lock #${l.id} · Details exceed the preview budget. <button type="button" class="small" data-record="locks" data-record-id="${l.id}">Load full lock</button></td></tr>` : `<tr>
         <td><code>${esc(l.name)}</code>${l.frozen ? ' <span class="pill paused">frozen</span>' : ''}</td><td>${esc(l.about)}</td>
         <td>${l.holder ? `#${l.holder} ${esc(l.holder_name || '')}` : 'free'}${l.queue?.length ? `<div class="meta">queue: ${l.queue.map(x => `#${x}`).join(', ')}</div>` : ''}</td>
         <td>${when(l.acquired_at)}</td><td>${l.frozen ? `frozen, ${l.frozen_left == null ? 'no TTL' : `${duration(l.frozen_left)} left`}` : l.expires_at ? when(l.expires_at) : '—'}</td><td>${l.holder ? `<button class="small danger" data-action="free-lock" data-name="${esc(l.name)}">Free</button>` : ''}</td>
@@ -539,17 +702,18 @@
     }
 
     function renderActivity() {
-      setHTML($('#activity'), state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div><span class="actor">${esc(e.actor)}</span> ${esc(e.what)}</div></div>`).join('') : '<div class="empty">No activity yet</div>');
+      setHTML($('#activity'), state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div>${e.truncated ? `<button type="button" class="small" data-record="activity" data-record-id="${e.id}">Load activity #${e.id}</button> · Details exceed the preview budget.` : `<span class="actor">${esc(e.actor)}</span> ${esc(e.what)}`}</div></div>`).join('') : '<div class="empty">No activity yet</div>');
     }
 
     function renderThreads() {
-      setText($('#thread-count'), `${state.threads.length}`);
+      setText($('#thread-count'), `${state.pages.threads?.total ?? state.threads.length}`);
       document.querySelectorAll('[data-thread-filter]').forEach(b => {
         const active = b.dataset.threadFilter === state.threadFilter;
         b.classList.toggle('active', active); b.setAttribute('aria-pressed', String(active));
       });
-      const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread > 0 : t.members?.includes(0) ? state.threadFilter === 'mine' : state.threadFilter === 'agents'));
-      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
+      const joined = t => typeof t.user_member === 'boolean' ? t.user_member : Array.isArray(t.members) ? t.members.includes(0) : null;
+      const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
+      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} messages`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
@@ -557,17 +721,58 @@
       return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''}" data-message="${m.id}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span></div><div class="message-text">${esc(m.text)}</div></div>`;
     }
 
+    let threadLoading = null;
     async function refreshThread(showError = true) {
       const selected = state.selectedThread;
       if (selected == null) return;
+      if (threadLoading?.selected === selected && threadLoading.request === state.threadRequest) return threadLoading.promise;
       const request = ++state.threadRequest;
+      const current = () => request === state.threadRequest && selected === state.selectedThread;
+      const flight = {selected, request}; threadLoading = flight;
+      flight.promise = (async () => {
       try {
-        const t = await api(`/threads/${selected}`);
-        if (request !== state.threadRequest || selected !== state.selectedThread) return;
-        const sameThread = state.thread?.id === t.id && $('#messages');
+        if (state.thread?.id === selected) state.thread.loadingNew = true;
+        const existing = state.thread?.id === selected ? state.thread : null;
+        const metadataRevision = state.revisions?.threads;
+        let metadata = existing;
+        if (!metadata || metadata.metadataRevision !== metadataRevision || metadata.resume) {
+          metadata = await record(`/threads/${selected}/metadata`, undefined, current);
+          if (!current()) return;
+        }
+        const missingUnread = existing && metadata.first_unread != null && metadata.first_unread <= (existing.messages.at(-1)?.id || 0) && !existing.messages.some(m => m.id === metadata.first_unread);
+        let cursor = missingUnread ? {after:metadata.first_unread-1, through:metadata.latest_message} : existing ? existing.resume || {after:existing.messages.at(-1)?.id || 0} : metadata.first_unread != null ? {after:metadata.first_unread-1, through:metadata.latest_message} : {through:metadata.latest_message};
+        while (current()) {
+        const page = await api(query(`/threads/${selected}/messages`, {...cursor, limit:pageSize, max_bytes:pageBytes}));
+        if (!current()) return;
+        const t = {...metadata, metadataRevision};
+        const incoming = [];
+        for (const message of page.items) {
+          const full = message.truncated ? await record(`/messages/${message.id}?agent=0`, message, current) : message;
+          if (!current()) return;
+          incoming.push(full);
+        }
+        incoming.sort((a,b) => a.id - b.id);
+        const previous = state.thread?.id === t.id ? state.thread : null;
+        const sameThread = previous && $('#messages');
+        const messagesById = new Map((previous?.messages || []).map(m => [m.id, m]));
+        const added = incoming.filter(m => !messagesById.has(m.id));
+        incoming.forEach(m => messagesById.set(m.id, m));
+        t.messages = [...messagesById.values()].sort((a,b) => a.id - b.id);
+        const forward = cursor.after != null;
+        t.resume = forward && page.has_more ? {after:page.next_after, through:page.through} : null;
+        if (t.resume && !(t.resume.after > (cursor.after || 0))) throw new Error('Message cursor did not advance');
+        t.loadingNew = true;
+        t.oldestReached = previous?.oldestReached || (!forward && !page.has_more);
+        t.total = page.total;
+        t.unread = (metadata.unread || 0) + t.messages.filter(m => m.id > metadata.latest_message && m.sender !== 0 && !m.outside_membership && t.members?.includes(0)).length;
+        if (previous && (t.last_read || 0) < (previous.last_read || 0)) {
+          t.last_read = previous.last_read;
+          t.unread = Math.max(previous.unread, t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > t.last_read).length);
+        }
         if (!sameThread) {
           saveVisibleDraft();
           $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Membership history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+            <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span></div>
             <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
           $('#message-form textarea').value = threadDraft(t.project, t.id);
@@ -577,12 +782,16 @@
         } else {
           const messages = $('#messages');
           const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36;
-          const last = state.thread?.messages?.at(-1)?.id || 0;
-          const added = (t.messages || []).filter(m => m.id > last);
           if (added.length) {
+            const anchor = messages.querySelector('[data-message]'), top = anchor?.getBoundingClientRect().top;
             $('.empty', messages)?.remove();
-            messages.insertAdjacentHTML('beforeend', added.map(messageHtml).join(''));
+            for (const message of added) {
+              const before = [...messages.children].find(node => Number(node.dataset.message) > message.id);
+              if (before) before.insertAdjacentHTML('beforebegin', messageHtml(message));
+              else messages.insertAdjacentHTML('beforeend', messageHtml(message));
+            }
             if (atBottom) messages.scrollTop = messages.scrollHeight;
+            else if (anchor) messages.scrollTop += anchor.getBoundingClientRect().top - top;
           }
           setText($('.thread-header h2', $('#thread-main')), t.title);
         }
@@ -596,23 +805,58 @@
         const events = [...(t.events || [])].sort((a,b) => a.id - b.id).map(e => `<div class="event"><time>${when(e.at)}</time><div>${who(e.agent)} ${e.kind === 'thread.joined' ? 'joined' : 'left'} · by ${esc(e.actor)}${e.details?.reason ? ` · ${esc(e.details.reason)}` : ''}</div></div>`).join('') || '<p class="meta">No membership changes yet.</p>';
         const history = events + (t.events_more ? '<p class="meta">Earlier membership events are not shown.</p>' : '');
         setHTML($('#thread-events'), history);
-        if (state.thread?.id === t.id) t.last_read = Math.max(t.last_read || 0, state.thread.last_read || 0);
-        t.unread = t.members?.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > t.last_read).length : 0;
         state.thread = t;
-        updateUnread(t.id, t.project, t.unread);
+        updateUnread(t.id, t.project, t.unread, previous?.unread);
+        $('#thread-older').hidden = t.oldestReached || t.total <= t.messages.length;
+        setText($('#thread-catchup'), t.resume ? 'Loading new messages…' : '');
+        if (!t.resume) break;
+        cursor = t.resume;
+        }
+        if (!current()) return;
+        state.thread.loadingNew = false;
         markThreadRead();
       } catch (error) {
-        if (request === state.threadRequest && selected === state.selectedThread) {
+        if (current()) {
+          if (state.thread) { state.thread.loadingNew = false; setText($('#thread-catchup'), 'Message updates unavailable. Retrying automatically.'); }
           if (showError) toast(error.message, true);
           if (!state.thread) setText($('#thread-main .empty'), `Conversation unavailable: ${error.message}. Retrying automatically.`);
         }
       }
+      })();
+      try { await flight.promise; }
+      finally { if (threadLoading === flight) threadLoading = null; }
     }
 
-    function updateUnread(id, project, unread) {
+    async function olderMessages() {
+      const t = state.thread, messages = $('#messages'), button = $('#thread-older');
+      if (!t || !messages || button.disabled) return;
+      const current = () => state.thread?.id === t.id && state.selectedThread === t.id && messages === $('#messages');
+      button.disabled = true;
+      try {
+        const page = await api(query(`/threads/${t.id}/messages`, {before:t.messages[0]?.id, limit:pageSize, max_bytes:pageBytes}));
+        if (!current()) return;
+        const incoming = [];
+        for (const m of page.items) {
+          incoming.push(m.truncated ? await record(`/messages/${m.id}?agent=0`, m, current) : m);
+          if (!current()) return;
+        }
+        const known = new Set(state.thread.messages.map(m => m.id)), added = incoming.filter(m => !known.has(m.id)).sort((a,b) => a.id - b.id);
+        const top = messages.scrollTop, height = messages.scrollHeight;
+        messages.insertAdjacentHTML('afterbegin', added.map(messageHtml).join(''));
+        messages.scrollTop = top + messages.scrollHeight - height;
+        state.thread.messages = [...added, ...state.thread.messages].sort((a,b) => a.id - b.id);
+        state.thread.oldestReached = !page.has_more;
+        button.hidden = state.thread.oldestReached;
+      } catch (error) { if (current()) toast(error.message, true); }
+      finally { if (current()) button.disabled = false; }
+    }
+
+    function updateUnread(id, project, unread, previous) {
       const summary = state.threads.find(t => t.id === id);
       const p = state.projects.find(p => p.id === project);
-      if (summary && p) p.unread = Math.max(0, (p.unread || 0) + unread - (summary.unread || 0));
+      const delta = unread - (summary?.unread ?? previous ?? unread);
+      if (p) p.unread = Math.max(0, (p.unread || 0) + delta);
+      if (state.unreadTotal != null) state.unreadTotal = Math.max(0, state.unreadTotal + delta);
       if (summary) summary.unread = unread;
       if (state.thread?.id === id && $('#thread-unread')) {
         $('#thread-unread').hidden = !unread;
@@ -624,18 +868,19 @@
     async function markThreadRead() {
       const t = state.thread, messages = $('#messages');
       const through = t?.messages?.at(-1)?.id || 0;
-      if (!t?.unread || through <= (t.last_read || 0) || reading.has(t.id) || !messages ||
+      if (!t?.unread || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(t.id) || !messages ||
           !$('#page-threads').classList.contains('active') || document.visibilityState !== 'visible' ||
           !document.hasFocus() || $('dialog[open]') || messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 36) return;
       reading.add(t.id);
       try {
         const read = await api(`/threads/${t.id}/read`, { method: 'POST', body: JSON.stringify({ message: through }) });
         if (state.thread?.id === t.id) {
+          const previous = state.thread.unread;
           state.thread.last_read = Math.max(state.thread.last_read || 0, read.last_read);
           // Messages can arrive after the snapshot or while this request is pending.
           state.thread.unread = Math.max(read.unread, state.thread.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > state.thread.last_read).length);
           $('#thread-read-error').hidden = true;
-          updateUnread(t.id, t.project, state.thread.unread);
+          updateUnread(t.id, t.project, state.thread.unread, previous);
         }
       } catch (error) {
         if (state.thread?.id === t.id) {
@@ -650,8 +895,15 @@
       if (id == null || !$('#agent-dialog').open || agentLoading === request) return;
       agentLoading = request;
       try {
-        const [a, log] = await Promise.all([api(`/agents/${id}`), api(`/agents/${id}/log?lines=100`)]);
+        const current = () => request === agentRequest && id === selectedAgent && $('#agent-dialog').open;
+        const [a, log] = await Promise.all([record(`/agents/${id}`, undefined, current), loadAgentLog(id, request)]);
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
+        const summary = state.agents.find(item => item.id === id);
+        if (summary?.truncated && a.project === state.selectedProject) {
+          Object.assign(summary, a, {task_preview:a.task?.slice(0,400), problem_preview:a.problem?.slice(0,400), has_problem:!!a.problem,
+            model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '')});
+          delete summary.truncated; renderAgents();
+        }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
         const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','running_configuration'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
@@ -670,7 +922,7 @@
         else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         $('#agent-config').dataset.continuationAllowed = String(a.state === 'working' && !a.done_req);
         syncAgentContinuation();
-        const el = $('#agent-log'), text = (log.lines || []).join('\n') || 'No activity yet';
+        const el = $('#agent-log'), text = log?.text || 'No activity yet';
         const selectingLog = hasSelectedText(el);
         if (el.textContent !== text && !selectingLog) {
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
@@ -682,6 +934,43 @@
       } catch (error) {
         if (request === agentRequest && $('#agent-dialog').open) setText($('#agent-detail-status'), `Updates unavailable: ${error.message}. Retrying automatically.`);
       } finally { if (agentLoading === request) agentLoading = null; }
+    }
+
+    let logLoading = null;
+    async function loadAgentLog(id, request, older = false) {
+      if (logLoading?.id === id && logLoading.request === request) {
+        await logLoading.promise;
+        return older ? loadAgentLog(id, request, true) : agentLog;
+      }
+      const flight = {id, request}; logLoading = flight;
+      flight.promise = readAgentLog(id, request, older);
+      try { return await flight.promise; }
+      finally { if (logLoading === flight) logLoading = null; }
+    }
+    async function readAgentLog(id, request, older = false) {
+      const current = () => request === agentRequest && id === selectedAgent && $('#agent-dialog').open;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let previous = agentLog?.id === id ? agentLog : null;
+        let cursor = previous ? older ? {before:previous.start, version:previous.version} : {after:previous.end, version:previous.version, since:previous.revision} : {};
+        try {
+          while (current()) {
+            const part = await api(query(`/agents/${id}/log`, {...cursor, lines:100, max_bytes:pageBytes}));
+            if (!current()) return null;
+            if (part.unchanged) return previous;
+            const next = {id, ...part, text:previous ? older ? part.text + previous.text : previous.text + part.text : part.text,
+              start:previous && !older ? previous.start : part.start, end:previous && older ? previous.end : part.end};
+            agentLog = previous = next;
+            $('#log-older').hidden = next.start === 0;
+            if (older || cursor.after == null || !part.has_more) return next;
+            if (!(part.next_after > cursor.after)) throw new Error('Log cursor did not advance');
+            cursor = {after:part.next_after, version:part.version, through:cursor.through ?? part.total_bytes};
+          }
+          return null;
+        } catch (error) {
+          if (error.status !== 409 || attempt === 2) throw error;
+          agentLog = null;
+        }
+      }
     }
 
     function updateAgentDetails(fields) {
@@ -729,12 +1018,12 @@
       const config = state.configs.find(c => c.id === state.editor.config);
       const usedBy = (config?.projects || []).map(id => {
         const p = state.projects.find(p => p.id === id);
-        return p ? `${p.name} (#${id})` : `#${id}`;
+        return p?.name ? `${p.name} (#${id})` : `#${id}`;
       });
-      const configControls = `<p class="launch-project" id="config-applied">${esc(appliedConfigText())}</p><div class="form-grid"><label>Select configuration <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
+      const configControls = `<p class="launch-project" id="config-applied">${esc(appliedConfigText())}</p><div class="form-grid"><label>Select configuration <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name || `Config #${c.id}`)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
         ${config && config.id !== 1 ? `<label>Config name <input name="config_name" value="${esc(config.name)}" required></label>` : '<span></span>'}</div>
         <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. ${config.id === 1 ? 'Default is read-only. Copy it with Save as new config, or choose Custom for this project.' : `Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.`}` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}${state.editor.pending ? ' Selection is not applied yet; Save applies it to this project.' : ''}</p>
-        <div class="actions"><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 1 ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
+        <div class="actions"><button type="button" class="small" data-more="configs" hidden>More configurations</button><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 1 ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
       const harnesses = Object.entries(s.harnesses || {}).map(([name, h]) => `<div class="harness-settings" data-harness="${esc(name)}"><h4>${esc(name)}</h4><div class="form-grid">
         <label><span><input type="checkbox" name="enabled" ${h.enabled ? 'checked' : ''} style="width:auto"> Enabled</span></label><span></span>
         <label>Default model <select name="model">${modelOptions(name, h.models, h.model)}</select></label><label>Default effort <select name="effort">${options(h.efforts, h.effort)}</select></label>
@@ -767,6 +1056,7 @@
       state.editor.formBaseline = settingsFormFingerprint();
       state.editor.name = config?.name || '';
       setSettingsControls();
+      updatePaging();
     }
 
     function splitList(value) { return value.split(',').map(x => x.trim()).filter(Boolean); }
@@ -897,8 +1187,9 @@
     function dialogChoice(dialog) {
       return new Promise(resolve => {
         dialog.returnValue = 'cancel';
-        dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true });
         openDialog(dialog);
+        const session = dialog._session;
+        dialog.addEventListener('close', () => resolve(dialog._session === session ? dialog.returnValue : 'cancel'), { once: true });
       });
     }
 
@@ -916,34 +1207,48 @@
       };
     }
 
-    async function browseFolder(path) {
+    async function browseFolder(path, more = false) {
       const request = ++state.folderRequest;
-      state.folder = null;
+      const previous = more ? state.folder : null;
+      if (!more) state.folder = null;
       $('#folder-use').disabled = true; $('#folder-error').textContent = '';
+      $('#folder-more').disabled = true;
       try {
-        const folder = await api(`/folders?hidden=${$('#folder-hidden').checked ? 1 : 0}${path ? `&path=${encodeURIComponent(path)}` : ''}`);
+        const folder = await api(query('/folders', {hidden:$('#folder-hidden').checked ? 1 : 0, path, limit:pageSize, max_bytes:pageBytes,
+          ...(previous ? {after:previous.next_after, revision:previous.revision} : {})}));
         if (request !== state.folderRequest) return;
+        if (previous) folder.entries = [...previous.entries, ...folder.entries];
         state.folder = folder; $('#folder-path').textContent = folder.path;
         $('#folder-up').disabled = !folder.parent;
         $('#folder-list').innerHTML = folder.entries.map(e=>e.directory
           ? `<button type="button" class="folder-row" data-folder="${esc(e.path)}"><strong>▸</strong>${esc(e.name)}<span>Folder</span></button>`
           : `<div class="folder-row">${esc(e.name)}<span>File</span></div>`).join('') || '<div class="empty">Empty folder</div>';
-        if (folder.truncated) $('#folder-error').textContent = 'Showing the first 1000 entries. Use the exact-path field for other folders.';
+        $('#folder-more').hidden = !folder.has_more;
         $('#folder-use').disabled = false;
-      } catch (error) { if (request === state.folderRequest) $('#folder-error').textContent = error.message; }
+      } catch (error) {
+        if (request === state.folderRequest) {
+          if (error.status === 409 && more) { await browseFolder(path); $('#folder-error').textContent = 'Folder contents changed. Reloaded its first page.'; }
+          else $('#folder-error').textContent = error.message;
+        }
+      } finally { if (request === state.folderRequest) $('#folder-more').disabled = false; }
     }
     function memberPicker(root, existing = [], includeUser = false) {
-      const agents = state.agents.filter(a=>!existing.includes(a.id));
+      root._existingMembers = existing;
+      const agents = state.agents.filter(a=>!existing.includes(a.id)).sort((a,b) => a.id - b.id);
       const sameProject = root.dataset.project===String(state.selectedProject);
       const previous = sameProject ? checked(root,'member') : [];
+      const search = sameProject ? $('[data-member-search]', root)?.value || '' : '';
       const userSelected = sameProject ? ($('[name=include_user]',root)?.checked ?? true) : true;
       root.dataset.project=state.selectedProject;
       root.innerHTML = `<label>Find members <input type="search" data-member-search placeholder="Name, ID or group"></label>
         ${includeUser ? '<label class="inline-check" style="margin:12px 0"><input type="checkbox" name="include_user" checked> Include me in this thread</label>' : ''}
         <div class="filter-actions"><button type="button" class="small" data-member-pick="active">Active agents</button><button type="button" class="small" data-member-pick="all">All agents</button><button type="button" class="small" data-member-pick="none">Clear</button></div>
-        <div class="member-list">${agents.map(a=>`<label data-member-row data-search="${esc(`${a.name} ${a.id} ${a.group || ''}`.toLowerCase())}"><input type="checkbox" name="member" value="${a.id}" data-state="${esc(a.state)}"><span><strong>${esc(a.name)}</strong><br><span class="meta">#${a.id} · ${esc(a.state)} · ${esc(a.harness)} / ${esc(a.model)}${a.group ? ` · ${esc(a.group)}` : ''}</span></span></label>`).join('') || '<div class="empty">No agents to add yet</div>'}</div>`;
+        <div class="member-list">${agents.map(a=>`<label data-member-row data-search="${esc(`${a.name || ''} ${a.id} ${a.group || ''}`.toLowerCase())}"><input type="checkbox" name="member" value="${a.id}" data-state="${esc(a.state)}"><span><strong>${esc(a.name || `Agent #${a.id}`)}</strong><br><span class="meta">#${a.id} · ${esc(a.state || 'State unavailable')} · ${a.harness && a.model ? `${esc(a.harness)} / ${esc(a.model)}` : 'Details exceed the preview budget'}${a.group ? ` · ${esc(a.group)}` : ''}</span></span></label>`).join('') || '<div class="empty">No agents to add yet</div>'}</div><button type="button" class="small" data-more="agents" hidden>Load more agents</button>`;
       root.querySelectorAll('[name=member]').forEach(input=>input.checked=previous.includes(input.value));
+      $('[data-member-search]', root).value = search;
+      root.querySelectorAll('[data-member-row]').forEach(row => row.hidden = !row.dataset.search.includes(search.toLowerCase()));
       if (includeUser) $('[name=include_user]',root).checked=userSelected;
+      updatePaging();
     }
     document.addEventListener('input', event=> {
       if (!event.target.matches('[data-member-search]')) return;
@@ -957,8 +1262,36 @@
       return dialogChoice($('#pause-dialog'));
     }
 
-    async function resumeChoice(id) {
-      const frozen = state.locks.filter(lock => lock.frozen && lock.holder_state === 'paused' && Number(lock.holder) !== id);
+    async function lockSnapshot(project, current) {
+      const scope = query('/locks', {project});
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          let page = await api(query(scope, {limit:pageSize, max_bytes:pageBytes})), items = [];
+          const revision = page.revision, through = page.through;
+          while (current()) {
+            for (const lock of page.items) {
+              const full = lock.truncated ? await record(query(`/locks/${lock.id}`, {project}), undefined, current) : lock;
+              if (!current()) return null;
+              items.push(full);
+            }
+            if (!page.has_more) break;
+            const before = page.next_before;
+            if (before == null) throw new Error('Missing lock cursor');
+            page = await api(query(scope, {before, through, revision, limit:pageSize, max_bytes:pageBytes}));
+            if (page.has_more && page.next_before === before) throw new Error('Lock cursor did not advance');
+          }
+          if (!current()) return null;
+          const check = await api(query(scope, {since:revision, limit:pageSize, max_bytes:pageBytes}));
+          if (!current()) return null;
+          if (!check.unchanged) throw Object.assign(new Error('Locks changed while loading. Try again.'), {status:409});
+          return [...new Map(items.map(lock => [lock.id, lock])).values()];
+        } catch (error) { if (!current()) return null; if (error.status !== 409 || attempt === 2) throw error; }
+      }
+    }
+    async function resumeChoice(id, project, current) {
+      const locks = await lockSnapshot(project, current);
+      if (!locks) return {choice:'cancel', frozen:[]};
+      const frozen = locks.filter(lock => lock.frozen && lock.holder_state === 'paused' && Number(lock.holder) !== id);
       if (!frozen.length) return { choice: 'only', frozen };
       const groups = new Map();
       frozen.forEach(lock => {
@@ -969,12 +1302,98 @@
       return { choice: await dialogChoice($('#resume-dialog')), frozen };
     }
 
+    async function agentTransition(action, id) {
+      if (agentTransitions.has(id)) return;
+      const project = state.selectedProject, generation = projectGeneration;
+      const current = () => project === state.selectedProject && generation === projectGeneration;
+      agentTransitions.add(id); action.disabled = true;
+      try {
+        if (action.dataset.action === 'pause') {
+          const agent = await record(`/agents/${id}`, undefined, current);
+          if (!current() || !agent) return;
+          const locks = await pauseChoice(agent);
+          if (current() && locks !== 'cancel') await mutate(`/agents/${id}/pause`, {locks});
+        } else {
+          const {choice, frozen} = await resumeChoice(id, project, current);
+          if (!current() || choice === 'cancel') return;
+          if (choice === 'release') for (const lock of frozen) {
+            if (!current()) return;
+            await api('/locks/free', {method:'POST', body:JSON.stringify({project:lock.project, name:lock.name, expected_holder:lock.holder})});
+          }
+          if (!current()) return;
+          const result = await mutate(`/agents/${id}/resume`);
+          if (!result.result_truncated && result.warnings?.length) toast(result.warnings.join('\n'));
+        }
+      } finally { agentTransitions.delete(id); action.disabled = false; }
+    }
+
     document.addEventListener('click', async event => {
+      const full = event.target.closest('[data-record]');
+      if (full) {
+        const dialog = $('#record-dialog'); openDialog(dialog); const session = dialog._session;
+        const current = () => dialog.open && dialog._session === session;
+        setText($('#record-title'), `${full.dataset.record} #${full.dataset.recordId}`); setText($('#record-content'), 'Loading…');
+        try {
+          const value = await record(`/${full.dataset.record}/${full.dataset.recordId}`, undefined, current);
+          if (!current()) return;
+          setText($('#record-content'), JSON.stringify(value, null, 2));
+          const item = state[full.dataset.record]?.find(item => item.id === value.id);
+          if (item) { Object.assign(item, value); delete item.truncated; render(); }
+        } catch (error) { if (current()) setText($('#record-content'), error.message); }
+        return;
+      }
+      const more = event.target.closest('[data-more]');
+      if (more) {
+        more.disabled = true;
+        try {
+          await loadCollection(more.dataset.more, true); render();
+          if (more.dataset.more === 'projects' && $('#launch-dialog').open) {
+            const select = $('#launch-project-select'), selected = select.value;
+            select.innerHTML = projectOptions(selected);
+          }
+          if (more.dataset.more === 'configs' && $('#config-select')) {
+            const select = $('#config-select'), selected = select.value;
+            select.innerHTML = state.configs.map(c => `<option value="${c.id}">${esc(c.name || `Config #${c.id}`)}</option>`).join('') + (state.editor.project == null ? '' : '<option value="custom">Custom</option>');
+            select.value = selected;
+          }
+          if (more.dataset.more === 'agents') {
+            if ($('#thread-dialog').open) memberPicker($('#thread-member-picker'));
+            if ($('#members-dialog').open) memberPicker($('#add-member-picker'), state.thread?.members);
+          }
+        } catch (error) { toast(error.message, true); }
+        finally { updatePaging(); }
+        return;
+      }
+      if (event.target.closest('#thread-older')) { await olderMessages(); return; }
+      if (event.target.closest('#log-older')) {
+        const button = $('#log-older'), id = selectedAgent, request = agentRequest, el = $('#agent-log');
+        button.disabled = true;
+        try {
+          const top = el.scrollTop, height = el.scrollHeight;
+          const log = await loadAgentLog(id, request, true);
+          if (request === agentRequest && $('#agent-dialog').open && log && !hasSelectedText(el)) {
+            el.textContent = log.text; el.scrollTop = top + el.scrollHeight - height;
+          }
+        } catch (error) { if (request === agentRequest) toast(error.message, true); }
+        finally { button.disabled = false; }
+        return;
+      }
       const close = event.target.closest('[data-close]');
       if (close) { document.getElementById(close.dataset.close).close('cancel'); return; }
       const pick = event.target.closest('[data-member-pick]');
       if (pick) {
-        pick.closest('#thread-member-picker, #add-member-picker').querySelectorAll('[name=member]').forEach(input=>input.checked=pick.dataset.memberPick==='all' || (pick.dataset.memberPick==='active' && ['working','idle'].includes(input.dataset.state)));
+        const root = pick.closest('#thread-member-picker, #add-member-picker'), dialog = root.closest('dialog'), session = dialog._session, project = state.selectedProject;
+        const request = root._pickRequest = (root._pickRequest || 0) + 1;
+        const current = () => project === state.selectedProject && dialog.open && session === dialog._session && request === root._pickRequest;
+        try {
+          if (pick.dataset.memberPick !== 'none') {
+            while (current() && state.pages.agents?.has_more) await loadCollection('agents', true);
+            if (!current()) return;
+            renderAgents(); updatePaging();
+            memberPicker(root, root._existingMembers);
+          }
+          root.querySelectorAll('[name=member]').forEach(input=>input.checked=pick.dataset.memberPick==='all' || (pick.dataset.memberPick==='active' && ['working','idle'].includes(input.dataset.state)));
+        } catch (error) { if (current()) toast(error.message,true); }
         return;
       }
       const folder = event.target.closest('[data-folder]');
@@ -982,6 +1401,7 @@
       if (event.target.closest('#browse-project')) { openDialog($('#folder-dialog')); await browseFolder($('#project-form [name=path]').value.trim() || undefined); return; }
       if (event.target.closest('#folder-home')) { await browseFolder(state.folder?.home); return; }
       if (event.target.closest('#folder-up')) { if(state.folder?.parent) await browseFolder(state.folder.parent); return; }
+      if (event.target.closest('#folder-more')) { await browseFolder(state.folder?.path, true); return; }
       if (event.target.closest('#folder-use')) { if(state.folder) { $('#project-form [name=path]').value=state.folder.path; $('#folder-dialog').close(); } return; }
       const usage = event.target.closest('[data-usage]');
       if (usage) { state.usageProvider=usage.dataset.usage; renderUsage(); openDialog($('#usage-dialog')); return; }
@@ -995,7 +1415,7 @@
         resetThread(); renderThreads(); return;
       }
       if(event.target.closest('#thread-membership')) {
-        try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); await refreshThread(); } catch(error) {toast(error.message,true);} return;
+        try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); } catch(error) {toast(error.message,true);} return;
       }
       if(event.target.closest('#add-thread-members')) { memberPicker($('#add-member-picker'),state.thread?.members); $('#members-form').dataset.memberThread = state.thread.id; openDialog($('#members-dialog')); return; }
       if(event.target.closest('#copy-thread')) {
@@ -1115,7 +1535,7 @@
       try {
         const id = Number(action.dataset.id);
         if (action.dataset.action === 'another-model') {
-          const agent=state.agents.find(a=>a.id===id);
+          const agent=await record(`/agents/${id}`);
           $('#launch-project-select').innerHTML=projectOptions(agent.project);
           const dialog = $('#launch-dialog'); openDialog(dialog);
           const session = dialog._session; await setLaunchProject();
@@ -1124,23 +1544,14 @@
           $('#launch-form [name=task]').value=agent.task || '';
         } else if (action.dataset.action === 'details') {
           selectedAgent = id; agentRequest++;
+          agentLog = null;
           $('#agent-title').textContent = `Agent #${id}`;
           $('#agent-details').replaceChildren(); $('#agent-config').replaceChildren(); $('#agent-log').textContent = '';
           $('#agent-detail-status').textContent = 'Loading…';
           openDialog($('#agent-dialog'));
           await refreshAgentDetails();
-        } else if (action.dataset.action === 'pause') {
-          const agent = state.agents.find(a => a.id === id);
-          const locks = await pauseChoice(agent);
-          if (locks !== 'cancel') await mutate(`/agents/${id}/pause`, { locks });
-        } else if (action.dataset.action === 'resume') {
-          const { choice, frozen } = await resumeChoice(id);
-          if (choice === 'cancel') return;
-          if (choice === 'release') {
-            for (const lock of frozen) await api('/locks/free', { method: 'POST', body: JSON.stringify({ project: lock.project, name: lock.name }) });
-          }
-          const result = await mutate(`/agents/${id}/resume`);
-          if (result.warnings?.length) toast(result.warnings.join('\n'));
+        } else if (['pause','resume'].includes(action.dataset.action)) {
+          await agentTransition(action, id);
         } else if (['close','reopen'].includes(action.dataset.action)) {
           if (action.dataset.action !== 'close' || confirm(`Close agent ${id}?`)) {
             await mutate(`/agents/${id}/${action.dataset.action}`);
@@ -1158,16 +1569,23 @@
     $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); showModelWarning(); });
     $('#launch-project-select').addEventListener('change', setLaunchProject);
     async function setLaunchProject() {
-      const p = state.projects.find(x => x.id === Number($('#launch-project-select').value));
+      let p = state.projects.find(x => x.id === Number($('#launch-project-select').value));
       $('#launch-project').textContent = p ? `Agents will work in ${p.path}` : 'Select a project';
       const request = ++state.launchRequest;
       const button = $('#launch-form button.primary');
       button.disabled = true;
       state.launchSettings = null;
       try {
-        const overview = await api(`/overview?project=${p.id}`);
+        if (!p) throw new Error('Select a project');
+        if (p.truncated) {
+          const full = await record(`/projects/${p.id}`);
+          if (request !== state.launchRequest) return;
+          Object.assign(p, full); delete p.truncated;
+          $('#launch-project').textContent = `Agents will work in ${p.path}`;
+        }
+        const settings = await record(`/settings?project=${p.id}`);
         if (request !== state.launchRequest) return;
-        state.launchSettings = overview.settings;
+        state.launchSettings = settings;
         setLaunchHarnesses(); button.disabled = !$('#launch-harness').value;
         if (button.disabled) toast('No harnesses are enabled in this project’s config.', true);
       } catch (error) { if (request === state.launchRequest) toast(error.message, true); }
@@ -1176,7 +1594,9 @@
       if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
       getSelection()?.removeAllRanges();
       state.editor = null;
+      projectGeneration++;
       state.selectedProject = Number(event.target.value);
+      state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
       for (const key of ['agents', 'threads', 'locks', 'activity']) state[key] = [];
       resetThread(); $('#settings-form').replaceChildren(); render(); await refresh();
@@ -1187,14 +1607,18 @@
       if (!p || !confirm(`Remove project “${p.name}” from acom? Its files will not be deleted.`)) return;
       try {
         await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
-        state.selectedProject = null; state.editor = null; resetThread(); await refresh();
+        projectGeneration++; state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread(); await refresh();
       } catch (error) { toast(error.message, true); }
     });
-    $('#settings-form').addEventListener('change', event => {
+    $('#settings-form').addEventListener('change', async event => {
       if (event.target.id === 'config-select') {
         if (!discardSettings()) { event.target.value = state.editor.config ?? 'custom'; return; }
         const config = event.target.value === 'custom' ? null : Number(event.target.value);
-        const s = config == null && state.project?.config == null ? state.settings : state.configs.find(c => c.id === (config ?? 1))?.settings;
+        const project = state.selectedProject;
+        let s;
+        try { s = config == null && state.project?.config == null ? state.settings : await configSettings(config ?? 1); }
+        catch (error) { toast(error.message, true); event.target.value = state.editor.config ?? 'custom'; return; }
+        if (project !== state.selectedProject || $('#config-select') !== event.target || event.target.value !== (config ?? 'custom').toString()) return;
         state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: false, pending: !!state.project && config !== state.project.config };
         renderSettings(); return;
       }
@@ -1230,9 +1654,9 @@
     }
     function showModelWarning() {
       const model=$('#launch-model').value;
-      const rejected=state.agents.find(a=>a.harness===$('#launch-harness').value && a.model===model && /not supported|not available|model.*not found/i.test(a.problem || ''));
+      const rejected=state.agents.find(a=>a.harness===$('#launch-harness').value && a.model===model && (a.model_unavailable || /not supported|not available|model.*not found/i.test(a.problem_preview ?? a.problem ?? '')));
       $('#launch-model-warning').hidden=!rejected;
-      $('#launch-model-warning').textContent=rejected ? `A previous launch rejected ${model}: ${rejected.problem}. Check the harness version and account access, or choose another model explicitly.` : '';
+      $('#launch-model-warning').textContent=rejected ? `A previous launch rejected ${model}: ${rejected.problem_preview ?? rejected.problem ?? 'Details unavailable'}. Check the harness version and account access, or choose another model explicitly.` : '';
     }
     function setLaunchEfforts(useDefault = false) {
       const name = $('#launch-harness').value;
@@ -1266,7 +1690,7 @@
           result = await mutate('/agents', {...data, force: true});
         }
         if (submission.current()) { $('#launch-dialog').close(); form.reset(); setLaunchChoices(); }
-        toast(['Agent launched', ...(result.warnings || [])].join('\n'));
+        toast(result.result_truncated ? 'Agent launched. See the completed-action result below.' : ['Agent launched', ...(result.warnings || [])].join('\n'));
       } catch (error) { toast(error.message, true); }
       finally { if (button && submission.latest()) button.disabled = false; }
     });
@@ -1319,7 +1743,7 @@
       const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread);
       if(!members.length) {toast('Choose at least one member.',true);return;}
       if (button) button.disabled = true;
-      try {await mutate(`/threads/${thread}/members`,{members}); if (submission.current()) $('#members-dialog').close(); if (thread === state.selectedThread) await refreshThread();} catch(error) {toast(error.message,true);}
+      try {await mutate(`/threads/${thread}/members`,{members}); if (submission.current()) $('#members-dialog').close();} catch(error) {toast(error.message,true);}
       finally {if(button && submission.latest()) button.disabled=false;}
     });
 
@@ -1333,7 +1757,7 @@
         if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
         if (submission.current() && project === state.selectedProject) {
-          state.selectedProject = Number(result.id); state.editor = null; resetThread();
+          projectGeneration++; state.selectedProject = Number(result.id); state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
         if (submission.current()) { $('#project-dialog').close(); form.reset(); }
@@ -1356,7 +1780,8 @@
         const current = $('#message-form');
         if (unchanged && current?.dataset.draftProject === project && current.dataset.draftThread === thread && $('[name=text]', current).value === text) current.reset();
         await refresh();
-        if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}.`).join('\n'));
+        if (result.result_truncated && result.counts?.not_woken) toast(`Message sent; ${fmt(result.counts.not_woken)} agents weren't woken. See the completed-action result below.`);
+        else if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}.`).join('\n'));
       } catch (error) { toast(error.message, true); }
       finally { button.disabled = false; }
     });
@@ -1433,7 +1858,7 @@
     }
     function setSettingsControls() {
       const busy = state.saving, readOnly = state.editor?.config === 1;
-      $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (readOnly && !['config-select','save-config-as'].includes(el.id)));
+      $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (readOnly && !el.dataset.more && !['config-select','save-config-as'].includes(el.id)));
       $('[form="settings-form"]').disabled = busy || !(state.editor?.dirty || state.editor?.pending);
       const config = state.configs.find(c => c.id === state.editor?.config);
       if ($('#remove-config')) $('#remove-config').disabled = busy || !!config?.projects.length;
@@ -1442,7 +1867,7 @@
       state.saving = busy;
       $('#project-select').disabled = busy || !state.projects.length;
       $('[data-open="project-dialog"]').disabled = busy;
-      $('#remove-project').disabled = busy || !state.project || state.agents.length > 0;
+      $('#remove-project').disabled = busy || !state.project || (state.project.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
       $('#project-form button.primary').disabled = busy;
       setSettingsControls();
       $('#config-form button.primary').disabled = busy;
@@ -1486,7 +1911,7 @@
     });
 
     refresh(true).catch(e => toast(e.message, true));
-    setInterval(() => { if (!refreshPending) refresh(false); }, 2000);
+    setInterval(() => { if (!refreshPending && document.visibilityState === 'visible') refresh(false); }, 2000);
   </script>
 </body>
 </html>

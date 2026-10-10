@@ -1,11 +1,15 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    App, Fail, HistoryQuery, LaunchReq, LockMode, R, Settings, acom_home, actor, bad, not_found,
+    App, Fail, HistoryQuery, LaunchReq, LockMode, PageQuery, R, Settings, acom_home, actor, bad,
+    bounded_record, not_found,
 };
 use crate::harness::catalog;
 use serde_json::{Value, json};
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -94,11 +98,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         Ok(Reply::Html(h)) => (200, h.to_string(), "text/html; charset=utf-8"),
         Ok(Reply::Text(t)) => (200, t.to_string(), "text/plain; charset=utf-8"),
         Ok(Reply::Json(v)) => (200, v.to_string(), "application/json"),
-        Err(Fail(code, msg)) => (
-            code,
-            json!({ "error": msg }).to_string(),
-            "application/json",
-        ),
+        Err(Fail(code, msg)) => (code, error_body(&msg), "application/json"),
     };
     let header = tiny_http::Header::from_bytes("Content-Type", ctype).unwrap();
     let _ = req.respond(
@@ -106,6 +106,40 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             .with_status_code(code)
             .with_header(header),
     );
+}
+
+fn error_body(msg: &str) -> String {
+    const BUDGET: usize = 16000;
+    let full = json!({"error":msg}).to_string();
+    if full.len() <= BUDGET {
+        return full;
+    }
+    let envelope = |end: usize| {
+        json!({"error":format!("{} … (error text truncated)",&msg[..end]),"truncated":true})
+            .to_string()
+    };
+    let mut boundaries: Vec<usize> = msg
+        .char_indices()
+        .map(|(n, _)| n)
+        .take_while(|n| *n <= BUDGET)
+        .collect();
+    boundaries.push(msg.len().min(BUDGET));
+    while boundaries
+        .last()
+        .is_some_and(|end| !msg.is_char_boundary(*end))
+    {
+        boundaries.pop();
+    }
+    let (mut low, mut high) = (0, boundaries.len() - 1);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if envelope(boundaries[mid]).len() <= BUDGET {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    envelope(boundaries[low])
 }
 
 /// No auth, but a web page elsewhere mustn't be able to drive the server: the Host and
@@ -225,6 +259,27 @@ fn user(b: &Value) -> String {
     actor(0, opt_int(b, "via"))
 }
 
+fn page(q: &Query) -> R<PageQuery> {
+    Ok(PageQuery {
+        before: q.int("before")?,
+        after: q.int("after")?,
+        through: q.int("through")?,
+        revision: q.get("revision"),
+        since: q.get("since"),
+        limit: q.int("limit")?.unwrap_or(50),
+        max_bytes: q.int("max_bytes")?.unwrap_or(16000),
+    })
+}
+
+fn record(value: Value, q: &Query) -> R<Value> {
+    bounded_record(
+        value,
+        q.int("offset")?,
+        q.int("max_bytes")?.unwrap_or(16000),
+        q.get("version").as_deref(),
+    )
+}
+
 fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Reply> {
     use Reply::Json as J;
     // Zero identifies the user; negative identities must never reach a write.
@@ -238,7 +293,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
     if q.int("agent")?.is_some_and(|id| id < 0) {
         return Err(bad("agent must be 0 (user) or a positive agent ID"));
     }
-    Ok(match (method, p) {
+    let reply = match (method, p) {
         ("GET", []) => Reply::Html(UI),
         ("GET", ["models"]) => Reply::Text(crate::app::MODELS),
         ("POST", ["agent-config"]) => {
@@ -260,44 +315,21 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             )?;
             J(json!({}))
         }
-        ("GET", ["overview"]) => {
-            // Everything the page shows, for one project (the first one by default).
-            let projects = app.projects()?;
-            let wanted = q.int("project")?;
-            let current = projects
-                .iter()
-                .find(|p| wanted.is_none_or(|w| p["id"] == w))
-                .or(projects.first())
-                .cloned();
-            let pid = current.as_ref().and_then(|p| p["id"].as_i64());
-            let (agents, threads, locks) = match pid {
-                Some(p) => (
-                    json!(app.agents(Some(p), None)?),
-                    json!(app.threads(Some(p), None)?),
-                    json!(app.locks(Some(p))?),
-                ),
-                None => (json!([]), json!([]), json!([])),
-            };
-            J(json!({
-                "url": app.url,
-                "projects": projects,
-                "project": current,
-                "agents": agents,
-                "threads": threads,
-                "locks": locks,
-                "limits": app.limits(pid)?,
-                "activity": app.activity(pid, 100)?,
-                "settings": app.settings(pid),
-                "configs": app.configs()?,
-                "model_catalog": { "claude": catalog("claude"), "codex": catalog("codex") },
-            }))
+        ("GET", ["overview"]) => J(record(
+            app.overview(q.int("project")?, q.get("since").as_deref())?,
+            q,
+        )?),
+        ("GET", ["settings"]) => J(record(json!(app.settings(q.int("project")?)), q)?),
+        ("GET", ["catalog"]) => {
+            J(json!({ "claude": catalog("claude"), "codex": catalog("codex") }))
         }
 
         // projects
         ("GET", ["projects"]) => match q.get("path") {
-            Some(path) => J(app.project_at(&path)?),
-            None => J(json!(app.projects()?)),
+            Some(path) => J(record(app.project_at(&path)?, q)?),
+            None => J(app.projects_page(page(q)?)?),
         },
+        ("GET", ["projects", p]) => J(record(app.project_view(id(p)?)?, q)?),
         ("POST", ["projects"]) => J(app.add_project(&text(b, "path")?, &user(b))?),
         ("POST", ["projects", p, "remove"]) => {
             app.remove_project(id(p)?, &user(b))?;
@@ -305,19 +337,20 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // agents
-        ("GET", ["agents"]) => J(json!(
-            app.agents(q.int("project")?, q.get("group").as_deref())?
-        )),
-        ("GET", ["agents", a]) => J(match q.int("agent")? {
-            None => app.agent_view(id(a)?)?,
-            agent => app.agent_view_for(id(a)?, agent)?,
-        }),
+        ("GET", ["agents"]) => {
+            J(app.agents_page(q.int("project")?, q.get("group").as_deref(), page(q)?)?)
+        }
+        ("GET", ["agents", a]) => J(record(app.agent_view_for(id(a)?, q.int("agent")?)?, q)?),
+        ("GET", ["agents", a, "project"]) => J(json!({"project":app.agent_project(id(a)?)?})),
         ("GET", ["agents", a, "log"]) => {
-            let n = q.int("lines")?.unwrap_or(200).max(1) as usize;
-            let txt = std::fs::read_to_string(crate::run::log_path(app, id(a)?, "txt"))
-                .unwrap_or_default();
-            let lines: Vec<&str> = txt.lines().collect();
-            J(json!({ "lines": lines[lines.len().saturating_sub(n)..] }))
+            let aid = id(a)?;
+            let project = app.agent_project(aid)?;
+            if let Some(actor) = q.int("agent")?.filter(|a| *a > 0)
+                && app.agent_project(actor)? != project
+            {
+                return Err(bad("agent is in another project"));
+            }
+            J(log_page(&crate::run::log_path(app, aid, "txt"), q)?)
         }
         ("POST", ["agents"]) => {
             let by = opt_int(b, "agent").unwrap_or(0);
@@ -390,7 +423,9 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("POST", ["hook", a]) => J(json!({ "text": app.hook(id(a)?)? })),
 
         // threads and messages
-        ("GET", ["threads"]) => J(json!(app.threads(q.int("project")?, q.int("agent")?)?)),
+        ("GET", ["threads"]) => {
+            J(app.threads_page(q.int("project")?, q.int("agent")?, page(q)?)?)
+        }
         ("POST", ["threads"]) => {
             let (tid, members) = app.new_thread(
                 opt_int(b, "agent").unwrap_or(0),
@@ -404,10 +439,16 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             )?;
             J(json!({ "id": tid, "members": members }))
         }
-        ("GET", ["threads", t]) => J(match q.int("agent")? {
-            None => app.thread(id(t)?)?,
-            agent => app.thread_for(id(t)?, agent)?,
-        }),
+        ("GET", ["threads", t]) => J(record(
+            app.thread_page(id(t)?, q.int("agent")?, page(q)?)?,
+            q,
+        )?),
+        ("GET", ["threads", t, "metadata"]) => {
+            J(record(app.thread_metadata(id(t)?, q.int("agent")?)?, q)?)
+        }
+        ("GET", ["threads", t, "messages"]) => {
+            J(app.messages_page(id(t)?, q.int("agent")?, page(q)?)?)
+        }
         ("POST", ["threads", t, "read"]) => {
             if b.get("agent").is_some_and(|a| a.as_i64() != Some(0)) {
                 return Err(bad("only the user can mark a thread read"));
@@ -437,6 +478,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["folders"]) => J(folders(
             q.get("path").as_deref(),
             q.get("hidden").as_deref() == Some("1"),
+            q,
         )?),
         ("POST", ["folders"]) => {
             let parent =
@@ -477,13 +519,10 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 .collect();
             J(json!({ "id": mid, "not_woken": not_woken }))
         }
-        ("GET", ["messages", m]) => J(match q.int("agent")? {
-            None => app.message(id(m)?)?,
-            agent => app.message_for(id(m)?, agent)?,
-        }),
-        ("GET", ["inbox", a]) => J(json!(
-            app.inbox(id(a)?, q.get("mark").as_deref().unwrap_or("new"))?
-        )),
+        ("GET", ["messages", m]) => J(record(app.message_for(id(m)?, q.int("agent")?)?, q)?),
+        ("GET", ["inbox", a]) => {
+            J(app.inbox_page(id(a)?, q.get("mark").as_deref().unwrap_or("new"), page(q)?)?)
+        }
         ("POST", ["marks"]) => {
             let ids: Vec<i64> = b["ids"]
                 .as_array()
@@ -497,7 +536,8 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // locks
-        ("GET", ["locks"]) => J(json!(app.locks(q.int("project")?)?)),
+        ("GET", ["locks"]) => J(app.locks_page(q.int("project")?, page(q)?)?),
+        ("GET", ["locks", l]) => J(record(app.lock_view(id(l)?, q.int("project")?)?, q)?),
         ("POST", ["locks"]) => {
             // An agent's lock goes in its own project.
             let project = match opt_int(b, "agent") {
@@ -523,15 +563,24 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({}))
         }
         ("POST", ["locks", "free"]) => {
-            app.free(int(b, "project")?, &text(b, "name")?, &user(b))?;
+            let project = int(b, "project")?;
+            let name = text(b, "name")?;
+            if b.get("expected_holder").is_some() {
+                let holder = int(b, "expected_holder")?;
+                if holder <= 0 {
+                    return Err(bad("expected_holder must be a positive agent ID"));
+                }
+                app.free_frozen(project, &name, holder, &user(b))?;
+            } else {
+                app.free(project, &name, &user(b))?;
+            }
             J(json!({}))
         }
 
         // limits, activity, settings
-        ("GET", ["limits"]) => J(app.limits(q.int("project")?)?),
-        ("GET", ["activity"]) => J(json!(
-            app.activity(q.int("project")?, q.int("limit")?.unwrap_or(100))?
-        )),
+        ("GET", ["limits"]) => J(record(app.limits(q.int("project")?)?, q)?),
+        ("GET", ["activity"]) => J(app.activity_page(q.int("project")?, page(q)?)?),
+        ("GET", ["activity", a]) => J(record(app.activity_view(id(a)?, q.int("project")?)?, q)?),
         ("GET", ["history"]) => J(app.history(
             q.int("project")?,
             HistoryQuery {
@@ -545,10 +594,21 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 max_bytes: q.int("max_bytes")?.unwrap_or(16000),
             },
         )?),
-        ("GET", ["history", event]) => J(app.history_event(q.int("project")?, id(event)?)?),
+        ("GET", ["history", event]) => J(record(
+            app.history_event(q.int("project")?, id(event)?)?,
+            q,
+        )?),
+        ("GET", ["receipts", event]) => {
+            J(record(app.receipt_view(id(event)?, q.int("agent")?)?, q)?)
+        }
+        ("GET", ["notices", agent]) => J(app.notices_page(id(agent)?, page(q)?)?),
+        ("GET", ["notices", agent, notice]) => {
+            J(record(app.notice_view(id(agent)?, id(notice)?)?, q)?)
+        }
 
         // configs: Default (id 1), saved ones, and each project's choice
-        ("GET", ["configs"]) => J(json!(app.configs()?)),
+        ("GET", ["configs"]) => J(app.configs_page(page(q)?)?),
+        ("GET", ["configs", c]) => J(record(app.config_view(id(c)?)?, q)?),
         ("POST", ["configs"]) => {
             let id = app.add_config(&text(b, "name")?, settings(b, "settings")?, &user(b))?;
             J(json!({ "id": id }))
@@ -572,10 +632,221 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({}))
         }
         _ => return Err(not_found(format!("no route {method} /{}", p.join("/")))),
-    })
+    };
+    if method != "GET"
+        && !matches!(p, ["hook", _])
+        && let Reply::Json(value) = reply
+    {
+        let agent = opt_int(b, "agent");
+        let thread = opt_int(b, "thread").or_else(|| match p {
+            ["threads", t, ..] => t.parse().ok(),
+            ["threads"] => value["id"].as_i64(),
+            _ => None,
+        });
+        let project = opt_int(b, "project").or_else(|| match p {
+            ["projects", id, ..] => id.parse().ok(),
+            ["projects"] => value["id"].as_i64(),
+            ["agents", id, ..] => id.parse().ok().and_then(|id| app.agent_project(id).ok()),
+            ["agents"] => value["id"]
+                .as_i64()
+                .and_then(|id| app.agent_project(id).ok()),
+            _ => None,
+        });
+        return Ok(J(app.compact_receipt(value, agent, project, thread)));
+    }
+    Ok(reply)
 }
 
-fn folders(path: Option<&str>, hidden: bool) -> R<Value> {
+fn response_bounds(q: &Query, default_limit: i64) -> R<(usize, usize)> {
+    let limit = q.int("limit")?.unwrap_or(default_limit);
+    let bytes = q.int("max_bytes")?.unwrap_or(16000);
+    if !(1..=200).contains(&limit) || !(512..=65536).contains(&bytes) {
+        return Err(bad("limit must be 1–200 and max_bytes 512–65536"));
+    }
+    Ok((limit as usize, bytes as usize))
+}
+
+fn fingerprint(value: &str) -> String {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    format!("{:016x}", hash.finish())
+}
+
+fn log_page(path: &std::path::Path, q: &Query) -> R<Value> {
+    let (_, budget) = response_bounds(q, 200)?;
+    let lines = q.int("lines")?.or(q.int("limit")?).unwrap_or(200);
+    if !(1..=200).contains(&lines) {
+        return Err(bad("lines must be 1–200"));
+    }
+    let before = q.int("before")?;
+    let after = q.int("after")?;
+    if before.is_some() && after.is_some()
+        || before.is_some_and(|n| n < 0)
+        || after.is_some_and(|n| n < 0)
+    {
+        return Err(bad("use one nonnegative before or after byte offset"));
+    }
+    if before.or(after).is_some_and(|n| n > 0) && q.get("version").is_none() {
+        return Err(bad("version is required to continue an agent log"));
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Fail(500, format!("cannot read agent log: {e}"))),
+    };
+    let metadata = file
+        .as_ref()
+        .map(|f| f.metadata())
+        .transpose()
+        .map_err(|e| Fail(500, e.to_string()))?;
+    let size = metadata.as_ref().map_or(0, |m| m.len());
+    let version = metadata
+        .as_ref()
+        .map_or_else(|| "missing".into(), |m| format!("{}:{}", m.dev(), m.ino()));
+    let revision = metadata.as_ref().map_or_else(
+        || "missing".into(),
+        |m| format!("{version}:{}:{}:{}", m.len(), m.mtime(), m.mtime_nsec()),
+    );
+    if q.get("version").is_some_and(|v| v != version) {
+        return Err(Fail(
+            409,
+            "agent log changed; reload its latest page".into(),
+        ));
+    }
+    let through = q.int("through")?;
+    if through.is_some_and(|n| n < 0 || n as u64 > size) {
+        return Err(Fail(
+            409,
+            "agent log changed or was truncated; reload its latest page".into(),
+        ));
+    }
+    let total = through.map_or(size, |n| n as u64);
+    if before.is_some_and(|n| n as u64 > total) || after.is_some_and(|n| n as u64 > total) {
+        return Err(Fail(
+            409,
+            "agent log changed or was truncated; reload its latest page".into(),
+        ));
+    }
+    if q.get("since").as_deref() == Some(&revision)
+        && before.is_none()
+        && after.is_none_or(|n| n as u64 == total)
+    {
+        return Ok(
+            json!({"unchanged":true,"revision":revision,"version":version,"next_after":total,"total_bytes":total}),
+        );
+    }
+    let forward = after.is_some();
+    let mut start = after.map_or_else(
+        || {
+            before
+                .map_or(total, |n| n as u64)
+                .saturating_sub(budget as u64)
+        },
+        |n| n as u64,
+    );
+    let mut end = if forward {
+        total.min(start + budget as u64)
+    } else {
+        before.map_or(total, |n| n as u64)
+    };
+    let mut bytes = vec![0; (end - start) as usize];
+    if let Some(file) = file.as_mut() {
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| Fail(500, format!("cannot read agent log: {e}")))?;
+    }
+    // A tail can begin inside a UTF-8 codepoint; move only that boundary.
+    // An explicit cursor must already be a codepoint boundary.
+    let leading = bytes.iter().take_while(|b| (**b & 0xc0) == 0x80).count();
+    if forward && leading > 0 {
+        return Err(bad("after must be a UTF-8 byte boundary"));
+    }
+    start += leading as u64;
+    bytes.drain(..leading);
+    let mut previous = [0];
+    if start > 0
+        && let Some(file) = file.as_mut()
+    {
+        file.seek(SeekFrom::Start(start - 1))
+            .and_then(|_| file.read_exact(&mut previous))
+            .map_err(|e| Fail(500, format!("cannot read agent log: {e}")))?;
+    }
+    if before.is_some() && std::str::from_utf8(&bytes).is_err_and(|e| e.error_len().is_none()) {
+        return Err(bad("before must be a UTF-8 byte boundary"));
+    }
+    while std::str::from_utf8(&bytes).is_err_and(|e| e.error_len().is_none()) {
+        bytes.pop();
+        end -= 1;
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad("agent log is not valid UTF-8"))?;
+    let mut lo = 0;
+    let mut hi = text.len();
+    let newlines: Vec<usize> = text.match_indices('\n').map(|(i, _)| i + 1).collect();
+    if forward {
+        if let Some(&cut) = newlines.get(lines as usize - 1) {
+            hi = cut;
+        }
+    } else {
+        let count = newlines.len() + usize::from(!text.ends_with('\n') && !text.is_empty());
+        if count > lines as usize {
+            lo = newlines[count - lines as usize - 1];
+        }
+    }
+    let envelope = |lo: usize, hi: usize| {
+        let a = start + lo as u64;
+        let b = start + hi as u64;
+        json!({"text":&text[lo..hi],"start":a,"end":b,"total_bytes":total,"through":total,"version":version,"revision":revision,
+            "next_before":if a>0 {Some(a)} else {None},"next_after":b,"has_more":if forward {b<total} else {a>0},"eof":b==total,
+            "start_partial":a>0 && (if lo==0 {previous[0]!=b'\n'} else {text.as_bytes()[lo-1]!=b'\n'}),"end_partial":b<total && (hi==0 || text.as_bytes()[hi-1]!=b'\n')})
+    };
+    if envelope(lo, hi).to_string().len() > budget {
+        let mut boundaries: Vec<usize> = text[lo..hi].char_indices().map(|(n, _)| lo + n).collect();
+        boundaries.push(hi);
+        let (mut a, mut b) = (0, boundaries.len() - 1);
+        if forward {
+            while a < b {
+                let mid = (a + b).div_ceil(2);
+                if envelope(lo, boundaries[mid]).to_string().len() <= budget {
+                    a = mid;
+                } else {
+                    b = mid - 1;
+                }
+            }
+            hi = boundaries[a];
+        } else {
+            while a < b {
+                let mid = (a + b) / 2;
+                if envelope(boundaries[mid], hi).to_string().len() <= budget {
+                    b = mid;
+                } else {
+                    a = mid + 1;
+                }
+            }
+            lo = boundaries[a];
+        }
+    }
+    let response = envelope(lo, hi);
+    if response.to_string().len() > budget || (start < end && lo == hi) {
+        return Err(bad("max_bytes too small for agent log metadata"));
+    }
+    Ok(response)
+}
+
+fn folders(path: Option<&str>, hidden: bool, q: &Query) -> R<Value> {
+    let (limit, budget) = response_bounds(q, 50)?;
+    let before = q.get("before");
+    let after = q.get("after");
+    if before.is_some() && after.is_some() {
+        return Err(bad("use one before or after folder cursor"));
+    }
+    if (before.is_some() || after.is_some()) && q.get("revision").is_none() {
+        return Err(bad("revision is required to continue a folder listing"));
+    }
+    for cursor in before.iter().chain(after.iter()) {
+        if !cursor.starts_with("d:") && !cursor.starts_with("f:") {
+            return Err(bad("folder cursor must begin with d: or f:"));
+        }
+    }
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| bad("home folder unavailable"))?;
@@ -606,15 +877,114 @@ fn folders(path: Option<&str>, hidden: bool) -> R<Value> {
             .cmp(&a["directory"].as_bool())
             .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
     });
-    let truncated = entries.len() > 1000;
-    entries.truncate(1000);
-    Ok(
-        json!({"path":path,"parent":path.parent(),"home":home,"entries":entries,"truncated":truncated}),
-    )
+    let revision = fingerprint(&json!([path, hidden, entries]).to_string());
+    if q.get("revision").is_some_and(|v| v != revision) {
+        return Err(Fail(
+            409,
+            "folder listing changed; restart its first page".into(),
+        ));
+    }
+    if q.get("since").as_deref() == Some(&revision) {
+        return Ok(json!({"unchanged":true,"revision":revision}));
+    }
+    let key = |entry: &Value| {
+        format!(
+            "{}:{}",
+            if entry["directory"] == true { "d" } else { "f" },
+            entry["name"].as_str().unwrap()
+        )
+    };
+    let total = entries.len();
+    entries.retain(|entry| {
+        before.as_ref().is_none_or(|c| key(entry) < *c)
+            && after.as_ref().is_none_or(|c| key(entry) > *c)
+    });
+    if before.is_some() {
+        entries.reverse();
+    }
+    let count = entries.len();
+    let envelope = |items: &Vec<Value>, more: bool| {
+        let cursor = items.last().map(&key);
+        json!({"path":path,"parent":path.parent(),"home":home,"entries":items,"has_more":more,"truncated":more,
+            "next_before":if before.is_some(){cursor.clone()}else{None},"next_after":if before.is_none(){cursor}else{None},"revision":revision,"total":total})
+    };
+    let mut result = Vec::new();
+    for entry in entries.into_iter().take(limit) {
+        result.push(entry);
+        if envelope(&result, true).to_string().len() > budget {
+            result.pop();
+            if result.is_empty() {
+                return Err(bad(
+                    "max_bytes too small for this folder entry; increase max_bytes",
+                ));
+            }
+            break;
+        }
+    }
+    let response = envelope(&result, result.len() < count);
+    if response.to_string().len() > budget {
+        return Err(bad("max_bytes too small for folder metadata"));
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_cursors_reject_partial_utf8_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "acom-log-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct OwnedFile(std::path::PathBuf);
+        impl Drop for OwnedFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let _owned = OwnedFile(path.clone());
+        std::io::Write::write_all(&mut file, "漢🙂\n".as_bytes()).unwrap();
+        drop(file);
+        let version = super::log_page(&path, &super::Query("max_bytes=512")).unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for key in ["before", "after"] {
+            let query = format!("{key}=1&version={version}&max_bytes=512");
+            assert_eq!(
+                super::log_page(&path, &super::Query(&query)).unwrap_err().0,
+                400
+            );
+        }
+    }
+
+    #[test]
+    fn error_text_is_explicitly_bounded_without_splitting_utf8() {
+        let body = super::error_body(&"\"\\漢🙂".repeat(10000));
+        assert!(body.len() <= 16000);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .ends_with("(error text truncated)")
+        );
+        assert_eq!(
+            super::error_body("small error"),
+            r#"{"error":"small error"}"#
+        );
+    }
+
     #[test]
     fn decodes_query_values() {
         assert_eq!(super::decode("group%3Aparser+team"), "group:parser team");
