@@ -46,7 +46,7 @@ async function fixture(run) {
     if (key === 'projects') return projectRows();
     if (key === 'configs') return configs();
     if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
-    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
+    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
     return (data[key] || []).filter(row => row.project == null || row.project === project).map((row,i) => ({id:i+1,...row}));
   };
   const revision = (key, project) => hash([key,['projects','configs'].includes(key)?null:project,collection(key,project)]);
@@ -63,7 +63,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','user_member','unread','messages'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','user_member','unread','messages','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -1518,7 +1518,7 @@ test('agent details preserve model drafts while polling and save provider-fixed 
   await page.evaluate(() => refresh());
   assert.equal(await config.locator('[name=agent_model]').inputValue(), 'gpt-6-luna');
   await config.locator('#save-agent-config').click();
-  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('saved for the next turn'));
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Model and effort saved');
   assert.deepEqual(data.requests.at(-1), {url:'/agent-config',method:'POST',body:{id:1,model:'gpt-6-luna',effort:'max'}});
   assert.equal(data.agents[0].state, 'working');
   assert.equal(data.agents[0].harness, 'codex');
@@ -1589,7 +1589,7 @@ test('continuation is an explicit working-agent opt-in and its pending instructi
   assert.match(await pending.textContent(), /Waiting: Usage <waiting>/);
   await config.locator('[name=agent_effort]').selectOption('high');
   await config.locator('#save-agent-config').click();
-  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('saved for the next turn'));
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Model and effort saved');
   assert.equal(Object.hasOwn(data.requests.at(-1).body, 'continuation'), false);
   assert.equal(data.agents[0].continuation.text, 'Continue <review> & finish', 'ordinary configuration does not cancel a pending request');
   await config.locator('[name=agent_continue]').check();
@@ -1709,7 +1709,7 @@ test('details show queued cross-provider replacements and link the explicit succ
   await reloadPage(page); await page.locator('[data-agent="1"] [data-action=details]').click();
   const details = page.locator('#agent-details');
   await details.locator('dt[data-key=replacement_request]').waitFor();
-  assert.match(await details.textContent(), /pending replacement.*claude \/ claude-sonnet-5-5.*current turn succeeds/s);
+  assert.match(await details.textContent(), /pending replacement.*claude \/ claude-sonnet-5-5.*current turn exits/s);
   data.agents[0].state = 'done';
   data.agents[0].replacement_request.blocked = 'Hard <target> limit';
   await page.evaluate(() => refresh());
@@ -1736,8 +1736,9 @@ test('replaced agents expose history and replacement details without restart or 
   ];
   data.agentLogs[1] = ['Retained predecessor history'];
   await reloadPage(page);
-  assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
-  await page.locator('[data-agent="1"] [data-action=details]').click();
+  assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details','details']);
+  assert.equal(await page.locator('[data-agent="1"] [data-action=details][data-id="2"]').textContent(),'Replacement agent #2');
+  await page.locator('[data-agent="1"] [data-action=details][data-id="1"]').click();
   await page.locator('#agent-details dt[data-key=replacement]').waitFor();
   assert.match(await page.locator('#agent-details').textContent(), /\/history\/old.jsonl.*Replacement agent #2/s);
   assert.equal(await page.locator('#agent-log').textContent(), 'Retained predecessor history');
@@ -1750,7 +1751,8 @@ test('replaced agents expose history and replacement details without restart or 
   data.agents[1].retry = {source:'claude-sonnet-5-5',handled:1,replacement:3,blocked:null};
   await page.evaluate(() => refresh());
   assert.equal(await page.locator('#save-agent-config').count(), 0, 'polling removes controls after replacement');
-  assert.deepEqual(await page.locator('[data-agent="2"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
+  assert.deepEqual(await page.locator('[data-agent="2"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details','details']);
+  assert.equal(await page.locator('[data-agent="2"] [data-action=details][data-id="3"]').textContent(),'Replacement agent #3');
   assert.equal(data.requests.length, 0);
 }));
 
@@ -2128,6 +2130,7 @@ test('mobile locks can scroll every control into view and dialogs and feedback h
   await page.locator('#launch-form button.primary').click();
   assert.match(await page.getByRole('dialog',{name:'Launch agent'}).ariaSnapshot(), /status: Enter a full model ID without spaces/);
   await page.locator('[data-close=launch-dialog]').click();
+  await page.locator('#toast').waitFor({state:'visible'});
   assert.equal(await page.locator('#toast').isVisible(), true);
   assert.match(await page.locator('#toast').textContent(), /Enter a full model ID without spaces/);
   assert.equal(data.requests.length, 0);
@@ -2350,6 +2353,7 @@ test('changed record versions restart chunk hydration instead of stitching old a
 test('folder paging reaches every entry and restarts when the listing changes during continuation', async () => fixture(async (page,data) => {
   data.pageLimit=2; data.folders['/home/example'].entries=Array.from({length:6},(_,i)=>({name:`folder${i+1}`,path:`/home/example/folder${i+1}`,directory:true}));
   await manualPolling(page); await reloadPage(page); await page.locator('[data-open=project-dialog]').click(); await page.locator('#browse-project').click();
+  await page.locator('#folder-list [data-folder]').first().waitFor();
   assert.equal(await page.locator('#folder-list [data-folder]').count(),2);
   const pending=await holdRequest(page,url=>url.pathname==='/folders'&&url.searchParams.has('after'),'GET');
   await page.locator('#folder-more').click(); await pending.started;
@@ -2609,4 +2613,137 @@ test('oversized selector previews retain unique ID labels and hydrate only the c
   await page.waitForFunction(()=>state.selectedProject===3&&refreshPending===0);
   assert.equal(await page.locator('#project-path').textContent(),'/projects/large');
   assert.ok(data.getRequests.some(url=>url.startsWith('/projects/3?offset=')||url.startsWith('/overview?project=3&offset=')));
+}));
+
+test('Overview exposes a pending replacement, preserves selected text and permanently links the committed successor', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Original worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:null}}];
+  await manualPolling(page); await reloadPage(page);
+  const source=page.locator('[data-agent="1"]');
+  assert.match(await source.textContent(),/Replacement pending.*claude \/ claude-sonnet-5-5.*current turn exits/s);
+  assert.equal(await source.locator('[data-action=pause]').textContent(),'Pause');
+  assert.equal(await source.locator('[data-action=details][data-id="2"]').count(),0);
+  const selected=await selectText(page,'[data-agent="1"] .meta');
+  data.agents[0].replacement_request.blocked='Target limit <waiting> & retry later';
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-agent="1"] .meta')===window.selectedNode),true);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.waitForFunction(()=>document.querySelector('[data-agent="1"]').textContent.includes('Target limit <waiting> & retry later'));
+  assert.equal(await source.locator('waiting').count(),0);
+  Object.assign(data.agents[0],{state:'replaced',replacement_request:null,replacement:2});
+  data.agents.push({id:2,project:1,name:'New owner',state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'high',replacement_start:{predecessor:1,blocked:'Hard target limit',attempted:0},wake_queued_at:1,wake_reason:'Ordinary wake reason'});
+  await page.evaluate(()=>refresh());
+  assert.doesNotMatch(await source.textContent(),/Replacement pending/);
+  assert.equal(await source.locator('[data-action=details][data-id="2"]').textContent(),'Replacement agent #2');
+  assert.equal(await source.locator('[data-action=pause],[data-action=resume],[data-action=reopen],[data-action=close]').count(),0);
+  const target=page.locator('[data-agent="2"]');
+  assert.match(await target.textContent(),/queued.*Replacement waiting.*Hard target limit/s);
+  assert.doesNotMatch(await target.textContent(),/waiting for a slot|Ordinary wake reason/);
+  await source.locator('[data-action=details][data-id="2"]').focus();
+  data.agents[1].replacement_start.blocked='Target capacity still full'; await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>document.activeElement.closest('[data-agent]')?.dataset.agent),'1','focus stays on the source successor link, not the successor card Details button');
+  await source.locator('[data-action=details][data-id="2"]').click();
+  await page.locator('#agent-details dt[data-key=replacement_start]').waitFor();
+  assert.match(await page.locator('#agent-details').textContent(),/New owner.*replacement waiting.*Predecessor agent #1.*Target capacity still full/s);
+  assert.equal(data.requests.length,0);
+}));
+
+test('pending first startup uses replacement-specific suspended actions and allows configuration but not continuation', async () => fixture(async (page,data) => {
+  data.agents=[{id:2,project:1,name:'Waiting successor',state:'done',harness:'codex',model:'gpt-6.1-sol',effort:'medium',pause_reason:'limit',wake_queued_at:1,wake_reason:'Do not show normal wake',replacement_pending:false,replacement_start_pending:true,replacement_start:{predecessor:1,blocked:'Usage <hard> limit',attempted:0}}];
+  await manualPolling(page); await reloadPage(page);
+  const target=page.locator('[data-agent="2"]');
+  assert.equal(await target.locator('[data-action=pause]').textContent(),'Pause replacement');
+  assert.equal(await target.locator('[data-action=close]').textContent(),'Close replacement');
+  assert.doesNotMatch(await target.textContent(),/Auto-resume is on|Do not show normal wake|waiting for a slot/);
+  data.agents[0].state='paused'; await page.evaluate(()=>refresh());
+  assert.match(await target.textContent(),/Replacement waiting.*Startup is paused.*Resume replacement to continue/s);
+  assert.equal(await target.locator('[data-action=resume]').textContent(),'Resume replacement');
+  assert.equal(await target.locator('[data-action=another-model]').count(),0);
+  data.agents[0].state='closed'; await page.evaluate(()=>refresh());
+  assert.match(await target.textContent(),/Startup is closed.*Reopen replacement to continue/s);
+  assert.equal(await target.locator('[data-action=reopen]').textContent(),'Reopen replacement');
+  await target.locator('[data-action=details][data-id="2"]').click();
+  await page.locator('#agent-details dt[data-key=replacement_start]').waitFor();
+  assert.equal(await page.locator('#agent-details dt[data-key=replacement_pending],#agent-details dt[data-key=replacement_start_pending]').count(),0);
+  assert.equal(await page.locator('#agent-config-title').textContent(),'First-session configuration');
+  assert.match(await page.locator('#agent-config-explainer').textContent(),/has not started.*paused or closed startup stays suspended.*Continuation is unavailable/s);
+  assert.equal(await page.locator('#agent-config [name=agent_continue]').isDisabled(),true);
+  await page.locator('#agent-config [name=agent_model]').selectOption('gpt-6-luna');
+  data.agents[0].replacement_start.blocked='Changed capacity reason'; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-config [name=agent_model]').inputValue(),'gpt-6-luna');
+  assert.equal(await page.locator('#save-agent-config').textContent(),'Apply to first session');
+  await page.locator('#save-agent-config').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Model and effort saved');
+  assert.equal(data.requests[0].body.model,'gpt-6-luna');
+  assert.equal(Object.hasOwn(data.requests[0].body,'continuation'),false);
+  Object.assign(data.agents[0],{state:'crashed',replacement_start:null,replacement_start_pending:false,problem:'First provider start failed',pause_reason:null});
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-details dt[data-key=replacement_start]').count(),0);
+  assert.equal(await page.locator('#agent-config-title').textContent(),'Next-turn configuration');
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  assert.doesNotMatch(await target.textContent(),/Replacement waiting/);
+  assert.equal(await target.locator('[data-action=resume]').textContent(),'Retry same model');
+  assert.equal(await target.locator('[data-action=another-model]').count(),1);
+}));
+
+test('bounded agent stubs retain replacement badges and links and Details hydrates the startup reason', async () => fixture(async (page,data) => {
+  const large='Large preview name ☃ '.repeat(1500);
+  data.agents=[
+    {id:1,project:1,name:large,state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:'Pending target reason'}},
+    {id:2,project:1,name:large,state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'high',replacement_start:{predecessor:3,blocked:'Exact <first start> reason',attempted:0}},
+    {id:3,project:1,name:large,state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement:2},
+  ];
+  await manualPolling(page); await reloadPage(page);
+  while(await page.locator('#page-overview [data-more=agents]').isVisible()) {await page.locator('#page-overview [data-more=agents]').click();await page.waitForFunction(()=>!state.pages.agents.pending);}
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Replacement pending.*See Details for the replacement target and reason/s);
+  assert.match(await page.locator('[data-agent="2"]').textContent(),/Replacement waiting.*See Details for the startup reason/s);
+  assert.doesNotMatch(await page.locator('#agents').textContent(),/undefined/);
+  assert.equal(await page.locator('[data-agent="3"] [data-action=details][data-id="2"]').textContent(),'Replacement agent #2');
+  assert.equal(data.getRequests.filter(url=>/^\/agents\/[123]/.test(url)).length,0,'stub display does not eagerly hydrate full agent records');
+  await page.locator('[data-agent="2"] [data-action=details][data-id="2"]').click();
+  await page.locator('#agent-details dt[data-key=replacement_start]').waitFor();
+  assert.match(await page.locator('#agent-details').textContent(),/replacement waiting.*Exact <first start> reason/s);
+  assert.equal(await page.locator('#agent-details first').count(),0);
+  assert.equal(await page.locator('[data-agent="2"] [data-action=pause]').textContent(),'Pause replacement');
+  assert.ok(data.getRequests.some(url=>url.startsWith('/agents/2?offset=')));
+}));
+
+test('a pending source replacement locks configuration without discarding drafts and cancellation restores editing', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Original worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},{id:2,project:1,name:'Other worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-agent="1"] [data-action=details][data-id="1"]').click();
+  await page.locator('#save-agent-config').waitFor();
+  const model=page.locator('#agent-config [name=agent_model]');
+  await model.selectOption('gpt-6-luna');
+  await page.locator('#agent-config [name=agent_continue]').check();
+  await page.locator('#agent-config [name=agent_continuation]').fill('Keep this unapplied draft');
+  data.agents[0].replacement_request={harness:'claude',model:'claude-sonnet-5-5',blocked:null};
+  await page.evaluate(()=>refresh());
+  assert.equal(await model.inputValue(),'gpt-6-luna');
+  assert.equal(await model.isDisabled(),true);
+  assert.equal(await page.locator('#save-agent-config').isDisabled(),true);
+  assert.equal(await page.locator('#agent-continuation-toggle').isHidden(),true);
+  assert.equal(await page.locator('#agent-config [name=agent_continuation]').inputValue(),'Keep this unapplied draft');
+  assert.match(await page.locator('#agent-config-explainer').textContent(),/read-only while a replacement is queued.*draft is kept/s);
+  await page.evaluate(()=>document.querySelector('#save-agent-config').click());
+  assert.equal(data.requests.length,0);
+  data.agents[0].replacement_request=null;
+  await page.evaluate(()=>refresh());
+  assert.equal(await model.inputValue(),'gpt-6-luna');
+  assert.equal(await model.isEnabled(),true);
+  assert.equal(await page.locator('#save-agent-config').isEnabled(),true);
+  assert.equal(await page.locator('#agent-config [name=agent_continue]').isChecked(),true);
+  assert.equal(await page.locator('#agent-config [name=agent_continuation]').inputValue(),'Keep this unapplied draft');
+  assert.equal(await page.locator('#agent-config [name=agent_continuation]').isEnabled(),true);
+  assert.equal(await page.locator('#agent-continuation-toggle').isVisible(),true);
+  assert.equal(data.requests.length,0);
+  data.agents[0].replacement_request={harness:'claude',model:'claude-sonnet-5-5',blocked:null}; await page.evaluate(()=>refresh());
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  await page.locator('[data-agent="2"] [data-action=details][data-id="2"]').click(); await page.locator('#save-agent-config').waitFor();
+  assert.equal(await page.locator('#agent-config [name=agent_model]').isEnabled(),true);
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  await page.locator('[data-agent="1"] [data-action=details][data-id="1"]').click(); await page.locator('#agent-details dt[data-key=replacement_request]').waitFor();
+  assert.equal(await model.isDisabled(),true);
+  data.agents[0].replacement_request=null; await page.evaluate(()=>refresh());
+  assert.equal(await model.isEnabled(),true,'reopened editor owns a fresh lock snapshot');
+  assert.equal(data.requests.length,0);
 }));

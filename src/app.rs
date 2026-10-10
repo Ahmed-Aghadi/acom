@@ -517,6 +517,7 @@ CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at I
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_continuations (agent_id INTEGER PRIMARY KEY, text TEXT NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_handoffs (agent_id INTEGER PRIMARY KEY, request TEXT NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS agent_starts (agent_id INTEGER PRIMARY KEY, predecessor INTEGER NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY, project INTEGER, at INTEGER NOT NULL, actor TEXT NOT NULL, what TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS thread_filters (thread_id INTEGER PRIMARY KEY, states TEXT NOT NULL, groups TEXT NOT NULL, watch TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS member_intervals (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
@@ -649,6 +650,9 @@ fn initialize_views(db: &Connection) -> R<()> {
         "usage",
         "usage_checks",
         "notices",
+        "agent_handoffs",
+        "agent_starts",
+        "agent_retries",
     ] {
         db.execute("INSERT OR IGNORE INTO view_revisions VALUES(?1,0)", [table])?;
         let columns: Vec<String> = rows(db, &format!("PRAGMA table_info({table})"), [])?
@@ -1748,6 +1752,49 @@ impl App {
             }
         }
 
+        let id = Self::create_agent(
+            st,
+            by,
+            via,
+            project,
+            LaunchReq {
+                task: req.task,
+                harness: Some(harness),
+                model: Some(model),
+                effort: Some(effort),
+                name: req.name,
+                group: req.group,
+                force: false,
+                done: false,
+                ack_crashes: true,
+            },
+            "idle",
+        )?;
+        Ok((id, warnings))
+    }
+
+    /// Persist a resolved choice. Waiting successors are created as done, never
+    /// briefly active or members of active-only threads.
+    fn create_agent(
+        st: &St,
+        by: i64,
+        via: Option<i64>,
+        project: i64,
+        req: LaunchReq,
+        state: &str,
+    ) -> R<i64> {
+        let harness = req
+            .harness
+            .as_deref()
+            .ok_or_else(|| bad("missing resolved harness"))?;
+        let model = req
+            .model
+            .as_deref()
+            .ok_or_else(|| bad("missing resolved model"))?;
+        let effort = req
+            .effort
+            .as_deref()
+            .ok_or_else(|| bad("missing resolved effort"))?;
         let session = if harness == "claude" {
             Some(crate::harness::new_uuid())
         } else {
@@ -1755,8 +1802,8 @@ impl App {
         };
         st.db.execute(
             "INSERT INTO agents(project,name,grp,task,harness,model,effort,state,session_id,launched_by,launched_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,'idle',?8,?9,?10)",
-            params![project, req.name.clone().unwrap_or_default(), req.group, req.task, harness, model, effort, session, by, now()],
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![project, req.name.clone().unwrap_or_default(), req.group, req.task, harness, model, effort, state, session, by, now()],
         )?;
         let id = st.db.last_insert_rowid();
         if req.name.as_deref().unwrap_or("").is_empty() {
@@ -1768,9 +1815,16 @@ impl App {
         st.log(
             Some(project),
             &actor(by, via),
-            &format!("launched agent {id} ({harness} / {model} / {effort})"),
+            &format!(
+                "{} agent {id} ({harness} / {model} / {effort})",
+                if state == "done" {
+                    "created waiting replacement"
+                } else {
+                    "launched"
+                }
+            ),
         )?;
-        Ok((id, warnings))
+        Ok(id)
     }
 
     pub fn briefing(&self, st: &St, id: i64) -> R<String> {
@@ -1805,28 +1859,25 @@ impl App {
         if !matches!(a.state.as_str(), "idle" | "done") {
             return Ok(());
         }
+        if Self::has_start(st, id)? {
+            return self.start_pending(st, id);
+        }
         let attempted: bool = st.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_continuations WHERE agent_id=?1 AND attempted=1)
-            OR EXISTS(SELECT 1 FROM agent_handoffs WHERE agent_id=?1 AND attempted=1)",
+            "SELECT EXISTS(SELECT 1 FROM agent_continuations WHERE agent_id=?1 AND attempted=1)",
             [id],
             |r| r.get(0),
         )?;
         if attempted {
-            let kind = if Self::has_handoff(st, id)? {
-                "Replacement"
-            } else {
-                "Continuation"
-            };
             Self::failed_followup(
                 st,
                 id,
-                kind,
+                "Continuation",
                 "a previous start attempt did not commit; it will not be relaunched automatically",
             )?;
             return Ok(());
         }
         if Self::has_handoff(st, id)? {
-            return self.start_handoff(st, id);
+            return self.commit_handoff(st, id);
         }
         if a.state == "idle" && self.continue_queued(st, id)? {
             return Ok(());
@@ -1862,7 +1913,15 @@ impl App {
             params![id, rest],
         )?;
         let guidance = st.settings_for(Some(st.agent(id)?.project)).prompts.wake;
-        let prompt = format!("## Guidance\n\n{guidance}");
+        let mut prompt = format!("## Guidance\n\n{guidance}");
+        let never_started: bool = st.db.query_row(
+            "SELECT turns=0 AND session_started=0 FROM agents WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if never_started {
+            prompt = format!("{}\n{prompt}", self.briefing(st, id)?);
+        }
         run::start_turn(self, st, id, &prompt, None)
     }
 
@@ -1880,7 +1939,11 @@ impl App {
                 continue;
             }
             let a = st.agent(id)?;
-            if a.state != "done" || st.pending(id)?.is_empty() {
+            if a.state != "done"
+                || Self::has_handoff(st, id)?
+                || Self::has_start(st, id)?
+                || st.pending(id)?.is_empty()
+            {
                 // Reopened, paused, or nothing left to hear about: it leaves the line.
                 st.db.execute(
                     "UPDATE agents SET wake_queued_at=NULL, wake_why=NULL WHERE id=?1",
@@ -2222,7 +2285,14 @@ impl App {
         if st.agent(id)?.state != "closed" {
             return Err(conflict(format!("agent {id} isn't closed")));
         }
-        st.set_state(id, "idle")?;
+        st.set_state(
+            id,
+            if Self::has_start(&st, id)? {
+                "done"
+            } else {
+                "idle"
+            },
+        )?;
         st.db
             .execute("UPDATE agents SET problem=NULL WHERE id=?1", [id])?;
         st.log_for(id, by, &format!("reopened agent {id}"))?;
@@ -2408,7 +2478,7 @@ impl App {
             Self::cancel_followups(st,id,"a replacement was requested instead")?;
             st.db.execute("INSERT INTO agent_handoffs(agent_id,request) VALUES(?1,?2)",params![id,serde_json::to_string(&req).map_err(|e|bad(e.to_string()))?])?;
             st.event(a.project,Some(id),None,"agent.replacement-queued",&who(id),json!({"harness":req.harness,"model":req.model,"effort":req.effort}))?;
-            st.notice(id,"Replacement queued. End this turn without acom done. After your successful exit, the new provider receives your task summary, history paths and static thread memberships. You become replaced only once it starts.")?;
+            st.notice(id,"Replacement queued. End this turn without acom done. After your successful exit, ownership transfers permanently to a new agent, even if its startup waits or fails. It receives your task summary, history paths and static memberships.")?;
             Ok(())
         })?;
         Self::cleanup_reaped_followup(&st, id);
@@ -2425,39 +2495,52 @@ impl App {
         }
     }
 
-    fn start_handoff(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
-        let a = st.agent(id)?;
-        let request: String = st.db.query_row(
-            "SELECT request FROM agent_handoffs WHERE agent_id=?1",
+    fn has_start(st: &St, id: i64) -> R<bool> {
+        Ok(st.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_starts WHERE agent_id=?1)",
             [id],
             |r| r.get(0),
+        )?)
+    }
+
+    /// Ownership moves once, before startup. A refused/failed startup must never
+    /// silently return the task to the predecessor.
+    fn commit_replacement(st: &St, id: i64, new: i64) -> R<()> {
+        let project = st.agent(id)?.project;
+        if st.db.execute("UPDATE agents SET problem=CASE WHEN state='done' THEN NULL ELSE problem END,state='replaced',ended_at=?2 WHERE id=?1 AND state IN ('done','crashed')", params![id,now()])? != 1 {
+            return Err(conflict("replacement predecessor is not crashed or awaiting handoff"));
+        }
+        st.event(
+            project,
+            Some(id),
+            None,
+            "agent.replaced",
+            "acom",
+            json!({"replacement":new}),
+        )?;
+        st.event(
+            project,
+            Some(new),
+            None,
+            "agent.replacement",
+            "acom",
+            json!({"predecessor":id}),
+        )?;
+        st.db.execute(
+            "INSERT INTO agent_starts(agent_id,predecessor) VALUES(?1,?2)",
+            params![new, id],
+        )?;
+        Ok(())
+    }
+
+    fn commit_handoff(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+        let a = st.agent(id)?;
+        let (request, attempted, blocked): (String, bool, Option<String>) = st.db.query_row(
+            "SELECT request,attempted,blocked FROM agent_handoffs WHERE agent_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let mut req: LaunchReq = serde_json::from_str(&request).map_err(|e| bad(e.to_string()))?;
-        let harness = req.harness.as_deref().unwrap_or("");
-        let model = req.model.as_deref().unwrap_or("");
-        let effort = req.effort.as_deref().unwrap_or("");
-        let s = st.settings_for(Some(a.project));
-        let blocked = if !s.harnesses.get(harness).is_some_and(|h| {
-            h.enabled
-                && h.models.iter().any(|m| m == model)
-                && h.efforts.iter().any(|e| e == effort)
-        }) {
-            Some("replacement model/effort is disabled or no longer allowed".into())
-        } else if let Err(e) = check_choice(harness, model, effort) {
-            Some(e.1)
-        } else {
-            st.model_no_room(a.project, harness, model)?
-        };
-        if let Some(why) = blocked {
-            if st.db.execute(
-                "UPDATE agent_handoffs SET blocked=?2 WHERE agent_id=?1 AND blocked IS NOT ?2",
-                params![id, why],
-            )? > 0
-            {
-                st.log_for(id, "acom", &format!("replacement waiting: {why}"))?;
-            }
-            return Ok(());
-        }
         let history = a
             .session
             .as_deref()
@@ -2473,29 +2556,103 @@ impl App {
             run::log_path(self, id, "jsonl").display()
         );
         req.ack_crashes = true; // Already reviewed when the request was accepted.
-        st.db.execute(
-            "UPDATE agent_handoffs SET attempted=1 WHERE agent_id=?1",
-            [id],
-        )?;
         let prepared=st.atomic(|st| {
-            let (new,warnings) = self.prepare_launch(st,0,None,Some(a.project),req,false)?;
-            for warning in warnings { st.notice(new,&warning)?; }
-            st.db.execute("UPDATE agents SET launched_by=?2 WHERE id=?1",params![new,id])?;
+            let new = Self::create_agent(st,id,None,a.project,req,"done")?;
             st.db.execute("UPDATE events SET actor=?2,details=json_set(details,'$.predecessor',?3) WHERE agent=?1 AND kind='agent.created'",params![new,who(id),id])?;
             Self::inherit_memberships(st,id,new)?;
             st.notice(new,&format!("Agent {id} handed off to you; read inherited messages with acom inbox and relevant thread history."))?;
-            let prompt=self.briefing(st,new)?;
-            let turn=run::prepare_turn(self,st,new,&prompt,Some(id))?;
+            Self::commit_replacement(st,id,new)?;
+            if attempted {
+                st.db.execute("UPDATE agent_starts SET attempted=1,blocked=?2 WHERE agent_id=?1",params![new,blocked])?;
+            }
             st.db.execute("DELETE FROM agent_handoffs WHERE agent_id=?1",[id])?;
-            Ok((new,turn))
+            Ok(new)
         });
         match prepared {
-            Ok((new, turn)) => run::activate_turn(self, st, new, turn),
+            Ok(new) => self.start_pending(st, new)?,
             Err(e) => {
-                Self::failed_followup(st, id, "Replacement", &e.1)?;
+                // A failed ownership commit creates neither a successor nor a
+                // terminal source. Retain the request for a safe transaction retry.
+                st.db
+                    .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, e.1])?;
+                if st.db.execute(
+                    "UPDATE agent_handoffs SET blocked=?2 WHERE agent_id=?1 AND blocked IS NOT ?2",
+                    params![id, e.1],
+                )? > 0
+                {
+                    st.log_for(
+                        id,
+                        "acom",
+                        &format!("replacement ownership could not be saved: {}", e.1),
+                    )?;
+                }
             }
         }
         Ok(())
+    }
+
+    fn start_pending(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+        let a = st.agent(id)?;
+        let (attempted, reason): (bool, Option<String>) = st.db.query_row(
+            "SELECT attempted,blocked FROM agent_starts WHERE agent_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if attempted {
+            return Self::failed_start(st,id,reason.as_deref().unwrap_or("startup attempt was interrupted before it committed; no duplicate first launch was attempted"));
+        }
+        let s = st.settings_for(Some(a.project));
+        let blocked = if !s.harnesses.get(&a.harness).is_some_and(|h| {
+            h.enabled && h.models.contains(&a.model) && h.efforts.contains(&a.effort)
+        }) {
+            Some("replacement model/effort is disabled or no longer allowed".into())
+        } else if let Err(e) = check_choice(&a.harness, &a.model, &a.effort) {
+            Some(e.1)
+        } else {
+            st.model_no_room(a.project, &a.harness, &a.model)?
+        };
+        if let Some(why) = blocked {
+            if st.db.execute(
+                "UPDATE agent_starts SET blocked=?2 WHERE agent_id=?1 AND blocked IS NOT ?2",
+                params![id, why],
+            )? > 0
+            {
+                st.log_for(id, "acom", &format!("replacement waiting: {why}"))?;
+            }
+            return Ok(());
+        }
+        // Disarm first startup durably before spawning. A restart after this
+        // point records a failure, never another implicit first launch.
+        st.db.execute(
+            "UPDATE agent_starts SET attempted=1,blocked=NULL WHERE agent_id=?1",
+            [id],
+        )?;
+        let start = self
+            .briefing(st, id)
+            .and_then(|prompt| run::start_turn(self, st, id, &prompt, None));
+        if let Err(e) = start {
+            st.db.execute(
+                "UPDATE agent_starts SET blocked=?2 WHERE agent_id=?1",
+                params![id, e.1],
+            )?;
+            Self::failed_start(st, id, &e.1)?;
+        }
+        Ok(())
+    }
+
+    fn failed_start(st: &mut St, id: i64, reason: &str) -> R<()> {
+        st.atomic(|st| {
+            let a = st.agent(id)?;
+            st.db.execute("DELETE FROM agent_starts WHERE agent_id=?1",[id])?;
+            st.remember_crash(id,&a)?;
+            st.set_state(id,"crashed")?;
+            st.release_all(id,"startup failed")?;
+            st.db.execute("UPDATE agents SET problem=?2 WHERE id=?1",params![id,reason])?;
+            st.event(a.project,Some(id),None,"agent.failed","acom",json!({"reason":reason,"harness":a.harness,"model":a.model,"effort":a.effort,"phase":"start"}))?;
+            st.log_for(id,"acom",&format!("agent {id} startup failed: {reason}; configured crash recovery applies"))?;
+            st.notice(id,&format!("Startup failed: {reason}. Configured crash recovery applies. Check partial work before continuing."))?;
+            Ok(())
+        })
     }
 
     fn failed_followup(st: &mut St, id: i64, kind: &str, reason: &str) -> R<()> {
@@ -3602,11 +3759,11 @@ impl App {
                 target_harness,
                 run::log_path(self, id, "jsonl")
             );
-            let (new, _) = self.prepare_launch(
+            let new = Self::create_agent(
                 st,
-                0,
+                id,
                 None,
-                Some(a.project),
+                a.project,
                 LaunchReq {
                     task,
                     harness: Some(target_harness.into()),
@@ -3618,11 +3775,7 @@ impl App {
                     done: false,
                     ack_crashes: true,
                 },
-                false,
-            )?;
-            st.db.execute(
-                "UPDATE agents SET launched_by=?2 WHERE id=?1",
-                params![new, id],
+                "done",
             )?;
             st.db.execute(
                 "UPDATE events SET actor='acom',details=json_set(details,'$.predecessor',?2)
@@ -3638,31 +3791,44 @@ impl App {
                 "UPDATE agent_retries SET replacement=?2 WHERE agent_id=?1",
                 params![id, new],
             )?;
-            // Mark the predecessor replaced only after the new process spawns.
+            Self::commit_replacement(st,id,new)?;
             st.notice(
                 new,
                 &format!("Agent {id} handed off to you; read inherited messages with acom inbox."),
             )?;
-            Ok((new, self.briefing(st, new)?))
+            Ok((new, String::new()))
         });
         match result {
             Ok((new, prompt)) => {
-                // All identities and inherited records are committed before any
-                // subprocess can act; failed spawns never orphan rolled-back IDs.
-                if let Err(e) = run::start_turn(self, st, new, &prompt, (new != id).then_some(id)) {
-                    st.db.execute(
-                        "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
-                        params![id, e.1],
-                    )?;
-                    if new == id {
-                        st.db.execute("UPDATE agents SET model=?2,effort=?3,state='crashed',problem=?4 WHERE id=?1",
-                            params![id, a.model, a.effort, a.problem])?;
-                    } else {
-                        st.set_state(new, "crashed")?;
-                        st.db.execute(
-                            "UPDATE agents SET problem=?2 WHERE id=?1",
-                            params![new, e.1],
-                        )?;
+                if new != id {
+                    self.start_pending(st, new)?;
+                    st.log_for(id,"acom",&format!("crash recovery: agent {id} ({source}) -> agent {new} ({target_harness} / {target_model}); {attempt_note}; {effort_note}"))?;
+                    return Ok(st.procs.contains_key(&new));
+                }
+                // Same-provider recovery retains its identity; a failed native
+                // startup is another failure of the selected model.
+                if let Err(e) = run::start_turn(self, st, new, &prompt, None) {
+                    if let Err(saved) = Self::failed_start(st, new, &e.1) {
+                        // Preparation already disarmed this retry. If recording
+                        // its failure cannot commit, stop visibly rather than
+                        // repeat a potentially interrupted provider invocation.
+                        let reason = format!(
+                            "Startup failed: {}. Could not record crash recovery: {}. Inspect state and retry manually.",
+                            e.1, saved.1
+                        );
+                        st.atomic(|st| {
+                            st.db.execute(
+                                "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
+                                params![new, reason],
+                            )?;
+                            st.db.execute(
+                                "UPDATE agents SET problem=?2 WHERE id=?1",
+                                params![new, reason],
+                            )?;
+                            st.log_for(new, "acom", &reason)?;
+                            Ok(())
+                        })?;
+                        return Ok(false);
                     }
                     st.log_for(
                         id,
@@ -3681,7 +3847,7 @@ impl App {
                 Ok(true)
             }
             Err(e) => {
-                // A missing client or failed spawn gets one attempt, not a loop.
+                // Failed preparation stops visibly before any client starts.
                 st.db.execute(
                     "UPDATE agent_retries SET handled=1,blocked=?2 WHERE agent_id=?1",
                     params![id, e.1],
@@ -3715,7 +3881,8 @@ impl App {
             &st.db,
             "SELECT a.id FROM agents a WHERE a.state IN ('idle','done')
             AND (EXISTS(SELECT 1 FROM agent_continuations c WHERE c.agent_id=a.id)
-                 OR EXISTS(SELECT 1 FROM agent_handoffs h WHERE h.agent_id=a.id)) ORDER BY a.id",
+                 OR EXISTS(SELECT 1 FROM agent_handoffs h WHERE h.agent_id=a.id)
+                 OR EXISTS(SELECT 1 FROM agent_starts s WHERE s.agent_id=a.id)) ORDER BY a.id",
             [],
         )? {
             let id = r["id"].as_i64().unwrap();
@@ -4248,7 +4415,13 @@ impl App {
         let mut page = self.select_page(
             &st,
             &q,
-            &["agents", "locks"],
+            &[
+                "agents",
+                "locks",
+                "agent_handoffs",
+                "agent_starts",
+                "events",
+            ],
             &format!("agents:{project:?}:{group:?}"),
             sql,
             &[project.into(), group.map(str::to_string).into()],
@@ -4256,6 +4429,7 @@ impl App {
         )?;
         for item in &mut page.items {
             item["locks"] = json!(st.held_by(item["id"].as_i64().unwrap())?);
+            Self::replacement_fields(&st, item)?;
         }
         page.finish(&q)
     }
@@ -4570,7 +4744,16 @@ impl App {
             ),
             ("configs", vec!["configs", "projects"]),
             ("settings", vec!["configs", "projects"]),
-            ("agents", vec!["agents", "locks"]),
+            (
+                "agents",
+                vec![
+                    "agents",
+                    "locks",
+                    "agent_handoffs",
+                    "agent_starts",
+                    "events",
+                ],
+            ),
             (
                 "threads",
                 vec![
@@ -4613,6 +4796,8 @@ impl App {
                 "activity",
                 "usage",
                 "usage_checks",
+                "agent_handoffs",
+                "agent_starts",
             ],
             &format!(
                 "overview:{project:?}:{}",
@@ -4954,8 +5139,7 @@ impl App {
             )?
             .pop()
         );
-        a["replacement_request"]=json!(rows(&st.db,"SELECT json_extract(request,'$.harness') harness,json_extract(request,'$.model') model,CASE WHEN attempted=1 THEN 'Start attempt interrupted; waiting to save cancellation' ELSE blocked END blocked FROM agent_handoffs WHERE agent_id=?1",[id])?.pop());
-        a["replacement"]=json!(rows(&st.db,"SELECT json_extract(details,'$.replacement') id FROM events WHERE agent=?1 AND kind='agent.replaced' ORDER BY id DESC LIMIT 1",[id])?.pop().map(|v|v["id"].clone()));
+        Self::replacement_fields(&st, &mut a)?;
         a["limits"] = json!(st.limits_text(Some(project))?);
         a["threads"] = json!(rows(
             &st.db,
@@ -4968,6 +5152,16 @@ impl App {
             [id],
         )?);
         Ok(a)
+    }
+
+    fn replacement_fields(st: &St, a: &mut Value) -> R<()> {
+        let id = a["id"].as_i64().unwrap();
+        a["replacement_request"]=json!(rows(&st.db,"SELECT json_extract(request,'$.harness') harness,json_extract(request,'$.model') model,blocked FROM agent_handoffs WHERE agent_id=?1",[id])?.pop());
+        a["replacement_start"]=json!(rows(&st.db,"SELECT predecessor,attempted,CASE WHEN attempted=1 THEN coalesce(blocked,'Startup attempt interrupted; waiting to record failure') ELSE blocked END blocked FROM agent_starts WHERE agent_id=?1",[id])?.pop());
+        a["replacement"]=json!(rows(&st.db,"SELECT json_extract(details,'$.replacement') id FROM events WHERE agent=?1 AND kind='agent.replaced' ORDER BY id DESC LIMIT 1",[id])?.pop().map(|v|v["id"].clone()));
+        a["replacement_pending"] = json!(!a["replacement_request"].is_null());
+        a["replacement_start_pending"] = json!(!a["replacement_start"].is_null());
+        Ok(())
     }
 
     #[cfg(test)]
@@ -7227,17 +7421,30 @@ mod tests {
     #[test]
     fn failed_followup_cleanup_rolls_back_request_state_and_history_together() {
         let app = self_change_app();
-        app.queue_replacement(1, replacement_request()).unwrap();
+        app.configure_agent(1, 1, None, Some("high"), Some("continue"), false)
+            .unwrap();
         let mut st = app.lock();
-        st.set_state(1, "done").unwrap();
+        st.set_state(1, "idle").unwrap();
         st.db
-            .execute("UPDATE agent_handoffs SET attempted=1 WHERE agent_id=1", [])
+            .execute(
+                "UPDATE agent_continuations SET attempted=1 WHERE agent_id=1",
+                [],
+            )
             .unwrap();
         let before = rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap();
         st.db.execute_batch("CREATE TRIGGER reject_failure_notice BEFORE INSERT ON notices BEGIN SELECT RAISE(ABORT,'failed notice'); END;").unwrap();
-        assert!(App::failed_followup(&mut st, 1, "Replacement", "missing client").is_err());
-        assert_eq!(st.agent(1).unwrap().state, "done");
-        assert!(App::has_handoff(&st, 1).unwrap());
+        assert!(App::failed_followup(&mut st, 1, "Continuation", "missing client").is_err());
+        assert_eq!(st.agent(1).unwrap().state, "idle");
+        assert_eq!(
+            rows(
+                &st.db,
+                "SELECT * FROM agent_continuations WHERE agent_id=1",
+                []
+            )
+            .unwrap()
+            .len(),
+            1
+        );
         assert!(st.agent(1).unwrap().problem.is_none());
         assert_eq!(
             rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
@@ -7246,7 +7453,7 @@ mod tests {
         assert_eq!(
             st.db
                 .query_row(
-                    "SELECT attempted FROM agent_handoffs WHERE agent_id=1",
+                    "SELECT attempted FROM agent_continuations WHERE agent_id=1",
                     [],
                     |r| r.get::<_, i64>(0)
                 )
@@ -7267,8 +7474,16 @@ mod tests {
         st.db
             .execute_batch("DROP TRIGGER reject_failure_notice")
             .unwrap();
-        App::failed_followup(&mut st, 1, "Replacement", "missing client").unwrap();
-        assert!(!App::has_handoff(&st, 1).unwrap());
+        App::failed_followup(&mut st, 1, "Continuation", "missing client").unwrap();
+        assert!(
+            rows(
+                &st.db,
+                "SELECT * FROM agent_continuations WHERE agent_id=1",
+                []
+            )
+            .unwrap()
+            .is_empty()
+        );
         assert_eq!(st.agent(1).unwrap().state, "idle");
     }
 
@@ -7530,17 +7745,28 @@ mod tests {
     }
 
     #[test]
-    fn failed_replacement_start_keeps_predecessor_honest_and_has_no_orphan() {
+    fn failed_replacement_start_is_owned_by_durable_successor() {
         let app = self_change_app();
         app.queue_replacement(1, replacement_request()).unwrap();
         app.turn_ended(1, 0, true, None).unwrap();
         let view = app.agent_view(1).unwrap();
-        assert_eq!(view["state"], "idle");
-        assert!(view["replacement"].is_null());
+        assert_eq!(view["state"], "replaced");
+        let new = view["replacement"].as_i64().unwrap();
         assert!(view["replacement_request"].is_null());
         assert!(view["retry"].is_null());
-        assert!(view["problem"].as_str().unwrap().contains("can't start"));
-        assert_eq!(app.agents(None, None).unwrap().len(), 2);
+        let successor = app.agent_view(new).unwrap();
+        assert_eq!(successor["state"], "crashed");
+        assert_eq!(successor["retry"]["source"], "gpt-6-sol");
+        assert_eq!(successor["retry"]["effort"], "high");
+        assert_eq!(successor["retry"]["handled"], 0);
+        assert!(successor["replacement_start"].is_null());
+        assert!(
+            successor["problem"]
+                .as_str()
+                .unwrap()
+                .contains("can't start")
+        );
+        assert_eq!(app.agents(None, None).unwrap().len(), 3);
         assert_eq!(
             rows(
                 &app.lock().db,
@@ -7549,7 +7775,300 @@ mod tests {
             )
             .unwrap()
             .len(),
-            0
+            1
+        );
+        assert!(app.resume(1, "user").is_err());
+        assert!(app.reopen(1, "user").is_err());
+        app.tick().unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "crashed");
+    }
+
+    fn waiting_replacement_app() -> (Arc<App>, i64) {
+        let app = self_change_app();
+        app.queue_replacement(1, replacement_request()).unwrap();
+        custom(&app, 1, |s| {
+            s.harnesses.get_mut("codex").unwrap().enabled = false
+        });
+        app.turn_ended(1, 0, true, None).unwrap();
+        let new = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+        (app, new)
+    }
+
+    #[test]
+    fn replacement_waiting_owns_work_without_active_slot_or_false_live_joins() {
+        let app = self_change_app();
+        let (tid, _) = app
+            .new_thread(
+                0,
+                Some(1),
+                "active audience",
+                &[],
+                false,
+                &["active".into()],
+            )
+            .unwrap();
+        app.queue_replacement(1, replacement_request()).unwrap();
+        custom(&app, 1, |s| {
+            s.harnesses.get_mut("codex").unwrap().enabled = false
+        });
+        app.turn_ended(1, 0, true, None).unwrap();
+        let new = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+        let view = app.agent_view(new).unwrap();
+        assert_eq!(view["state"], "done");
+        assert_eq!(view["replacement_start"]["predecessor"], 1);
+        assert!(
+            view["replacement_start"]["blocked"]
+                .as_str()
+                .unwrap()
+                .contains("disabled")
+        );
+        let st = app.lock();
+        assert_eq!(st.active_counts(Some(1)).unwrap().0, 0);
+        assert!(
+            rows(
+                &st.db,
+                "SELECT * FROM member_intervals WHERE thread_id=?1 AND agent_id=?2",
+                params![tid, new]
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(st.procs.is_empty());
+    }
+
+    #[test]
+    fn waiting_successor_survives_restart_and_user_pause_close_without_waking_source() {
+        let (app, new) = waiting_replacement_app();
+        app.pause(new, LockMode::Keep, "user").unwrap();
+        app.tick().unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "paused");
+        assert_eq!(
+            app.agent_view(new).unwrap()["replacement_start"]["predecessor"],
+            1
+        );
+        app.resume(new, "user").unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "done");
+        app.close(new, "user").unwrap();
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        app.tick().unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "closed");
+        app.reopen(new, "user").unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "done");
+        assert_eq!(app.agent_view(1).unwrap()["state"], "replaced");
+        assert_eq!(app.agents(None, None).unwrap().len(), 3);
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn ownership_commit_failure_retains_request_and_retries_without_orphans() {
+        let app = self_change_app();
+        app.queue_replacement(1, replacement_request()).unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER reject_ownership BEFORE INSERT ON events WHEN NEW.kind='agent.replaced' BEGIN SELECT RAISE(ABORT,'ownership failed'); END;").unwrap();
+        app.turn_ended(1, 0, true, None).unwrap();
+        let view = app.agent_view(1).unwrap();
+        assert_eq!(view["state"], "done");
+        assert!(view["replacement"].is_null());
+        assert_eq!(
+            view["replacement_request"]["blocked"],
+            "database: ownership failed"
+        );
+        assert_eq!(app.agents(None, None).unwrap().len(), 2);
+        app.tick().unwrap();
+        assert_eq!(app.agents(None, None).unwrap().len(), 2);
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_ownership")
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(app.agent_view(1).unwrap()["state"], "replaced");
+        assert_eq!(app.agents(None, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn startup_failure_persistence_is_atomic_and_restart_never_duplicates_first_attempt() {
+        let app = self_change_app();
+        app.queue_replacement(1, replacement_request()).unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER reject_start_failure BEFORE DELETE ON agent_starts BEGIN SELECT RAISE(ABORT,'failure persistence'); END;").unwrap();
+        app.turn_ended(1, 0, true, None).unwrap();
+        let new = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+        let view = app.agent_view(new).unwrap();
+        assert_eq!(view["state"], "done");
+        assert_eq!(view["replacement_start"]["attempted"], 1);
+        assert!(view["retry"].is_null());
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        assert!(app.tick().is_err());
+        assert!(app.lock().procs.is_empty());
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_start_failure")
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "crashed");
+        assert_eq!(app.agent_view(1).unwrap()["state"], "replaced");
+        app.tick().unwrap();
+        assert_eq!(
+            rows(
+                &app.lock().db,
+                "SELECT * FROM events WHERE agent=?1 AND kind='agent.failed'",
+                [new]
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn disarmed_handoff_becomes_successor_failure_without_implicit_start() {
+        let app = self_change_app();
+        app.queue_replacement(1, replacement_request()).unwrap();
+        {
+            let st = app.lock();
+            st.set_state(1, "done").unwrap();
+            st.db.execute("UPDATE agent_handoffs SET attempted=1,blocked='interrupted startup' WHERE agent_id=1",[]).unwrap();
+        }
+        app.tick().unwrap();
+        let new = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+        let view = app.agent_view(new).unwrap();
+        assert_eq!(view["state"], "crashed");
+        assert_eq!(view["turns"], 0);
+        assert_eq!(view["problem"], "interrupted startup");
+        assert_eq!(app.agent_view(1).unwrap()["state"], "replaced");
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn successor_startup_failure_uses_its_bounded_retry_chain() {
+        let app = self_change_app();
+        custom(&app, 1, |s| {
+            s.allow_agent_model_change = true;
+            s.crash_retries.insert(
+                "gpt-6-sol".into(),
+                RetryRule {
+                    harness: "claude".into(),
+                    model: "claude-opus-5".into(),
+                    same_model_retries: 1,
+                },
+            );
+        });
+        app.queue_replacement(1, replacement_request()).unwrap();
+        app.turn_ended(1, 0, true, None).unwrap();
+        let new = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agent_retries SET eligible_at=0 WHERE agent_id=?1",
+                [new],
+            )
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            app.agent_view(new).unwrap()["retry"]["same_model_attempts"],
+            1
+        );
+        assert_eq!(app.agent_view(new).unwrap()["state"], "crashed");
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agent_retries SET eligible_at=0 WHERE agent_id=?1",
+                [new],
+            )
+            .unwrap();
+        app.tick().unwrap();
+        let later = app.agent_view(new).unwrap()["replacement"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(app.agent_view(new).unwrap()["state"], "replaced");
+        assert_eq!(app.agent_view(later).unwrap()["state"], "crashed");
+        assert_eq!(
+            app.agent_view(later).unwrap()["retry"]["source"],
+            "claude-opus-5"
+        );
+        assert_eq!(app.agent_view(1).unwrap()["replacement"], new);
+        assert_eq!(app.agents(None, None).unwrap().len(), 4);
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn failed_retry_failure_save_stops_visibly_without_repeating_the_invocation() {
+        let app = self_change_app();
+        custom(&app, 1, |s| {
+            s.crash_retries.insert(
+                "claude-opus-5-5".into(),
+                RetryRule {
+                    harness: "claude".into(),
+                    model: "claude-opus-5".into(),
+                    same_model_retries: 1,
+                },
+            );
+        });
+        record_test_crash(&app, 1);
+        app.lock().db.execute_batch("CREATE TRIGGER reject_failure_event BEFORE INSERT ON events WHEN NEW.kind='agent.failed' BEGIN SELECT RAISE(ABORT,'failure write rejected'); END;").unwrap();
+        app.tick().unwrap();
+        let view = app.agent_view(1).unwrap();
+        assert_eq!(view["state"], "crashed");
+        assert_eq!(view["retry"]["handled"], 1);
+        assert_eq!(view["retry"]["same_model_attempts"], 1);
+        assert!(
+            view["retry"]["blocked"]
+                .as_str()
+                .unwrap()
+                .contains("Could not record crash recovery")
+        );
+        assert_eq!(view["problem"], view["retry"]["blocked"]);
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_failure_event")
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(app.agent_view(1).unwrap()["retry"], view["retry"]);
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn replacement_queue_and_wait_reason_invalidate_matching_overview_and_agent_pages() {
+        let app = self_change_app();
+        let before = app
+            .agents_page(Some(1), None, PageQuery::default())
+            .unwrap();
+        app.queue_replacement(1, replacement_request()).unwrap();
+        let queued = app
+            .agents_page(Some(1), None, PageQuery::default())
+            .unwrap();
+        assert_ne!(before["revision"], queued["revision"]);
+        assert_eq!(
+            queued["revision"],
+            app.overview(Some(1), None).unwrap()["revisions"]["agents"]
+        );
+        assert_eq!(queued["items"][0]["replacement_pending"], true);
+        custom(&app, 1, |s| {
+            s.harnesses.get_mut("codex").unwrap().enabled = false
+        });
+        app.turn_ended(1, 0, true, None).unwrap();
+        let waiting = app
+            .agents_page(Some(1), None, PageQuery::default())
+            .unwrap();
+        assert_eq!(waiting["items"][0]["replacement_start_pending"], true);
+        assert_eq!(
+            waiting["revision"],
+            app.overview(Some(1), None).unwrap()["revisions"]["agents"]
+        );
+        let new = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agent_starts SET blocked='a changed reason' WHERE agent_id=?1",
+                [new],
+            )
+            .unwrap();
+        assert_ne!(
+            waiting["revision"],
+            app.agents_page(Some(1), None, PageQuery::default())
+                .unwrap()["revision"]
         );
     }
 

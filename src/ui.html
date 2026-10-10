@@ -370,7 +370,9 @@
       deferredContent.delete(node);
       if (html) {
         const focused = node.contains(document.activeElement) ? document.activeElement : null;
-        const selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
+        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
+        const agent = focused?.closest('[data-agent]');
+        if (selector && agent && node.contains(agent)) selector = `[data-agent="${CSS.escape(agent.dataset.agent)}"] ${selector}`;
         node.innerHTML = value; node._renderedHTML = value;
         const replacement = selector && node.querySelector(selector);
         if (replacement && replacement.tagName === focused.tagName) replacement.focus({preventScroll:true});
@@ -670,23 +672,37 @@
       setHTML(root, [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join(''));
     }
 
+    function replacementSummary(a) {
+      if (a.replacement) return `<div class="meta"><button type="button" class="small" data-action="details" data-id="${esc(a.replacement)}">Replacement agent #${esc(a.replacement)}</button></div>`;
+      if (a.replacement_start || a.replacement_start_pending) {
+        const start = a.replacement_start;
+        const suspended = a.state === 'paused' ? 'Startup is paused. Resume replacement to continue.' : a.state === 'closed' ? 'Startup is closed. Reopen replacement to continue.' : '';
+        return `<div class="meta"><span class="pill waiting">Replacement waiting</span>${start?.predecessor ? ` <button type="button" class="small" data-action="details" data-id="${esc(start.predecessor)}">Predecessor agent #${esc(start.predecessor)}</button>` : ''}<div>${esc(suspended || start?.blocked || (start ? start.attempted ? 'A first-session startup attempt is recorded.' : 'Waiting for the first provider session.' : 'See Details for the startup reason.'))}</div>${suspended && start?.blocked ? `<div>${esc(start.blocked)}</div>` : ''}</div>`;
+      }
+      if (a.replacement_request || a.replacement_pending) {
+        const request = a.replacement_request;
+        return `<div class="meta"><span class="pill waiting">Replacement pending</span>${request ? ` · ${esc(request.harness)} / ${esc(request.model)}` : ''}<div>${esc(request?.blocked || (request ? 'A new provider session after the current turn exits.' : 'See Details for the replacement target and reason.'))}</div></div>`;
+      }
+      return '';
+    }
     function agentRow(a) {
-      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div><div class="meta">Details exceed the preview budget.</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
+      const replacement = replacementSummary(a), starting = a.replacement_start || a.replacement_start_pending;
+      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div><div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
       const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
       const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
-        ? `<button class="small" data-action="pause" data-id="${a.id}">Pause</button>`
-        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${a.state === 'crashed' || unavailable ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
-        : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">Reopen</button>` : '';
-      const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}">Close</button>` : '';
-      const waiting = a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
-      const waitReason = a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
+        ? `<button class="small" data-action="pause" data-id="${a.id}">${starting ? 'Pause replacement' : 'Pause'}</button>`
+        : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}">${starting ? 'Resume replacement' : a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${!starting && (a.state === 'crashed' || unavailable) ? `<button class="small" data-action="another-model" data-id="${a.id}">Launch another model…</button>` : ''}`
+        : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}">${starting ? 'Reopen replacement' : 'Reopen'}</button>` : '';
+      const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}">${starting ? 'Close replacement' : 'Close'}</button>` : '';
+      const waiting = !starting && a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
+      const waitReason = !starting && a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
       const problem = a.has_problem || problemText ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
-      const recovery = a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
+      const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
-        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${esc(a.state)}">${esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta" title="${esc(task)}">${esc(a.status || task)}</div>${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
+        <div><div class="meta" title="${esc(task)}">${esc(a.status || task)}</div>${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -900,13 +916,14 @@
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
         const summary = state.agents.find(item => item.id === id);
         if (summary?.truncated && a.project === state.selectedProject) {
-          Object.assign(summary, a, {task_preview:a.task?.slice(0,400), problem_preview:a.problem?.slice(0,400), has_problem:!!a.problem,
+          Object.assign(summary, a, {replacement_pending:!!a.replacement_request, replacement_start_pending:!!a.replacement_start,
+            task_preview:a.task?.slice(0,400), problem_preview:a.problem?.slice(0,400), has_problem:!!a.problem,
             model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '')});
           delete summary.truncated; renderAgents();
         }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','running_configuration'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
         fields.push({key:'running_configuration',label:'current turn',content:a.running_configuration ? `${esc(a.harness)} / ${esc(a.running_configuration.model)} / effort ${esc(a.running_configuration.effort)}` : '— (no running turn)'});
         fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
         const retryStatus = a.retry?.blocked ? `${a.retry.handled ? 'Stopped' : 'Waiting'}: ${esc(a.retry.blocked)}` : a.retry?.replacement ? '' : a.retry?.handled ? 'Retry attempt handled' : 'Pending; requires a configured rule and available limits';
@@ -915,13 +932,32 @@
         if (a.retry) fields.push({key:'retry',label:'crash recovery',content:`${esc(a.retry.source)} · Same-model retries: ${esc(a.retry.same_model_attempts ?? 0)}${retryEffort}${retryStatus ? `<br>${retryStatus}` : ''}${eligible}`});
         const replacement = a.replacement ?? a.retry?.replacement;
         if (replacement) fields.push({key:'replacement',label:'replacement',content:`<button type="button" class="small" data-action="details" data-id="${esc(replacement)}">Replacement agent #${esc(replacement)}</button>`});
-        if (a.replacement_request) fields.push({key:'replacement_request',label:'pending replacement',content:`${esc(a.replacement_request.harness)} / ${esc(a.replacement_request.model)}<br>${a.replacement_request.blocked ? `Waiting: ${esc(a.replacement_request.blocked)}` : 'A new provider session after the current turn succeeds'}`});
+        if (a.replacement_request) fields.push({key:'replacement_request',label:'pending replacement',content:`${esc(a.replacement_request.harness)} / ${esc(a.replacement_request.model)}<br>${a.replacement_request.blocked ? `Waiting: ${esc(a.replacement_request.blocked)}` : 'A new provider session after the current turn exits'}`});
+        if (a.replacement_start) fields.push({key:'replacement_start',label:'replacement waiting',content:replacementSummary(a)});
         if (a.continuation) fields.push({key:'continuation',label:'pending continuation',content:`${esc(a.continuation.text)}<br>${a.continuation.blocked ? `Waiting: ${esc(a.continuation.blocked)}` : 'One turn after the current turn succeeds'}`});
         updateAgentDetails(fields);
         if (a.state === 'replaced') $('#agent-config').replaceChildren();
         else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
-        $('#agent-config').dataset.continuationAllowed = String(a.state === 'working' && !a.done_req);
+        const configRoot = $('#agent-config'), blocked = !!a.replacement_request;
+        configRoot.dataset.firstStart = String(!!a.replacement_start);
+        setText($('#agent-config-title'), blocked ? 'Source configuration (locked)' : a.replacement_start ? 'First-session configuration' : 'Next-turn configuration');
+        setText($('#agent-config-explainer'), blocked ? 'Source configuration is read-only while a replacement is queued. Pause or Close before ownership transfers cancels the request. Your unsaved configuration draft is kept here.' : a.replacement_start ? 'This replacement has not started its first provider session. Saved model and effort are checked when startup is attempted. Saving alone does not start or resume it; paused or closed startup stays suspended. Continuation is unavailable before the first session.' : 'The current turn is not interrupted. Saving model or effort alone does not start a turn. This keeps the same provider and native session. A different provider requires a new agent supplied with this agent’s history.');
+        setText($('#save-agent-config'), a.replacement_start ? 'Apply to first session' : 'Apply to next turn');
+        if (blocked && configRoot.dataset.configurationBlocked !== 'true') configRoot._replacementDisabled = new Map([...configRoot.querySelectorAll('input,select,textarea,button')].map(control => [control, control.disabled]));
+        else if (!blocked && configRoot._replacementDisabled) {
+          for (const [control, disabled] of configRoot._replacementDisabled) control.disabled = disabled;
+          configRoot._replacementDisabled = null;
+        }
+        configRoot.dataset.configurationBlocked = String(blocked);
+        configRoot.dataset.continuationAllowed = String(a.state === 'working' && !a.done_req && !a.replacement_start && !blocked);
         syncAgentContinuation();
+        for (const id of ['agent-continuation-toggle','agent-continuation-copy']) if ($(`#${id}`)) $(`#${id}`).hidden = blocked || !!a.replacement_start;
+        if (blocked || a.replacement_start) {
+          $('[data-agent-continuation]', configRoot)?.setAttribute('hidden','');
+          if ($('[name=agent_continue]', configRoot)) $('[name=agent_continue]', configRoot).disabled = true;
+        }
+        if (blocked) configRoot.querySelectorAll('input,select,textarea,button').forEach(control => control.disabled = true);
+        if ($('#save-agent-config')) $('#save-agent-config').disabled = blocked || configRoot.dataset.saving === 'true';
         const el = $('#agent-log'), text = log?.text || 'No activity yet';
         const selectingLog = hasSelectedText(el);
         if (el.textContent !== text && !selectingLog) {
@@ -1143,14 +1179,16 @@
     }
     function renderAgentConfig(a) {
       const root = $('#agent-config');
+      root._configurationSession = (root._configurationSession || 0) + 1;
+      root._replacementDisabled = null; root.dataset.configurationBlocked = 'false'; root.dataset.saving = 'false';
       root.dataset.harness = a.harness;
-      root.innerHTML = `<h3>Next-turn configuration</h3><p class="meta launch-project">The current turn is not interrupted. Saving model or effort alone does not start a turn. This keeps the same provider and native session. A different provider requires a new agent supplied with this agent's history.</p><div class="form-grid">
+      root.innerHTML = `<h3 id="agent-config-title">Next-turn configuration</h3><p class="meta launch-project" id="agent-config-explainer"></p><div class="form-grid">
         <label>Model <select name="agent_model">${modelOptions(a.harness, providerModels(a.harness, a.model), a.model)}</select></label>
         <label data-agent-custom-model hidden>Custom model ID <input name="agent_custom_model"></label>
         <label>Effort <select name="agent_effort">${options(providerEfforts(a.harness, a.model), a.effort || 'medium')}</select></label>
-      </div><label class="inline-check" style="margin-top:12px"><input type="checkbox" name="agent_continue"> Continue once after this turn succeeds</label>
+      </div><label id="agent-continuation-toggle" class="inline-check" style="margin-top:12px"><input type="checkbox" name="agent_continue"> Continue once after this turn succeeds</label>
       <label data-agent-continuation hidden>Continuation instruction <textarea name="agent_continuation" rows="3" disabled></textarea></label>
-      <p class="meta launch-project">An explicit continuation is available only while working and not finishing with done. It replaces any earlier pending instruction, uses another model turn and waits for allowed-model, effort and usage checks. Manual pause, done, close, crash or interruption of this turn cancels it; a between-turn usage pause keeps it queued. Choose model and effort for the task; cheaper or lower effort does not guarantee less total usage.</p>
+      <p id="agent-continuation-copy" class="meta launch-project">An explicit continuation is available only while working and not finishing with done. It replaces any earlier pending instruction, uses another model turn and waits for allowed-model, effort and usage checks. Manual pause, done, close, crash or interruption of this turn cancels it; a between-turn usage pause keeps it queued. Choose model and effort for the task; cheaper or lower effort does not guarantee less total usage.</p>
       <button type="button" id="save-agent-config">Apply to next turn</button>`;
     }
     function syncAgentContinuation() {
@@ -1472,8 +1510,10 @@
       const saveAgentConfig = event.target.closest('#save-agent-config');
       if (saveAgentConfig) {
         const root = $('#agent-config'), model = $('[name=agent_model]', root);
+        const session = root._configurationSession;
         if (!$('#agent-dialog form').reportValidity()) return;
-        saveAgentConfig.disabled = true;
+        if (root.dataset.configurationBlocked === 'true') return;
+        root.dataset.saving = 'true'; saveAgentConfig.disabled = true;
         try {
           const checkbox = $('[name=agent_continue]', root), text = $('[name=agent_continuation]', root), draft = text.value;
           const request = {id:selectedAgent, model:model.value === '__custom__' ? customModel($('[name=agent_custom_model]',root).value) : model.value, effort:$('[name=agent_effort]',root).value};
@@ -1489,9 +1529,9 @@
             await save({...request, ack_crashes:true});
           }
           if (request.continuation && text.value === draft) { checkbox.checked = false; text.value = ''; syncAgentContinuation(); }
-          toast(request.continuation ? 'Configuration saved; one continuation queued' : 'Model and effort saved for the next turn'); await refresh();
+          toast(request.continuation ? 'Configuration saved; one continuation queued' : 'Model and effort saved'); await refresh();
         } catch (error) { toast(error.message, true); }
-        finally { saveAgentConfig.disabled = false; }
+        finally { if (root._configurationSession === session) root.dataset.saving = 'false'; saveAgentConfig.disabled = root.dataset.configurationBlocked === 'true'; }
         return;
       }
       const open = event.target.closest('[data-open]');

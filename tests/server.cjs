@@ -1,6 +1,7 @@
 // API, CLI and process regressions; the fake harness never calls a model provider.
 // cargo build && node --test tests/server.cjs
 // ACOM_BROWSER_TEST=1 node --test tests/server.cjs also drives the real page.
+// ACOM_FOLLOWUP_TEST_ONLY=1 runs the continuation/replacement subset.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -346,6 +347,10 @@ process.stdin.on('end', async () => {
     assert.equal(builtin.name,'Default');
     assert.deepEqual(storedConfigs(),[],'fresh database contains no saved Default settings');
     const defaults = structuredClone(builtin.settings);
+    if(process.env.ACOM_FOLLOWUP_TEST_ONLY) {
+      await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
+      return;
+    }
     assert.equal(defaults.harnesses.codex.model,'gpt-6-sol');
     await api('PUT','/configs/1',{settings:defaults},409);
     await api('PUT','/configs/1',{name:'Changed Default',settings:defaults},409);
@@ -792,21 +797,20 @@ process.stdin.on('end', async () => {
     assert.equal(unchangedPredecessor.status,predecessor.status);
     assert.ok((await api('GET',`/agents/${handoff.id}/log`)).lines.length>0,'replaced output remains readable');
 
-    // Preparing a handoff is not replacement until its native process starts.
+    // Ownership belongs to the committed successor even if its client is absent.
     fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude-unavailable'));
     try {
       const failedHandoff=await api('POST','/agents',{project:a.id,harness:'codex',task:'HANDOFF_TEST'});
       const failedView=await until(async()=>{
         const view=await api('GET',`/agents/${failedHandoff.id}`);
-        return view.retry?.handled && view.retry?.blocked && view;
-      },'replacement spawn failure');
-      assert.equal(failedView.state,'crashed','failed replacement leaves the predecessor recoverable');
-      assert.match(failedView.problem,/Temporary handoff failure/);
-      if(failedView.retry.replacement) {
-        assert.equal((await api('GET',`/agents/${failedView.retry.replacement}`)).state,'crashed');
-        assert.equal(runs().some(run=>run.id===failedView.retry.replacement),false,'missing client never starts a replacement process');
-      }
-      await api('POST',`/agents/${failedHandoff.id}/close`,{});
+        return view.state==='replaced' && view.retry?.replacement && view;
+      },'replacement owns the failed start');
+      const failedTarget=failedView.retry.replacement;
+      await finished(failedTarget,'crashed');
+      assert.match((await api('GET',`/agents/${failedTarget}`)).problem,/claude|No such file|not found/i);
+      assert.equal(runs().some(run=>run.id===failedTarget),false,'missing client never activates a replacement process');
+      await api('POST',`/agents/${failedHandoff.id}/resume`,{},409);
+      await api('POST',`/agents/${failedTarget}/close`,{});
     } finally { fs.renameSync(path.join(bin,'claude-unavailable'),path.join(bin,'claude')); }
 
     for(const [model,expected] of [['claude-sonnet-5-5','max'],['claude-haiku-4-5','medium']]) {
@@ -976,7 +980,7 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,lifecycleProject.id,followupProject.id].sort((a,b)=>a-b));
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
     assert.equal(fs.existsSync(path.join(second, '.acom')), false);
-    assert.equal(stderr.replaceAll('tick: database: TEST_HANDOFF_CANCEL_FAILURE\n',''),'','only the deliberately injected cancellation failure may reach stderr');
+    assert.equal(stderr.replace(/tick: database: TEST_REPLACEMENT_(OWNERSHIP|START)_FAILURE\n/g,''),'','only deliberately injected replacement persistence failures may reach stderr');
   } finally {
     await stop();
     // Failed assertions can leave a deliberately held fake turn alive after
@@ -1008,6 +1012,10 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   config.done_closes=false; config.auto_resume=false;
   config.allow_agent_model_change=true; config.allow_agent_effort_change=true;
   const settings=custom=>api('PUT',`/projects/${project.id}/config`,{custom});
+  const dbAction=action=>{
+    const db=new DatabaseSync(path.join(home,'acom.db'));
+    try { db.exec('PRAGMA busy_timeout=5000'); return action(db); } finally { db.close(); }
+  };
   await settings(config);
   const view=id=>api('GET',`/agents/${id}`);
   const captures=id=>runs().filter(r=>r.id===id);
@@ -1278,25 +1286,60 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
     await until(()=>!fs.existsSync(`/proc/${background}/stat`) || fs.readFileSync(`/proc/${background}/stat`,'utf8').includes(') Z '),'late-request descendant is stopped');
   }
 
-  // Source releases its active slot at successful exit, but no new identity is
-  // fabricated until target capacity becomes available.
+  // Successful exit transfers ownership before capacity becomes available.
   const capacity=await launch('NEXT_TURN_REPLACE capacity wait');
   const blocker=await launch('NEXT_TURN_PLAIN occupy capacity');
   release(blocker.id); await finished(blocker.id,'idle');
   const limited=structuredClone(config); limited.limits.active={soft:null,hard:1};
   await settings(limited);
+  const capacityThread=await api('POST','/threads',{project:project.id,title:'Waiting ownership has no normal wakes',members:[String(capacity.id)],include_user:false});
+  const capacityMessage=await api('POST','/messages',{thread:capacityThread.id,text:'Carry this marked work before first startup'});
+  await api('POST','/marks',{agent:capacity.id,ids:[capacityMessage.id],mark:'in-progress'});
   await api('POST',`/agents/${capacity.id}/replacement`,targetRequest);
   release(capacity.id);
-  await until(async()=>{const a=await view(capacity.id);return a.state==='done' && a.replacement_request?.blocked;},'replacement waits for target capacity');
-  const waitingCount=(await api('GET',`/agents?project=${project.id}`)).length;
-  assert.equal((await view(capacity.id)).replacement,null);
-  await stop(); await start();
-  assert.equal((await view(capacity.id)).state,'done');
-  assert.ok((await view(capacity.id)).replacement_request);
-  assert.equal((await api('GET',`/agents?project=${project.id}`)).length,waitingCount);
-  await api('POST',`/agents/${blocker.id}/close`,{});
-  await until(async()=>(await view(capacity.id)).replacement,'replacement starts after capacity frees');
+  await until(async()=>{const a=await view(capacity.id);return a.state==='replaced' && a.replacement;},'capacity-waiting replacement owns the task');
   const capacityTarget=(await view(capacity.id)).replacement;
+  await until(async()=>{const a=await view(capacityTarget);return a.state==='done' && a.replacement_start?.blocked;},'successor waits for target capacity');
+  const waitingCount=(await api('GET',`/agents?project=${project.id}`)).length;
+  const capacitySource=await view(capacity.id);
+  assert.equal(capacitySource.replacement_request,null);
+  assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
+  const ownershipOverview=await api('GET',`/overview?project=${project.id}`);
+  assert.equal(ownershipOverview.agents.find(agent=>agent.id===capacity.id).replacement,capacityTarget,'overview links the committed source to its owner');
+  assert.equal(ownershipOverview.agents.find(agent=>agent.id===capacityTarget).replacement_start.predecessor,capacity.id,'overview identifies the waiting successor');
+  assert.equal(captures(capacityTarget).length,0);
+  assert.equal((await api('GET',`/limits?project=${project.id}`)).active.total,1,'waiting successor consumes no active slot');
+  assert.ok((await api('GET',`/threads/${capacityThread.id}`)).members.includes(capacityTarget));
+  assert.equal((await api('GET',`/messages/${capacityMessage.id}?agent=${capacityTarget}`)).mark,'in-progress');
+  await api('POST','/messages',{thread:capacityThread.id,text:'Do not wake the replaced source or bypass pending startup'});
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  assert.equal(captures(capacity.id).length,1);
+  assert.equal(captures(capacityTarget).length,0);
+  await api('POST',`/agents/${capacityTarget}/pause`,{locks:'release'});
+  assert.equal((await view(capacityTarget)).state,'paused');
+  assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
+  await api('POST',`/agents/${capacityTarget}/resume`,{});
+  assert.equal((await view(capacityTarget)).state,'done');
+  assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
+  await api('POST',`/agents/${capacityTarget}/close`,{});
+  assert.equal((await view(capacityTarget)).state,'closed');
+  assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
+  await stop(); await start();
+  assert.equal((await view(capacity.id)).state,'replaced');
+  assert.equal((await view(capacity.id)).replacement,capacityTarget);
+  assert.equal((await view(capacityTarget)).state,'closed');
+  assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
+  assert.equal((await api('GET',`/agents?project=${project.id}`)).length,waitingCount);
+  await api('POST',`/agents/${capacityTarget}/reopen`,{});
+  assert.equal((await view(capacityTarget)).state,'done');
+  assert.equal((await view(capacityTarget)).replacement_start.predecessor,capacity.id);
+  await api('POST',`/agents/${blocker.id}/close`,{});
+  await until(()=>captures(capacityTarget).length===1,'same successor starts after capacity frees');
+  assert.equal(captures(capacityTarget)[0].resume,false);
+  assert.equal(captures(capacityTarget)[0].prompt.split('# acom guide').length-1,1);
+  assert.equal(captures(capacityTarget)[0].prompt.split(`You replace agent ${capacity.id} `).length-1,1,'Pause/Close before startup preserve the original full handoff');
+  assert.equal((await view(capacityTarget)).replacement_start,null);
+  assert.equal(captures(capacity.id).length,1);
   await finished(capacityTarget,'done'); await api('POST',`/agents/${capacityTarget}/close`,{});
   await settings(config);
 
@@ -1319,49 +1362,170 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude.disabled'));
   try {
     release(spawnFailure.id);
-    await until(async()=>{const a=await view(spawnFailure.id);return a.state==='idle' && a.problem;},'failed target spawn leaves original usable');
-    assert.equal((await view(spawnFailure.id)).replacement,null);
+    await until(async()=>{const a=await view(spawnFailure.id);return a.state==='replaced' && a.replacement;},'failed spawn belongs to the committed successor');
+    const failedTarget=(await view(spawnFailure.id)).replacement;
+    await finished(failedTarget,'crashed');
+    const crashed=await view(failedTarget);
+    assert.match(crashed.problem,/claude|No such file|not found/i);
+    assert.equal(crashed.replacement_start,null);
     assert.equal((await view(spawnFailure.id)).replacement_request,null);
-    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,countBeforeFailure,'failed target creation is rolled back without an orphan');
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,countBeforeFailure+1,'failed setup retains exactly its owned successor');
     assert.equal((await events(spawnFailure.id)).filter(e=>e.kind==='agent.failed').length,0);
+    const failures=(await events(failedTarget)).filter(e=>e.kind==='agent.failed');
+    assert.equal(failures.length,1);
+    assert.equal(failures[0].details.phase,'start');
     assert.equal(captures(spawnFailure.id).length,1);
+    assert.equal(captures(failedTarget).length,0);
+    await new Promise(resolve=>setTimeout(resolve,2100));
+    assert.equal((await view(failedTarget)).state,'crashed','no matching rule means no automatic retry');
+    await api('POST',`/agents/${spawnFailure.id}/resume`,{},409);
+    await api('POST',`/agents/${failedTarget}/close`,{});
   } finally { fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude')); }
-  await api('POST',`/agents/${spawnFailure.id}/close`,{});
 
-  // A start attempt is durable before spawning. Even when saving its cancellation
-  // fails, restarting must retry the cleanup rather than spawn a successor again.
-  const persistenceFailure=await launch('NEXT_TURN_REPLACE cancellation persistence');
+  // Startup crashes use the successor's own configured retry budget, then may
+  // replace that successor without reviving the original source.
+  const recovering=structuredClone(config);
+  recovering.crash_retries['claude-sonnet-5-5']={harness:'codex',model:'gpt-6-luna',same_model_retries:1};
+  await settings(recovering);
+  const restoredSource=await launch('NEXT_TURN_REPLACE restored initial startup');
+  await api('POST',`/agents/${restoredSource.id}/replacement`,targetRequest);
+  fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude.disabled'));
+  let restoredTarget;
+  try {
+    release(restoredSource.id);
+    restoredTarget=await until(async()=>(await view(restoredSource.id)).replacement,'restored-client successor owns its initial failure');
+    await finished(restoredTarget,'crashed');
+    assert.equal(captures(restoredTarget).length,0);
+  } finally {
+    fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
+  }
+  await until(()=>captures(restoredTarget).length===1,'configured same-model retry can make its first native start');
+  const restoredRun=captures(restoredTarget)[0];
+  assert.equal(restoredRun.harness,'claude');
+  assert.equal(restoredRun.resume,false,'a failed setup did not create a native conversation to resume');
+  assert.equal(restoredRun.prompt.split('# acom guide').length-1,1,'the first actual turn receives exactly one full guide');
+  assert.equal(restoredRun.prompt.split('## Your task').length-1,1);
+  assert.equal(restoredRun.prompt.split(targetRequest.task).length-1,1,'handoff task is not duplicated by failed-start recovery');
+  assert.equal(restoredRun.prompt.split(`You replace agent ${restoredSource.id} `).length-1,1);
+  assert.match(restoredRun.prompt,/NEXT_TURN_REPLACE restored initial startup/);
+  assert.match(restoredRun.prompt,/Conversation history:.*rollout-/);
+  assert.match(restoredRun.prompt,/Output log:/);
+  await finished(restoredTarget,'done');
+  assert.equal(captures(restoredTarget).length,1);
+  assert.equal((await view(restoredTarget)).replacement,null);
+  assert.equal((await events(restoredTarget)).filter(event=>event.kind==='agent.failed').length,1);
+  assert.equal((await view(restoredSource.id)).state,'replaced');
+  assert.equal(captures(restoredSource.id).length,1);
+  await api('POST',`/agents/${restoredTarget}/close`,{});
+
+  const failedOwner=await launch('NEXT_TURN_REPLACE successor startup recovery');
+  await api('POST',`/agents/${failedOwner.id}/replacement`,targetRequest);
+  fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude.disabled'));
+  try {
+    release(failedOwner.id);
+    const owned=await until(async()=>(await view(failedOwner.id)).replacement,'successor is persisted before its failing setup');
+    const retryReplacement=await until(async()=>(await view(owned)).retry?.replacement,'successor retry then cross-provider replacement',15000);
+    const owner=await view(owned);
+    assert.equal(owner.state,'replaced');
+    assert.equal(owner.retry.same_model_attempts,1);
+    const failures=(await events(owned)).filter(e=>e.kind==='agent.failed');
+    assert.equal(failures.length,2,'initial startup and one same-model retry each fail once');
+    assert.ok(failures.every(event=>event.details.phase==='start'));
+    assert.equal(captures(owned).length,0,'missing client never activates a native turn');
+    await until(()=>captures(retryReplacement).length===1,'configured recovery successor starts');
+    assert.equal(captures(retryReplacement)[0].harness,'codex');
+    assert.equal(captures(failedOwner.id).length,1);
+    assert.equal((await view(failedOwner.id)).state,'replaced');
+    release(retryReplacement);
+    await finished(retryReplacement,'idle');
+    await api('POST',`/agents/${retryReplacement}/close`,{});
+  } finally {
+    fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
+    await settings(config);
+  }
+
+  // If the ownership commit fails, no successor process or partial inherited
+  // records can survive; retry only that atomic transfer after persistence returns.
+  const ownershipFailure=await launch('NEXT_TURN_REPLACE ownership persistence');
+  await api('POST',`/agents/${ownershipFailure.id}/replacement`,targetRequest);
+  const beforeOwnershipFailure=(await api('GET',`/agents?project=${project.id}`)).length;
+  dbAction(db=>db.exec(`CREATE TRIGGER reject_test_replacement_ownership BEFORE INSERT ON events WHEN NEW.agent=${ownershipFailure.id} AND NEW.kind='agent.replaced' BEGIN SELECT RAISE(ABORT,'TEST_REPLACEMENT_OWNERSHIP_FAILURE'); END;`));
+  try {
+    release(ownershipFailure.id);
+    await until(async()=>{const a=await view(ownershipFailure.id);return a.state==='done' && a.replacement_request && a.problem?.includes('TEST_REPLACEMENT_OWNERSHIP_FAILURE');},'failed ownership remains queued, not idle');
+    assert.equal((await view(ownershipFailure.id)).replacement,null);
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforeOwnershipFailure);
+    await new Promise(resolve=>setTimeout(resolve,1100));
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforeOwnershipFailure);
+    assert.equal(captures(ownershipFailure.id).length,1);
+  } finally {
+    dbAction(db=>db.exec('DROP TRIGGER IF EXISTS reject_test_replacement_ownership'));
+  }
+  const ownedAfterCommit=await until(async()=>(await view(ownershipFailure.id)).replacement,'atomic ownership retry succeeds once');
+  await until(()=>captures(ownedAfterCommit).length===1,'only committed successor activates');
+  assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforeOwnershipFailure+1);
+  await finished(ownedAfterCommit,'done'); await api('POST',`/agents/${ownedAfterCommit}/close`,{});
+
+  // A start attempt is durable before spawning. Failed failure persistence must
+  // never replay its implicit first start after the client returns and we restart.
+  const persistenceFailure=await launch('NEXT_TURN_REPLACE start persistence');
   await api('POST',`/agents/${persistenceFailure.id}/replacement`,targetRequest);
   const beforePersistenceFailure=(await api('GET',`/agents?project=${project.id}`)).length;
-  const dbAction=action=>{
-    const db=new DatabaseSync(path.join(home,'acom.db'));
-    try { db.exec('PRAGMA busy_timeout=5000'); return action(db); } finally { db.close(); }
-  };
-  const attempted=()=>dbAction(db=>db.prepare('SELECT attempted FROM agent_handoffs WHERE agent_id=?').get(persistenceFailure.id)?.attempted);
-  dbAction(db=>db.exec(`CREATE TRIGGER reject_test_handoff_cancel BEFORE DELETE ON agent_handoffs WHEN OLD.agent_id=${persistenceFailure.id} BEGIN SELECT RAISE(ABORT,'TEST_HANDOFF_CANCEL_FAILURE'); END;`));
+  const pendingStart=()=>dbAction(db=>db.prepare('SELECT agent_id,attempted FROM agent_starts WHERE predecessor=?').get(persistenceFailure.id));
+  dbAction(db=>db.exec(`CREATE TRIGGER reject_test_replacement_start BEFORE DELETE ON agent_starts WHEN OLD.predecessor=${persistenceFailure.id} BEGIN SELECT RAISE(ABORT,'TEST_REPLACEMENT_START_FAILURE'); END;`));
   fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude.disabled'));
   try {
     release(persistenceFailure.id);
-    await until(async()=>attempted()===1 && (await view(persistenceFailure.id)).state==='done','attempt persists despite rejected cancellation');
-    await until(()=>serverErrors().includes('tick: database: TEST_HANDOFF_CANCEL_FAILURE'),'failed cancellation is retried as persistence only');
-    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure);
+    await until(async()=>pendingStart()?.attempted===1 && (await view(persistenceFailure.id)).state==='replaced','owned start attempt persists despite rejected cleanup');
+    const interruptedTarget=pendingStart().agent_id;
+    await until(()=>serverErrors().includes('tick: database: TEST_REPLACEMENT_START_FAILURE'),'failed startup recording is retried as persistence only');
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure+1);
     fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
     await stop(); await start();
-    assert.equal(attempted(),1);
-    assert.equal((await view(persistenceFailure.id)).state,'done');
-    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure);
-    dbAction(db=>db.exec('DROP TRIGGER reject_test_handoff_cancel'));
-    await until(async()=>{const a=await view(persistenceFailure.id);return a.state==='idle' && a.problem && a.replacement_request===null;},'restart saves cancellation without launching a successor');
+    assert.equal(pendingStart().attempted,1);
+    assert.equal(pendingStart().agent_id,interruptedTarget);
+    assert.equal((await view(persistenceFailure.id)).state,'replaced');
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure+1);
+    dbAction(db=>db.exec('DROP TRIGGER reject_test_replacement_start'));
+    await finished(interruptedTarget,'crashed');
     await new Promise(resolve=>setTimeout(resolve,1100));
-    assert.equal((await view(persistenceFailure.id)).replacement,null);
-    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure);
+    assert.equal((await view(persistenceFailure.id)).replacement,interruptedTarget);
+    assert.equal((await view(interruptedTarget)).replacement_start,null);
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure+1);
     assert.equal(captures(persistenceFailure.id).length,1);
+    assert.equal(captures(interruptedTarget).length,0,'returning client cannot cause a duplicate implicit start');
     assert.equal((await events(persistenceFailure.id)).filter(e=>e.kind==='agent.failed').length,0);
+    assert.equal((await events(interruptedTarget)).filter(e=>e.kind==='agent.failed').length,1);
+    await api('POST',`/agents/${interruptedTarget}/close`,{});
   } finally {
-    dbAction(db=>db.exec('DROP TRIGGER IF EXISTS reject_test_handoff_cancel'));
+    dbAction(db=>db.exec('DROP TRIGGER IF EXISTS reject_test_replacement_start'));
     if(fs.existsSync(path.join(bin,'claude.disabled'))) fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
   }
-  await api('POST',`/agents/${persistenceFailure.id}/close`,{});
+
+  // A persisted first-start disarm flag must survive the ownership transfer.
+  // The client is available, so zero captures proves no implicit replay occurred.
+  const disarmedSource=await launch('NEXT_TURN_REPLACE persisted disarmed first start');
+  await api('POST',`/agents/${disarmedSource.id}/replacement`,targetRequest);
+  const disarmedReason='Persisted first startup was interrupted';
+  dbAction(db=>db.prepare('UPDATE agent_handoffs SET attempted=1,blocked=? WHERE agent_id=?').run(disarmedReason,disarmedSource.id));
+  release(disarmedSource.id);
+  const disarmedTarget=await until(async()=>(await view(disarmedSource.id)).replacement,'disarmed handoff still commits successor ownership');
+  await finished(disarmedTarget,'crashed');
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  const disarmed=await view(disarmedTarget);
+  assert.equal(disarmed.problem,disarmedReason);
+  assert.equal(disarmed.turns,0);
+  assert.equal(disarmed.replacement_start,null);
+  assert.equal(captures(disarmedTarget).length,0,'available client cannot replay a disarmed implicit first start');
+  assert.equal(captures(disarmedSource.id).length,1);
+  assert.equal((await view(disarmedSource.id)).state,'replaced');
+  assert.equal((await view(disarmedSource.id)).replacement_request,null);
+  const disarmedFailures=(await events(disarmedTarget)).filter(event=>event.kind==='agent.failed');
+  assert.equal(disarmedFailures.length,1);
+  assert.equal(disarmedFailures[0].details.phase,'start');
+  assert.equal(disarmedFailures[0].details.reason,disarmedReason);
+  await api('POST',`/agents/${disarmedTarget}/close`,{});
+
   for(const thread of await api('GET',`/threads?project=${project.id}`)) {
     const messages=(await api('GET',`/threads/${thread.id}`)).messages;
     if(messages.length) await api('POST',`/threads/${thread.id}/read`,{message:messages.at(-1).id});

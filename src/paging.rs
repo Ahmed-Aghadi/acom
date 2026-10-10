@@ -119,6 +119,9 @@ fn stub(item: &Value) -> Value {
         "user_member",
         "unread",
         "messages",
+        "replacement",
+        "replacement_pending",
+        "replacement_start_pending",
     ] {
         if let Some(value) = item.get(key).filter(|v| !v.is_null()) {
             result[key] = value.clone();

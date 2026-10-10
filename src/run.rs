@@ -177,6 +177,8 @@ pub(crate) fn prepare_turn(
         )?;
     }
     st.set_state(id, "working")?;
+    st.db
+        .execute("DELETE FROM agent_starts WHERE agent_id=?1", [id])?;
     let updates = st.take_updates(id)?;
     let summary = st.coordination_summary(id, true)?;
     let prompt = [prompt.to_string(), updates, summary]
@@ -200,7 +202,7 @@ pub(crate) fn prepare_turn(
             st.limits_text(Some(a.project))?
         );
         &briefed
-    } else if turns > 0 {
+    } else if turns > 0 || matches!(a.state.as_str(), "crashed" | "paused") {
         briefed = format!("{}\n{prompt}", app.briefing(st, id)?);
         &briefed
     } else {

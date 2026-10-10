@@ -1091,6 +1091,12 @@ fn print_agent(a: &Value) {
             println!("Replacement waiting: {why}");
         }
     }
+    if let Some(predecessor) = a["replacement_start"]["predecessor"].as_i64() {
+        println!("Replacement of agent {predecessor}: waiting for first startup");
+        if let Some(why) = a["replacement_start"]["blocked"].as_str() {
+            println!("Replacement waiting: {why}");
+        }
+    }
     if let Some(why) = a["problem"].as_str() {
         println!("Previous error: {why}");
     }
@@ -1236,7 +1242,7 @@ fn main() {
                 let id = me();
                 let v = post(&format!("/agents/{id}/replacement"), b);
                 println!(
-                    "Replacement queued; end this turn without acom done. You become replaced only after it starts."
+                    "Replacement queued; end this turn without acom done. After your successful exit, ownership transfers permanently to the successor, even if its startup waits or fails."
                 );
                 for warning in v["warnings"].as_array().into_iter().flatten() {
                     println!("{}", warning.as_str().unwrap_or(""));
