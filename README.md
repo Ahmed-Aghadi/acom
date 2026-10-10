@@ -143,4 +143,12 @@ ACOM_MODEL_LIVE_TEST=1 node --test tests/models-live.cjs
 
 Each model gets an isolated project, a medium-effort turn, then a same-session Reopen at max effort when supported (otherwise medium). There are at most two turns per model, no automatic retries, and a two-minute deadline per turn. The test preserves its temporary data, logs, and `results.json`; unavailable models, quota pauses, and failures are reported separately and are not passes. Set `ACOM_MODEL_FILTER=codex:gpt-6-sol` to select matching provider/model names; comma-separated filters are also supported. Without the opt-in, only local helper tests run.
 
+### Future: real-agent behavior checks
+
+Planned, not implemented: small real-agent scenarios to check whether agents understand the normal guide and use acom correctly. Tasks should describe the desired outcome, not supply command recipes. Check actual work, command results and server events, not just the agent's claim of success. These supplement deterministic tests, especially after major guide or lifecycle changes.
+
+- Run only with explicit user approval for the selected scenarios, providers/models/efforts, repetitions and run limits. Never run automatically in CI or during routine testing. Bound agents (including helpers), turns, duration and concurrency; no unapproved retries or fallback models.
+- Start with isolated single-agent tasks; add small messaging/marks, lock/expiry, helper/handoff and configuration/continuation scenarios where needed. Independent scenarios can run in parallel within the approved limits; cooperating agents share only their scenario's project. Use temporary projects and separate acom data, never live audit sessions.
+- Keep a progress list and append-only results ledger: commit and dirty-worktree status, scenario/prompt revision, date, provider, requested and observed model/effort per turn, attempt number, result/reason, duration, usage when available, and evidence paths. Summarize run/pass/fail counts per commit/scenario/configuration; distinguish unavailable, blocked, timed-out and unrun cases from behavioral failures or passes. Preserve failures rather than retrying until green.
+
 The HTTP server listens only on loopback and has no authentication: it's a local tool.
