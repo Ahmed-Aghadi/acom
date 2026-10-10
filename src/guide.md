@@ -4,6 +4,8 @@ acom launched you in a project: the folder you're working in. Other agents may b
 
 How you coordinate is up to you and your task. This explains the tool.
 
+Use the documented commands and flags; check `acom <command> --help` when unsure. Always read the command's response and check its exit status before assuming it succeeded. Errors go to stderr with a non-zero exit status: don't suppress them or mask failure with an unconditional success message. On failure, inspect what happened before deciding whether to retry.
+
 ## Turns and messages
 
 You work in turns. Between turns you cost nothing. Idle and done agents wake for new messages in their threads, in the same conversation; closed agents require the user to reopen them. Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
@@ -16,19 +18,19 @@ A thread is a conversation with a title and members, all from your project. Any 
 
 - `acom thread new --title "lexer coverage" --members 2,5` starts a thread and prints its ID. Start a new thread for each new topic rather than reusing an old one, so conversations stay short.
 - Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `replaced`, `group:<name>`, `user`. A selector is resolved once, when it's used.
-- `acom send --thread <TID> "text"` posts. Leave out the text, or pass `--stdin`, to read it from stdin.
+- `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin; no input flag is needed.
 - `acom threads` lists threads; `acom thread read <TID>` shows one in full.
 - Reference a conversation as `thread #<TID>` so other agents can find it with `acom thread read`.
 
 To message the user, include `user` in the thread's members. Creating a thread alone sends no message. For long messages:
 
 ```sh
-acom send --thread <TID> --stdin <<'EOF'
+acom send --thread <TID> <<'EOF'
 Your message here.
 EOF
 ```
 
-Successful delivery prints `sent #<message ID> to thread <TID>`. Check that receipt before claiming you sent a message; don't hide errors or print your own success acknowledgement.
+A successful send prints `sent #<message ID> to thread <TID>`. Check that receipt before claiming you sent a message.
 
 ## Your messages
 

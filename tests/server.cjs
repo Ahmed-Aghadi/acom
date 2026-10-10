@@ -263,33 +263,33 @@ process.stdin.on('end', async () => {
     const cliThread=await api('POST','/threads',{project:a.id,title:'CLI stdin delivery',members:[]});
     const actor={ACOM_ID:String(one.id),ACOM_URL:url};
     const multiline='First line from stdin\nSecond line from stdin\n';
-    const acknowledged=cli(first,['send','--thread',String(cliThread.id),'--stdin'],actor,multiline);
+    const acknowledged=cli(first,['send','--thread',String(cliThread.id)],actor,multiline);
     const sent=acknowledged.match(/^sent #(\d+) to thread (\d+)$/m);
     assert.ok(sent,'success reports the real message ID');
     assert.equal(Number(sent[2]),cliThread.id);
-    const explicitStdin=await api('GET',`/threads/${cliThread.id}`);
-    assert.equal(explicitStdin.messages.at(-1).id,Number(sent[1]));
-    assert.equal(explicitStdin.messages.at(-1).sender,one.id);
-    assert.equal(explicitStdin.messages.at(-1).text,multiline);
-    assert.ok(explicitStdin.members.includes(one.id),'sending joins the sender to the thread');
-    assert.ok(explicitStdin.members.includes(0));
-    assert.equal(explicitStdin.unread,1);
-    assert.match(cli(first,['send','--thread',String(cliThread.id)],actor,'Implicit stdin still works\n'),/^sent #\d+ to thread/m);
+    const fromStdin=await api('GET',`/threads/${cliThread.id}`);
+    assert.equal(fromStdin.messages.at(-1).id,Number(sent[1]));
+    assert.equal(fromStdin.messages.at(-1).sender,one.id);
+    assert.equal(fromStdin.messages.at(-1).text,multiline);
+    assert.ok(fromStdin.members.includes(one.id),'sending joins the sender to the thread');
+    assert.ok(fromStdin.members.includes(0));
+    assert.equal(fromStdin.unread,1);
     assert.match(cli(first,['send','--thread',String(cliThread.id),'Positional','text'],actor),/^sent #\d+ to thread/m);
     const delivered=await api('GET',`/threads/${cliThread.id}`);
-    assert.deepEqual(delivered.messages.map(m=>m.text),[multiline,'Implicit stdin still works\n','Positional text']);
+    assert.deepEqual(delivered.messages.map(m=>m.text),[multiline,'Positional text']);
     assert.ok(delivered.messages.every(m=>m.sender===one.id));
-    assert.equal(delivered.unread,3);
+    assert.equal(delivered.unread,2);
     for(const failure of [
-      {args:['send','--thread',String(cliThread.id),'--stdin','Conflicting text'],input:multiline,error:/cannot be used with/},
-      {args:['send','--thread',String(cliThread.id),'--stdin'],input:' \n\t',error:/message is empty/},
-      {args:['send','--thread','99999','--stdin'],input:multiline,error:/no thread/},
+      {args:['send','--thread',String(cliThread.id),'--stdin'],input:multiline,error:/unexpected argument.*--stdin/},
+      {args:['send','--thread',String(cliThread.id),'--invented-input'],input:multiline,error:/unexpected argument.*--invented-input/},
+      {args:['send','--thread',String(cliThread.id)],input:' \n\t',error:/message is empty/},
+      {args:['send','--thread','99999'],input:multiline,error:/no thread/},
     ]) {
       const failed=spawnSync(binary,failure.args,{cwd:first,env:{...env,...actor},encoding:'utf8',input:failure.input});
       assert.notEqual(failed.status,0,'failed sends return a failing exit status');
       assert.match(failed.stderr,failure.error);
       assert.doesNotMatch(failed.stdout,/sent #/,'failed sends never claim delivery');
-      assert.equal((await api('GET',`/threads/${cliThread.id}`)).messages.length,3,'failed sends do not write a message');
+      assert.equal((await api('GET',`/threads/${cliThread.id}`)).messages.length,2,'failed sends do not write a message');
     }
     await api('POST',`/threads/${cliThread.id}/read`,{message:delivered.messages.at(-1).id});
     const firstMessage = await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread for the user' });
