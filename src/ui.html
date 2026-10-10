@@ -343,6 +343,32 @@
     const fmt = n => Number(n || 0).toLocaleString();
     const when = n => n ? new Date(n * 1000).toLocaleString() : '—';
     const who = id => Number(id) === 0 ? 'user' : `agent ${id}`;
+    const deferredContent = new Map();
+    function hasSelectedText(node) {
+      const selection = getSelection();
+      if (!selection || selection.isCollapsed) return false;
+      for (let i = 0; i < selection.rangeCount; i++) if (selection.getRangeAt(i).intersectsNode(node)) return true;
+      return false;
+    }
+    function setContent(node, value, html = false) {
+      if (!node) return;
+      value = String(value ?? '');
+      // Compare HTML source strings: browser entity normalization must not
+      // recreate unchanged text. Keep only the latest selected-region update.
+      if ((html ? node._renderedHTML : node.textContent) === value) { deferredContent.delete(node); return; }
+      if (hasSelectedText(node)) { deferredContent.set(node, {value, html}); return; }
+      deferredContent.delete(node);
+      if (html) { node.innerHTML = value; node._renderedHTML = value; }
+      else node.textContent = value;
+    }
+    const setText = (node, value) => setContent(node, value);
+    const setHTML = (node, value) => setContent(node, value, true);
+    document.addEventListener('selectionchange', () => {
+      for (const [node, {value, html}] of deferredContent) {
+        if (!node.isConnected) deferredContent.delete(node);
+        else setContent(node, value, html);
+      }
+    });
     function duration(seconds) {
       const n = Math.max(0, Number(seconds || 0));
       if (n >= 3600) return `${Math.ceil(n / 3600)}h`;
@@ -385,7 +411,7 @@
       } catch (_) {}
       if (request !== state.overviewRequest) return;
       $('#live-dot').classList.toggle('off', !healthy);
-      $('#live-text').textContent = healthy ? 'live' : 'connection error';
+      setText($('#live-text'), healthy ? 'live' : 'connection error');
       render();
       syncSettings(initial);
       await Promise.all([
@@ -398,21 +424,21 @@
 
     function renderProject() {
       const p = state.project;
-      $('#project-select').innerHTML = state.projects.length ? projectOptions(state.selectedProject) : '<option>No projects yet</option>';
+      setHTML($('#project-select'), state.projects.length ? projectOptions(state.selectedProject) : '<option>No projects yet</option>');
       $('#project-select').disabled = state.saving || !state.projects.length;
-      $('#project-path').textContent = p?.path || 'Add a project folder to get started';
-      $('#project-url').textContent = state.url || '';
+      setText($('#project-path'), p?.path || 'Add a project folder to get started');
+      setText($('#project-url'), state.url || '');
       $('#remove-project').disabled = state.saving || !p || state.agents.length > 0;
       $('#remove-project').title = state.agents.length ? 'Projects with agents cannot be removed' : 'Remove the registration, not files';
       const unread = state.projects.reduce((n, p) => n + (p.unread || 0), 0);
       $('#unread-total').hidden = !unread;
-      $('#unread-total').textContent = `${fmt(unread)} unread`;
+      setText($('#unread-total'), `${fmt(unread)} unread`);
       $('[data-page=threads]').title = 'Unread messages across all projects; choose a project to view its threads';
       document.title = `${unread ? `(${unread}) ` : ''}${p ? `${p.name} · acom` : 'acom'}`;
       const url = new URL(location.href);
       if (p) url.searchParams.set('project', p.id); else url.searchParams.delete('project');
       history.replaceState(null, '', url);
-      if ($('#config-applied')) $('#config-applied').textContent = appliedConfigText();
+      setText($('#config-applied'), appliedConfigText());
     }
     function projectOptions(selected) {
       return state.projects.map(p => `<option value="${p.id}" title="${esc(p.path)}" ${p.id === Number(selected) ? 'selected' : ''}>${esc(p.name)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${p.id}` : ''}${p.unread ? ` · ${fmt(p.unread)} unread` : ''}</option>`).join('');
@@ -433,7 +459,7 @@
         {provider:'claude',win:'seven_day_fable',label:'Claude · Fable weekly'},
         {provider:'codex',win:null,label:'Codex'},
       ];
-      root.innerHTML = windows.map(({provider,win,label}) => {
+      setHTML(root, windows.map(({provider,win,label}) => {
         const now = Date.now() / 1000;
         const readings = usages.filter(u => u.provider === provider && (!win || u.win === win));
         const known = readings.length > 0;
@@ -444,12 +470,12 @@
         const reset = readings.filter(u => u.resets_at && (win || u.used_pct >= 100)).map(u => u.resets_at).sort((a,b)=>a-b).at(-1);
         const resetLabel = reset ? new Date(reset*1000).toLocaleString([], { ...(win?.startsWith('seven_day') ? {weekday:'short'} : {}), hour:'2-digit',minute:'2-digit' }) : '';
         return `<button class="meter" data-usage="${esc(provider)}" data-window="${win || ''}" title="Usage windows, reset times and check status${reset ? ` · ${esc(when(reset))}` : ''}"><div class="meter-label"><span>${esc(label)}</span><span>${known ? `${Math.round(value)}%` : 'unknown'}</span></div><div class="track">${marks}<div class="fill ${kind}" style="width:${Math.min(value, 100)}%"></div></div><div class="meta">${reset ? reset > now ? `resets ${esc(resetLabel)}` : 'reset due · checking' : 'View usage details'}</div></button>`;
-      }).join('');
+      }).join(''));
       if (state.usageProvider) {
         const check = state.limits?.checks?.find(c => c.provider === state.usageProvider);
-        $('#usage-details').innerHTML = `<p>${esc(state.usageProvider)} · Last checked: ${esc(when(check?.checked_at))}<br>Next check: ${esc(when(check?.next_check))}</p>
+        setHTML($('#usage-details'), `<p>${esc(state.usageProvider)} · Last checked: ${esc(when(check?.checked_at))}<br>Next check: ${esc(when(check?.next_check))}</p>
           ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win === 'five_hour' ? '5-hour' : u.win === 'seven_day' ? 'Weekly' : u.win === 'seven_day_fable' ? 'Fable weekly' : u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
-          ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}">Check now</button>`;
+          ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}">Check now</button>`);
       }
     }
 
@@ -459,11 +485,11 @@
 
     function renderAgents() {
       const root = $('#agents');
-      $('#agent-count').textContent = `${state.agents.length} total`;
-      if (!state.agents.length) { root.innerHTML = '<div class="empty">No agents yet</div>'; return; }
+      setText($('#agent-count'), `${state.agents.length} total`);
+      if (!state.agents.length) { setHTML(root, '<div class="empty">No agents yet</div>'); return; }
       const groups = new Map();
       state.agents.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
-      root.innerHTML = [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join('');
+      setHTML(root, [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join(''));
     }
 
     function agentRow(a) {
@@ -486,24 +512,24 @@
     }
 
     function renderLocks() {
-      $('#lock-count').textContent = `${state.locks.length} total`;
-      if (!state.locks.length) { $('#locks').innerHTML = '<div class="empty">No locks</div>'; return; }
-      $('#locks').innerHTML = `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => `<tr>
+      setText($('#lock-count'), `${state.locks.length} total`);
+      if (!state.locks.length) { setHTML($('#locks'), '<div class="empty">No locks</div>'); return; }
+      setHTML($('#locks'), `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => `<tr>
         <td><code>${esc(l.name)}</code>${l.frozen ? ' <span class="pill paused">frozen</span>' : ''}</td><td>${esc(l.about)}</td>
         <td>${l.holder ? `#${l.holder} ${esc(l.holder_name || '')}` : 'free'}${l.queue?.length ? `<div class="meta">queue: ${l.queue.map(x => `#${x}`).join(', ')}</div>` : ''}</td>
         <td>${when(l.acquired_at)}</td><td>${l.frozen ? `frozen, ${l.frozen_left == null ? 'no TTL' : `${duration(l.frozen_left)} left`}` : l.expires_at ? when(l.expires_at) : '—'}</td><td>${l.holder ? `<button class="small danger" data-action="free-lock" data-name="${esc(l.name)}">Free</button>` : ''}</td>
-      </tr>`).join('')}</tbody></table>`;
+      </tr>`).join('')}</tbody></table>`);
     }
 
     function renderActivity() {
-      $('#activity').innerHTML = state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div><span class="actor">${esc(e.actor)}</span> ${esc(e.what)}</div></div>`).join('') : '<div class="empty">No activity yet</div>';
+      setHTML($('#activity'), state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div><span class="actor">${esc(e.actor)}</span> ${esc(e.what)}</div></div>`).join('') : '<div class="empty">No activity yet</div>');
     }
 
     function renderThreads() {
-      $('#thread-count').textContent = `${state.threads.length}`;
+      setText($('#thread-count'), `${state.threads.length}`);
       document.querySelectorAll('[data-thread-filter]').forEach(b=>b.classList.toggle('active',b.dataset.threadFilter===state.threadFilter));
       const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread > 0 : t.members?.includes(0) ? state.threadFilter === 'mine' : state.threadFilter === 'agents'));
-      $('#thread-list').innerHTML = threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`;
+      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${t.members?.includes(0) ? 'idle' : ''}">${t.members?.includes(0) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${fmt(t.messages)} messages · ${memberNames(t.members)}</div></button>`).join('') : `<div class="empty">${state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
@@ -538,18 +564,18 @@
             messages.insertAdjacentHTML('beforeend', added.map(messageHtml).join(''));
             if (atBottom) messages.scrollTop = messages.scrollHeight;
           }
-          $('.thread-header h2', $('#thread-main')).textContent = t.title;
+          setText($('.thread-header h2', $('#thread-main')), t.title);
         }
-        $('.thread-header .meta', $('#thread-main')).innerHTML = `Thread #${t.id} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`;
-        $('#thread-membership').textContent = t.members?.includes(0) ? 'Leave thread' : 'Join thread';
+        setHTML($('.thread-header .meta', $('#thread-main')), `Thread #${t.id} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`);
+        setText($('#thread-membership'), t.members?.includes(0) ? 'Leave thread' : 'Join thread');
         const live = !!t.watch?.length;
         $('#add-thread-members').hidden = live;
         $('#thread-watch').hidden = !live;
-        $('#thread-watch').textContent = live ? `Live filters: ${t.watch.join(', ')}. Agent membership updates automatically.` : '';
+        setText($('#thread-watch'), live ? `Live filters: ${t.watch.join(', ')}. Agent membership updates automatically.` : '');
         $('#thread-history').hidden = !live && !t.events?.length;
         const events = [...(t.events || [])].sort((a,b) => a.id - b.id).map(e => `<div class="event"><time>${when(e.at)}</time><div>${who(e.agent)} ${e.kind === 'thread.joined' ? 'joined' : 'left'} · by ${esc(e.actor)}${e.details?.reason ? ` · ${esc(e.details.reason)}` : ''}</div></div>`).join('') || '<p class="meta">No membership changes yet.</p>';
         const history = events + (t.events_more ? '<p class="meta">Earlier membership events are not shown.</p>' : '');
-        if ($('#thread-events')._content !== history) { $('#thread-events').innerHTML = history; $('#thread-events')._content = history; }
+        setHTML($('#thread-events'), history);
         if (state.thread?.id === t.id) t.last_read = Math.max(t.last_read || 0, state.thread.last_read || 0);
         t.unread = t.members?.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > t.last_read).length : 0;
         state.thread = t;
@@ -565,7 +591,7 @@
       if (summary) summary.unread = unread;
       if (state.thread?.id === id && $('#thread-unread')) {
         $('#thread-unread').hidden = !unread;
-        $('#thread-unread').textContent = `${fmt(unread)} unread · Jump to latest`;
+        setText($('#thread-unread'), `${fmt(unread)} unread · Jump to latest`);
       }
       renderProject(); renderThreads();
     }
@@ -588,7 +614,7 @@
         }
       } catch (error) {
         if (state.thread?.id === t.id) {
-          $('#thread-read-error').textContent = `Couldn't save read status: ${error.message}. Retrying automatically.`;
+          setText($('#thread-read-error'), `Couldn't save read status: ${error.message}. Retrying automatically.`);
           $('#thread-read-error').hidden = false;
         }
       } finally { reading.delete(t.id); }
@@ -601,7 +627,7 @@
       try {
         const [a, log] = await Promise.all([api(`/agents/${id}`), api(`/agents/${id}/log?lines=100`)]);
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
-        $('#agent-title').textContent = `${a.name} · #${a.id}`;
+        setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
         const fields = Object.entries(a).filter(([k,v]) => k !== 'retry' && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:key.replaceAll('_',' '),content:esc(display(key, value))}));
         fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
@@ -613,17 +639,16 @@
         if (a.state === 'replaced') $('#agent-config').replaceChildren();
         else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         const el = $('#agent-log'), text = (log.lines || []).join('\n') || 'No activity yet';
-        const selection = getSelection();
-        const selectingLog = selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).intersectsNode(el);
+        const selectingLog = hasSelectedText(el);
         if (el.textContent !== text && !selectingLog) {
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
           const top = el.scrollTop;
           el.textContent = text;
           el.scrollTop = atBottom ? el.scrollHeight : top;
         }
-        $('#agent-detail-status').textContent = `Live · updated ${new Date().toLocaleTimeString()}`;
+        setText($('#agent-detail-status'), `Live · updated ${new Date().toLocaleTimeString()}`);
       } catch (error) {
-        if (request === agentRequest && $('#agent-dialog').open) $('#agent-detail-status').textContent = `Updates unavailable: ${error.message}. Retrying automatically.`;
+        if (request === agentRequest && $('#agent-dialog').open) setText($('#agent-detail-status'), `Updates unavailable: ${error.message}. Retrying automatically.`);
       } finally { if (agentLoading === request) agentLoading = null; }
     }
 
@@ -636,9 +661,7 @@
           pair = [document.createElement('dt'),document.createElement('dd')];
           pair[0].dataset.key = key; pair[0].textContent = label; root.append(...pair);
         }
-        // Cache the source string: browsers normalize innerHTML entities, so
-        // comparing serialized markup would replace unchanged text selections.
-        if (pair[1]._detailContent !== content) { pair[1].innerHTML = content; pair[1]._detailContent = content; }
+        setHTML(pair[1], content);
         existing.delete(key);
       }
       for (const pair of existing.values()) pair.forEach(node => node.remove());
@@ -1065,6 +1088,7 @@
     }
     $('#project-select').addEventListener('change', async event => {
       if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
+      getSelection()?.removeAllRanges();
       state.editor = null;
       state.selectedProject = Number(event.target.value);
       state.project = state.projects.find(p => p.id === state.selectedProject);

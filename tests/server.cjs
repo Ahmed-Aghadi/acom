@@ -10,6 +10,7 @@ const net = require('node:net');
 const { DatabaseSync } = require('node:sqlite');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const startupDiagnostic={type:'item.completed',item:{id:'item_0',type:'error',message:'`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.'}};
 
 async function until(check, label, timeout = 10000) {
   const deadline = Date.now() + timeout;
@@ -76,6 +77,8 @@ process.stdin.on('end', async () => {
   if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
   if (prompt.includes('REFUSAL_OK_TEST')) console.log(JSON.stringify({type:'refusal',message:'Cannot complete this request'}));
   if (prompt.includes('UNSUPPORTED_TEST')) { console.log(JSON.stringify({type:'turn.failed',error:{message:JSON.stringify({error:{message:"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}})}})); process.exitCode=1;return; }
+  if (['STARTUP_DIAGNOSTIC_TEST','STARTUP_DIAGNOSTIC_FAILURE_TEST','CYBER_FAILURE_TEST'].some(marker=>task.includes(marker))) console.log(JSON.stringify(${JSON.stringify(startupDiagnostic)}));
+  if (task.includes('STARTUP_DIAGNOSTIC_FAILURE_TEST')) { process.exitCode=1; return; }
   if (task.includes('CYBER_FAILURE_TEST') && !resume) {
     const message='This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you’re doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying.';
     console.log(JSON.stringify({type:'error',message})); console.log(JSON.stringify({type:'turn.failed',error:{message}})); process.exitCode=1; return;
@@ -446,11 +449,27 @@ process.stdin.on('end', async () => {
     await api('POST',`/agents/${disallowed.id}/close`,{});
     await api('PUT',`/projects/${a.id}/config`,{custom:retryConfig});
 
+    // Item diagnostics are visible notices, not failed turns or retry triggers.
+    const diagnostic=await api('POST','/agents',{project:a.id,harness:'codex',task:'STARTUP_DIAGNOSTIC_TEST'});
+    await finished(diagnostic.id);
+    assert.equal((await api('GET',`/agents/${diagnostic.id}`)).problem,null);
+    assert.equal(runs().filter(r=>r.id===diagnostic.id).length,1,'successful startup warnings do not trigger configured recovery');
+    assert.deepEqual((await api('GET',`/history?project=${a.id}&agent=${diagnostic.id}&kind=agent.failed`)).events,[]);
+    assert.ok((await api('GET',`/agents/${diagnostic.id}/log`)).lines.some(line=>line.includes(startupDiagnostic.item.message)),'startup diagnostics remain visible in the output log');
+    const diagnosticFailure=await api('POST','/agents',{project:b.id,harness:'codex',task:'STARTUP_DIAGNOSTIC_FAILURE_TEST'});
+    await finished(diagnosticFailure.id,'crashed');
+    assert.equal((await api('GET',`/agents/${diagnosticFailure.id}`)).problem,'its process exited with an error','a warning alone is not invented as the cause of a nonzero exit');
+    await api('POST',`/agents/${diagnosticFailure.id}/close`,{});
+
     // Duplicate error frames and the real cyber-risk wording are a single crash.
     const cyber=await api('POST','/agents',{project:a.id,harness:'codex',task:'CYBER_FAILURE_TEST'});
     await until(()=>runs().filter(r=>r.id===cyber.id).length===2,'cyber-risk process crash recovers');
     assert.equal(runs().filter(r=>r.id===cyber.id)[1].model,'gpt-6-luna');
     assert.match(runs().filter(r=>r.id===cyber.id)[1].prompt,/flagged for possible cybersecurity risk/);
+    assert.ok(!runs().filter(r=>r.id===cyber.id)[1].prompt.includes(startupDiagnostic.item.message),'recovery context records the actual failure rather than the earlier hook warning');
+    const cyberFailures=(await api('GET',`/history?project=${a.id}&agent=${cyber.id}&kind=agent.failed`)).events;
+    assert.equal(cyberFailures.length,1);
+    assert.match(cyberFailures[0].details.reason,/^This content was flagged for possible cybersecurity risk\./);
     await finished(cyber.id);
     assert.equal(runs().filter(r=>r.id===cyber.id).length,2,'duplicate terminal frames do not launch duplicate retries');
     const refusal=await api('POST','/agents',{project:a.id,harness:'codex',task:'REFUSAL_OK_TEST'});

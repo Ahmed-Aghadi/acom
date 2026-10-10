@@ -475,8 +475,6 @@ fn codex_events(v: &Value) -> Vec<Event> {
         &v["payload"]
     } else if v["method"] == "model/rerouted" {
         &v["params"]
-    } else if v["type"] == "item.completed" && v["item"]["type"] == "error" {
-        &v["item"]
     } else {
         v
     };
@@ -584,6 +582,12 @@ fn codex_events(v: &Value) -> Vec<Event> {
                     .as_str()
                     .map(|s| format!("search: {}", short(s, 200))),
                 "file_change" => Some("changed files".to_string()),
+                // Codex also uses error items for nonfatal startup diagnostics,
+                // including the hook-trust warning. Only turn/core errors (above)
+                // or an unsuccessful process exit establish a failed turn.
+                "error" => item["message"]
+                    .as_str()
+                    .map(|s| format!("notice: {}", short(s, 300))),
                 _ => None,
             };
             text.map(|s| vec![Event::Text(s)]).unwrap_or_default()
@@ -751,6 +755,54 @@ mod tests {
                 .efforts,
             &["medium"]
         );
+    }
+
+    #[test]
+    fn catalog_models_and_efforts_are_preserved_in_first_and_resumed_commands() {
+        for harness in KNOWN {
+            for model in catalog(harness) {
+                for effort in model.efforts {
+                    for resume in [false, true] {
+                        let launch = Launch {
+                            harness,
+                            model: model.id,
+                            effort,
+                            session: Some("11111111-1111-4111-8111-111111111111"),
+                            resume,
+                            prompt: "test task",
+                            context_limit: 0,
+                            flags: &[],
+                            acom: Path::new("/bin/acom"),
+                        };
+                        let (cmd, input) = command(&launch);
+                        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy()).collect();
+                        assert_eq!(input.as_deref(), Some("test task"));
+                        let model_flag = if harness == "claude" { "--model" } else { "-m" };
+                        assert!(
+                            args.windows(2)
+                                .any(|a| a[0] == model_flag && a[1] == model.id)
+                        );
+                        if harness == "codex" {
+                            assert!(
+                                args.iter().any(|a| a
+                                    == &format!("model_reasoning_effort={}", toml_string(effort)))
+                            );
+                            assert_eq!(args.iter().any(|a| a == "resume"), resume);
+                        } else {
+                            let fixed = model.efforts.len() == 1;
+                            assert_eq!(args.iter().any(|a| a == "--effort"), !fixed);
+                            if !fixed {
+                                assert!(
+                                    args.windows(2)
+                                        .any(|a| a[0] == "--effort" && a[1] == *effort)
+                                );
+                            }
+                            assert_eq!(args.iter().any(|a| a == "--resume"), resume);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1082,7 +1134,6 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"model_reroute","from_model":"gpt-6-sol","to_model":"gpt-other","reason":"high_risk_cyber_activity"}}"#,
             r#"{"method":"model/rerouted","params":{"fromModel":"gpt-6-sol","toModel":"gpt-other","reason":"highRiskCyberActivity"}}"#,
             r#"{"type":"turn.failed","error":{"code":"policy_violation","message":"request blocked under the usage policy"}}"#,
-            r#"{"type":"item.completed","item":{"type":"error","message":"the safeguards flagged this request"}}"#,
         ] {
             assert!(
                 parse_line("codex", line)
@@ -1151,7 +1202,6 @@ mod tests {
             r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#,
             r#"{"type":"error","message":"invalid credentials"}"#,
             r#"{"type":"event_msg","payload":{"type":"error","message":"server unavailable"}}"#,
-            r#"{"type":"item.completed","item":{"type":"error","message":"model not found"}}"#,
             r#"{"type":"turn.failed","error":"unexpected harness failure"}"#,
             r#"{"type":"turn.failed"}"#,
         ] {
@@ -1160,6 +1210,21 @@ mod tests {
             assert!(
                 matches!(&events[0], Event::Failed(text) if !text.is_empty()),
                 "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_error_items_are_diagnostics_not_turn_failures() {
+        for message in [
+            "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.",
+            "model not found",
+            "the safeguards flagged this request",
+        ] {
+            let line = json!({"type":"item.completed","item":{"id":"item_0","type":"error","message":message}}).to_string();
+            let events = parse_line("codex", &line);
+            assert!(
+                matches!(events.as_slice(), [Event::Text(text)] if text == &format!("notice: {message}"))
             );
         }
     }

@@ -503,6 +503,28 @@ mod tests {
     }
 
     #[test]
+    fn startup_diagnostics_do_not_mask_the_actual_turn_failure() {
+        let app = test_app(0);
+        let warning = r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}"#;
+        for ev in harness::parse_line("codex", warning) {
+            apply(&app, 1, "codex", "gpt-6-sol", ev);
+        }
+        assert!(app.lock().procs[&1].failure.is_none());
+        for line in [
+            r#"{"type":"error","message":"actual request rejected"}"#,
+            r#"{"type":"turn.failed","error":{"message":"actual request rejected"}}"#,
+        ] {
+            for ev in harness::parse_line("codex", line) {
+                apply(&app, 1, "codex", "gpt-6-sol", ev);
+            }
+        }
+        assert_eq!(
+            app.lock().procs[&1].failure.as_deref(),
+            Some("actual request rejected")
+        );
+    }
+
+    #[test]
     fn failed_group_cleanup_preserves_successful_and_unrelated_workers() {
         for (ok, failed, stopping) in [
             (true, false, false),

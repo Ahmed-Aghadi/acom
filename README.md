@@ -37,7 +37,7 @@ Unsent conversation drafts save as you type, separately for each project/thread.
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
 
-An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Connection failures keep the last view and show a retry status.
+Polling preserves unchanged text. If you select text in a changing region, that region waits until you clear the selection; unrelated panels keep updating. An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Connection failures keep the last view and show a retry status.
 
 When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so new messages delivered while it's a current member can wake it; live active-only threads remove done agents. Agents are told which rule applies. An agent can hand over with `acom launch --task "..." --done`, which closes it and launches the new agent in one step, so it fits even when the active-agent limit is full. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
@@ -74,7 +74,7 @@ The catalog isn't a guarantee that your installed harness supports a model. Fres
 
 Errors are shown plainly, with **Retry same model** and **Launch another model…**. Settings → Crash recovery optionally maps a source model to a different replacement model/provider and a **Same-model retries** count. No rules are configured by default; no matching rule means the agent stays crashed.
 
-The count defaults to `0` (go straight to the replacement). With `2`, a failed original turn gets two retries with the same model/session before switching. An unexpected nonzero process exit or a harness-reported failed turn triggers recovery, regardless of error wording; successful responses, including refusal text, do not. Manual pauses, closes, server-shutdown pauses and subscription-quota pauses are separate. A retry waits at least two seconds after failure, until the old process exits, and until target allowed lists and active/usage limits permit it.
+The count defaults to `0` (go straight to the replacement). With `2`, a failed original turn gets two retries with the same model/session before switching. An unexpected nonzero process exit or a harness-reported failed turn triggers recovery, regardless of error wording; successful responses, including refusal text, do not. Startup notices, including Codex's hook-trust warning, are logged but do not trigger recovery or mask the actual failure reason. Manual pauses, closes, server-shutdown pauses and subscription-quota pauses are separate. A retry waits at least two seconds after failure, until the old process exits, and until target allowed lists and active/usage limits permit it.
 
 Recovery uses the failed turn's actual effort, not a queued next-turn change:
 
@@ -121,5 +121,14 @@ ACOM_LIVE_TEST=1 node --test tests/live.cjs
 ```
 
 Set `ACOM_LIVE_MODEL=gpt-6.1-sol` to test that model for the tool and same-session Reopen checks.
+
+To test every known Claude and Codex model using the installed logins (also spends usage):
+
+```sh
+cargo build
+ACOM_MODEL_LIVE_TEST=1 node --test tests/models-live.cjs
+```
+
+Each model gets an isolated project, a medium-effort turn, then a same-session Reopen at max effort when supported (otherwise medium). There are at most two turns per model, no automatic retries, and a two-minute deadline per turn. The test preserves its temporary data, logs, and `results.json`; unavailable models, quota pauses, and failures are reported separately and are not passes. Set `ACOM_MODEL_FILTER=codex:gpt-6-sol` to select matching provider/model names; comma-separated filters are also supported. Without the opt-in, only local helper tests run.
 
 The HTTP server listens only on loopback and has no authentication: it's a local tool.

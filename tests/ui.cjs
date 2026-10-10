@@ -50,7 +50,7 @@ async function fixture(run) {
       const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
       const project = data.projects.find(p => p.id === id) || data.projects[0] || null;
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
-      return send({ ...data, projects: data.projects.map(p => ({ ...p, unread: data.threads.filter(t => t.project === p.id).reduce((n, t) => n + unread(t), 0) })), configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length, unread: unread(t) })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: [], activity: [], limits: { usage: data.usage || [], checks:data.checks || [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
+      return send({ ...data, projects: data.projects.map(p => ({ ...p, unread: data.threads.filter(t => t.project === p.id).reduce((n, t) => n + unread(t), 0) })), configs: configs(), settings: effective(project), threads: data.threads.filter(t => t.project === project?.id).map(t => ({ ...t, messages: t.messages.length, unread: unread(t) })), agents: data.agents.filter(a => a.project === project?.id), model_catalog: catalog, locks: data.locks || [], activity: data.activity || [], limits: { usage: data.usage || [], checks:data.checks || [], limits: effective(project).limits }, project, url: `http://127.0.0.1:${server.address().port}` });
     }
     if(req.url.startsWith('/folders')) {
       if(req.method==='GET') {
@@ -1499,6 +1499,108 @@ test('details polling preserves selected task text and defers selected log updat
   await page.evaluate(() => { getSelection().removeAllRanges(); return refresh(); });
   await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Deferred while selected'));
   assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollTop), 35);
+}));
+
+const selectText = async (page, selector) => page.evaluate(selector => {
+  const node = document.querySelector(selector);
+  const range = document.createRange(); range.selectNodeContents(node);
+  const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+  window.selectedNode = node;
+  return selection.toString();
+}, selector);
+
+test('polling preserves project-path selection and unchanged overview nodes while unrelated activity stays live', async () => fixture(async (page, data) => {
+  data.projects[0].path = '/projects/example with "quotes" & spaces';
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',task:'Review "quotes" & escapes',status:'Starting'}];
+  data.locks = [{name:'src/<file>',about:'Edit "quotes"',holder:1,holder_name:'Worker',acquired_at:1}];
+  data.activity = [{at:1,actor:'user',what:'Initial activity'}];
+  await page.reload();
+  const selected = await selectText(page, '#project-path');
+  await page.evaluate(() => {
+    window.overviewNodes = ['#project-path','#agents .agent','#locks tbody tr','#activity .event','#usage .meter'].map(selector=>document.querySelector(selector));
+  });
+  await page.waitForTimeout(2200); // A normal poll must not disturb text being copied.
+  assert.equal(await page.evaluate(() => getSelection().toString()), selected);
+  assert.equal(await page.evaluate(() => window.overviewNodes.every(node=>node.isConnected)), true);
+  data.projects[0].path = '/projects/new path';
+  data.agents[0].status = 'Still live';
+  data.activity.push({at:2,actor:'agent 1',what:'Independent activity'});
+  await page.evaluate(() => refresh());
+  assert.equal(await page.evaluate(() => getSelection().toString()), selected);
+  assert.equal(await page.evaluate(() => document.querySelector('#project-path') === window.selectedNode), true);
+  assert.match(await page.locator('#agents').textContent(), /Still live/);
+  assert.match(await page.locator('#activity').textContent(), /Independent activity/);
+  await page.evaluate(() => getSelection().removeAllRanges());
+  await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/new path');
+  await selectText(page, '#project-path');
+  data.projects[0].path = '/projects/transient'; await page.evaluate(() => refresh());
+  data.projects[0].path = '/projects/new path'; await page.evaluate(() => refresh());
+  await page.evaluate(() => getSelection().removeAllRanges());
+  await page.waitForTimeout(50);
+  assert.equal(await page.locator('#project-path').textContent(), '/projects/new path', 'reverted updates must cancel stale deferred values');
+  await selectText(page, '#project-path');
+  data.projects[0].path = '/projects/queued old project'; await page.evaluate(() => refresh());
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/other');
+  assert.equal(await page.locator('#project-select').inputValue(), '2', 'explicit navigation does not retain stale selected-project content');
+}));
+
+test('selected agent, lock and activity regions defer only their changes and flush the latest value on deselection', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',status:'Initial status'}];
+  data.locks = [{name:'src/main',about:'Initial purpose',holder:1,acquired_at:1}];
+  data.activity = [{at:1,actor:'user',what:'Initial activity'}];
+  await page.reload();
+  const cases = [
+    {selector:'#agents .agent .meta[title]',root:'#agents',change:()=>{data.agents[0].status='Changed status';},latest:()=>{data.agents[0].status='Latest status';},expected:'Latest status'},
+    {selector:'#locks tbody tr td:nth-child(2)',root:'#locks',change:()=>{data.locks[0].about='Changed purpose';},latest:()=>{data.locks[0].about='Latest purpose';},expected:'Latest purpose'},
+    {selector:'#activity .event > div',root:'#activity',change:()=>{data.activity[0].what='Changed activity';},latest:()=>{data.activity[0].what='Latest activity';},expected:'Latest activity'},
+  ];
+  for (const [index, c] of cases.entries()) {
+    const selected = await selectText(page, c.selector);
+    c.change(); await page.evaluate(() => refresh());
+    c.latest(); data.agents[0].context = index + 1;
+    if (c.root !== '#activity') data.activity.push({at:index+2,actor:'acom',what:`Live event ${index}`});
+    await page.evaluate(() => refresh());
+    assert.equal(await page.evaluate(() => getSelection().toString()), selected);
+    assert.equal(await page.evaluate(() => window.selectedNode.isConnected), true);
+    assert.equal((await page.locator(c.root).textContent()).includes(c.expected), false);
+    if (c.root !== '#activity') assert.match(await page.locator('#activity').textContent(), new RegExp(`Live event ${index}`));
+    else assert.match(await page.locator('#agents').textContent(), /context 3/);
+    await page.evaluate(() => getSelection().removeAllRanges());
+    await page.waitForFunction(({root,expected})=>document.querySelector(root).textContent.includes(expected), {root:c.root,expected:c.expected});
+  }
+}));
+
+test('thread list, header and membership-history selections survive polling while new messages and drafts remain live', async () => fixture(async (page, data) => {
+  data.threads = [conversation([], {events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'acom',details:{reason:'Initial join'}}]})];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep draft');
+  await page.locator('#thread-history summary').click();
+  for (const selector of ['#thread-list strong','.thread-header h2','.thread-header > div.meta','#thread-events .event > div']) {
+    const selected = await selectText(page, selector);
+    await page.evaluate(() => refresh());
+    assert.equal(await page.evaluate(() => getSelection().toString()), selected);
+    assert.equal(await page.evaluate(() => window.selectedNode.isConnected), true);
+  }
+  const selectedTitle = await selectText(page, '.thread-header h2');
+  data.threads[0].title = 'Updated conversation';
+  data.threads[0].messages.push(incoming(1,'Live while title selected'));
+  await page.evaluate(() => refresh());
+  assert.equal(await page.evaluate(() => getSelection().toString()), selectedTitle);
+  assert.match(await page.locator('#messages').textContent(), /Live while title selected/);
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep draft');
+  await page.evaluate(() => getSelection().removeAllRanges());
+  await page.waitForFunction(() => document.querySelector('.thread-header h2').textContent === 'Updated conversation');
+  const selectedRow = await selectText(page, '#thread-list strong');
+  data.threads[0].title = 'Latest conversation';
+  data.threads[0].messages.push(incoming(2,'Second live message'));
+  await page.evaluate(() => refresh());
+  assert.equal(await page.evaluate(() => getSelection().toString()), selectedRow);
+  assert.match(await page.locator('#messages').textContent(), /Second live message/);
+  assert.equal(await page.locator('.thread-header h2').textContent(), 'Latest conversation');
+  await page.evaluate(() => getSelection().removeAllRanges());
+  await page.waitForFunction(() => document.querySelector('#thread-list strong').textContent === 'Latest conversation');
 }));
 
 test('thread identifiers are visible and copyable for references in another conversation', async () => fixture(async (page, data) => {
