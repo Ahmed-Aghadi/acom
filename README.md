@@ -15,6 +15,10 @@ Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles 
 
 Incompatible development databases are left untouched; startup explains how to use a separate data folder.
 
+Before upgrading an older running instance, pause or stop its agents through the old server. If a worker without a data-home marker remains live, new startup refuses and identifies its PID; stop that worker before retrying.
+
+Ctrl-C and SIGTERM stop owned workers and persist running turns as restart-paused, retaining valid locks with their TTL clocks frozen. Idle agents and existing manual/limit pauses stay unchanged. Starting the server does not resume interrupted turns automatically: `acom resume-restart` resumes only restart-paused agents across all projects, reporting any failures or warnings; manual pauses still need an explicit Resume. After an abrupt kill, startup performs the same owned-worker cleanup.
+
 ## Projects
 
 A project is a folder. Agents run in their project's folder, and only see that project's agents, threads and locks. Each project has its own settings: limits, models, permissions and rules. New projects use the built-in **Default** config, which cannot be edited, renamed or removed. Copy it to a named config or the project's **Custom** settings to make changes. Saved configs can be reused; editing a shared config shows which projects it affects. Settings shows the **applied configuration** separately from your selection; Save applies the selection and is enabled only for actual unsaved changes. Reverting changes disables it again. Selecting a config isn't an edit; discard confirmation is only for changed settings. There's no cap across projects.
@@ -40,6 +44,8 @@ Unsent conversation drafts save as you type, separately for each project/thread.
 ## Agents
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
+
+An agent can wait for notifications in its current turn with `acom wait --timeout 10m` (default 60 seconds, maximum one hour). Keep the timeout below the shell tool's timeout. Waiting remains foreground and working: it consumes an active slot and lock TTLs continue. Notifications give counts, not message contents, and do not mark messages handled. Successful delivery is acknowledged so the next hook does not repeat it. If acknowledgement fails after you received the complete text, use the printed `acom wait --ack <delivery ID>` instruction; otherwise repeat `acom wait` to retrieve the same delivery.
 
 Polling preserves unchanged text and keyboard focus on controls that still exist. If you select text in a changing region, that region waits until you clear the selection; unrelated panels keep updating. An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Slow reads finish before the next background poll; stalled reads time out after 15 seconds so polling can recover. Connection failures keep the last view and show a retry status. Writes are not automatically retried or canceled by this read timeout.
 

@@ -169,6 +169,7 @@
       <button class="primary" data-open="launch-dialog">Launch</button>
       <button id="pause-all" title="All projects">Pause all</button>
       <button id="resume-all" title="All projects">Resume all</button>
+      <button id="resume-restart" title="All projects on this machine; only agents paused by a server restart" disabled>Resume restart-paused <span id="restart-paused-count">(checking · all projects)</span></button>
     </div>
   </header>
 
@@ -348,6 +349,7 @@
     let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null;
     let projectGeneration = 0;
     const agentTransitions = new Set();
+    let resumingRestart = false;
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -564,6 +566,7 @@
           state.selectedProject = state.project?.id ?? null;
           state.limits = overview.limits; state.url = overview.url;
           state.unreadTotal = overview.unread_total;
+          state.restartPaused = overview.restart_paused;
           state.overviewRevision = overview.revision;
           state.revisions = overview.revisions;
         }
@@ -599,7 +602,14 @@
       ]);
     }
 
-    function render() { renderProject(); renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); updatePaging(); }
+    function render() { renderProject(); renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); updatePaging(); }
+
+    function renderRestartResume() {
+      const count = state.restartPaused;
+      const known = Number.isInteger(count) && count >= 0;
+      setText($('#restart-paused-count'), `(${known ? fmt(count) : 'checking'} · all projects)`);
+      $('#resume-restart').disabled = resumingRestart || !known || !count;
+    }
 
     function renderProject() {
       const p = state.project;
@@ -1604,6 +1614,17 @@
 
     $('#pause-all').addEventListener('click', async () => { try { if (confirm('Pause all agents in all projects and freeze their locks?')) await mutate('/pause-all'); } catch (e) { toast(e.message, true); } });
     $('#resume-all').addEventListener('click', async () => { try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); } });
+    $('#resume-restart').addEventListener('click', async () => {
+      if (resumingRestart || !(state.restartPaused > 0)) return;
+      resumingRestart = true; renderRestartResume();
+      try {
+        const result = await mutate('/resume-restart');
+        const failed = result.counts?.errors ?? result.errors?.length ?? 0;
+        if (result.result_truncated) toast(`Restart-paused agents across all projects: ${fmt(result.counts?.ids ?? result.ids?.length)} resumed, ${fmt(failed)} failed. See the completed-action result below.`, failed > 0);
+        else toast([`Resumed ${fmt(result.ids?.length)} restart-paused agents across all projects.`, ...(result.warnings || []), ...(result.errors || [])].join('\n'), !!result.errors?.length);
+      } catch (e) { toast(e.message, true); }
+      finally { resumingRestart = false; renderRestartResume(); }
+    });
 
     $('#launch-harness').addEventListener('change', setLaunchChoices);
     $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); showModelWarning(); });

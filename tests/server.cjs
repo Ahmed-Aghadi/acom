@@ -2,12 +2,14 @@
 // cargo build && node --test tests/server.cjs
 // ACOM_BROWSER_TEST=1 node --test tests/server.cjs also drives the real page.
 // ACOM_FOLLOWUP_TEST_ONLY=1 runs the continuation/replacement subset.
+// ACOM_WAIT_RESTART_TEST_ONLY=1 runs foreground wait/graceful restart coverage.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const http = require('node:http');
 const { DatabaseSync } = require('node:sqlite');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
@@ -185,6 +187,98 @@ test('CLI paths and agent details use caller context; negative API actors cannot
   }
 });
 
+test('CLI wait validates delivery envelopes before acknowledgement', async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'acom-wait-envelope-'));
+  const home=path.join(root,'state'), emptyBin=path.join(root,'empty-bin');
+  fs.mkdirSync(home); fs.mkdirSync(emptyBin);
+  const env={...process.env,ACOM_HOME:home,ACOM_ID:'1',PATH:emptyBin};
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  const cases=[
+    ['missing text',{delivery_id:1,timed_out:false},false],
+    ['null text',{delivery_id:1,text:null,timed_out:false},false],
+    ['nonstring text',{delivery_id:1,text:3,timed_out:false},false],
+    ['empty delivery text',{delivery_id:1,text:'',timed_out:false},false],
+    ['zero ID',{delivery_id:0,text:'notice',timed_out:false},false],
+    ['negative ID',{delivery_id:-1,text:'notice',timed_out:false},false],
+    ['fractional ID',{delivery_id:1.5,text:'notice',timed_out:false},false],
+    ['string ID',{delivery_id:'1',text:'notice',timed_out:false},false],
+    ['missing timed_out',{delivery_id:1,text:'notice'},false],
+    ['delivery and timeout',{delivery_id:1,text:'notice',timed_out:true},false],
+    ['nonboolean timed_out',{delivery_id:1,text:'notice',timed_out:0},false],
+    ['missing delivery ID',{text:'',timed_out:true},false],
+    ['timeout carries text',{delivery_id:null,text:'notice',timed_out:true},false],
+    ['null JSON',null,false],
+    ['scalar JSON','notice',false],
+    ['valid delivery',{delivery_id:7,text:'[acom] 1 new message from user.',timed_out:false},true],
+    ['valid timeout',{delivery_id:null,text:'',timed_out:true},true],
+    ['ACK rejected',{delivery_id:7,text:'[acom] 1 new message from user.',timed_out:false},true,{acknowledged:false}],
+    ['ACK missing acknowledgement',{delivery_id:7,text:'[acom] 1 new message from user.',timed_out:false},true,{}],
+    ['ACK null response',{delivery_id:7,text:'[acom] 1 new message from user.',timed_out:false},true,null],
+  ];
+  try {
+    for(const [name,payload,valid,ackResponse={acknowledged:true}] of cases) await t.test(name,async()=>{
+      const requests=[];
+      const mock=http.createServer((req,res)=>{
+        requests.push(req.url); req.resume();
+        res.writeHead(200,{'Content-Type':'application/json'});
+        res.end(JSON.stringify(req.url.endsWith('/ack') ? ackResponse : payload));
+      });
+      await new Promise(resolve=>mock.listen(0,'127.0.0.1',resolve));
+      let child;
+      try {
+        const url=`http://127.0.0.1:${mock.address().port}`;
+        child=spawn(binary,['wait','--timeout','1s'],{env:{...env,ACOM_URL:url},stdio:['ignore','pipe','pipe']});
+        let stdout='',stderr=''; child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk);
+        const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});
+        assert.equal(requests.filter(route=>route==='/wait/1').length,1);
+        assert.equal(requests.filter(route=>route==='/wait/1/ack').length,valid && payload.delivery_id ? 1 : 0,'malformed response must never be acknowledged');
+        if(valid) {
+          if(payload.delivery_id && ackResponse?.acknowledged!==true) {
+            assert.notEqual(status,0); assert.match(stderr,/acom wait --ack 7/);
+          } else assert.equal(status,0,stderr);
+          assert.match(stdout,payload.delivery_id ? /Delivery #7/ : /timed out/i);
+        }
+        else {assert.notEqual(status,0);assert.match(stderr,/invalid.*response/i);assert.doesNotMatch(stdout,/Delivery #/);}
+      } finally {
+        if(child && child.exitCode===null && child.signalCode===null) child.kill('SIGTERM');
+        await new Promise(resolve=>mock.close(resolve));
+      }
+    });
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('CLI resume-restart retains compact partial failure status', async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'acom-resume-restart-envelope-'));
+  const home=path.join(root,'state'), emptyBin=path.join(root,'empty-bin');
+  fs.mkdirSync(home); fs.mkdirSync(emptyBin);
+  const env={...process.env,ACOM_HOME:home,PATH:emptyBin};
+  delete env.ACOM_ID; delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  try {
+    for(const errors of [1,0]) await t.test(errors ? 'unsampled error still fails' : 'successful compact control',async()=>{
+      const requests=[];
+      const mock=http.createServer((req,res)=>{
+        requests.push([req.method,req.url]); req.resume();
+        res.writeHead(200,{'Content-Type':'application/json'});
+        res.end(JSON.stringify({result_truncated:true,counts:{ids:2,errors,warnings:0},ids:[],errors:[],warnings:[],receipt_event:77}));
+      });
+      await new Promise(resolve=>mock.listen(0,'127.0.0.1',resolve));
+      let child;
+      try {
+        child=spawn(binary,['resume-restart'],{env:{...env,ACOM_URL:`http://127.0.0.1:${mock.address().port}`},stdio:['ignore','pipe','pipe']});
+        let stdout='',stderr=''; child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk);
+        const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});
+        assert.equal(status,errors ? 1 : 0,stderr);
+        assert.match(stdout,/resumed 2 restart-paused agent/i);
+        assert.match(stderr,/acom receipt 77/,'full error details remain recoverable without reexecuting the action');
+        assert.deepEqual(requests,[['POST','/resume-restart']],'receipt sampling must not trigger automatic resumption retries');
+      } finally {
+        if(child && child.exitCode===null && child.signalCode===null) child.kill('SIGTERM');
+        await new Promise(resolve=>mock.close(resolve));
+      }
+    });
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
+});
+
 test('single server scopes projects, preserves settings and supervises first/resumed turns', async () => {
   // acom prepends its executable directory to child PATH. Reject any client
   // there before starting the isolated server, even when ACOM_BINARY is overridden.
@@ -288,6 +382,14 @@ process.stdin.on('end', async () => {
     console.log(JSON.stringify({type:'response.created',response:{model}}));
   }
   if (task.includes('MEMBERSHIP_HOLD_TEST')) {
+    if(task.includes('RESTART_LATE_FORK_TEST') && previous.length===0) process.on('SIGTERM',()=>{
+      const child=require('node:child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{detached:true,stdio:'ignore'});
+      fs.writeFileSync(path.join(process.env.ACOM_HOME,'restart-late-'+id),String(child.pid)); child.unref(); process.exit(0);
+    });
+    if(task.includes('RESTART_ESCAPE_TEST') && previous.length===0) {
+      const child=require('node:child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{detached:true,stdio:'ignore'});
+      fs.writeFileSync(path.join(process.env.ACOM_HOME,'restart-escaped-'+id),String(child.pid)); child.unref();
+    }
     const released=path.join(process.env.ACOM_HOME,'release-'+id);
     while(!fs.existsSync(released)) await new Promise(resolve=>setTimeout(resolve,25));
   }
@@ -319,10 +421,10 @@ process.stdin.on('end', async () => {
     }, 'server startup');
     assert.ok(storedConfigs().every(c=>c.id!==1 && c.name!=='Default'),'startup must not persist the virtual Default');
   };
-  const stop = async () => {
+  const stop = async (signal='SIGTERM') => {
     if (server && server.exitCode === null) {
       const exited = new Promise(resolve => server.once('exit', resolve));
-      server.kill('SIGTERM'); await exited;
+      server.kill(signal); await exited;
     }
   };
   const api = (method,route,body,status=200)=>fixtureRead(url,method,route,body,status);
@@ -347,6 +449,11 @@ process.stdin.on('end', async () => {
     assert.equal(builtin.name,'Default');
     assert.deepEqual(storedConfigs(),[],'fresh database contains no saved Default settings');
     const defaults = structuredClone(builtin.settings);
+    if(process.env.ACOM_WAIT_RESTART_TEST_ONLY) {
+      await waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,env,defaults});
+      assert.equal(stderr,'');
+      return;
+    }
     if(process.env.ACOM_FOLLOWUP_TEST_ONLY) {
       await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
       return;
@@ -413,6 +520,7 @@ process.stdin.on('end', async () => {
     const duplicate = spawnSync(binary, ['serve', '--port', String(port + 1)], { env, encoding: 'utf8' });
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already running/);
+    const waitProjects=await waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,env,defaults});
     const lifecycleProject=await lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults});
     const followupProject=await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
@@ -977,7 +1085,7 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET', '/configs')).find(c => c.id === saved.id).projects, [a.id, b.id]);
     for (const p of [a.id, b.id]) await api('PUT', `/projects/${p}/config`, { config: mine.id });
     await api('POST', `/configs/${saved.id}/remove`, {});
-    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,lifecycleProject.id,followupProject.id].sort((a,b)=>a-b));
+    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,...waitProjects.map(p=>p.id),lifecycleProject.id,followupProject.id].sort((a,b)=>a-b));
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
     assert.equal(fs.existsSync(path.join(second, '.acom')), false);
     assert.equal(stderr.replace(/tick: database: TEST_REPLACEMENT_(OWNERSHIP|START)_FAILURE\n/g,''),'','only deliberately injected replacement persistence failures may reach stderr');
@@ -992,18 +1100,274 @@ process.stdin.on('end', async () => {
         if(vars.includes(`ACOM_HOME=${home}`) && args.some(arg=>arg===path.join(bin,'codex') || arg===path.join(bin,'claude'))) process.kill(-pid,'SIGKILL');
       } catch(error) { if(!['ENOENT','ESRCH'].includes(error.code)) throw error; }
     }
-    for(const name of fs.readdirSync(home).filter(name=>/^(replacement|late-failure)-child-\d+$/.test(name))) {
+    for(const name of fs.readdirSync(home).filter(name=>/^(replacement|late-failure)-child-\d+$/.test(name) || /^restart-(escaped|late|idle)-\d+$/.test(name))) {
       try {
         const pid=Number(fs.readFileSync(path.join(home,name),'utf8'));
         const vars=fs.readFileSync(`/proc/${pid}/environ`,'utf8').split('\0');
         const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
         const group=Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[2]);
-        if(vars.includes(`ACOM_HOME=${home}`) && runs().some(run=>run.pid===group)) process.kill(-group,'SIGKILL');
+        if(vars.includes(`ACOM_HOME=${home}`) && (runs().some(run=>run.pid===group) || (name.startsWith('restart-') && group===pid))) process.kill(-group,'SIGKILL');
       } catch(error) { if(!['ENOENT','ESRCH'].includes(error.code)) throw error; }
     }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,env,defaults}) {
+  const folder=path.join(root,'wait-restart'), otherFolder=path.join(root,'wait-restart-other');
+  fs.mkdirSync(folder); fs.mkdirSync(otherFolder);
+  const project=await api('POST','/projects',{path:folder}), other=await api('POST','/projects',{path:otherFolder});
+  const config=structuredClone(defaults);
+  config.done_closes=false; config.auto_resume=false;
+  config.allow_agent_model_change=true; config.allow_agent_effort_change=true;
+  config.limits.active={soft:null,hard:null};
+  for(const provider of Object.keys(config.limits.active_per_harness)) config.limits.active_per_harness[provider]={soft:null,hard:null};
+  config.limits.usage.codex={soft:null,hard:50};
+  for(const p of [project,other]) await api('PUT',`/projects/${p.id}/config`,{custom:config});
+  const view=id=>api('GET',`/agents/${id}`), captures=id=>runs().filter(run=>run.id===id);
+  const dbAction=action=>{
+    const db=new DatabaseSync(path.join(home,'acom.db'));
+    try {db.exec('PRAGMA busy_timeout=5000');return action(db);} finally {db.close();}
+  };
+  const alive=pid=>{
+    try {return !fs.readFileSync(`/proc/${pid}/stat`,'utf8').includes(') Z ');} catch(error) {if(error.code==='ENOENT') return false;throw error;}
+  };
+  const launch=async(task,p=project,harness='codex')=>{
+    const a=await api('POST','/agents',{project:p.id,harness,task});
+    await until(()=>captures(a.id).length===1,`wait/restart fake agent ${a.id} starts`);
+    await until(async()=>(await view(a.id)).session,`wait/restart fake agent ${a.id} records its session`);
+    return {...a,project:p.id};
+  };
+  const ack=(id,delivery)=>api('POST',`/wait/${id}/ack`,{delivery_id:delivery});
+  const cursor=(id,thread)=>dbAction(db=>db.prepare('SELECT last_notified FROM members WHERE agent_id=? AND thread_id=?').get(id,thread).last_notified);
+  const spawnCli=(args,id)=>{
+    const child=spawn(binary,args,{cwd:folder,env:{...env,ACOM_ID:String(id)},stdio:['ignore','pipe','pipe']});
+    let stdout='',stderr=''; child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk);
+    const done=new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',status=>resolve({status,stdout,stderr}));});
+    return {child,done};
+  };
+  const rawWait=async(id,timeout)=>{
+    try {
+      const url=`http://127.0.0.1:${fs.readFileSync(path.join(home,'port'),'utf8').trim()}`;
+      const response=await fetch(`${url}/wait/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout})});
+      return {status:response.status,body:await response.json()};
+    } catch(error) {return {error};}
+  };
+  let foreign,foreignHome,idleTool;
+  const foreignHomePath=path.join(root,'foreign-tool-home'); fs.mkdirSync(foreignHomePath);
+  const stopOwnedTool=(child,toolHome,toolUrl)=>{
+    if(!child || !alive(child.pid)) return;
+    const vars=fs.readFileSync(`/proc/${child.pid}/environ`,'utf8').split('\0');
+    const stat=fs.readFileSync(`/proc/${child.pid}/stat`,'utf8');
+    const group=Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[2]);
+    assert.ok(vars.includes(`ACOM_HOME=${toolHome}`) && vars.includes(`ACOM_URL=${toolUrl}`) && group===child.pid,'cleanup must match the exact owned fixture process group');
+    process.kill(-child.pid,'SIGKILL');
+  };
+  let ownUrl;
+  const subscription=path.join(home,'subscription.json');
+  try {
+    const waiter=await launch('MEMBERSHIP_HOLD_TEST foreground notification wait');
+    const thread=await api('POST','/threads',{project:project.id,title:'Foreground wait notifications',members:[String(waiter.id)]});
+    await api('POST',`/hook/${waiter.id}`,{});
+    for(const timeout of [0,-1,3601,1.5,null,'1']) await api('POST',`/wait/${waiter.id}`,{timeout},400);
+    const started=Date.now();
+    const timeout=await api('POST',`/wait/${waiter.id}`,{timeout:1});
+    assert.deepEqual(timeout,{text:'',delivery_id:null,timed_out:true});
+    assert.ok(Date.now()-started>=800,'foreground timeout waits, rather than returning immediately');
+    assert.equal((await view(waiter.id)).state,'working');
+    assert.equal((await api('GET',`/limits?project=${project.id}`)).active.total,1,'foreground wait retains its active slot');
+    assert.equal(captures(waiter.id).length,1,'wait does not start another provider turn');
+
+    const exclusive=api('POST',`/wait/${waiter.id}`,{timeout:2});
+    await new Promise(resolve=>setTimeout(resolve,150));
+    await api('POST',`/wait/${waiter.id}`,{timeout:1},409);
+    assert.equal((await exclusive).timed_out,true);
+
+    const message=await api('POST','/messages',{thread:thread.id,text:'WAIT_PRIVATE_MESSAGE_CONTENT'});
+    const batch=await api('POST',`/wait/${waiter.id}`,{timeout:1});
+    assert.ok(batch.delivery_id>0); assert.equal(batch.timed_out,false);
+    assert.match(batch.text,/1 new message/); assert.doesNotMatch(batch.text,/WAIT_PRIVATE_MESSAGE_CONTENT/);
+    assert.deepEqual(await api('POST',`/wait/${waiter.id}`,{timeout:1}),batch,'lost response can be retried without changing its delivery');
+    const later=await api('POST','/messages',{thread:thread.id,text:'WAIT_LATER_MESSAGE_CONTENT'});
+    assert.equal((await api('POST',`/hook/${waiter.id}`,{})).text,'','hook cannot duplicate a pending wait receipt');
+    assert.deepEqual(await ack(waiter.id,batch.delivery_id),{acknowledged:true});
+    assert.equal(cursor(waiter.id,thread.id),message.id,'the delivery cursor remains pinned to its immutable snapshot after ACK');
+    assert.match((await api('POST',`/hook/${waiter.id}`,{})).text,/1 new message/,'later arrival remains announceable after ACK');
+    assert.equal((await api('POST',`/hook/${waiter.id}`,{})).text,'');
+    for(const m of [message,later]) assert.equal((await api('GET',`/messages/${m.id}?agent=${waiter.id}`)).mark,'new','notification delivery does not mark content handled');
+    await ack(waiter.id,batch.delivery_id);
+    await api('POST','/messages',{thread:thread.id,text:'WAIT_THIRD_MESSAGE_CONTENT'});
+    const newer=await api('POST',`/wait/${waiter.id}`,{timeout:1});
+    assert.ok(newer.delivery_id>batch.delivery_id);
+    await api('POST',`/wait/${waiter.id}/ack`,{delivery_id:batch.delivery_id},409);
+    assert.deepEqual(await api('POST',`/wait/${waiter.id}`,{timeout:1}),newer,'stale ACK cannot clear a newer receipt');
+    await ack(waiter.id,newer.delivery_id);
+
+    const waitingCli=spawnCli(['wait','--timeout','5s'],waiter.id);
+    try {
+      await new Promise(resolve=>setTimeout(resolve,150));
+      await api('POST','/messages',{thread:thread.id,text:'WAIT_CLI_PRIVATE_CONTENT'});
+      const output=await waitingCli.done;
+      assert.equal(output.status,0,output.stderr); assert.match(output.stdout,/Delivery #\d+/i);
+      assert.match(output.stdout,/1 new message/); assert.doesNotMatch(output.stdout,/WAIT_CLI_PRIVATE_CONTENT/);
+      assert.equal((await api('POST',`/hook/${waiter.id}`,{})).text,'','CLI ACK prevents the following hook repeating delivery');
+    } finally {if(waitingCli.child.exitCode===null && waitingCli.child.signalCode===null) waitingCli.child.kill('SIGTERM');}
+    assert.match(cli(folder,['wait','--timeout','1s'],{ACOM_ID:String(waiter.id)}),/timed out/i);
+    const invalid=spawnSync(binary,['wait','--timeout','0s'],{cwd:folder,env:{...env,ACOM_ID:String(waiter.id)},encoding:'utf8'});
+    assert.notEqual(invalid.status,0);
+
+    await api('POST','/messages',{thread:thread.id,text:'WAIT_ACK_FAILURE_PRIVATE_CONTENT'});
+    dbAction(db=>db.exec(`CREATE TRIGGER reject_test_wait_ack BEFORE UPDATE ON update_deliveries WHEN NEW.agent_id=${waiter.id} AND NEW.text IS NULL AND OLD.text IS NOT NULL BEGIN SELECT RAISE(ABORT,'TEST_WAIT_ACK_FAILURE'); END;`));
+    let failedDelivery;
+    try {
+      const output=spawnSync(binary,['wait','--timeout','1s'],{cwd:folder,env:{...env,ACOM_ID:String(waiter.id)},encoding:'utf8'});
+      assert.notEqual(output.status,0); assert.match(output.stderr,/acom wait --ack/);
+      failedDelivery=Number(output.stdout.match(/Delivery #(\d+)/i)?.[1]); assert.ok(failedDelivery>0,'delivery ID and text are printed before failed ACK');
+      assert.match(output.stdout,/1 new message/); assert.doesNotMatch(output.stdout,/WAIT_ACK_FAILURE_PRIVATE_CONTENT/);
+      assert.equal((await api('POST',`/wait/${waiter.id}`,{timeout:1})).delivery_id,failedDelivery,'failed ACK leaves the same receipt retryable');
+      assert.equal((await api('POST',`/hook/${waiter.id}`,{})).text,'');
+    } finally {dbAction(db=>db.exec('DROP TRIGGER IF EXISTS reject_test_wait_ack'));}
+    assert.match(cli(folder,['wait','--ack',String(failedDelivery)],{ACOM_ID:String(waiter.id)}),/acknowledged delivery/i);
+
+    // More than one notice page remains pending, with no loss on a receipt retry.
+    dbAction(db=>{const insert=db.prepare('INSERT INTO notices(agent_id,text,at) VALUES(?,?,?)');for(let i=0;i<30;i++) insert.run(waiter.id,`WAIT_BACKLOG_${i}`,Math.floor(Date.now()/1000));});
+    const notes=await api('POST',`/wait/${waiter.id}`,{timeout:1});
+    assert.ok(Buffer.byteLength(JSON.stringify(notes))<=16000);
+    assert.match(notes.text,/WAIT_BACKLOG_0/); assert.doesNotMatch(notes.text,/WAIT_BACKLOG_29/);
+    await ack(waiter.id,notes.delivery_id);
+    const remaining=await api('POST',`/wait/${waiter.id}`,{timeout:1});
+    assert.match(remaining.text,/WAIT_BACKLOG_29/); await ack(waiter.id,remaining.delivery_id);
+    assert.equal((await api('POST',`/hook/${waiter.id}`,{})).text,'');
+
+    await api('POST','/locks',{project:project.id,name:'wait-expiry',about:'TTL continues during foreground wait'});
+    await api('POST','/locks/acquire',{agent:waiter.id,name:'wait-expiry',wait:0,ttl:2});
+    await api('POST',`/hook/${waiter.id}`,{});
+    const expired=await api('POST',`/wait/${waiter.id}`,{timeout:5});
+    assert.match(expired.text,/TTL ran out/); await ack(waiter.id,expired.delivery_id);
+    assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='wait-expiry').holder,null);
+    assert.equal((await view(waiter.id)).state,'working','lease expiry does not end a waiting turn');
+
+    const interrupted=api('POST',`/wait/${waiter.id}`,{timeout:5},409);
+    await new Promise(resolve=>setTimeout(resolve,150));
+    fs.writeFileSync(subscription,JSON.stringify({rateLimits:{primary:{usedPercent:60,resetsAt:Math.floor(Date.now()/1000)+3600}}}));
+    await api('POST','/usage/check',{provider:'codex'});
+    await finished(waiter.id,'paused'); await interrupted;
+    assert.equal((await view(waiter.id)).pause_reason,'limit','usage limit interrupts the waiting turn, not just its wait');
+    fs.writeFileSync(subscription,JSON.stringify({rateLimits:{primary:{usedPercent:0,resetsAt:Math.floor(Date.now()/1000)+3600}}}));
+    await api('POST','/usage/check',{provider:'codex'});
+    await until(async()=>(await api('GET',`/limits?project=${project.id}`)).usage.some(u=>u.provider==='codex'&&u.used_pct===0),'owned fake usage reset');
+
+    const idle=await launch('NEXT_TURN_PLAIN idle survives shutdown');
+    fs.writeFileSync(path.join(home,`release-${idle.id}`),''); await finished(idle.id,'idle');
+    const manual=await launch('MEMBERSHIP_HOLD_TEST manual pause survives shutdown');
+    await api('POST','/locks',{project:project.id,name:'manual-frozen',about:'Manual pause must remain untouched'});
+    await api('POST','/locks/acquire',{agent:manual.id,name:'manual-frozen',wait:0,ttl:30});
+    await api('POST',`/agents/${manual.id}/pause`,{locks:'keep'});
+    const manualBefore=await view(manual.id);
+    const working=await launch('MEMBERSHIP_HOLD_TEST RESTART_ESCAPE_TEST RESTART_LATE_FORK_TEST interrupted continuation');
+    const cross=await launch('MEMBERSHIP_HOLD_TEST interrupted replacement',other,'claude');
+    await api('POST','/agent-config',{id:working.id,agent:working.id,effort:'high',continuation:'WAIT_RESTART_CANCELLED_CONTINUATION'});
+    await api('POST',`/agents/${cross.id}/replacement`,{harness:'codex',model:'gpt-6-luna',effort:'low',task:'WAIT_RESTART_CANCELLED_REPLACEMENT'});
+    await api('POST','/locks',{project:project.id,name:'restart-frozen',about:'Graceful shutdown freezes the remaining TTL'});
+    await api('POST','/locks/acquire',{agent:working.id,name:'restart-frozen',wait:0,ttl:30});
+    await until(()=>fs.existsSync(path.join(home,`restart-escaped-${working.id}`)),'owned escaped fake process starts');
+    const escaped=Number(fs.readFileSync(path.join(home,`restart-escaped-${working.id}`),'utf8'));
+    foreign=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(working.id),ACOM_URL:'http://127.0.0.1:1'},detached:true,stdio:'ignore'});
+    await until(()=>alive(foreign.pid),'owned foreign-URL process starts');
+    ownUrl=`http://127.0.0.1:${fs.readFileSync(path.join(home,'port'),'utf8').trim()}`;
+    foreignHome=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(working.id),ACOM_URL:ownUrl,ACOM_HOME:foreignHomePath},detached:true,stdio:'ignore'});
+    await until(()=>alive(foreignHome.pid),'owned foreign-home process starts');
+    await api('POST',`/hook/${working.id}`,{});
+    const recoveryThread=await api('POST','/threads',{project:other.id,title:'Receipt survives interrupted startup',members:[String(cross.id)]});
+    await api('POST','/messages',{thread:recoveryThread.id,text:'WAIT_RECOVERED_PRIVATE_CONTENT'});
+    const recovery=await api('POST',`/wait/${cross.id}`,{timeout:1});
+    assert.ok(recovery.delivery_id>0);
+    await api('POST',`/wait/${manual.id}/ack`,{delivery_id:recovery.delivery_id},404);
+    assert.deepEqual(await api('POST',`/wait/${cross.id}`,{timeout:1}),recovery,'another agent cannot acknowledge this pending receipt');
+    const shutdownWait=rawWait(working.id,5);
+    await new Promise(resolve=>setTimeout(resolve,150));
+    await stop('SIGTERM');
+    const saved=()=>dbAction(db=>db.prepare('SELECT id,state,pause_reason,pause_from,paused_at FROM agents WHERE id IN (?,?,?,?,?) ORDER BY id').all(waiter.id,idle.id,manual.id,working.id,cross.id));
+    const persisted=saved();
+    for(const a of [working,cross]) {
+      const row=persisted.find(row=>row.id===a.id);
+      assert.equal(row.state,'paused','graceful handler saves pause before boot cleanup');
+      assert.equal(row.pause_reason,'restart'); assert.equal(row.pause_from,'working'); assert.ok(row.paused_at>0);
+      await until(()=>!alive(captures(a.id)[0].pid),`owned worker ${a.id} stops before server exits`);
+    }
+    await until(()=>!alive(escaped),'escaped owned background group stops at graceful shutdown');
+    const late=Number(fs.readFileSync(path.join(home,`restart-late-${working.id}`),'utf8'));
+    await until(()=>!alive(late),'same-identity child forked while handling SIGTERM also stops before shutdown returns');
+    assert.ok(alive(foreign.pid),'same agent ID at another server URL is not owned by this shutdown');
+    assert.ok(alive(foreignHome.pid),'same ID and URL in a different data home is not owned by this shutdown');
+    assert.equal(persisted.find(row=>row.id===idle.id).state,'idle');
+    assert.equal(persisted.find(row=>row.id===manual.id).pause_reason,manualBefore.pause_reason);
+    assert.equal(persisted.find(row=>row.id===manual.id).paused_at,manualBefore.paused_at);
+    assert.equal(persisted.find(row=>row.id===waiter.id).pause_reason,'limit');
+    const frozen=dbAction(db=>db.prepare('SELECT holder,frozen,frozen_left,expires_at FROM locks WHERE project=? AND name=?').get(project.id,'restart-frozen'));
+    assert.equal(frozen.holder,working.id); assert.equal(frozen.frozen,1); assert.ok(frozen.frozen_left>0); assert.equal(frozen.expires_at,null);
+    const stoppedWait=await shutdownWait;
+    assert.ok(stoppedWait.error || [409,503].includes(stoppedWait.status),'shutdown interrupts a foreground wait instead of delivering fake success');
+    await start();
+    assert.deepEqual(saved(),persisted,'boot does not resave already graceful-paused state');
+    for(const a of [working,cross]) {
+      assert.equal(captures(a.id).length,1,'starting the server does not automatically resume restart pauses');
+      assert.equal((await view(a.id)).continuation,null); assert.equal((await view(a.id)).replacement_request,null);
+    }
+    await api('POST',`/wait/${manual.id}/ack`,{delivery_id:newer.delivery_id},404);
+    fs.renameSync(path.join(env.PATH,'claude'),path.join(env.PATH,'claude.disabled'));
+    let resumed;
+    try {resumed=await api('POST','/resume-restart',{});} finally {fs.renameSync(path.join(env.PATH,'claude.disabled'),path.join(env.PATH,'claude'));}
+    assert.deepEqual(resumed.ids,[working.id]);
+    assert.equal(resumed.errors.length,1); assert.match(resumed.errors[0],new RegExp(`agent ${cross.id}:`));
+    assert.equal((await view(cross.id)).pause_reason,'restart');
+    assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text),recovery.text,'failed successor turn preparation rolls back recovered receipt consumption');
+    const retryResumed=await api('POST','/resume-restart',{});
+    assert.deepEqual(retryResumed.ids,[cross.id]); assert.deepEqual(retryResumed.errors,[]);
+    resumed.ids.push(...retryResumed.ids);
+    assert.deepEqual(resumed.ids.toSorted((a,b)=>a-b),[working.id,cross.id].toSorted((a,b)=>a-b),'restart resume is global but excludes manual and usage pauses');
+    assert.ok(resumed.warnings.some(w=>w.includes(String(manual.id))),'retained manual frozen locks are reported');
+    for(const a of [working,cross]) await until(()=>captures(a.id).length===2,`restart-only resume starts ${a.id} once`);
+    assert.doesNotMatch(captures(working.id)[1].prompt,/WAIT_RESTART_CANCELLED_CONTINUATION/);
+    assert.doesNotMatch(captures(cross.id)[1].prompt,/WAIT_RESTART_CANCELLED_REPLACEMENT/);
+    assert.equal(captures(cross.id)[1].prompt.split(`Recovered delivery #${recovery.delivery_id}`).length-1,1,'committed startup recovers the unacknowledged immutable batch once');
+    assert.doesNotMatch(captures(cross.id)[1].prompt,/WAIT_RECOVERED_PRIVATE_CONTENT/);
+    assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text),null);
+    assert.equal((await view(manual.id)).state,'paused'); assert.equal((await view(waiter.id)).state,'paused');
+    assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='restart-frozen').frozen,0);
+    await stop('SIGINT');
+    for(const row of saved().filter(row=>[working.id,cross.id].includes(row.id))) {assert.equal(row.state,'paused');assert.equal(row.pause_reason,'restart');}
+    assert.ok(alive(foreign.pid),'SIGINT also preserves the foreign-URL process');
+    assert.ok(alive(foreignHome.pid),'SIGINT also preserves the foreign-home process');
+    await start();
+    assert.match(cli(folder,['resume-restart']),/resumed 2 restart-paused agent/i,'user CLI resumes across projects, not just its current folder');
+    for(const a of [working,cross]) await until(()=>captures(a.id).length===3,`CLI restart-only resume starts ${a.id} once`);
+
+    // Abrupt exit leaves saved working state; boot reconciles owned tools even
+    // when a tool belongs to an idle agent, without altering that idle state.
+    idleTool=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(idle.id),ACOM_URL:ownUrl},detached:true,stdio:'ignore'});
+    fs.writeFileSync(path.join(home,`restart-idle-${idle.id}`),String(idleTool.pid));
+    await until(()=>alive(idleTool.pid),'owned idle orphan fixture starts');
+    await stop('SIGKILL');
+    assert.equal(saved().find(row=>row.id===working.id).state,'working','abrupt stop deliberately bypasses graceful persistence');
+    assert.ok(alive(idleTool.pid));
+    await start();
+    await until(()=>!alive(idleTool.pid),'boot cleans an owned escaped tool of an idle agent');
+    assert.equal((await view(idle.id)).state,'idle');
+    assert.equal((await view(manual.id)).pause_reason,'user'); assert.equal((await view(waiter.id)).pause_reason,'limit');
+    for(const a of [working,cross]) {
+      assert.equal((await view(a.id)).pause_reason,'restart'); assert.equal(captures(a.id).length,3);
+      assert.equal((await api('GET',`/history?project=${a.project}&agent=${a.id}&kind=agent.failed`)).events.length,0,'server interruptions do not enter normal crash history');
+    }
+    assert.ok(alive(foreign.pid)); assert.ok(alive(foreignHome.pid));
+    for(const a of [waiter,idle,manual,working,cross]) await api('POST',`/agents/${a.id}/close`,{});
+    return [project,other];
+  } finally {
+    stopOwnedTool(foreign,home,'http://127.0.0.1:1');
+    stopOwnedTool(foreignHome,foreignHomePath,ownUrl);
+    stopOwnedTool(idleTool,home,ownUrl);
+  }
+}
 
 async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors}) {
   const folder=path.join(root,'followups'); fs.mkdirSync(folder);

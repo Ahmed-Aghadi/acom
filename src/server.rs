@@ -11,12 +11,36 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 const UI: &str = include_str!("ui.html");
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_stop(_: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+fn install_stop_handlers() -> std::io::Result<()> {
+    // The handler only sets a flag; persistence and process cleanup happen in
+    // the normal server thread, never inside the signal handler.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = request_stop as *const () as usize;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 pub fn serve(port: u16) {
+    if let Err(e) = install_stop_handlers() {
+        eprintln!("can't install shutdown handlers: {e}");
+        std::process::exit(1);
+    }
     let home = acom_home();
     if let Err(e) = std::fs::create_dir_all(&home) {
         eprintln!("can't create {}: {e}", home.display());
@@ -54,6 +78,9 @@ pub fn serve(port: u16) {
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(1));
+                if STOP_REQUESTED.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Err(e) = app.tick() {
                     eprintln!("tick: {}", e.1);
                 }
@@ -63,9 +90,24 @@ pub fn serve(port: u16) {
             }
         });
     }
-    for req in server.incoming_requests() {
-        let app = app.clone();
-        thread::spawn(move || handle(&app, req));
+    while !STOP_REQUESTED.load(Ordering::Relaxed) {
+        match server.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(req)) => {
+                let app = app.clone();
+                thread::spawn(move || handle(&app, req));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("server stopped accepting requests: {e}");
+                break;
+            }
+        }
+    }
+    if let Err(e) = app.shutdown() {
+        eprintln!(
+            "couldn't save shutdown state: {}. Interrupted agents will be reconciled on restart.",
+            e.1
+        );
     }
     drop(lock);
 }
@@ -282,6 +324,9 @@ fn record(value: Value, q: &Query) -> R<Value> {
 
 fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Reply> {
     use Reply::Json as J;
+    if app.lock().shutting_down {
+        return Err(Fail(503, "the server is stopping".into()));
+    }
     // Zero identifies the user; negative identities must never reach a write.
     for key in ["agent", "via"] {
         if opt_int(b, key).is_some_and(|id| id < 0) {
@@ -420,7 +465,17 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
         ("POST", ["pause-all"]) => J(json!({ "ids": app.pause_all(&user(b))? })),
         ("POST", ["resume-all"]) => J(json!({ "ids": app.resume_all(&user(b))? })),
+        ("POST", ["resume-restart"]) => J(app.resume_restart(&user(b))?),
         ("POST", ["hook", a]) => J(json!({ "text": app.hook(id(a)?)? })),
+        ("POST", ["wait", a]) => {
+            let timeout = u64::try_from(int(b, "timeout")?)
+                .map_err(|_| bad("wait timeout must be 1–3600 seconds"))?;
+            J(app.wait_updates(id(a)?, timeout)?)
+        }
+        ("POST", ["wait", a, "ack"]) => {
+            app.ack_updates(id(a)?, int(b, "delivery_id")?)?;
+            J(json!({"acknowledged":true}))
+        }
 
         // threads and messages
         ("GET", ["threads"]) => {
@@ -634,7 +689,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         _ => return Err(not_found(format!("no route {method} /{}", p.join("/")))),
     };
     if method != "GET"
-        && !matches!(p, ["hook", _])
+        && !matches!(p, ["hook", _] | ["wait", ..])
         && let Reply::Json(value) = reply
     {
         let agent = opt_int(b, "agent");

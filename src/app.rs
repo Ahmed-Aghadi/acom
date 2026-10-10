@@ -465,6 +465,8 @@ pub struct Proc {
 
 pub struct St {
     pub db: Connection,
+    pub shutting_down: bool,
+    pub waiting_updates: HashSet<i64>,
     /// Lock queues by (project, lock name).
     pub queues: HashMap<(i64, String), Vec<i64>>,
     pub procs: HashMap<i64, Proc>,
@@ -512,6 +514,7 @@ CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS notices_agent ON notices(agent_id,id);
 CREATE INDEX IF NOT EXISTS notices_delivery ON notices(agent_id,shown,id);
+CREATE TABLE IF NOT EXISTS update_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER NOT NULL UNIQUE, text TEXT);
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
@@ -1314,9 +1317,54 @@ impl St {
         Ok(())
     }
 
-    /// Everything new for an agent, as `[acom]` lines, and mark it all as told.
-    /// Never includes message content: only counts and senders.
+    fn pending_delivery(&self, agent: i64) -> R<Option<(i64, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id,text FROM update_deliveries WHERE agent_id=?1 AND text IS NOT NULL",
+                [agent],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Recover an unacknowledged wait receipt at startup, then drain fresh updates.
+    /// Startup's surrounding transaction restores the receipt if spawning fails.
     pub fn take_updates(&mut self, agent: i64) -> R<String> {
+        let Some((id, previous)) = self.pending_delivery(agent)? else {
+            return self.take_fresh_updates(agent, 11000);
+        };
+        self.db
+            .execute("UPDATE update_deliveries SET text=NULL WHERE id=?1", [id])?;
+        let previous = format!(
+            "[acom] Recovered delivery #{id} (same batch; ignore if already received).\n{previous}"
+        );
+        let remaining = 14900usize.saturating_sub(json!({"text":previous}).to_string().len());
+        let fresh = self.take_fresh_updates(agent, remaining)?;
+        Ok([previous, fresh]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn coordination_updates(&mut self, agent: i64) -> R<String> {
+        let updates = self.take_updates(agent)?;
+        let summary = self.coordination_summary(agent, false)?;
+        Ok([updates, summary]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    /// Never includes message content: only bounded notices, counts and senders.
+    fn take_fresh_updates(&mut self, agent: i64, max_bytes: usize) -> R<String> {
+        if max_bytes < 512 {
+            return Ok(String::new());
+        }
+        // Reserve room for the remaining-notice and message-count lines below.
+        let notice_budget = max_bytes.saturating_sub(512).min(10000);
         let mut lines = Vec::new();
         let mut s = self
             .db
@@ -1327,7 +1375,7 @@ impl St {
         drop(s);
         for (id, text, truncated) in notes {
             lines.push(if truncated {format!("[acom] {text}… [Notice #{id} shortened; read `acom notices {id}` for the full notice.]")}else{format!("[acom] {text}")});
-            if json!({"text":lines.join("\n")}).to_string().len() > 10000 {
+            if json!({"text":lines.join("\n")}).to_string().len() > notice_budget {
                 lines.pop();
                 break;
             }
@@ -1519,13 +1567,43 @@ impl SelectedPage {
 impl App {
     pub fn open(home: PathBuf, url: String) -> R<Arc<App>> {
         std::fs::create_dir_all(home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
+        let home = std::fs::canonicalize(home).map_err(|e| Fail(500, e.to_string()))?;
         let db = Connection::open(home.join("acom.db"))?;
         check_stored_schema(&db)?;
+        // Refuse ambiguous live ownership before schema/cursor writes or cleanup.
+        // The old address remains saved until startup completes, including when
+        // this restart selects a different port.
+        let previous_url = std::fs::read_to_string(home.join("port"))
+            .ok()
+            .and_then(|port| port.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            .unwrap_or_else(|| url.clone());
+        let has_agents: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents')",
+            [],
+            |r| r.get(0),
+        )?;
+        let agent_ids: HashSet<i64> = if has_agents {
+            rows(&db, "SELECT id FROM agents", [])?
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        if let Some((id, pid)) = run::unmarked_tools(&agent_ids, &previous_url).first() {
+            return Err(conflict(format!(
+                "cannot verify ownership of live agent {id} worker PID {pid}: ACOM_HOME is missing. Stop its workers using the previous server/version, then restart; no workers or saved agent state were changed."
+            )));
+        }
         db.execute_batch(SCHEMA)?;
         initialize_views(&db)?;
         db.execute("UPDATE usage_checks SET in_flight=0", [])?;
         let mut st = St {
             db,
+            shutting_down: false,
+            waiting_updates: HashSet::new(),
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
@@ -1533,14 +1611,7 @@ impl App {
         };
         // Agents that were mid-turn when the server stopped can't be followed any more.
         // Treat it like pause all: stop leftovers, keep their locks frozen.
-        // The server writes its new port only after open; leftovers belong to the
-        // previous address, even when this restart selects a different port.
-        let previous_url = std::fs::read_to_string(home.join("port"))
-            .ok()
-            .and_then(|port| port.trim().parse::<u16>().ok())
-            .filter(|port| *port != 0)
-            .map(|port| format!("http://127.0.0.1:{port}"))
-            .unwrap_or_else(|| url.clone());
+        let old_tools = run::server_tools(&agent_ids, &previous_url, &home);
         for r in rows(
             &st.db,
             "SELECT id, pid, state FROM agents WHERE state='working' OR pid IS NOT NULL",
@@ -1549,6 +1620,11 @@ impl App {
             let id = r["id"].as_i64().unwrap();
             if let Some(pid) = r["pid"].as_i64()
                 && run::is_our_agent_group(pid as u32, id, &previous_url)
+                && old_tools.iter().any(|(owner, tool)| {
+                    *owner == id
+                        && run::is_server_tool(*tool, id, &previous_url, &home)
+                        && unsafe { libc::getpgid(*tool as i32) } == pid as i32
+                })
             {
                 run::kill_group(pid as u32, libc::SIGKILL);
             }
@@ -1575,6 +1651,7 @@ impl App {
                 &format!("paused agent {id}: the server restarted during its turn"),
             )?;
         }
+        run::kill_server_tools(&old_tools, &previous_url, &home, libc::SIGKILL);
         let exe = std::env::current_exe().map_err(|e| Fail(500, e.to_string()))?;
         Ok(Arc::new(App {
             st: Mutex::new(st),
@@ -1647,6 +1724,9 @@ impl App {
         req: LaunchReq,
         defer_limits: bool,
     ) -> R<(i64, Vec<String>)> {
+        if st.shutting_down {
+            return Err(conflict("the server is stopping"));
+        }
         // An agent's helpers join its project; the user picks one.
         let project = if by > 0 {
             let a = st.agent(by)?;
@@ -1852,6 +1932,9 @@ impl App {
     /// isn't counted as active, so it joins the wake line instead, which `drain_wakes` serves
     /// oldest first whenever there's room under the hard limits.
     pub fn maybe_wake(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+        if st.shutting_down {
+            return Ok(());
+        }
         if st.procs.contains_key(&id) {
             return Ok(()); // still stopping; turn_ended wakes it if needed
         }
@@ -1927,6 +2010,9 @@ impl App {
 
     /// Wake agents in the wake line, oldest first, while there's room. Returns whether any woke.
     fn drain_wakes(self: &Arc<Self>, st: &mut St) -> R<bool> {
+        if st.shutting_down {
+            return Ok(false);
+        }
         let queued = rows(
             &st.db,
             "SELECT id, wake_why FROM agents WHERE wake_queued_at IS NOT NULL ORDER BY wake_queued_at, id",
@@ -1988,6 +2074,21 @@ impl App {
             return Ok(()); // not this process's entry; never happens since turns don't overlap
         }
         let a = st.agent(id)?;
+        if st.shutting_down && a.state == "working" {
+            // A shutdown save may have failed. Once persistence recovers, the
+            // exit must still become a restart pause, not idle or a crash.
+            st.atomic(|st| {
+                Self::cancel_followups(st, id, "the server stopped during the turn")?;
+                st.freeze_locks(id)?;
+                st.db.execute("UPDATE agents SET state='paused',pause_reason='restart',pause_from='working',paused_at=?2,pid=NULL WHERE id=?1",params![id,now()])?;
+                st.log_for(id,"acom",&format!("paused agent {id}: the server stopped during its turn"))?;
+                Ok(())
+            })?;
+            st.procs.remove(&id);
+            st.reaped.remove(&id);
+            self.cv.notify_all();
+            return Ok(());
+        }
         let failure = st.procs.get(&id).and_then(|p| p.failure.clone());
         let stopping = st.procs.get(&id).is_some_and(|p| p.stopping);
         let failed = (!ok || failure.is_some()) && !stopping && a.state == "working";
@@ -2173,6 +2274,9 @@ impl App {
     }
 
     fn prepare_resume(&self, st: &mut St, id: i64, by: &str) -> R<Option<String>> {
+        if st.shutting_down {
+            return Err(conflict("the server is stopping"));
+        }
         let a = st.agent(id)?;
         if a.state != "paused" && a.state != "crashed" {
             return Err(conflict(format!("agent {id} is {}, not paused", a.state)));
@@ -2251,6 +2355,135 @@ impl App {
             self.resume_locked(&mut st, id, by)?;
         }
         Ok(ids)
+    }
+
+    /// Unlike Resume all, leave manual and usage-limit pauses alone.
+    pub fn resume_restart(self: &Arc<Self>, by: &str) -> R<Value> {
+        let st = self.lock();
+        let ids: Vec<i64> = rows(
+            &st.db,
+            "SELECT id FROM agents WHERE state='paused' AND pause_reason='restart' ORDER BY id",
+            [],
+        )?
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+        let mut st = self.wait_stopped(st, &ids);
+        let mut resumed = Vec::new();
+        let mut errors = Vec::new();
+        for id in ids {
+            // Waiting releases the mutex: don't undo a concurrent user action.
+            let eligible: bool = st.db.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1 AND state='paused' AND pause_reason='restart')", [id], |r|r.get(0))?;
+            if !eligible {
+                continue;
+            }
+            match self.resume_locked(&mut st, id, by) {
+                Ok(()) => resumed.push(id),
+                Err(e) => errors.push(format!("agent {id}: {}", e.1)),
+            }
+        }
+        let warnings: Vec<String> = rows(
+            &st.db,
+            "SELECT DISTINCT a.id FROM agents a JOIN locks l ON l.holder=a.id
+             WHERE a.state='paused' AND l.frozen=1 ORDER BY a.id",
+            [],
+        )?
+        .iter()
+        .map(|r| format!("paused agent {} still holds frozen locks", r["id"]))
+        .collect();
+        self.cv.notify_all();
+        Ok(json!({"ids":resumed,"errors":errors,"warnings":warnings}))
+    }
+
+    /// Stop turns deliberately, so shutdown never invokes crash recovery.
+    pub fn shutdown(self: &Arc<Self>) -> R<()> {
+        let mut st = self.lock();
+        st.shutting_down = true;
+        let agent_ids: HashSet<i64> = rows(&st.db, "SELECT id FROM agents", [])
+            .map(|rs| rs.iter().map(|r| r["id"].as_i64().unwrap()).collect())
+            .unwrap_or_else(|_| st.procs.keys().copied().collect());
+        let tools = run::server_tools(&agent_ids, &self.url, &self.home);
+        let saved = st.atomic(|st| {
+            let ids = rows(&st.db, "SELECT id FROM agents WHERE state='working' ORDER BY id", [])?;
+            for row in ids {
+                let id = row["id"].as_i64().unwrap();
+                Self::cancel_followups(st, id, "the server stopped during the turn")?;
+                st.freeze_locks(id)?;
+                st.db.execute("UPDATE agents SET state='paused',pause_reason='restart',pause_from='working',paused_at=?2 WHERE id=?1", params![id,now()])?;
+                st.log_for(id,"acom",&format!("paused agent {id}: the server stopped during its turn"))?;
+            }
+            Ok(())
+        });
+        // Even if persistence failed, stop the workers. Startup can reconcile
+        // their saved working states; they must not continue unattended.
+        let mut signalled_groups = HashSet::new();
+        for (&id, p) in &mut st.procs {
+            p.stopping = true;
+            if tools.iter().any(|(owner, tool)| {
+                *owner == id
+                    && run::is_server_tool(*tool, id, &self.url, &self.home)
+                    && unsafe { libc::getpgid(*tool as i32) } == p.pid as i32
+            }) {
+                run::kill_group(p.pid, libc::SIGTERM);
+                signalled_groups.insert(p.pid);
+            }
+        }
+        let detached: Vec<_> = tools
+            .iter()
+            .copied()
+            .filter(|(_, pid)| {
+                !signalled_groups.contains(&(unsafe { libc::getpgid(*pid as i32) } as u32))
+            })
+            .collect();
+        run::kill_server_tools(&detached, &self.url, &self.home, libc::SIGTERM);
+        self.cv.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while (!st.procs.is_empty()
+            || tools
+                .iter()
+                .any(|(id, pid)| run::is_server_tool(*pid, *id, &self.url, &self.home)))
+            && Instant::now() < deadline
+        {
+            st = self
+                .cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        // Include tools forked after the first scan (including TERM handlers).
+        let remaining = run::server_tools(&agent_ids, &self.url, &self.home);
+        for (&id, p) in &st.procs {
+            if remaining.iter().any(|(owner, tool)| {
+                *owner == id
+                    && run::is_server_tool(*tool, id, &self.url, &self.home)
+                    && unsafe { libc::getpgid(*tool as i32) } == p.pid as i32
+            }) {
+                run::kill_group(p.pid, libc::SIGKILL);
+            }
+        }
+        run::kill_server_tools(&remaining, &self.url, &self.home, libc::SIGKILL);
+        let settle = Instant::now() + Duration::from_millis(500);
+        while (!st.procs.is_empty()
+            || remaining
+                .iter()
+                .any(|(id, pid)| run::is_server_tool(*pid, *id, &self.url, &self.home)))
+            && Instant::now() < settle
+        {
+            st = self
+                .cv
+                .wait_timeout(st, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if remaining
+            .iter()
+            .any(|(id, pid)| run::is_server_tool(*pid, *id, &self.url, &self.home))
+        {
+            eprintln!(
+                "some owned agent tools are still stopping; startup will verify cleanup again"
+            );
+        }
+        saved
     }
 
     pub fn close(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
@@ -2676,6 +2909,12 @@ impl App {
             params![id, new],
         )?;
         st.db.execute("INSERT INTO marks(agent_id,message_id,mark) SELECT ?2,message_id,mark FROM marks WHERE agent_id=?1",params![id,new])?;
+        // Notification cursors already belong to this durable batch. Transfer
+        // its unacknowledged body with ownership, retaining the stable ID.
+        st.db.execute(
+            "UPDATE update_deliveries SET agent_id=?2 WHERE agent_id=?1 AND text IS NOT NULL",
+            params![id, new],
+        )?;
         Ok(())
     }
 
@@ -2859,16 +3098,129 @@ impl App {
 
     pub fn hook(&self, id: i64) -> R<String> {
         let mut st = self.lock();
-        if st.agent(id)?.state != "working" {
+        if st.shutting_down
+            || st.agent(id)?.state != "working"
+            || st.waiting_updates.contains(&id)
+            || st.pending_delivery(id)?.is_some()
+        {
             return Ok(String::new());
         }
-        let updates = st.take_updates(id)?;
-        let summary = st.coordination_summary(id, false)?;
-        Ok([updates, summary]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"))
+        st.atomic(|st| st.coordination_updates(id))
+    }
+
+    /// Foreground wait in the current turn. A persisted receipt survives a lost
+    /// HTTP response; only ACK or a successfully committed startup consumes it.
+    pub fn wait_updates(&self, id: i64, timeout: u64) -> R<Value> {
+        if !(1..=3600).contains(&timeout) {
+            return Err(bad("wait timeout must be 1–3600 seconds"));
+        }
+        let mut st = self.lock();
+        st.agent(id)?;
+        let snapshot: (String, i64, Option<i64>) = st.db.query_row(
+            "SELECT state,turns,pid FROM agents WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if st.shutting_down || snapshot.0 != "working" {
+            return Err(conflict(
+                "wait requires a working turn and a running server",
+            ));
+        }
+        if !st.waiting_updates.insert(id) {
+            return Err(conflict("another wait is already running for this agent"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        let result = loop {
+            let ready = (|| -> R<Option<Value>> {
+                if st.shutting_down {
+                    return Err(conflict("server is shutting down; wait cancelled"));
+                }
+                let current: (String, i64, Option<i64>) = st.db.query_row(
+                    "SELECT state,turns,pid FROM agents WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                if current != snapshot {
+                    return Err(conflict(
+                        "the working turn changed or stopped; wait cancelled",
+                    ));
+                }
+                if let Some((delivery, text)) = st.pending_delivery(id)? {
+                    return Ok(Some(
+                        json!({"text":text,"delivery_id":delivery,"timed_out":false}),
+                    ));
+                }
+                st.atomic(|st| {
+                    let text = st.coordination_updates(id)?;
+                    if text.is_empty() { return Ok(None); }
+                    st.db.execute("DELETE FROM update_deliveries WHERE agent_id=?1",[id])?;
+                    st.db.execute("INSERT INTO update_deliveries(agent_id,text) VALUES(?1,?2)",params![id,text])?;
+                    Ok(Some(json!({"text":text,"delivery_id":st.db.last_insert_rowid(),"timed_out":false})))
+                })
+            })();
+            match ready {
+                Ok(Some(value)) => break Ok(value),
+                Err(error) => break Err(error),
+                Ok(None) => {}
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Ok(json!({"text":"","delivery_id":null,"timed_out":true}));
+            }
+            // Notice producers that do not signal the shared condition variable
+            // are covered by a bounded local recheck, without another model turn.
+            st = self
+                .cv
+                .wait_timeout(st, left.min(Duration::from_secs(1)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        };
+        st.waiting_updates.remove(&id);
+        self.cv.notify_all();
+        result
+    }
+
+    pub fn ack_updates(&self, id: i64, delivery: i64) -> R<()> {
+        if delivery <= 0 {
+            return Err(bad("delivery_id must be positive"));
+        }
+        let st = self.lock();
+        st.agent(id)?;
+        let owner: Option<i64> = st
+            .db
+            .query_row(
+                "SELECT agent_id FROM update_deliveries WHERE id=?1",
+                [delivery],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if owner.is_some_and(|owner| owner != id) {
+            return Err(not_found("no such delivery for this agent"));
+        }
+        let current: Option<i64> = st
+            .db
+            .query_row(
+                "SELECT id FROM update_deliveries WHERE agent_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current == Some(delivery) {
+            // Keep the latest receipt ID, but discard its body. ACK retries are
+            // idempotent until a later batch replaces this bounded record.
+            st.db.execute(
+                "UPDATE update_deliveries SET text=NULL WHERE agent_id=?1",
+                [id],
+            )?;
+            self.cv.notify_all();
+            return Ok(());
+        }
+        if current.is_some_and(|current| current > delivery) {
+            return Err(conflict(
+                "delivery is stale; the newer batch was not acknowledged",
+            ));
+        }
+        Err(not_found("no such delivery for this agent"))
     }
 
     // ---------- threads and messages ----------
@@ -3865,6 +4217,9 @@ impl App {
     /// Once a second: expire locks, act on subscription limits.
     pub fn tick(self: &Arc<Self>) -> R<()> {
         let mut st = self.lock();
+        if st.shutting_down {
+            return Ok(());
+        }
         let mut changed = st.expire_locks()?;
         // Usage is per account, but each project has its own thresholds for its own agents.
         let projects: Vec<i64> = rows(&st.db, "SELECT id FROM projects", [])?
@@ -4809,10 +5164,15 @@ impl App {
         }
         let unread_total:i64=st.db.query_row("SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0 LEFT JOIN user_reads r ON r.thread_id=m.thread_id WHERE m.sender<>0 AND m.id>coalesce(r.message_id,0) AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))",[],|r|r.get(0))?;
         let s = st.settings_for(pid);
+        let restart_paused: i64 = st.db.query_row(
+            "SELECT count(*) FROM agents WHERE state='paused' AND pause_reason='restart'",
+            [],
+            |r| r.get(0),
+        )?;
         let (total, per) = st.active_counts(pid)?;
         let limits = json!({"limits":s.limits,"active":{"total":total,"per_harness":per},"usage":rows(&st.db,"SELECT provider,win,used_pct,resets_at,at FROM usage ORDER BY provider,win",[])?,"checks":rows(&st.db,"SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider",[])?,"text":st.limits_text(pid)?});
         Ok(
-            json!({"url":self.url,"project":current,"unread_total":unread_total,"limits":limits,"revisions":revisions,"revision":revision}),
+            json!({"url":self.url,"project":current,"unread_total":unread_total,"restart_paused":restart_paused,"limits":limits,"revisions":revisions,"revision":revision}),
         )
     }
 
@@ -5572,6 +5932,8 @@ mod tests {
         }
         St {
             db,
+            shutting_down: false,
+            waiting_updates: HashSet::new(),
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
@@ -5944,6 +6306,96 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_preserves_idle_and_existing_pauses_and_freezes_working_locks() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db.execute_batch("UPDATE agents SET state='working' WHERE id=1;
+                INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at,pause_reason,pause_from)
+                VALUES(3,1,'manual','t','claude','m','e','paused',0,0,'user','idle'),
+                      (4,2,'limited','t','claude','m','e','paused',0,0,'limit','idle');
+                INSERT INTO agent_continuations(agent_id,text) VALUES(1,'cancel me');").unwrap();
+            hold(&st, "schema", 1, Some(now() + 120));
+        }
+        app.shutdown().unwrap();
+        let st = app.lock();
+        let agents = rows(
+            &st.db,
+            "SELECT id,state,pause_reason FROM agents ORDER BY id",
+            [],
+        )
+        .unwrap();
+        assert_eq!(agents[0]["state"], "paused");
+        assert_eq!(agents[0]["pause_reason"], "restart");
+        assert_eq!(agents[1]["state"], "idle");
+        assert_eq!(agents[2]["pause_reason"], "user");
+        assert_eq!(agents[3]["pause_reason"], "limit");
+        assert_eq!(lock(&st, "schema").2, 1);
+        assert!(!App::has_handoff(&st, 1).unwrap());
+        assert_eq!(
+            st.db
+                .query_row("SELECT count(*) FROM agent_continuations", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(st.shutting_down);
+        drop(st);
+        assert_eq!(app.overview(Some(2), None).unwrap()["restart_paused"], 1);
+    }
+
+    #[test]
+    fn resume_restart_is_global_and_leaves_other_pause_reasons_and_idle_alone() {
+        let app = app_with_two_projects();
+        app.lock().db.execute_batch("UPDATE agents SET state='paused',pause_from='idle',pause_reason='restart';
+            INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at,pause_reason,pause_from)
+            VALUES(3,1,'manual','t','claude','m','e','paused',0,0,'user','idle'),
+                  (4,2,'limited','t','claude','m','e','paused',0,0,'limit','idle'),
+                  (5,1,'idle','t','claude','m','e','idle',0,0,NULL,NULL);").unwrap();
+        let before = app.overview(Some(1), None).unwrap();
+        assert_eq!(before["restart_paused"], 2);
+        let result = app.resume_restart("user").unwrap();
+        assert_eq!(result["ids"], json!([1, 2]));
+        assert_eq!(result["errors"], json!([]));
+        assert_eq!(app.lock().agent(3).unwrap().state, "paused");
+        assert_eq!(app.lock().agent(4).unwrap().state, "paused");
+        assert_eq!(app.lock().agent(5).unwrap().state, "idle");
+        let after = app.overview(Some(1), before["revision"].as_str()).unwrap();
+        assert_eq!(after["restart_paused"], 0);
+        assert_ne!(after["unchanged"], true);
+        assert_eq!(app.resume_restart("user").unwrap()["ids"], json!([]));
+    }
+
+    #[test]
+    fn failed_shutdown_save_still_records_restart_pause_at_worker_exit() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute_batch(
+                "UPDATE agents SET state='working' WHERE id=1;
+            CREATE TRIGGER fail_shutdown BEFORE UPDATE ON agents WHEN NEW.state='paused'
+            BEGIN SELECT RAISE(ABORT,'shutdown fixture'); END;",
+            )
+            .unwrap();
+        assert!(app.shutdown().is_err());
+        assert!(app.lock().shutting_down);
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_shutdown")
+            .unwrap();
+        app.turn_ended(1, u32::MAX, false, Some("stopped deliberately"))
+            .unwrap();
+        let state = rows(
+            &app.lock().db,
+            "SELECT state,pause_reason FROM agents WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(state[0]["state"], "paused");
+        assert_eq!(state[0]["pause_reason"], "restart");
+    }
+
+    #[test]
     fn view_revisions_are_atomic_and_include_quiet_changes() {
         let app = app_with_two_projects();
         let initial = app
@@ -6091,6 +6543,348 @@ mod tests {
             app.notices_page(1, PageQuery::default()).unwrap()["total"],
             36
         );
+    }
+
+    fn wait_registered(app: &App, id: i64) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.lock().waiting_updates.contains(&id) {
+            assert!(Instant::now() < deadline, "wait was not registered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn wait_updates_transfers_once_and_leaves_new_arrivals_for_after_ack() {
+        let app = self_change_app();
+        let (thread, _) = app
+            .new_thread(0, Some(1), "wait", &["1".into()], true, &[])
+            .unwrap();
+        let (message, _) = app
+            .post(0, thread, "not message content in the notice")
+            .unwrap();
+        {
+            let st = app.lock();
+            st.notice(1, "first notice").unwrap();
+            st.notice(2, "other agent notice").unwrap();
+            hold(&st, "held", 1, Some(now() + 120));
+        }
+        let active = app.lock().active_counts(Some(1)).unwrap();
+        let first = app.wait_updates(1, 1).unwrap();
+        let delivery = first["delivery_id"].as_i64().unwrap();
+        let text = first["text"].as_str().unwrap();
+        assert!(text.contains("first notice"));
+        assert!(text.contains("1 new message from user"));
+        assert!(!text.contains("not message content"));
+        assert!(!text.contains("other agent notice"));
+        assert_eq!(first["timed_out"], false);
+        assert_eq!(app.wait_updates(1, 1).unwrap(), first);
+        app.lock().notice(1, "later notice").unwrap();
+        assert!(app.hook(1).unwrap().is_empty());
+        assert_eq!(app.lock().agent(1).unwrap().state, "working");
+        assert_eq!(app.lock().active_counts(Some(1)).unwrap(), active);
+        assert_eq!(lock(&app.lock(), "held").0, Some(1));
+        let st = app.lock();
+        assert_eq!(
+            st.db
+                .query_row(
+                    "SELECT count(*) FROM marks WHERE agent_id=1 AND message_id=?1",
+                    [message],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            st.db
+                .query_row("SELECT shown FROM notices WHERE agent_id=2", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(st);
+        app.ack_updates(1, delivery).unwrap();
+        let next = app.hook(1).unwrap();
+        assert!(next.contains("later notice"));
+        assert!(!next.contains("first notice"));
+        assert!(!next.contains("new message"));
+        assert!(app.hook(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_ack_is_owned_idempotent_bounded_and_does_not_clear_a_newer_batch() {
+        let app = self_change_app();
+        app.lock().notice(1, "first").unwrap();
+        let first = app.wait_updates(1, 1).unwrap()["delivery_id"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(app.ack_updates(1, 0).unwrap_err().0, 400);
+        assert_eq!(app.ack_updates(2, first).unwrap_err().0, 404);
+        assert_eq!(app.ack_updates(1, first + 100).unwrap_err().0, 404);
+        app.ack_updates(1, first).unwrap();
+        app.ack_updates(1, first).unwrap();
+        let mut latest = first;
+        for i in 0..5 {
+            app.lock().notice(1, &format!("batch {i}")).unwrap();
+            let batch = app.wait_updates(1, 1).unwrap();
+            let current = batch["delivery_id"].as_i64().unwrap();
+            assert!(current > latest);
+            assert_eq!(app.ack_updates(1, latest).unwrap_err().0, 409);
+            assert_eq!(app.wait_updates(1, 1).unwrap(), batch);
+            app.ack_updates(1, current).unwrap();
+            latest = current;
+        }
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM update_deliveries WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn wait_timeout_releases_registration_without_changing_the_turn() {
+        let app = self_change_app();
+        assert_eq!(app.wait_updates(1, 0).unwrap_err().0, 400);
+        assert_eq!(app.wait_updates(1, 3601).unwrap_err().0, 400);
+        assert_eq!(app.wait_updates(2, 1).unwrap_err().0, 409);
+        let started = Instant::now();
+        assert_eq!(
+            app.wait_updates(1, 1).unwrap(),
+            json!({"text":"","delivery_id":null,"timed_out":true})
+        );
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        let st = app.lock();
+        assert!(st.waiting_updates.is_empty());
+        assert_eq!(st.agent(1).unwrap().state, "working");
+        assert!(st.pending_delivery(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn wait_is_exclusive_and_backstop_delivers_unsignalled_notices() {
+        let app = self_change_app();
+        let waiting = app.clone();
+        let thread = std::thread::spawn(move || waiting.wait_updates(1, 10));
+        wait_registered(&app, 1);
+        assert_eq!(app.wait_updates(1, 1).unwrap_err().0, 409);
+        assert!(app.hook(1).unwrap().is_empty());
+        app.lock()
+            .notice(1, "notice without a producer signal")
+            .unwrap();
+        let delivery = thread.join().unwrap().unwrap();
+        assert!(
+            delivery["text"]
+                .as_str()
+                .unwrap()
+                .contains("notice without a producer signal")
+        );
+        assert!(app.lock().waiting_updates.is_empty());
+        assert!(app.hook(1).unwrap().is_empty());
+        app.ack_updates(1, delivery["delivery_id"].as_i64().unwrap())
+            .unwrap();
+        assert!(app.hook(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_aborts_on_state_turn_pid_or_shutdown_changes() {
+        for change in ["state", "turn", "pid", "shutdown"] {
+            let app = self_change_app();
+            let waiting = app.clone();
+            let thread = std::thread::spawn(move || waiting.wait_updates(1, 10));
+            wait_registered(&app, 1);
+            {
+                let mut st = app.lock();
+                match change {
+                    "state" => st
+                        .db
+                        .execute("UPDATE agents SET state='paused' WHERE id=1", [])
+                        .unwrap(),
+                    "turn" => st
+                        .db
+                        .execute("UPDATE agents SET turns=turns+1 WHERE id=1", [])
+                        .unwrap(),
+                    "pid" => st
+                        .db
+                        .execute("UPDATE agents SET pid=123456 WHERE id=1", [])
+                        .unwrap(),
+                    _ => {
+                        st.shutting_down = true;
+                        0
+                    }
+                };
+            }
+            app.cv.notify_all();
+            assert_eq!(thread.join().unwrap().unwrap_err().0, 409, "{change}");
+            assert!(app.lock().waiting_updates.is_empty(), "{change}");
+        }
+    }
+
+    #[test]
+    fn wait_and_hook_consumption_roll_back_when_receipt_or_summary_storage_fails() {
+        let app = self_change_app();
+        let (thread, _) = app
+            .new_thread(0, Some(1), "atomic", &["1".into()], true, &[])
+            .unwrap();
+        app.post(0, thread, "waiting").unwrap();
+        app.lock().notice(1, "do not lose this").unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER fail_wait_receipt BEFORE INSERT ON update_deliveries BEGIN SELECT RAISE(ABORT,'wait storage fixture'); END;").unwrap();
+        assert!(app.wait_updates(1, 1).is_err());
+        {
+            let st = app.lock();
+            assert!(st.waiting_updates.is_empty());
+            assert!(st.pending_delivery(1).unwrap().is_none());
+            assert_eq!(
+                st.db
+                    .query_row("SELECT shown FROM notices WHERE agent_id=1", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                st.db
+                    .query_row(
+                        "SELECT last_notified FROM members WHERE agent_id=1",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                st.db
+                    .query_row(
+                        "SELECT count(*) FROM summary_cursors WHERE agent_id=1",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            st.db.execute_batch("DROP TRIGGER fail_wait_receipt; CREATE TRIGGER fail_hook_summary BEFORE INSERT ON summary_cursors BEGIN SELECT RAISE(ABORT,'hook storage fixture'); END;").unwrap();
+        }
+        assert!(app.hook(1).is_err());
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT shown FROM notices WHERE agent_id=1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_hook_summary")
+            .unwrap();
+        let text = app.hook(1).unwrap();
+        assert!(text.contains("do not lose this"));
+        assert!(text.contains("1 new message"));
+        assert!(app.hook(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_receipt_survives_restart_and_failed_startup_and_recovery_stays_bounded() {
+        let app = self_change_app();
+        for _ in 0..35 {
+            app.lock().notice(1, &"☃\\\"\n😀".repeat(150)).unwrap();
+        }
+        let first = app.wait_updates(1, 1).unwrap();
+        let delivery = first["delivery_id"].as_i64().unwrap();
+        assert!(first.to_string().len() < 16000);
+        {
+            let mut st = app.lock();
+            let failed: R<()> = st.atomic(|st| {
+                assert!(
+                    st.take_updates(1)?
+                        .contains(&format!("Recovered delivery #{delivery}"))
+                );
+                Err(bad("simulate startup rollback"))
+            });
+            assert!(failed.is_err());
+        }
+        assert_eq!(app.wait_updates(1, 1).unwrap(), first);
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        assert_eq!(app.lock().agent(1).unwrap().state, "paused");
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working' WHERE id=1", [])
+            .unwrap();
+        assert_eq!(app.wait_updates(1, 1).unwrap(), first);
+        for _ in 0..25 {
+            app.lock().notice(1, &"\\\"".repeat(300)).unwrap();
+        }
+        let recovered = app
+            .lock()
+            .atomic(|st| {
+                let updates = st.take_updates(1)?;
+                let summary = st.coordination_summary(1, true)?;
+                Ok(format!("{updates}\n{summary}"))
+            })
+            .unwrap();
+        assert!(recovered.contains(&format!(
+            "Recovered delivery #{delivery} (same batch; ignore if already received)"
+        )));
+        assert!(json!({"text":recovered}).to_string().len() < 16000);
+        assert!(app.lock().pending_delivery(1).unwrap().is_none());
+        assert!(app.hook(1).unwrap().contains("more notices waiting"));
+    }
+
+    #[test]
+    fn replacement_inherits_only_pending_wait_delivery_atomically_by_the_same_id() {
+        for acknowledged in [false, true] {
+            let app = self_change_app();
+            app.lock().notice(1, "handoff notification").unwrap();
+            let batch = app.wait_updates(1, 1).unwrap();
+            let delivery = batch["delivery_id"].as_i64().unwrap();
+            if acknowledged {
+                app.ack_updates(1, delivery).unwrap();
+            }
+            {
+                let mut st = app.lock();
+                st.db.execute("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(3,1,'successor','t','codex','gpt-6-sol','medium','working',1,0)", []).unwrap();
+                let failed: R<()> = st.atomic(|st| {
+                    App::inherit_memberships(st, 1, 3)?;
+                    st.set_state(1, "replaced")?;
+                    Err(bad("simulate ownership rollback"))
+                });
+                assert!(failed.is_err());
+                assert_eq!(st.agent(1).unwrap().state, "working");
+                assert_eq!(st.pending_delivery(1).unwrap().is_some(), !acknowledged);
+                assert!(st.pending_delivery(3).unwrap().is_none());
+                assert_eq!(
+                    st.db
+                        .query_row(
+                            "SELECT agent_id FROM update_deliveries WHERE id=?1",
+                            [delivery],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    1
+                );
+                st.atomic(|st| {
+                    App::inherit_memberships(st, 1, 3)?;
+                    st.set_state(1, "replaced")
+                })
+                .unwrap();
+            }
+            if acknowledged {
+                assert!(app.lock().pending_delivery(3).unwrap().is_none());
+                app.ack_updates(1, delivery).unwrap();
+                assert_eq!(app.ack_updates(3, delivery).unwrap_err().0, 404);
+            } else {
+                assert_eq!(app.ack_updates(1, delivery).unwrap_err().0, 404);
+                assert_eq!(app.wait_updates(3, 1).unwrap(), batch);
+                let recovered = app.lock().atomic(|st| st.take_updates(3)).unwrap();
+                assert!(recovered.contains(&format!("Recovered delivery #{delivery}")));
+                assert!(recovered.contains("handoff notification"));
+                app.ack_updates(3, delivery).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -7046,6 +7840,7 @@ mod tests {
                 .arg("30")
                 .env("ACOM_ID", "1")
                 .env("ACOM_URL", url)
+                .env("ACOM_HOME", &app.home)
                 .process_group(0)
                 .spawn()
                 .unwrap()
@@ -7104,6 +7899,7 @@ mod tests {
                     .arg(&ready)
                     .env("ACOM_ID", "1")
                     .env("ACOM_URL", "http://127.0.0.1:45678")
+                    .env("ACOM_HOME", &app.home)
                     .process_group(0)
                     .spawn()
                     .unwrap(),
@@ -7113,6 +7909,7 @@ mod tests {
                     .arg("30")
                     .env("ACOM_ID", "2")
                     .env("ACOM_URL", "http://127.0.0.1:45680")
+                    .env("ACOM_HOME", &app.home)
                     .process_group(0)
                     .spawn()
                     .unwrap(),
@@ -7184,6 +7981,110 @@ mod tests {
     }
 
     #[test]
+    fn startup_ownership_preflight_preserves_unmarked_workers_and_saved_data() {
+        use std::os::unix::process::CommandExt;
+        struct Worker(std::process::Child);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                run::kill_group(self.0.id(), libc::SIGKILL);
+                let _ = self.0.wait();
+            }
+        }
+        let port = 49152 + std::process::id() % 16000;
+        let url = format!("http://127.0.0.1:{port}");
+        for identity in ["unmarked", "idle-unmarked", "foreign-home", "owned"] {
+            let app = self_change_app();
+            std::fs::write(app.home.join("port"), port.to_string()).unwrap();
+            let ready = app.home.join("preflight-ready");
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf ready > \"$1\"; while :; do /bin/sleep 30; done",
+                    "preflight-worker",
+                ])
+                .arg(&ready)
+                .env("ACOM_ID", "1")
+                .env("ACOM_URL", &url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0);
+            match identity {
+                "owned" => {
+                    command.env("ACOM_HOME", &app.home);
+                }
+                "foreign-home" => {
+                    command.env("ACOM_HOME", app.home.join("another-server"));
+                }
+                _ => {
+                    command.env_remove("ACOM_HOME");
+                }
+            }
+            let mut worker = Worker(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "preflight fixture did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            {
+                let st = app.lock();
+                st.notice(1, "pending notification").unwrap();
+                hold(&st, "preflight-held", 1, Some(now() + 120));
+                st.db
+                    .execute("UPDATE agents SET pid=?1 WHERE id=1", [worker.0.id()])
+                    .unwrap();
+                st.db.execute_batch("INSERT INTO agent_continuations(agent_id,text) VALUES(1,'pending continuation');
+                    INSERT INTO summary_cursors(agent_id,event_id) VALUES(1,0);
+                    INSERT INTO usage_checks(provider,in_flight) VALUES('claude',1);").unwrap();
+                if identity == "idle-unmarked" {
+                    st.db
+                        .execute("UPDATE agents SET state='idle',pid=NULL WHERE id=1", [])
+                        .unwrap();
+                }
+            }
+            let home = app.home.clone();
+            let saved = std::fs::read(home.join("acom.db")).unwrap();
+            drop(app);
+            let reopened = App::open(home.clone(), "http://127.0.0.1:1".into());
+            if identity.ends_with("unmarked") {
+                let error = reopened
+                    .err()
+                    .expect("unmarked live ownership must refuse startup");
+                assert_eq!(error.0, 409);
+                assert!(error.1.contains(&format!("PID {}", worker.0.id())));
+                assert!(error.1.contains("ACOM_HOME is missing"));
+                assert!(worker.0.try_wait().unwrap().is_none());
+                // Entire persisted database is untouched: schema/revisions,
+                // usage flags, PID/state, locks, notices and followups alike.
+                assert_eq!(std::fs::read(home.join("acom.db")).unwrap(), saved);
+            } else {
+                let reopened = reopened.unwrap();
+                assert_eq!(reopened.lock().agent(1).unwrap().state, "paused");
+                if identity == "foreign-home" {
+                    assert!(
+                        worker.0.try_wait().unwrap().is_none(),
+                        "foreign home was signalled"
+                    );
+                } else {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        if let Some(status) = worker.0.try_wait().unwrap() {
+                            assert!(!status.success());
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "owned worker survived cleanup");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn restart_cleans_owned_descendant_after_its_worker_leader_was_reaped() {
         use std::os::unix::process::CommandExt;
         struct OwnedGroup(std::process::Child);
@@ -7202,12 +8103,13 @@ mod tests {
                 std::process::Command::new("/bin/sh")
                     .args([
                         "-c",
-                        "/bin/sleep 30 & printf '%s' \"$!\" > \"$1\"",
+                        "/bin/sh -c 'printf \"%s\" \"$$\" > \"$1\"; while :; do /bin/sleep 30; done' audit-descendant \"$1\" &",
                         "audit-worker",
                     ])
                     .arg(&child_pid)
                     .env("ACOM_ID", "1")
                     .env("ACOM_URL", url)
+                    .env("ACOM_HOME", &app.home)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -7217,11 +8119,19 @@ mod tests {
             );
             let group = worker.0.id();
             assert!(worker.0.wait().unwrap().success());
-            let descendant: u32 = std::fs::read_to_string(child_pid).unwrap().parse().unwrap();
+            // The surviving shell writes readiness after exec and stays alive.
+            // A parent's child PID can otherwise precede an exec/environment gap.
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !run::is_our_agent(descendant, 1, url) && Instant::now() < deadline {
+            let descendant: u32 = loop {
+                if let Some(pid) = std::fs::read_to_string(&child_pid)
+                    .ok()
+                    .and_then(|text| text.parse().ok())
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "descendant did not become ready");
                 std::thread::sleep(Duration::from_millis(5));
-            }
+            };
             assert!(!run::is_our_agent(group, 1, url));
             assert!(run::is_our_agent(descendant, 1, url));
             // Matching environment in a different group must not authorize
@@ -7234,6 +8144,7 @@ mod tests {
                         .arg("30")
                         .env("ACOM_ID", "1")
                         .env("ACOM_URL", "http://127.0.0.1:45678")
+                        .env("ACOM_HOME", app.home.join("another-server"))
                         .process_group(0)
                         .spawn()
                         .unwrap(),

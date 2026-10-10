@@ -99,9 +99,10 @@ async function fixture(run) {
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
       const revisions = Object.fromEntries(['projects','configs','agents','threads','locks','activity'].map(key => [key,revision(key,project?.id)]));
       revisions.settings=hash([data.projects,configs()]);
-      const rev=hash([revisions,data.usage,data.checks]);
+      const restartPaused=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart').length;
+      const rev=hash([revisions,data.usage,data.checks,restartPaused]);
       if(params.get('since')===rev) return send({unchanged:true,revision:rev});
-      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
+      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),restart_paused:restartPaused, limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
     }
     if(req.method==='GET' && pathname==='/catalog') return send(bounded(catalog,params));
     if(req.method==='GET' && pathname==='/settings') {
@@ -184,6 +185,13 @@ async function fixture(run) {
     if (/^\/agents\/\d+\/resume$/.test(req.url)) {
       Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'working',pause_reason:null,problem:null});
       return send({warnings:[]});
+    }
+    if (req.url === '/resume-restart') {
+      if(data.resumeRestartError)return send({status:503,error:data.resumeRestartError});
+      const eligible=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart');
+      const ids=eligible.filter(a=>!data.resumeRestartFailures?.[a.id]).map(a=>a.id);
+      for(const id of ids)Object.assign(data.agents.find(a=>a.id===id),{state:'working',pause_reason:null});
+      return send(data.resumeRestartResult || {ids,warnings:data.resumeRestartWarnings || [],errors:eligible.filter(a=>data.resumeRestartFailures?.[a.id]).map(a=>data.resumeRestartFailures[a.id])});
     }
     if (/^\/agents\/\d+\/pause$/.test(req.url)) {
       Object.assign(data.agents.find(a => a.id === Number(req.url.split('/')[2])), {state:'paused'});
@@ -2746,4 +2754,109 @@ test('a pending source replacement locks configuration without discarding drafts
   data.agents[0].replacement_request=null; await page.evaluate(()=>refresh());
   assert.equal(await model.isEnabled(),true,'reopened editor owns a fresh lock snapshot');
   assert.equal(data.requests.length,0);
+}));
+
+test('Resume restart-paused uses an exact all-project count and leaves manual and limit pauses unchanged', async () => fixture(async (page,data) => {
+  data.pageLimit=1;
+  data.agents=[
+    {id:1,project:1,name:'Manual pause',state:'paused',pause_reason:'user'},
+    {id:2,project:1,name:'Usage pause',state:'paused',pause_reason:'limit'},
+    {id:3,project:2,name:'Restart one',state:'paused',pause_reason:'restart'},
+    {id:4,project:2,name:'Restart two',state:'paused',pause_reason:'restart'},
+    {id:5,project:1,name:'Already crashed',state:'crashed',pause_reason:'restart'},
+    {id:6,project:1,name:'Already done',state:'done',pause_reason:'restart'},
+  ];
+  await manualPolling(page); await reloadPage(page);
+  const button=page.locator('#resume-restart');
+  assert.equal(await button.textContent(),'Resume restart-paused (2 · all projects)');
+  assert.equal(await button.isEnabled(),true);
+  assert.equal(await page.locator('[data-agent]').count(),1,'selected-project previews remain bounded');
+  assert.equal(await page.locator('[data-agent="3"],[data-agent="4"]').count(),0,'no restart-paused preview is needed for the global action');
+  await button.click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Resumed 2 restart-paused agents across all projects.');
+  assert.deepEqual(data.requests,[{url:'/resume-restart',method:'POST',body:{}}]);
+  assert.deepEqual(data.agents.map(a=>[a.id,a.state,a.pause_reason]),[[1,'paused','user'],[2,'paused','limit'],[3,'working',null],[4,'working',null],[5,'crashed','restart'],[6,'done','restart']]);
+  assert.equal(await button.textContent(),'Resume restart-paused (0 · all projects)');
+  assert.equal(await button.isDisabled(),true);
+  assert.equal(await page.locator('#project-select').inputValue(),'1','global resume does not change the selected project');
+  assert.equal(await page.locator('#resume-all').textContent(),'Resume all');
+}));
+
+test('restart-paused counts refresh across projects without disturbing selected text and disable an empty action', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Selected manual pause',state:'paused',pause_reason:'user'},{id:2,project:2,name:'Other project restart',state:'paused',pause_reason:'restart'}];
+  await manualPolling(page); await reloadPage(page);
+  const selected=await selectText(page,'[data-agent="1"] .agent-name span');
+  data.agents[1].pause_reason='limit'; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#resume-restart').textContent(),'Resume restart-paused (0 · all projects)');
+  assert.equal(await page.locator('#resume-restart').isDisabled(),true);
+  await page.evaluate(()=>document.querySelector('#resume-restart').click());
+  assert.equal(data.requests.length,0);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>window.selectedNode===document.querySelector('[data-agent="1"] .agent-name span')),true);
+  data.agents[1].pause_reason='restart'; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#resume-restart').isEnabled(),true);
+  assert.equal(await page.locator('#restart-paused-count').textContent(),'(1 · all projects)');
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-details dt[data-key=pause_reason]').waitFor();
+  assert.equal(await page.locator('#agent-details dt[data-key=pause_reason] + dd').textContent(),'user');
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'the global count and scope fit the mobile header');
+}));
+
+test('restart-paused resume stays disabled during polling and reports request errors without retrying', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Restart pause',state:'paused',pause_reason:'restart'}];
+  data.resumeRestartError='Cannot resume restart-paused agents';
+  await manualPolling(page); await reloadPage(page);
+  const pending=await holdRequest(page,'**/resume-restart');
+  await page.locator('#resume-restart').click(); await pending.started;
+  assert.equal(await page.locator('#resume-restart').isDisabled(),true);
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#resume-restart').isDisabled(),true);
+  await page.evaluate(()=>document.querySelector('#resume-restart').click());
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Cannot resume restart-paused agents');
+  assert.equal(await page.locator('#toast').evaluate(el=>el.classList.contains('error')),true);
+  assert.equal(await page.locator('#resume-restart').isEnabled(),true);
+  await page.evaluate(()=>refresh());
+  assert.equal(data.requests.filter(r=>r.url==='/resume-restart').length,1,'failure and subsequent polling never repeat the mutation');
+  assert.deepEqual([data.agents[0].state,data.agents[0].pause_reason],['paused','restart']);
+}));
+
+test('restart-paused resume exposes partial failures and warnings while retaining unsuccessful agents', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Restart success',state:'paused',pause_reason:'restart'},{id:2,project:2,name:'Restart blocked',state:'paused',pause_reason:'restart'},{id:3,project:1,name:'Manual pause',state:'paused',pause_reason:'user'}];
+  data.resumeRestartWarnings=['Agent 1 is waiting for an active slot'];
+  data.resumeRestartFailures={2:'Agent 2: requested model is disabled'};
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('#resume-restart').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Agent 2: requested model is disabled'));
+  assert.equal(await page.locator('#toast').textContent(),'Resumed 1 restart-paused agents across all projects.\nAgent 1 is waiting for an active slot\nAgent 2: requested model is disabled');
+  assert.equal(await page.locator('#toast').evaluate(el=>el.classList.contains('error')),true);
+  assert.deepEqual(data.agents.map(a=>[a.state,a.pause_reason]),[['working',null],['paused','restart'],['paused','user']]);
+  assert.equal(await page.locator('#restart-paused-count').textContent(),'(1 · all projects)');
+  assert.equal(await page.locator('#resume-restart').isEnabled(),true);
+  assert.equal(data.requests.filter(r=>r.url==='/resume-restart').length,1);
+}));
+
+test('truncated restart-paused results report full failure counts even when the error sample is empty', async () => fixture(async (page,data) => {
+  data.agents=[1,2,3].map(id=>({id,project:1,name:`Restart ${id}`,state:'paused',pause_reason:'restart'}));
+  const error='Agent 3: disabled model '.repeat(100);
+  data.resumeRestartFailures={3:error};
+  data.resumeRestartResult={result_truncated:true,counts:{ids:2,errors:1,warnings:0},ids:[1],errors:[],warnings:[],receipt_event:11};
+  data.receipts={11:{details:{response:{ids:[1,2],errors:[error],warnings:[]}}}};
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('#resume-restart').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('2 resumed, 1 failed'));
+  assert.equal(await page.locator('#toast').textContent(),'Restart-paused agents across all projects: 2 resumed, 1 failed. See the completed-action result below.');
+  assert.equal(await page.locator('#toast').evaluate(el=>el.classList.contains('error')),true);
+  assert.match(await page.locator('#result-notice').textContent(),/ids: 2.*errors: 1.*Result details/);
+  await page.locator('#result-notice [data-record=receipts]').click();
+  await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('Agent 3: disabled model'));
+  assert.deepEqual(JSON.parse(await page.locator('#record-content').textContent()).details.response.errors,[error]);
+  await page.locator('#record-dialog').getByRole('button',{name:'Close'}).click();
+  await page.evaluate(()=>refresh());
+  assert.equal(data.requests.filter(r=>r.url==='/resume-restart').length,1,'reading the receipt and polling do not repeat a partially completed action');
+  assert.deepEqual(data.agents.map(a=>a.state),['working','working','paused']);
 }));

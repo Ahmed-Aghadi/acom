@@ -8,7 +8,7 @@ mod usage;
 use app::{GUIDE, MODELS, hhmm, who};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::exit;
 
 const HELP: &str = "\
@@ -29,6 +29,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   status <text>                           Set your status text
   group <name>                            Put yourself in a group
   done                                    Mark your task finished, then end your turn
+  wait [--timeout duration | --ack ID]     Wait for hook updates (default 60s, maximum 1h)
   agents [--group <name>]                 List agents
   agent <ID>                              One agent's details
   launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done|--replace] [--ack-crashes]
@@ -72,6 +73,7 @@ User commands (they act on the project the current folder is in):
   send --thread <TID> [text]              Post as user
   pause <ID> [--release-locks|--keep-locks]
   pause-all / resume-all
+  resume-restart                          Resume restart-paused agents across all projects
   resume <ID,...>
   close <ID> / reopen <ID>
   lock free <name>                        Release a lock whoever holds it
@@ -99,6 +101,37 @@ struct Cli {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn wait_flags_and_response_validation_do_not_ack_incomplete_delivery() {
+        assert!(Cli::try_parse_from(["acom", "wait"]).is_ok());
+        assert!(Cli::try_parse_from(["acom", "wait", "--ack", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["acom", "wait", "--ack", "0"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "wait", "--ack", "1", "--timeout", "1s"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "resume-restart"]).is_ok());
+        assert_eq!(
+            wait_output(&json!({"delivery_id":1,"text":"notice","timed_out":false}))
+                .unwrap()
+                .1,
+            Some(1)
+        );
+        assert_eq!(
+            wait_output(&json!({"delivery_id":null,"text":"","timed_out":true}))
+                .unwrap()
+                .1,
+            None
+        );
+        for v in [
+            json!({"delivery_id":1,"text":null,"timed_out":false}),
+            json!({"delivery_id":0,"text":"notice","timed_out":false}),
+            json!({"delivery_id":1,"text":"","timed_out":false}),
+            json!({"delivery_id":1,"text":"notice","timed_out":true}),
+            json!({"text":"","timed_out":true}),
+            json!({"delivery_id":null,"text":"notice","timed_out":true}),
+        ] {
+            assert!(wait_output(&v).is_err());
+        }
+    }
 
     #[test]
     fn help_lists_all_thread_state_selectors() {
@@ -396,6 +429,12 @@ enum Cmd {
         name: String,
     },
     Done,
+    Wait {
+        #[arg(long, default_value = "60s")]
+        timeout: String,
+        #[arg(long, conflicts_with = "timeout", value_parser = clap::value_parser!(i64).range(1..))]
+        ack: Option<i64>,
+    },
     Agents {
         #[arg(long)]
         group: Option<String>,
@@ -555,6 +594,7 @@ enum Cmd {
     },
     PauseAll,
     ResumeAll,
+    ResumeRestart,
     Resume {
         ids: String,
     },
@@ -703,11 +743,20 @@ fn call(method: &str, path: &str, body: Option<Value>) -> Value {
 
 /// One API call; an error status comes back as (status, message).
 fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value, (u16, String)> {
+    request_with_timeout(method, path, body, None)
+}
+
+fn request_with_timeout(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value, (u16, String)> {
     let url = format!("{}{path}", base_url());
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(None)
+            .timeout_global(timeout)
             .build(),
     );
     let res = match (method, body) {
@@ -829,6 +878,22 @@ fn duration(s: &str) -> u64 {
         .ok()
         .and_then(|n| n.checked_mul(mult))
         .unwrap_or_else(|| die(&format!("bad duration {s:?}: use e.g. 30s, 5m, 1h")))
+}
+
+fn wait_output(v: &Value) -> Result<(String, Option<i64>), &'static str> {
+    match (
+        v["delivery_id"].as_i64(),
+        v["text"].as_str(),
+        v["timed_out"].as_bool(),
+    ) {
+        (Some(id), Some(text), Some(false)) if id > 0 && !text.is_empty() => {
+            Ok((format!("[acom] Delivery #{id}\n{text}\n"), Some(id)))
+        }
+        (None, Some(""), Some(true)) if v.get("delivery_id").is_some_and(Value::is_null) => {
+            Ok(("[acom] Wait timed out; no new updates.\n".into(), None))
+        }
+        _ => Err("invalid wait response; no delivery was acknowledged"),
+    }
 }
 
 fn encode(s: &str) -> String {
@@ -1201,6 +1266,52 @@ fn main() {
         Cmd::Done => {
             post(&format!("/agents/{}/done", me()), json!({}));
             println!("marked done; end your turn now");
+        }
+        Cmd::Wait { timeout, ack } => {
+            let id = me();
+            let acknowledge = |delivery: i64| {
+                let recover = |error: &str| {
+                    die(&format!(
+                        "{error}. Delivery #{delivery} may still be pending. If you received its text, run `acom wait --ack {delivery}`; otherwise run `acom wait` to retrieve it again by the same ID."
+                    ))
+                };
+                let value = request_with_timeout(
+                    "POST",
+                    &format!("/wait/{id}/ack"),
+                    Some(json!({"delivery_id":delivery})),
+                    Some(std::time::Duration::from_secs(5)),
+                )
+                .unwrap_or_else(|(_, error)| recover(&error));
+                if value["acknowledged"] != true {
+                    recover("invalid acknowledgement response");
+                }
+                value
+            };
+            if let Some(delivery) = ack {
+                acknowledge(delivery);
+                println!("acknowledged delivery #{delivery}");
+                return;
+            }
+            let secs = duration(&timeout);
+            if !(1..=3600).contains(&secs) {
+                die("wait timeout must be between 1s and 1h");
+            }
+            let v = request_with_timeout("POST", &format!("/wait/{id}"), Some(json!({"timeout":secs})), Some(std::time::Duration::from_secs(secs+5)))
+                .unwrap_or_else(|(_, error)| die(&format!("{error}. No delivery was acknowledged. Retry `acom wait` to retrieve any pending delivery.")));
+            let (output, delivery) = wait_output(&v).unwrap_or_else(|e| die(e));
+            let mut stdout = std::io::stdout().lock();
+            if let Err(e) = stdout
+                .write_all(output.as_bytes())
+                .and_then(|_| stdout.flush())
+            {
+                die(&format!(
+                    "can't write wait response: {e}; delivery was not acknowledged"
+                ));
+            }
+            drop(stdout);
+            if let Some(n) = delivery {
+                acknowledge(n);
+            }
         }
         Cmd::Agents { group, page } => {
             let mut path = format!("/agents?{}&{}", scope(), page.query());
@@ -1817,6 +1928,25 @@ fn main() {
         Cmd::ResumeAll => {
             let v = post("/resume-all", user_body(json!({})));
             println!("resumed {} agent(s)", result_count(&v, "ids"));
+        }
+        Cmd::ResumeRestart => {
+            let v = post("/resume-restart", user_body(json!({})));
+            println!(
+                "resumed {} restart-paused agent(s) across all projects",
+                result_count(&v, "ids")
+            );
+            for key in ["warnings", "errors"] {
+                for message in v[key].as_array().into_iter().flatten() {
+                    eprintln!(
+                        "{}: {}",
+                        if key == "errors" { "error" } else { "warning" },
+                        message.as_str().unwrap_or("")
+                    );
+                }
+            }
+            if result_count(&v, "errors") > 0 {
+                exit(1);
+            }
         }
         Cmd::Resume { ids: list } => {
             for id in ids(&list) {

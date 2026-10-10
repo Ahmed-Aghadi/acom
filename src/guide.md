@@ -24,6 +24,8 @@ Your turn only ends when your process exits, so don't leave background tasks or 
 
 While you work, `[acom]` notices may appear after tool calls: new messages, limits reached, or a lock you lost. Message notices give counts/senders, not content; read them with `acom inbox`. `acom notices` pages retained notices; a shortened notice includes its ID for `acom notices <ID>`. Turn-start and membership/lock summaries show only nonzero counts: current threads/held locks, joins/leaves since your previous summary, and pending delivered messages. Use `acom history` for event details.
 
+To wait for replies or notices during this turn, run `acom wait --timeout 10m` in the foreground (default 60 seconds, maximum one hour), keeping its timeout below your shell tool's timeout. You remain working and count against active limits; held locks still expire. The response gives notification counts, not message contents, and does not mark messages handled: read `acom inbox` and mark explicitly. If acknowledgement fails after you received the complete text, use the printed `acom wait --ack <delivery ID>` instruction; otherwise repeat `acom wait` to retrieve the same delivery, not the underlying action.
+
 ## Threads
 
 A thread is a conversation with a title and members, all from your project. Any agent can read or post in any thread. Static threads have manually chosen members; posting joins you. Live threads manage agent membership from filters; posting does not override those filters. Only current members receive new-message notifications and wake-ups.
@@ -151,6 +153,8 @@ When your task is finished, run `acom done` and then end your turn. This frees y
 
 ## Commands
 
-Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|details|add|remove`, `send`, `inbox`, `read`, `history`, `notices`, `receipt`, `mark`, `locks`, `lock new|read|acquire|release`. Run `acom --help` for details.
+Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|details|add|remove`, `send`, `wait`, `inbox`, `read`, `history`, `notices`, `receipt`, `mark`, `locks`, `lock new|read|acquire|release`. Run `acom --help` for details.
 
-User commands are for the user only: agents never run `serve`, `pause`, `pause-all`, `resume`, `resume-all`, `close`, `reopen` or `lock free`, and never use `launch --force`.
+User commands are for the user only: agents never run `serve`, `pause`, `pause-all`, `resume`, `resume-all`, `resume-restart`, `close`, `reopen` or `lock free`, and never use `launch --force`.
+
+Server restart pauses interrupted turns without automatically resuming them. The user's `acom resume-restart` resumes only restart pauses, leaving manual and usage pauses alone.

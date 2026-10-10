@@ -3,10 +3,12 @@
 use crate::app::{App, Fail, Proc, R, St, now};
 use crate::harness::{self, Event, Launch};
 use rusqlite::params;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +29,115 @@ pub fn is_our_agent(pid: u32, id: i64, url: &str) -> bool {
     let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
     vars.contains(&format!("ACOM_ID={id}").as_bytes())
         && vars.contains(&format!("ACOM_URL={url}").as_bytes())
+}
+
+/// Scan once for registered agents' tools, including separate process groups.
+pub fn server_tools(agent_ids: &HashSet<i64>, url: &str, home: &Path) -> Vec<(i64, u32)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let server_pid = std::process::id();
+    let address = format!("ACOM_URL={url}");
+    let home_marker = home_marker(home);
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            if pid == 0 || pid > i32::MAX as u32 || pid == server_pid {
+                return None;
+            }
+            let env = std::fs::read(entry.path().join("environ")).ok()?;
+            let id = server_tool_id(&env, address.as_bytes(), &home_marker)?;
+            agent_ids.contains(&id).then_some((id, pid))
+        })
+        .collect()
+}
+
+/// A matching worker without a home marker cannot be safely owned or ignored.
+pub fn unmarked_tools(agent_ids: &HashSet<i64>, url: &str) -> Vec<(i64, u32)> {
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let address = format!("ACOM_URL={url}");
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            if pid == 0 || pid > i32::MAX as u32 || pid == std::process::id() {
+                return None;
+            }
+            let env = std::fs::read(entry.path().join("environ")).ok()?;
+            let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
+            if !vars.contains(&address.as_bytes())
+                || vars.iter().any(|v| v.starts_with(b"ACOM_HOME="))
+            {
+                return None;
+            }
+            let id = vars.iter().find_map(|v| {
+                std::str::from_utf8(v.strip_prefix(b"ACOM_ID=")?)
+                    .ok()?
+                    .parse::<i64>()
+                    .ok()
+            })?;
+            (id > 0 && agent_ids.contains(&id)).then_some((id, pid))
+        })
+        .collect()
+}
+
+fn home_marker(home: &Path) -> Vec<u8> {
+    let mut marker = b"ACOM_HOME=".to_vec();
+    marker.extend_from_slice(home.as_os_str().as_bytes());
+    marker
+}
+
+fn server_tool_id(env: &[u8], address: &[u8], home: &[u8]) -> Option<i64> {
+    let vars = env.split(|&b| b == 0);
+    if !vars.clone().any(|v| v == address) || !vars.clone().any(|v| v == home) {
+        return None;
+    }
+    vars.filter_map(|v| {
+        std::str::from_utf8(v.strip_prefix(b"ACOM_ID=")?)
+            .ok()?
+            .parse::<i64>()
+            .ok()
+    })
+    .find(|id| *id > 0)
+}
+
+fn matches_server_tool(pid: u32, id: i64, address: &[u8], home: &[u8]) -> bool {
+    id > 0
+        && pid > 0
+        && pid <= i32::MAX as u32
+        && pid != std::process::id()
+        && std::fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .and_then(|env| server_tool_id(&env, address, home))
+            == Some(id)
+}
+
+pub fn is_server_tool(pid: u32, id: i64, url: &str, home: &Path) -> bool {
+    matches_server_tool(
+        pid,
+        id,
+        format!("ACOM_URL={url}").as_bytes(),
+        &home_marker(home),
+    )
+}
+
+pub fn kill_server_tools(tools: &[(i64, u32)], url: &str, home: &Path, sig: i32) {
+    let address = format!("ACOM_URL={url}");
+    let home_marker = home_marker(home);
+    for &(id, pid) in tools {
+        // Revalidate after waiting: never signal an unrelated reused PID.
+        if matches_server_tool(pid, id, address.as_bytes(), &home_marker) {
+            unsafe {
+                libc::kill(pid as i32, sig);
+            }
+        }
+    }
 }
 
 /// A reaped leader can leave owned tools in its process group. Validate a live
@@ -133,6 +244,9 @@ pub(crate) fn prepare_turn(
     prompt: &str,
     replaces: Option<i64>,
 ) -> R<PreparedTurn> {
+    if st.shutting_down {
+        return Err(crate::app::conflict("the server is stopping"));
+    }
     if st.db.is_autocommit() {
         return Err(crate::app::bad("turn preparation requires a transaction"));
     }
@@ -242,6 +356,7 @@ pub(crate) fn prepare_turn(
     cmd.current_dir(project_dir)
         .env("ACOM_ID", id.to_string())
         .env("ACOM_URL", &app.url)
+        .env("ACOM_HOME", &app.home)
         .env("PATH", path)
         .stdout(Stdio::piped())
         .stderr(err)
@@ -641,6 +756,8 @@ mod tests {
         Arc::new(App {
             st: Mutex::new(St {
                 db,
+                shutting_down: false,
+                waiting_updates: Default::default(),
                 queues: Default::default(),
                 procs: [(
                     1,
@@ -701,6 +818,89 @@ mod tests {
         assert_eq!(
             app.lock().procs[&1].failure.as_deref(),
             Some("actual request rejected")
+        );
+    }
+
+    #[test]
+    fn server_tool_cleanup_matches_registered_identity_and_revalidates_before_signalling() {
+        let url = format!("http://127.0.0.1:65530/owned-{}", std::process::id());
+        let home = PathBuf::from(format!("/owned/run-tools/{}", std::process::id()));
+        let spawn = |id: i64, address: &str, home: &Path| {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .env("ACOM_ID", id.to_string())
+                .env("ACOM_URL", address)
+                .env("ACOM_HOME", home)
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn(1, &url, &home);
+        let mut second = spawn(2, &url, &home);
+        let mut unregistered = spawn(3, &url, &home);
+        let mut foreign = spawn(1, "http://127.0.0.1:1", &home);
+        let mut foreign_home = spawn(1, &url, Path::new("/owned/another-server"));
+        let mut missing_home = std::process::Command::new("sleep")
+            .arg("30")
+            .env("ACOM_ID", "1")
+            .env("ACOM_URL", &url)
+            .env_remove("ACOM_HOME")
+            .spawn()
+            .unwrap();
+        let mut found = server_tools(&HashSet::from([1, 2]), &url, &home);
+        found.sort_unstable();
+        let expected = vec![(1, first.id()), (2, second.id())];
+        let identity_matches = is_server_tool(first.id(), 1, &url, &home)
+            && !is_server_tool(first.id(), 2, &url, &home)
+            && !is_server_tool(foreign.id(), 1, &url, &home)
+            && !is_server_tool(foreign_home.id(), 1, &url, &home)
+            && !is_server_tool(missing_home.id(), 1, &url, &home)
+            && !is_server_tool(std::process::id(), 1, &url, &home);
+        kill_server_tools(
+            &[
+                (1, first.id()),
+                (1, foreign.id()),
+                (1, foreign_home.id()),
+                (1, missing_home.id()),
+                (99, second.id()),
+                (1, 0),
+                (1, std::process::id()),
+            ],
+            &url,
+            &home,
+            libc::SIGKILL,
+        );
+        let first_stopped = !first.wait().unwrap().success();
+        let others_alive = [
+            &mut second,
+            &mut unregistered,
+            &mut foreign,
+            &mut foreign_home,
+            &mut missing_home,
+        ]
+        .into_iter()
+        .all(|child| child.try_wait().unwrap().is_none());
+        for child in [
+            &mut second,
+            &mut unregistered,
+            &mut foreign,
+            &mut foreign_home,
+            &mut missing_home,
+        ] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(
+            found, expected,
+            "foreign URLs, homes, missing markers and unregistered IDs are excluded"
+        );
+        assert!(first_stopped);
+        assert!(
+            identity_matches,
+            "fresh group guards require the same full ownership identity"
+        );
+        assert!(
+            others_alive,
+            "each positive PID is revalidated, not signalled by snapshot alone"
         );
     }
 
