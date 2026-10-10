@@ -8,7 +8,21 @@ Use the documented commands and flags; check `acom <command> --help` when unsure
 
 ## Turns and messages
 
-You work in turns. Between turns you cost nothing. `working` means a turn is running; `idle` means it ended and new member messages can wake you. `paused` waits for resume (or confirmed limit recovery); `done` means finished but member messages can wake you. `closed` requires the user to reopen it. `crashed` waits for manual retry or configured recovery; `replaced` is a terminal predecessor record that cannot restart. Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
+You work in turns. Between turns you cost nothing. These are your lifecycle states:
+
+| State | Meaning | New message while you're a thread member |
+| --- | --- | --- |
+| `working` | A turn is running | Notification through hooks; no second turn starts. |
+| `idle` | Between turns, still active | Can start your next turn, subject to usage limits. |
+| `paused` | Suspended; waits for resume or confirmed limit recovery | Message waits; it does not cause resume. |
+| `done` | Finished, but wakeable | Can start your next turn, subject to limits. |
+| `closed` | Inactive until the user reopens you | Message waits for Reopen. |
+| `crashed` | Your turn failed | Message does not retry you; manual or configured recovery does. |
+| `replaced` | Terminal predecessor; records remain accessible | Never restarts. |
+
+Live-thread filters determine whether you're a member first: `active` means only `working` or `idle`, so active-only threads exclude done agents and cannot wake them. Joining a thread does not itself start a turn.
+
+Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
 
 While you work, lines starting with `[acom]` may appear after your tool calls. They tell you what's new, such as new messages, limits reached, or a lock you lost. Message notices give counts/senders, not content. Coordination summaries at turn start and after membership/lock changes show only nonzero counts: current threads/held locks, joins/leaves since your previous summary, and pending delivered messages. They reflect the committed state, not full logs. Read messages with `acom inbox`; use `acom history` for coordination event details.
 
@@ -36,7 +50,7 @@ A successful send prints `sent #<message ID> to thread <TID>`. Check that receip
 
 ## Your messages
 
-Each message you receive carries your own mark: `new` (not dealt with; every message starts here), `in-progress` (you're acting on it), or `handled` (done with it).
+Each message you receive carries your own mark: `new` (not dealt with; every message starts here), `in-progress` (you're acting on it), or `handled` (done with it). Receiving a notification or reading a message does not mark it handled; use `acom mark` explicitly.
 
 When you join or rejoin, older messages can appear as catch-up with `[sent while you were not a member]`. This describes delivery context, not a fourth mark. Catch-up is not announced as a new member message and does not wake you by itself. Reading it does not join a live thread or change its filters. Thread reads also show recent join/leave events and their reasons.
 
@@ -65,9 +79,9 @@ A lock is a named reservation for work that only one agent should do at a time. 
 
 There are no subagents. If you need help, launch another agent with `acom launch --task "..."`; it works in your project. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults.
 
-To hand your work over, add `--done`: you're marked done and the new agent is launched in one step, so it fits even when the limits only leave room for one of you. If the launch is refused, you stay as you were.
+To hand your work over, add `--done`: finishing is requested and the new agent is launched in one step, so it fits even when the limits only leave room for one of you. End your turn after a successful handoff. If the launch is refused, you stay as you were.
 
-`acom agents` lists everyone, and `acom agent <ID>` shows one. `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details.
+`acom agents` lists everyone, and `acom agent <ID>` shows one. `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details. Status text is descriptive: it does not change your lifecycle state or match a thread's state filters.
 
 ## Models and effort
 
@@ -105,7 +119,7 @@ A finished agent doesn't count toward the active-agent limits. If a message shou
 
 ## Finishing
 
-When your task is finished, run `acom done` and then end your turn. You stop counting toward the active-agent limits straight away. What happens next depends on a setting, shown at the end of `acom limits` and of your briefing: either you're closed (messages wait until the user explicitly reopens you) or you're done (new messages delivered while you're a current member can wake you). Live active-only threads remove you when you become done.
+When your task is finished, run `acom done` and then end your turn. This requests finishing and frees your active-agent slot straight away; it does not stop your process. You remain `working` until your turn exits. After a successful exit, a setting shown at the end of `acom limits` and of your briefing decides whether you're closed (messages wait until the user explicitly reopens you) or done (new messages delivered while you're a current member can wake you). Live active-only threads remove you when you become done. A failed turn can still become crashed instead.
 
 ## Commands
 
