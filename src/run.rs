@@ -137,6 +137,20 @@ pub(crate) fn prepare_turn(
     // or rendering a prompt. Failed starts roll all of this back, including
     // notification/history cursors. The mutex also prevents concurrent posts.
     st.expire_locks()?;
+    if st
+        .db
+        .execute("DELETE FROM agent_continuations WHERE agent_id=?1", [id])?
+        > 0
+    {
+        st.event(
+            a.project,
+            Some(id),
+            None,
+            "agent.continuation-started",
+            "acom",
+            serde_json::json!({"model":a.model,"effort":a.effort}),
+        )?;
+    }
     st.set_state(id, "working")?;
     let updates = st.take_updates(id)?;
     let summary = st.coordination_summary(id, true)?;
@@ -221,12 +235,12 @@ pub(crate) fn prepare_turn(
             params![id, pid])?;
         if let Some(old) = replaces {
             let changed = st.db.execute(
-                "UPDATE agents SET state='replaced' WHERE id=?1 AND state='crashed'",
+                "UPDATE agents SET state='replaced' WHERE id=?1 AND state IN ('crashed','done')",
                 [old],
             )?;
             if changed != 1 {
                 return Err(crate::app::conflict(
-                    "replacement predecessor is not crashed",
+                    "replacement predecessor is not crashed or awaiting handoff",
                 ));
             }
             st.event(
@@ -291,6 +305,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             failure: None,
         },
     );
+    st.reaped.remove(&id);
     if let (Some(text), Some(mut stdin)) = (turn.input.take(), child.stdin.take()) {
         thread::spawn(move || {
             let _ = stdin.write_all(text.as_bytes());
@@ -312,7 +327,18 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             let (app, harness, done) = (app.clone(), harness.clone(), done.clone());
             thread::spawn(move || follow_side_file(&app, id, &harness, resume, &done))
         };
-        if let Some(out) = child.stdout.take() {
+        let out = child.stdout.take();
+        // Reap independently of stdout: a descendant can otherwise keep its
+        // inherited pipe open after the harness exits and stall a handoff forever.
+        let waiter = {
+            let app = app.clone();
+            thread::spawn(move || {
+                let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                cleanup_failed_group(&app, id, pid, ok);
+                ok
+            })
+        };
+        if let Some(out) = out {
             let raw = log_path(&app, id, "jsonl");
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 append(&raw, &line);
@@ -321,7 +347,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
                 }
             }
         }
-        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        let ok = waiter.join().unwrap_or(false);
         let exit_error = (!ok)
             .then(|| last_line(&log_path(&app, id, "err"), err_from))
             .flatten();
@@ -349,12 +375,26 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
 
 /// Failed/stopped turns must not leave old background tools running into recovery.
 fn cleanup_failed_group(app: &App, id: i64, pid: u32, ok: bool) {
-    let kill = app
-        .lock()
+    let mut st = app.lock();
+    let current = st.procs.get(&id).is_some_and(|p| p.pid == pid);
+    if current {
+        st.reaped.insert(id);
+    }
+    let kill = st
         .procs
         .get(&id)
         .is_some_and(|p| p.pid == pid && (!ok || p.failure.is_some() || p.stopping));
-    if kill {
+    let followup = current
+        && st
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_handoffs WHERE agent_id=?1)
+                OR EXISTS(SELECT 1 FROM agent_continuations WHERE agent_id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+    if kill || followup {
         kill_group(pid, libc::SIGKILL);
     }
 }
@@ -475,6 +515,7 @@ mod tests {
                 )]
                 .into(),
                 over_soft: Default::default(),
+                reaped: Default::default(),
             }),
             cv: Condvar::new(),
             home: std::env::temp_dir().join(format!("acom-worker-test-{}", harness::new_uuid())),
@@ -563,5 +604,21 @@ mod tests {
             );
             assert!(!status.success());
         }
+    }
+
+    #[test]
+    fn late_failure_cleans_a_reaped_workers_remaining_group() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let app = test_app(pid);
+        cleanup_failed_group(&app, 1, pid, true);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(app.lock().reaped.contains(&1));
+        app.fail_turn(1, "late buffered failure").unwrap();
+        assert!(!child.wait().unwrap().success());
     }
 }

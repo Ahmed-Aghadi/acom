@@ -21,7 +21,8 @@ Agents never run user commands.
 Agent commands (your ID comes from ACOM_ID; they act on your project):
   guide                                   Print the guide for agents
   models [--catalog]                     Model/provider guidance, or IDs and effort choices
-  configure [ID] [--model m] [--effort e] Set next-turn model/effort (agents: themselves only)
+  configure [ID] [--model m] [--effort e] [--continue text] [--ack-crashes]
+                                          Set next-turn model/effort; optionally queue one turn
   me                                      Your details, usage and locks
   limits                                  Limits and current usage
   status <text>                           Set your status text
@@ -29,9 +30,10 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   done                                    Mark your task finished, then end your turn
   agents [--group <name>]                 List agents
   agent <ID>                              One agent's details
-  launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done]
+  launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done|--replace] [--ack-crashes]
                                           Launch a helper agent; --done also marks you done,
                                           so you hand over without needing a second slot
+                                          --replace queues a terminal cross-provider handoff
   threads                                 List threads
   thread new --title <text> [--members <ID or selector,...> | --watch <states,group:name,...>] [--include-user]
   thread read <TID>                       A thread's full history
@@ -150,6 +152,44 @@ mod cli_tests {
             "\n[membership at send time unknown]"
         );
     }
+
+    #[test]
+    fn continuation_and_replacement_flags_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "acom",
+            "configure",
+            "--effort",
+            "high",
+            "--continue",
+            "Review remaining files",
+            "--ack-crashes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Configure {
+                continuation: Some(_),
+                ack_crashes: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["acom", "configure", "--continue"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "launch", "--replace", "--done"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "launch", "--replace", "--force"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "acom",
+                "launch",
+                "--replace",
+                "--harness",
+                "claude",
+                "--task",
+                "summary",
+                "--ack-crashes"
+            ])
+            .is_ok()
+        );
+    }
 }
 
 #[derive(Subcommand)]
@@ -165,6 +205,10 @@ enum Cmd {
         model: Option<String>,
         #[arg(long)]
         effort: Option<String>,
+        #[arg(long = "continue")]
+        continuation: Option<String>,
+        #[arg(long)]
+        ack_crashes: bool,
     },
     Me,
     Limits,
@@ -199,6 +243,10 @@ enum Cmd {
         force: bool,
         #[arg(long)]
         done: bool,
+        #[arg(long, conflicts_with_all = ["done", "force"])]
+        replace: bool,
+        #[arg(long)]
+        ack_crashes: bool,
     },
     Threads,
     Thread {
@@ -562,12 +610,21 @@ fn print_agent(a: &Value) {
             .map(|s| format!(" ({s})"))
             .unwrap_or_default()
     );
+    let running = &a["running_configuration"];
     println!(
-        "Running: {} / {} / effort {}",
+        "Configuration for next turn: {} / {} / effort {}",
         a["harness"].as_str().unwrap_or(""),
         a["model"].as_str().unwrap_or(""),
         a["effort"].as_str().unwrap_or("")
     );
+    if running.is_object() {
+        println!(
+            "Current turn: {} / {} / effort {}",
+            a["harness"].as_str().unwrap_or(""),
+            running["model"].as_str().unwrap_or(""),
+            running["effort"].as_str().unwrap_or("")
+        );
+    }
     println!(
         "Launched by {} at {}",
         sender(&a["launched_by"]),
@@ -598,11 +655,32 @@ fn print_agent(a: &Value) {
             println!("{label}: {path}");
         }
     }
-    if let Some(new) = a["retry"]["replacement"].as_i64() {
-        println!("Retry replacement: agent {new}");
+    if let Some(new) = a["replacement"]
+        .as_i64()
+        .or_else(|| a["retry"]["replacement"].as_i64())
+    {
+        println!("Replacement: agent {new}");
     }
     if let Some(why) = a["retry"]["blocked"].as_str() {
         println!("Retry waiting/stopped: {why}");
+    }
+    if let Some(text) = a["continuation"]["text"].as_str() {
+        println!("Queued continuation: {text}");
+        if let Some(why) = a["continuation"]["blocked"].as_str() {
+            println!("Continuation waiting: {why}");
+        }
+    }
+    if let Some(harness) = a["replacement_request"]["harness"].as_str() {
+        println!(
+            "Queued replacement: {harness}/{}",
+            a["replacement_request"]["model"].as_str().unwrap_or("")
+        );
+        if let Some(why) = a["replacement_request"]["blocked"].as_str() {
+            println!("Replacement waiting: {why}");
+        }
+    }
+    if let Some(why) = a["problem"].as_str() {
+        println!("Previous error: {why}");
     }
 }
 
@@ -653,7 +731,13 @@ fn main() {
                 print!("{MODELS}");
             }
         }
-        Cmd::Configure { id, model, effort } => {
+        Cmd::Configure {
+            id,
+            model,
+            effort,
+            continuation,
+            ack_crashes,
+        } => {
             let by = my_id().unwrap_or(0);
             let id = id.or_else(my_id).unwrap_or_else(|| die("give an agent ID"));
             if by > 0 && id != by {
@@ -661,9 +745,17 @@ fn main() {
             }
             post(
                 "/agent-config",
-                json!({ "id": id, "agent": by, "model": model, "effort": effort }),
+                json!({ "id": id, "agent": by, "model": model, "effort": effort, "continuation":continuation,"ack_crashes":ack_crashes }),
             );
-            println!("Configuration saved for the next turn; current tools are unchanged.");
+            if continuation.is_some() {
+                println!(
+                    "Configuration saved; one continuation queued. End this turn without acom done. Current tools are unchanged."
+                );
+            } else {
+                println!(
+                    "Configuration saved for the next turn; this does not schedule a turn. Current tools are unchanged."
+                );
+            }
         }
         Cmd::Me => print_agent(&get(&format!("/agents/{}", me()))),
         Cmd::Limits => println!(
@@ -706,9 +798,22 @@ fn main() {
             group,
             force,
             done,
+            replace,
+            ack_crashes,
         } => {
             let task = task.unwrap_or_else(|| text_or_stdin(vec![]));
-            let mut b = json!({ "task": task, "harness": harness, "model": model, "effort": effort, "name": name, "group": group, "force": force, "done": done });
+            let mut b = json!({ "task": task, "harness": harness, "model": model, "effort": effort, "name": name, "group": group, "force": force, "done": done, "ack_crashes":ack_crashes });
+            if replace {
+                let id = me();
+                let v = post(&format!("/agents/{id}/replacement"), b);
+                println!(
+                    "Replacement queued; end this turn without acom done. You become replaced only after it starts."
+                );
+                for warning in v["warnings"].as_array().into_iter().flatten() {
+                    println!("{}", warning.as_str().unwrap_or(""));
+                }
+                return;
+            }
             match my_id() {
                 Some(id) => b["agent"] = json!(id),
                 None => {

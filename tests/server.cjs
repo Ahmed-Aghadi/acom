@@ -22,6 +22,14 @@ async function until(check, label, timeout = 10000) {
   throw new Error(`Timed out: ${label}`);
 }
 
+async function freePort() {
+  const probe=net.createServer();
+  await new Promise(resolve=>probe.listen(0,'127.0.0.1',resolve));
+  const port=probe.address().port;
+  await new Promise(resolve=>probe.close(resolve));
+  return port;
+}
+
 test('single server scopes projects, preserves settings and supervises first/resumed turns', async () => {
   // acom prepends its executable directory to child PATH. Reject any client
   // there before starting the isolated server, even when ACOM_BINARY is overridden.
@@ -62,15 +70,40 @@ process.stdin.on('end', async () => {
   const model = args[args.indexOf(claude ? '--model' : '-m') + 1];
   const previous=fs.existsSync(path.join(process.env.ACOM_HOME,'runs.jsonl')) ? fs.readFileSync(path.join(process.env.ACOM_HOME,'runs.jsonl'),'utf8').split('\\n').slice(0,-1).map(JSON.parse).filter(r=>r.id===id) : [];
   const task=previous[0]?.prompt || prompt;
-  const membership_snapshot=task.includes('MEMBERSHIP_HOLD_TEST') || task.includes('Project B defaults') ? {
+  const membership_snapshot=task.includes('MEMBERSHIP_HOLD_TEST') || task.includes('NEXT_TURN_') || task.includes('Project B defaults') ? {
     state:(await fetch(process.env.ACOM_URL+'/agents/'+id).then(r=>r.json())).state,
     threads:(await fetch(process.env.ACOM_URL+'/threads?agent='+id).then(r=>r.json())).map(t=>t.id)
   } : undefined;
   fs.appendFileSync(path.join(process.env.ACOM_HOME, 'runs.jsonl'), JSON.stringify({ id, args, prompt, model, pid:process.pid, at:Date.now(), harness:claude?'claude':'codex', cwd: process.cwd(), resume, membership_snapshot }) + '\\n');
   const session = claude ? args[args.indexOf(resume?'--resume':'--session-id')+1] : resume ? args.at(-2) : crypto.randomUUID();
-  console.log(JSON.stringify(claude ? {type:'system',subtype:'init',session_id:session} : { type: 'thread.started', thread_id: session }));
-  const sessions=path.join(process.env.CODEX_HOME,'sessions','2026','10','08'); fs.mkdirSync(sessions,{recursive:true});
-  fs.appendFileSync(path.join(sessions,'rollout-'+session+'.jsonl'),JSON.stringify({type:'session_meta',payload:{id:session}})+'\\n');
+  if(!task.includes('NEXT_TURN_NO_SESSION')) {
+    console.log(JSON.stringify(claude ? {type:'system',subtype:'init',session_id:session} : { type: 'thread.started', thread_id: session }));
+    const sessions=path.join(process.env.CODEX_HOME,'sessions','2026','10','08'); fs.mkdirSync(sessions,{recursive:true});
+    fs.appendFileSync(path.join(sessions,'rollout-'+session+'.jsonl'),JSON.stringify({type:'session_meta',payload:{id:session}})+'\\n');
+  }
+  if(task.includes('LATE_FAILURE_PIPE_TEST')) {
+    const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify("setTimeout(()=>console.log(JSON.stringify({type:'turn.failed',error:{message:'Delayed background failure'}})),500);setInterval(()=>{},1000)")}],{stdio:['ignore','inherit','ignore']});
+    fs.writeFileSync(path.join(process.env.ACOM_HOME,'late-failure-child-'+id),String(child.pid)); child.unref(); return;
+  }
+  if (task.includes('NEXT_TURN_') && !claude) {
+    if(previous.length===0) {
+      if(task.includes('NEXT_TURN_REPLACE_CHILD') || task.includes('NEXT_TURN_LATE_')) {
+        const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore','inherit','ignore']});
+        fs.writeFileSync(path.join(process.env.ACOM_HOME,'replacement-child-'+id),String(child.pid)); child.unref();
+      }
+      if(!task.includes('NEXT_TURN_LATE_')) while(!fs.existsSync(path.join(process.env.ACOM_HOME,'release-'+id))) await new Promise(resolve=>setTimeout(resolve,25));
+      if(task.includes('NEXT_TURN_FAIL')) { console.log(JSON.stringify({type:'turn.failed',error:{message:'Controlled first-turn failure'}})); return; }
+    } else {
+      const inbox=await fetch(process.env.ACOM_URL+'/inbox/'+id+'?mark=new').then(r=>r.json());
+      const ids=inbox.filter(m=>!m.outside_membership).map(m=>m.id);
+      if(ids.length) await fetch(process.env.ACOM_URL+'/marks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:id,ids,mark:'handled'})});
+    }
+    if(previous.length || task.includes('NEXT_TURN_DONE')) {
+      await new Promise(resolve=>setTimeout(resolve,300));
+      await fetch(process.env.ACOM_URL+'/agents/'+id+'/done',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    }
+    console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:2}})); return;
+  }
   if (prompt.includes('CRASH_TEST') && !resume) { process.exitCode=1; return; }
   if (prompt.includes('REROUTE_TEST') && !resume) console.log(JSON.stringify({ type: 'model_reroute', from_model: 'gpt-6.1-sol', to_model: 'gpt-other', reason: 'high_risk_cyber_activity' }));
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
@@ -106,16 +139,14 @@ process.stdin.on('end', async () => {
 }
 `, { mode: 0o755 });
   fs.copyFileSync(path.join(bin,'codex'),path.join(bin,'claude'));
-  const probe = net.createServer();
-  await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
-  const port = probe.address().port;
-  await new Promise(resolve => probe.close(resolve));
-  const url = `http://127.0.0.1:${port}`;
+  let port=await freePort();
+  let url=`http://127.0.0.1:${port}`;
   // No inherited PATH: a missing fake client must never fall through to a real provider.
   const env = { ...process.env, ACOM_HOME: home, CODEX_HOME:path.join(root,'codex'), CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: bin };
   delete env.ACOM_ID; delete env.ACOM_URL; delete env.CLAUDE_CODE_OAUTH_TOKEN;
   let server, stderr = '';
-  const start = async () => {
+  const start = async (nextPort=port) => {
+    port=nextPort; url=`http://127.0.0.1:${port}`;
     server = spawn(binary, ['serve', '--port', String(port)], { env, stdio: ['ignore', 'ignore', 'pipe'] });
     server.stderr.on('data', chunk => stderr += chunk);
     await until(async () => {
@@ -220,6 +251,7 @@ process.stdin.on('end', async () => {
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already running/);
     const lifecycleProject=await lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults});
+    const followupProject=await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr,otherProject:lifecycleProject.id});
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
     const boundedLocks=structuredClone(defaults); boundedLocks.max_lock_ttl_secs=60;
     await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
@@ -460,6 +492,20 @@ process.stdin.on('end', async () => {
     await finished(diagnosticFailure.id,'crashed');
     assert.equal((await api('GET',`/agents/${diagnosticFailure.id}`)).problem,'its process exited with an error','a warning alone is not invented as the cause of a nonzero exit');
     await api('POST',`/agents/${diagnosticFailure.id}/close`,{});
+
+    // The parent already exited successfully when its stdout-owning descendant
+    // reports failure. That late frame must stop the pipe owner, not hang forever.
+    const lateFailure=await api('POST','/agents',{project:b.id,harness:'codex',task:'LATE_FAILURE_PIPE_TEST'});
+    const lateChildFile=path.join(home,`late-failure-child-${lateFailure.id}`);
+    await until(()=>fs.existsSync(lateChildFile),'late-failure descendant starts');
+    const lateChild=Number(fs.readFileSync(lateChildFile,'utf8'));
+    await finished(lateFailure.id,'crashed');
+    assert.equal((await api('GET',`/agents/${lateFailure.id}`)).problem,'Delayed background failure');
+    assert.equal(fs.existsSync(`/proc/${runs().find(r=>r.id===lateFailure.id).pid}`),false,'successful parent was reaped despite the inherited stdout pipe');
+    await until(()=>!fs.existsSync(`/proc/${lateChild}/stat`) || fs.readFileSync(`/proc/${lateChild}/stat`,'utf8').includes(') Z '),'late-failure descendant is stopped');
+    await new Promise(resolve=>setTimeout(resolve,1100));
+    assert.equal(runs().filter(r=>r.id===lateFailure.id).length,1,'no configured rule means no invented automatic retry');
+    await api('POST',`/agents/${lateFailure.id}/close`,{});
 
     // Duplicate error frames and the real cyber-risk wording are a single crash.
     const cyber=await api('POST','/agents',{project:a.id,harness:'codex',task:'CYBER_FAILURE_TEST'});
@@ -767,15 +813,375 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET', '/configs')).find(c => c.id === saved.id).projects, [a.id, b.id]);
     for (const p of [a.id, b.id]) await api('PUT', `/projects/${p}/config`, { config: mine.id });
     await api('POST', `/configs/${saved.id}/remove`, {});
-    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,lifecycleProject.id].sort((a,b)=>a-b));
+    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,lifecycleProject.id,followupProject.id].sort((a,b)=>a-b));
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
     assert.equal(fs.existsSync(path.join(second, '.acom')), false);
-    assert.equal(stderr, '');
+    assert.equal(stderr.replaceAll('tick: database: TEST_HANDOFF_CANCEL_FAILURE\n',''),'','only the deliberately injected cancellation failure may reach stderr');
   } finally {
     await stop();
+    // Failed assertions can leave a deliberately held fake turn alive after
+    // SIGTERM. Validate its temp home and fake path before stopping its group.
+    for(const {pid} of runs()) {
+      try {
+        const vars=fs.readFileSync(`/proc/${pid}/environ`,'utf8').split('\0');
+        const args=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').split('\0');
+        if(vars.includes(`ACOM_HOME=${home}`) && args.some(arg=>arg===path.join(bin,'codex') || arg===path.join(bin,'claude'))) process.kill(-pid,'SIGKILL');
+      } catch(error) { if(!['ENOENT','ESRCH'].includes(error.code)) throw error; }
+    }
+    for(const name of fs.readdirSync(home).filter(name=>/^(replacement|late-failure)-child-\d+$/.test(name))) {
+      try {
+        const pid=Number(fs.readFileSync(path.join(home,name),'utf8'));
+        const vars=fs.readFileSync(`/proc/${pid}/environ`,'utf8').split('\0');
+        const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
+        const group=Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[2]);
+        if(vars.includes(`ACOM_HOME=${home}`) && runs().some(run=>run.pid===group)) process.kill(-group,'SIGKILL');
+      } catch(error) { if(!['ENOENT','ESRCH'].includes(error.code)) throw error; }
+    }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors,otherProject}) {
+  const folder=path.join(root,'followups'); fs.mkdirSync(folder);
+  const project=await api('POST','/projects',{path:folder});
+  const config=structuredClone(defaults);
+  config.done_closes=false; config.auto_resume=false;
+  config.allow_agent_model_change=true; config.allow_agent_effort_change=true;
+  const settings=custom=>api('PUT',`/projects/${project.id}/config`,{custom});
+  await settings(config);
+  const view=id=>api('GET',`/agents/${id}`);
+  const captures=id=>runs().filter(r=>r.id===id);
+  const events=async id=>(await api('GET',`/history?project=${project.id}&agent=${id}&limit=200`)).events;
+  const launch=async (task,extra={})=>{
+    const agent=await api('POST','/agents',{project:project.id,harness:'codex',model:'gpt-6-luna',effort:'low',task,...extra});
+    await until(()=>captures(agent.id).length===1,`controlled turn ${agent.id} starts`);
+    if(!task.includes('NEXT_TURN_NO_SESSION')) await until(async()=>(await view(agent.id)).session,`controlled turn ${agent.id} records its session`);
+    return agent;
+  };
+  const release=id=>fs.writeFileSync(path.join(home,`release-${id}`),'');
+  const configure=(id,extra,status=200)=>api('POST','/agent-config',{id,agent:id,...extra},status);
+  const noFollowup=async (id,state)=>{
+    await finished(id,state);
+    await new Promise(resolve=>setTimeout(resolve,1100));
+    assert.equal(captures(id).length,1,'cancelled or absent intent must not start another turn');
+    assert.equal((await view(id)).continuation,null);
+    assert.equal((await view(id)).replacement_request,null);
+  };
+  const rejectedCli=(id,args)=>{
+    const result=spawnSync(binary,args,{cwd:folder,env:{...env,ACOM_ID:String(id)},encoding:'utf8'});
+    assert.notEqual(result.status,0);
+    assert.doesNotMatch(result.stdout,/queued|launched agent/);
+    return result.stderr;
+  };
+
+  // The current turn never changes; latest explicit continuation wins and an
+  // ordinary configure only updates the choice, not the queued instruction.
+  const continuing=await launch('NEXT_TURN_CONTINUE latest wins');
+  const session=(await view(continuing.id)).session;
+  await configure(continuing.id,{model:'gpt-6-sol',effort:'medium',continuation:'Discarded earlier instruction'});
+  assert.match(cli(folder,['configure','--model','gpt-6-sol','--continue','Use the latest continuation'],{ACOM_ID:String(continuing.id)}),/continuation queued/);
+  assert.match(cli(folder,['configure','--effort','high'],{ACOM_ID:String(continuing.id)}),/does not schedule a turn/);
+  assert.equal((await view(continuing.id)).continuation.text,'Use the latest continuation');
+  assert.deepEqual((await view(continuing.id)).running_configuration,{model:'gpt-6-luna',effort:'low'});
+  const stable=await events(continuing.id);
+  for(const continuation of ['  ','x'.repeat(16001),17]) {
+    await configure(continuing.id,{effort:'high',continuation},400);
+    assert.deepEqual(await events(continuing.id),stable,'invalid input cannot add notices/events or mutate intent');
+  }
+  const pendingThread=await api('POST','/threads',{project:project.id,title:'Continuation pending delivery',members:[String(continuing.id)]});
+  const pending=await api('POST','/messages',{thread:pendingThread.id,text:'Fold this message into the explicit continuation'});
+  assert.equal(captures(continuing.id)[0].model,'gpt-6-luna');
+  release(continuing.id);
+  await until(()=>captures(continuing.id).length===2,'explicit same-session continuation starts');
+  const next=captures(continuing.id)[1];
+  assert.equal(next.resume,true); assert.equal(next.model,'gpt-6-sol');
+  assert.ok(next.args.includes(session)); assert.ok(next.args.includes('model_reasoning_effort="high"'));
+  assert.match(next.prompt,/Use the latest continuation/);
+  assert.doesNotMatch(next.prompt,/Discarded earlier instruction/);
+  assert.match(next.prompt,/\bpending 1\b/);
+  assert.equal(next.membership_snapshot.state,'working');
+  assert.equal(fs.existsSync(`/proc/${captures(continuing.id)[0].pid}`),false,'old process is reaped before its continuation');
+  await finished(continuing.id,'done');
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  assert.equal(captures(continuing.id).length,2,'pending-message wake cannot duplicate the explicit continuation');
+  assert.equal((await view(continuing.id)).session,session);
+  assert.equal((await view(continuing.id)).running_configuration,null);
+  assert.equal((await view(continuing.id)).continuation,null);
+  assert.equal((await api('GET',`/messages/${pending.id}?agent=${continuing.id}`)).mark,'handled');
+  const stateChanges=(await events(continuing.id)).filter(e=>e.kind==='agent.state').reverse().map(e=>e.details.to);
+  assert.deepEqual(stateChanges,['working','idle','working','done'],'successful first exit does not mark the agent done before continuing');
+  await configure(continuing.id,{effort:'medium',continuation:'Cannot schedule from done'},409);
+  await api('POST',`/agents/${continuing.id}/close`,{});
+
+  const plain=await launch('NEXT_TURN_PLAIN no scheduling');
+  await configure(plain.id,{model:'gpt-6-sol',effort:'high'});
+  release(plain.id); await noFollowup(plain.id,'idle');
+  await api('POST',`/agents/${plain.id}/close`,{});
+
+  const noSession=await launch('NEXT_TURN_NO_SESSION explicit continuation');
+  await configure(noSession.id,{effort:'high',continuation:'Do not silently create a fresh session'});
+  release(noSession.id); await noFollowup(noSession.id,'idle');
+  assert.equal((await view(noSession.id)).session,null);
+  assert.match((await view(noSession.id)).problem,/did not record a native session/);
+  await api('POST',`/agents/${noSession.id}/close`,{});
+
+  // Explicit done, user stops and actual failures cancel intent. Successful
+  // exit is insufficient when a structured turn.failed was emitted.
+  for(const action of ['fail','done','pause','close']) {
+    const agent=await launch(`NEXT_TURN_${action==='fail' ? 'FAIL' : action==='done' ? 'DONE' : 'CANCEL'} ${action}`,action==='fail' ? {model:'gpt-6-sol'} : {});
+    await configure(agent.id,{effort:'high',continuation:'This cancelled instruction must not run'});
+    if(action==='pause') await api('POST',`/agents/${agent.id}/pause`,{locks:'release'});
+    else if(action==='close') await api('POST',`/agents/${agent.id}/close`,{});
+    else release(agent.id);
+    await noFollowup(agent.id,{fail:'crashed',done:'done',pause:'paused',close:'closed'}[action]);
+    assert.ok((await events(agent.id)).some(e=>e.kind==='agent.followup-cancelled'));
+    if(action!=='close') await api('POST',`/agents/${agent.id}/close`,{});
+  }
+  const interrupted=await launch('NEXT_TURN_CANCEL restart');
+  await configure(interrupted.id,{effort:'high',continuation:'Cancelled by restart'});
+  await stop(); await start();
+  await noFollowup(interrupted.id,'paused');
+  release(interrupted.id);
+  await api('POST',`/agents/${interrupted.id}/resume`,{});
+  await finished(interrupted.id,'done');
+  assert.equal(captures(interrupted.id).length,2);
+  assert.doesNotMatch(captures(interrupted.id)[1].prompt,/## Continuation\n\nCancelled by restart/);
+  await api('POST',`/agents/${interrupted.id}/close`,{});
+
+  // Ready, blocked intent survives a restart without starting a provider turn.
+  const waiting=await launch('NEXT_TURN_CONTINUE temporarily disabled');
+  await configure(waiting.id,{model:'gpt-6-sol',continuation:'Continue after the model is allowed again',ack_crashes:true});
+  const disabled=structuredClone(config); disabled.harnesses.codex.model='gpt-6-luna';
+  disabled.harnesses.codex.models=disabled.harnesses.codex.models.filter(m=>m!=='gpt-6-sol');
+  await settings(disabled); release(waiting.id);
+  await until(async()=>{const a=await view(waiting.id); return a.state==='idle' && a.continuation?.blocked;},'blocked continuation is visible');
+  assert.equal(captures(waiting.id).length,1);
+  await stop(); await start();
+  assert.equal((await view(waiting.id)).state,'idle');
+  assert.equal((await view(waiting.id)).continuation.text,'Continue after the model is allowed again');
+  await settings(config);
+  await finished(waiting.id,'done');
+  assert.equal(captures(waiting.id).length,2);
+  await api('POST',`/agents/${waiting.id}/close`,{});
+
+  // Crash warnings use the actual failed turn, not the queued model, and are
+  // restricted to the same project/provider/model. Users are never gated.
+  const failed=await launch('NEXT_TURN_FAIL actual snapshot',{model:'gpt-6-sol'});
+  await configure(failed.id,{model:'gpt-6-luna'});
+  release(failed.id); await finished(failed.id,'crashed');
+  const failure=(await events(failed.id)).find(e=>e.kind==='agent.failed');
+  assert.equal(failure.details.model,'gpt-6-sol'); assert.equal(failure.details.harness,'codex');
+  assert.equal((await view(failed.id)).model,'gpt-6-luna');
+  await api('POST',`/agents/${failed.id}/close`,{});
+  const warned=await launch('NEXT_TURN_CONTINUE acknowledged choice');
+  const beforeWarn=await events(warned.id);
+  const warning=await configure(warned.id,{model:'gpt-6-sol',continuation:'Only after acknowledgement'},409);
+  assert.match(JSON.stringify(warning),/Previous crashes for codex\/gpt-6-sol/);
+  assert.match(JSON.stringify(warning),/Controlled first-turn failure/);
+  assert.equal((await view(warned.id)).model,'gpt-6-luna');
+  assert.equal((await view(warned.id)).continuation,null);
+  assert.deepEqual(await events(warned.id),beforeWarn);
+  const agentsBefore=await api('GET',`/agents?project=${project.id}`);
+  await api('POST','/agents',{agent:warned.id,harness:'codex',model:'gpt-6-sol',task:'Rejected prior-crash helper'},409);
+  assert.deepEqual(await api('GET',`/agents?project=${project.id}`),agentsBefore,'rejected advisory cannot create an identity');
+  assert.match(rejectedCli(warned.id,['configure','--model','gpt-6-sol','--continue','Rejected CLI intent']),/Previous crashes for/);
+  assert.match(rejectedCli(warned.id,['launch','--harness','codex','--model','gpt-6-sol','--task','Rejected CLI helper']),/Previous crashes for/);
+  const otherModel=await api('POST','/agents',{agent:warned.id,harness:'codex',model:'gpt-6-luna',task:'Unfailed model helper'});
+  const otherProvider=await api('POST','/agents',{agent:warned.id,harness:'claude',model:'claude-sonnet-5-5',task:'Different provider helper'});
+  const acknowledgedOutput=cli(folder,['launch','--harness','codex','--model','gpt-6-sol','--task','Acknowledged helper','--ack-crashes'],{ACOM_ID:String(warned.id)});
+  assert.match(acknowledgedOutput,/agent \d+/);
+  assert.match(cli(folder,['configure','--model','gpt-6-sol','--continue','Acknowledged continuation','--ack-crashes'],{ACOM_ID:String(warned.id)}),/continuation queued/);
+  release(warned.id); await finished(warned.id,'done');
+  assert.match(captures(warned.id)[1].prompt,/Acknowledged continuation/);
+  const userChoice=await launch('NEXT_TURN_PLAIN user bypass');
+  await configure(userChoice.id,{model:'gpt-6-sol'},409); // Success did not erase the crash advisory.
+  await api('POST','/agent-config',{id:userChoice.id,model:'gpt-6-sol',effort:'medium'});
+  release(userChoice.id); await finished(userChoice.id,'idle');
+  const currentChoice=await launch('NEXT_TURN_CONTINUE same actual model',{model:'gpt-6-sol'});
+  await configure(currentChoice.id,{effort:'high',continuation:'Same running model needs no acknowledgement'});
+  release(currentChoice.id); await finished(currentChoice.id,'done');
+  await api('PUT',`/projects/${otherProject}/config`,{custom:config});
+  const otherScope=await api('POST','/agents',{project:otherProject,harness:'codex',model:'gpt-6-luna',task:'NEXT_TURN_PLAIN other project'});
+  await until(()=>captures(otherScope.id).length===1,'other-project actor starts');
+  await configure(otherScope.id,{model:'gpt-6-sol'});
+  release(otherScope.id); await finished(otherScope.id,'idle');
+  await api('POST',`/agents/${otherScope.id}/close`,{});
+  for(const id of [warned.id,userChoice.id,currentChoice.id,otherModel.id,otherProvider.id]) await api('POST',`/agents/${id}/close`,{});
+  const acknowledgedHelper=(await api('GET',`/agents?project=${project.id}`)).find(a=>a.task==='Acknowledged helper');
+  assert.ok(acknowledgedHelper); await api('POST',`/agents/${acknowledgedHelper.id}/close`,{});
+
+  // --replace is not an ordinary helper launch: nothing is created or replaced
+  // while the predecessor is still working. Fixed memberships/marks transfer;
+  // live membership follows the successor's own committed state and group.
+  const live=await api('POST','/threads',{project:project.id,title:'Replacement live audience',watch:['active','group:reviewers'],include_user:false});
+  const replacement=await launch('NEXT_TURN_REPLACE_CHILD deliberate',{name:'Carry name',group:'reviewers'});
+  const fixed=await api('POST','/threads',{project:project.id,title:'Replacement fixed audience',members:[String(replacement.id)],include_user:false});
+  const marked=await api('POST','/messages',{thread:fixed.id,text:'Carry the work mark'});
+  await api('POST','/marks',{agent:replacement.id,ids:[marked.id],mark:'in-progress'});
+  await api('POST','/locks',{project:project.id,name:'handoff-lock',about:'Locks do not transfer'});
+  await api('POST','/locks/acquire',{agent:replacement.id,name:'handoff-lock',wait:0,ttl:30});
+  await configure(replacement.id,{model:'gpt-6-sol',effort:'medium',continuation:'Superseded by replacement',ack_crashes:true});
+  assert.deepEqual((await view(replacement.id)).running_configuration,{model:'gpt-6-luna',effort:'low'});
+  const targetRequest={harness:'claude',model:'claude-sonnet-5-5',effort:'high',task:'Continue the deliberate handoff'};
+  for(const invalid of [{...targetRequest,harness:'codex',model:'gpt-6-luna'},{...targetRequest,force:true},{...targetRequest,done:true}]) {
+    await api('POST',`/agents/${replacement.id}/replacement`,invalid,400);
+    assert.equal((await view(replacement.id)).continuation.text,'Superseded by replacement');
+    assert.equal((await view(replacement.id)).replacement_request,null);
+  }
+  const beforeReplacement=await api('GET',`/agents?project=${project.id}`);
+  const replacementOutput=cli(folder,['launch','--replace','--harness','claude','--model','claude-sonnet-5-5','--effort','high','--task',targetRequest.task],{ACOM_ID:String(replacement.id)});
+  assert.match(replacementOutput,/Replacement queued/); assert.doesNotMatch(replacementOutput,/launched agent/);
+  assert.equal((await view(replacement.id)).continuation,null);
+  assert.equal((await view(replacement.id)).replacement_request.model,targetRequest.model);
+  assert.equal((await view(replacement.id)).state,'working');
+  assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforeReplacement.length);
+  await api('POST',`/agents/${replacement.id}/replacement`,targetRequest,409);
+  await configure(replacement.id,{effort:'medium'},409);
+  const childFile=path.join(home,`replacement-child-${replacement.id}`);
+  await until(()=>fs.existsSync(childFile),'replacement descendant started');
+  const child=Number(fs.readFileSync(childFile,'utf8'));
+  release(replacement.id);
+  await until(async()=>(await view(replacement.id)).replacement,'deliberate replacement starts');
+  const successorId=(await view(replacement.id)).replacement;
+  await until(()=>captures(successorId).length===1,'replacement receives task');
+  await until(async()=>(await view(successorId)).session,'replacement records its independent session');
+  const successor=await view(successorId), target=captures(successorId)[0];
+  assert.equal((await view(replacement.id)).state,'replaced');
+  assert.equal(target.resume,false); assert.equal(target.harness,'claude'); assert.equal(target.model,targetRequest.model);
+  assert.notEqual(successor.session,(await view(replacement.id)).session);
+  assert.equal(successor.name,'Carry name'); assert.equal(successor.group,'reviewers');
+  assert.equal(successor.effort,'high');
+  assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='handoff-lock').holder,null);
+  assert.match(target.prompt,/Continue the deliberate handoff/);
+  assert.match(target.prompt,new RegExp(`You replace agent ${replacement.id} \\(codex / gpt-6-luna\\)`),'handoff names the actual exited model, not its queued choice');
+  assert.match(target.prompt,/Conversation history:.*rollout-/);
+  assert.match(target.prompt,/Output log:/); assert.match(target.prompt,/native context, locks and background processes do not transfer/);
+  assert.doesNotMatch(target.prompt,/## Continuation\n\nSuperseded by replacement/);
+  assert.equal(target.membership_snapshot.state,'working');
+  assert.ok(target.membership_snapshot.threads.includes(live.id));
+  assert.equal(fs.existsSync(`/proc/${captures(replacement.id)[0].pid}`),false);
+  await until(()=>{try{return fs.readFileSync(`/proc/${child}/stat`,'utf8').split(' ')[2]==='Z';}catch(e){if(e.code==='ENOENT')return true;throw e;}},'predecessor background process is stopped');
+  assert.deepEqual((await api('GET',`/threads/${live.id}`)).members,[successorId]);
+  assert.ok((await api('GET',`/threads/${fixed.id}`)).members.includes(successorId));
+  assert.equal((await api('GET',`/messages/${marked.id}?agent=${successorId}`)).mark,'in-progress');
+  const created=(await events(successorId)).find(e=>e.kind==='agent.created');
+  assert.equal(created.actor,`agent ${replacement.id}`); assert.equal(created.details.predecessor,replacement.id);
+  assert.equal((await events(replacement.id)).filter(e=>e.kind==='agent.failed').length,0,'deliberate replacement is not recorded as a crash');
+  await finished(successorId,'done'); await api('POST',`/agents/${successorId}/close`,{});
+
+  // Queue after the successful parent has already been reaped but its descendant
+  // still owns stdout. Both followup modes must release that pipe and make progress.
+  for(const mode of ['CONTINUE','REPLACE']) {
+    const source=await launch(`NEXT_TURN_LATE_${mode}`);
+    await until(()=>!fs.existsSync(`/proc/${captures(source.id)[0].pid}`),'late-request source is already reaped');
+    assert.equal((await view(source.id)).state,'working');
+    const background=Number(fs.readFileSync(path.join(home,`replacement-child-${source.id}`),'utf8'));
+    if(mode==='CONTINUE') {
+      await configure(source.id,{effort:'high',continuation:'Continue after the parent exited'});
+      await finished(source.id,'done');
+      assert.equal(captures(source.id).length,2);
+      assert.equal(captures(source.id)[1].resume,true);
+      assert.match(captures(source.id)[1].prompt,/Continue after the parent exited/);
+      await api('POST',`/agents/${source.id}/close`,{});
+    } else {
+      await api('POST',`/agents/${source.id}/replacement`,targetRequest);
+      await until(async()=>(await view(source.id)).replacement,'late-request replacement starts');
+      const target=(await view(source.id)).replacement;
+      await finished(target,'done'); await api('POST',`/agents/${target}/close`,{});
+    }
+    await until(()=>!fs.existsSync(`/proc/${background}/stat`) || fs.readFileSync(`/proc/${background}/stat`,'utf8').includes(') Z '),'late-request descendant is stopped');
+  }
+
+  // Source releases its active slot at successful exit, but no new identity is
+  // fabricated until target capacity becomes available.
+  const capacity=await launch('NEXT_TURN_REPLACE capacity wait');
+  const blocker=await launch('NEXT_TURN_PLAIN occupy capacity');
+  release(blocker.id); await finished(blocker.id,'idle');
+  const limited=structuredClone(config); limited.limits.active={soft:null,hard:1};
+  await settings(limited);
+  await api('POST',`/agents/${capacity.id}/replacement`,targetRequest);
+  release(capacity.id);
+  await until(async()=>{const a=await view(capacity.id);return a.state==='done' && a.replacement_request?.blocked;},'replacement waits for target capacity');
+  const waitingCount=(await api('GET',`/agents?project=${project.id}`)).length;
+  assert.equal((await view(capacity.id)).replacement,null);
+  await stop(); await start();
+  assert.equal((await view(capacity.id)).state,'done');
+  assert.ok((await view(capacity.id)).replacement_request);
+  assert.equal((await api('GET',`/agents?project=${project.id}`)).length,waitingCount);
+  await api('POST',`/agents/${blocker.id}/close`,{});
+  await until(async()=>(await view(capacity.id)).replacement,'replacement starts after capacity frees');
+  const capacityTarget=(await view(capacity.id)).replacement;
+  await finished(capacityTarget,'done'); await api('POST',`/agents/${capacityTarget}/close`,{});
+  await settings(config);
+
+  // Failure/stop cancellation does not become an accidental helper launch.
+  for(const action of ['fail','done','pause','close','restart']) {
+    const source=await launch(`NEXT_TURN_${action==='fail' ? 'FAIL' : action==='done' ? 'DONE' : 'REPLACE'} replacement ${action}`);
+    const before=(await api('GET',`/agents?project=${project.id}`)).length;
+    await api('POST',`/agents/${source.id}/replacement`,targetRequest);
+    if(action==='restart') { await stop(); await start(); }
+    else if(action==='pause') await api('POST',`/agents/${source.id}/pause`,{locks:'release'});
+    else if(action==='close') await api('POST',`/agents/${source.id}/close`,{});
+    else release(source.id);
+    await noFollowup(source.id,{fail:'crashed',done:'done',pause:'paused',close:'closed',restart:'paused'}[action]);
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,before);
+    if(action!=='close') await api('POST',`/agents/${source.id}/close`,{});
+  }
+  const spawnFailure=await launch('NEXT_TURN_REPLACE missing fake target');
+  await api('POST',`/agents/${spawnFailure.id}/replacement`,targetRequest);
+  const countBeforeFailure=(await api('GET',`/agents?project=${project.id}`)).length;
+  fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude.disabled'));
+  try {
+    release(spawnFailure.id);
+    await until(async()=>{const a=await view(spawnFailure.id);return a.state==='idle' && a.problem;},'failed target spawn leaves original usable');
+    assert.equal((await view(spawnFailure.id)).replacement,null);
+    assert.equal((await view(spawnFailure.id)).replacement_request,null);
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,countBeforeFailure,'failed target creation is rolled back without an orphan');
+    assert.equal((await events(spawnFailure.id)).filter(e=>e.kind==='agent.failed').length,0);
+    assert.equal(captures(spawnFailure.id).length,1);
+  } finally { fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude')); }
+  await api('POST',`/agents/${spawnFailure.id}/close`,{});
+
+  // A start attempt is durable before spawning. Even when saving its cancellation
+  // fails, restarting must retry the cleanup rather than spawn a successor again.
+  const persistenceFailure=await launch('NEXT_TURN_REPLACE cancellation persistence');
+  await api('POST',`/agents/${persistenceFailure.id}/replacement`,targetRequest);
+  const beforePersistenceFailure=(await api('GET',`/agents?project=${project.id}`)).length;
+  const dbAction=action=>{
+    const db=new DatabaseSync(path.join(home,'acom.db'));
+    try { db.exec('PRAGMA busy_timeout=5000'); return action(db); } finally { db.close(); }
+  };
+  const attempted=()=>dbAction(db=>db.prepare('SELECT attempted FROM agent_handoffs WHERE agent_id=?').get(persistenceFailure.id)?.attempted);
+  dbAction(db=>db.exec(`CREATE TRIGGER reject_test_handoff_cancel BEFORE DELETE ON agent_handoffs WHEN OLD.agent_id=${persistenceFailure.id} BEGIN SELECT RAISE(ABORT,'TEST_HANDOFF_CANCEL_FAILURE'); END;`));
+  fs.renameSync(path.join(bin,'claude'),path.join(bin,'claude.disabled'));
+  try {
+    release(persistenceFailure.id);
+    await until(async()=>attempted()===1 && (await view(persistenceFailure.id)).state==='done','attempt persists despite rejected cancellation');
+    await until(()=>serverErrors().includes('tick: database: TEST_HANDOFF_CANCEL_FAILURE'),'failed cancellation is retried as persistence only');
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure);
+    fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
+    await stop(); await start();
+    assert.equal(attempted(),1);
+    assert.equal((await view(persistenceFailure.id)).state,'done');
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure);
+    dbAction(db=>db.exec('DROP TRIGGER reject_test_handoff_cancel'));
+    await until(async()=>{const a=await view(persistenceFailure.id);return a.state==='idle' && a.problem && a.replacement_request===null;},'restart saves cancellation without launching a successor');
+    await new Promise(resolve=>setTimeout(resolve,1100));
+    assert.equal((await view(persistenceFailure.id)).replacement,null);
+    assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure);
+    assert.equal(captures(persistenceFailure.id).length,1);
+    assert.equal((await events(persistenceFailure.id)).filter(e=>e.kind==='agent.failed').length,0);
+  } finally {
+    dbAction(db=>db.exec('DROP TRIGGER IF EXISTS reject_test_handoff_cancel'));
+    if(fs.existsSync(path.join(bin,'claude.disabled'))) fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
+  }
+  await api('POST',`/agents/${persistenceFailure.id}/close`,{});
+  for(const thread of await api('GET',`/threads?project=${project.id}`)) {
+    const messages=(await api('GET',`/threads/${thread.id}`)).messages;
+    if(messages.length) await api('POST',`/threads/${thread.id}/read`,{message:messages.at(-1).id});
+  }
+  return project;
+}
 
 async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults}) {
   const folder=path.join(root,'lifecycle'); fs.mkdirSync(folder);
@@ -876,7 +1282,13 @@ async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defau
   await api('POST','/locks',{project:project.id,name:'history-lock',about:'Structured lock events'});
   await api('POST','/locks/acquire',{agent:held.id,name:'history-lock',wait:0,ttl:30});
   await api('POST','/locks/release',{agent:held.id,name:'history-lock'});
-  await stop(); await start();
+  const previousPort=Number(fs.readFileSync(path.join(home,'port'),'utf8'));
+  let nextPort=await freePort();
+  while(nextPort===previousPort) nextPort=await freePort();
+  const oldPid=runs().find(run=>run.id===held.id).pid;
+  await stop(); await start(nextPort);
+  assert.equal(Number(fs.readFileSync(path.join(home,'port'),'utf8')),nextPort);
+  await until(()=>!fs.existsSync(`/proc/${oldPid}/stat`) || fs.readFileSync(`/proc/${oldPid}/stat`,'utf8').includes(') Z '),'changed-port restart stops its previously owned fake client');
   assert.equal((await api('GET',`/agents/${held.id}`)).state,'paused');
   assert.ok(!(await members(active)).includes(held.id));
   assert.deepEqual(await members(paused),[held.id]);

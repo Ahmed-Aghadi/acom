@@ -236,6 +236,16 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 opt_int(b, "agent").unwrap_or(0),
                 opt_text(b, "model").as_deref(),
                 opt_text(b, "effort").as_deref(),
+                if b["continuation"].is_null() {
+                    None
+                } else {
+                    Some(
+                        b["continuation"]
+                            .as_str()
+                            .ok_or_else(|| bad("continuation must be text"))?,
+                    )
+                },
+                b["ack_crashes"].as_bool().unwrap_or(false),
             )?;
             J(json!({}))
         }
@@ -306,6 +316,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 group: opt_text(b, "group"),
                 force: b["force"].as_bool().unwrap_or(false),
                 done: b["done"].as_bool().unwrap_or(false),
+                ack_crashes: b["ack_crashes"].as_bool().unwrap_or(false),
             };
             let (new, warnings) = app.launch(by, opt_int(b, "via"), opt_int(b, "project"), req)?;
             J(json!({ "id": new, "warnings": warnings }))
@@ -321,6 +332,23 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("POST", ["agents", a, "done"]) => {
             app.mark_done(id(a)?)?;
             J(json!({}))
+        }
+        ("POST", ["agents", a, "replacement"]) => {
+            let warnings = app.queue_replacement(
+                id(a)?,
+                LaunchReq {
+                    task: text(b, "task")?,
+                    harness: opt_text(b, "harness"),
+                    model: opt_text(b, "model"),
+                    effort: opt_text(b, "effort"),
+                    name: opt_text(b, "name"),
+                    group: opt_text(b, "group"),
+                    force: b["force"].as_bool().unwrap_or(false),
+                    done: b["done"].as_bool().unwrap_or(false),
+                    ack_crashes: b["ack_crashes"].as_bool().unwrap_or(false),
+                },
+            )?;
+            J(json!({"queued":true,"warnings":warnings}))
         }
         ("POST", ["agents", a, "pause"]) => {
             let mode = match b["locks"].as_str() {

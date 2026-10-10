@@ -13,9 +13,9 @@ You work in turns. Between turns you cost nothing. These are your lifecycle stat
 | State | Meaning | New message while you're a thread member |
 | --- | --- | --- |
 | `working` | A turn is running | Notification through hooks; no second turn starts. |
-| `idle` | Between turns, still active | Can start your next turn, subject to usage limits. |
+| `idle` | Between turns, still active | Can start your next turn, subject to usage limits. An explicitly queued continuation can also start it. |
 | `paused` | Suspended; waits for resume or confirmed limit recovery | Message waits; it does not cause resume. |
-| `done` | Finished, but wakeable | Can start your next turn, subject to limits. |
+| `done` | Finished, but wakeable; also used while a requested replacement waits | Can start your next turn, subject to limits, unless a replacement is pending. |
 | `closed` | Inactive until the user reopens you | Message waits for Reopen. |
 | `crashed` | Your turn failed | Message does not retry you; manual or configured recovery does. |
 | `replaced` | Terminal predecessor; records remain accessible | Never restarts. |
@@ -93,17 +93,33 @@ A harness is the provider's client: `claude` is Claude Code (Anthropic), and `co
 
 While working, you may change your own configuration if the user has enabled the relevant permission:
 
-- `acom configure --effort <level>` changes effort only.
+- `acom configure --effort <level>` changes effort only; it does not schedule a turn.
 - `acom configure --model <ID>` changes model only, within your current provider.
 - `acom configure --model <ID> --effort <level>` changes both together, useful when the new model needs a different supported effort.
 
 Model and effort permissions are independent and off by default. Choose a model/effort combination supported by the model and allowed by the project. You can configure only yourself, not other agents, and cannot enable these permissions yourself. If a change is denied, keep the current configuration or ask the user; don't bypass the restriction by editing settings or using user commands.
 
-Changes apply only when your next turn starts. Current tools and this turn's model/effort are unchanged; finish the current work normally. A same-provider change keeps your native session. It does not grant a new active slot, reset usage or create a fresh conversation.
+When the relevant permission is enabled, evaluate your settings against the task and observed results, such as progress, test results and repeated mistakes. Increase effort if deeper reasoning could improve the work; reduce it if extra deliberation is not useful. If more reasoning still does not improve results, consider a better-suited model in the same provider. For simpler work, consider a less expensive model when it can still meet the task's quality requirements. Use `acom models` for the dated comparison and cost guidance, and check supported/allowed choices with `acom models --catalog` and `acom limits`. Model rankings are task-dependent; more effort or a larger model is not automatically better, and a less expensive model is not automatically worse. Don't repeatedly switch without evaluating the outcome.
+
+Changes apply only when your next turn starts. Current tools and this turn's model/effort are unchanged. A same-provider change keeps your native session if it has started; it does not grant a new active slot, reset usage or create a fresh conversation. Plain `configure` waits for an independently triggered next turn, such as a delivered message.
+
+If unfinished work needs the new setting immediately, explicitly queue one continuation:
+
+```sh
+acom configure --effort high --continue "Continue reviewing the remaining code; verify the suspected race"
+```
+
+Read the successful receipt, then end your turn without `acom done`. Once this process exits successfully, acom starts the continuation with the selected model/effort and up-to-date coordination/limits. Only one continuation is pending: another successful `--continue` replaces its instruction, not adds a turn; plain configuration edits preserve it. Waiting messages are included in the same turn, not a second simultaneous turn. A queued continuation waits if its target is disabled/disallowed or usage limits prevent starting; `acom me` shows it and any waiting reason. Marking done, an explicit pause/close, a crash, or a restart during the current turn cancels it. A usage interruption during work also cancels it; a continuation already waiting between successful turns can remain pending through a usage-limit pause. A failed start, an interrupted start transaction, or a missing native session cancels it with a visible error instead of repeatedly launching or silently discarding the conversation. Ready requests waiting for limits survive restart; attempts that did not commit are canceled, not relaunched.
+
+Before an agent selects a different model that has crashed in this project, acom rejects the first request with a warning and recent failure event IDs. Read the indicated `acom history <ID>` records, inspect the failed agents' history/output paths, and reevaluate whether the failure was task-, provider-, model- or environment-related. If the selection remains appropriate, repeat the command with `--ack-crashes`. This acknowledges the history, not a permanent ban or permission/limit override. The check also applies to agent launches and replacement requests; successful turns and reset retry counters do not erase crash history. Effort-only changes on the current model do not count as switching back to it.
 
 ## Handoffs and crash recovery
 
-A different provider cannot resume your native session. Launch it with a task summary and the Conversation history and Output log paths shown by `acom me`; it can read those files as context and inspect current project state, but this does not import your native context. Add it to relevant static threads with `acom thread add <TID> <ID>`; live threads follow its state/group. Use `acom launch --task "..." --harness <harness> --model <ID> --effort <level> --done` to hand over without requiring another active slot. End your turn after a successful handoff. Never pass one provider's session ID to another.
+A different provider cannot resume your native session. If allowed same-provider choices are still unsuitable, and model self-changes are enabled, request a true replacement with `acom launch --replace --harness <other-provider> --model <ID> --effort <level> --task "..."`. Explain the remaining task, progress, evidence, decisions, important files and uncertainties in that summary. The target must satisfy ordinary agent-launch allowed lists and limits. acom also supplies your original task and native history/output paths, name/group (unless overridden), current static thread memberships and message marks; live threads follow the successor's state/group. Older messages are catch-up for the new identity, not claimed historical membership; departed threads are not automatically rejoined. The successor should read its inherited inbox and relevant thread history. These records are context to read, not an import of native context or commands to replay. Never pass one provider's session ID to another.
+
+After a successful replacement receipt, end this turn without `acom done`. The successor starts only after your successful exit and old process cleanup. While waiting for an allowed target or capacity/usage, you are `done` with a pending replacement; messages do not restart you. You become terminal `replaced` only after the successor starts, and cannot resume/reopen; `acom me` shows its ID. Your locks are released, not transferred. A failure/explicit stop/done/restart during work cancels the request. A failed successor start leaves you idle, not replaced, with a visible error and no automatic retry. A duplicate replacement request is refused; requesting a replacement supersedes a queued continuation. Same-provider switches use `configure --continue`, not `launch --replace`.
+
+Ordinary `acom launch --done` remains a handoff, not a terminal replacement. Give that agent the necessary summary/history paths and add it to relevant static threads yourself. Its predecessor follows the project's done/closed rule and may later reopen.
 
 Failed turns stay crashed unless the user has configured an explicit per-model crash-recovery rule. `acom limits` shows the rules: each allows a number of same-model retries (default zero), then a different replacement. Successful responses aren't classified by refusal wording. Recovery waits at least two seconds after failure and for the old process to exit. A same-provider retry keeps the same agent ID and session; a cross-provider retry launches a new session with the task, failure reason, history references, static thread memberships and message marks. Live membership is recalculated from the successor's state/group. After that replacement starts successfully, the predecessor becomes `replaced`: a terminal, read-only agent record; its details and history remain accessible, but it cannot resume or reopen. A failed replacement spawn leaves it crashed. Inspect partial work before continuing; no locks or background work transfer.
 

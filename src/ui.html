@@ -380,7 +380,10 @@
       const text = await response.text();
       let body = text;
       try { body = text ? JSON.parse(text) : {}; } catch (_) {}
-      if (!response.ok) throw new Error(body?.error || text || `${response.status} ${response.statusText}`);
+      if (!response.ok) {
+        const error = new Error(body?.error || text || `${response.status} ${response.statusText}`);
+        error.status = response.status; throw error;
+      }
       return body;
     }
 
@@ -629,15 +632,22 @@
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => k !== 'retry' && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:key.replaceAll('_',' '),content:esc(display(key, value))}));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','running_configuration'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        fields.push({key:'running_configuration',label:'current turn',content:a.running_configuration ? `${esc(a.harness)} / ${esc(a.running_configuration.model)} / effort ${esc(a.running_configuration.effort)}` : '— (no running turn)'});
         fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
         const retryStatus = a.retry?.blocked ? `${a.retry.handled ? 'Stopped' : 'Waiting'}: ${esc(a.retry.blocked)}` : a.retry?.replacement ? '' : a.retry?.handled ? 'Retry attempt handled' : 'Pending; requires a configured rule and available limits';
         const retryEffort = a.retry?.effort ? a.retry.effort === a.effort ? ` · effort ${esc(a.retry.effort)}` : ` · failed effort ${esc(a.retry.effort)}; requested effort ${esc(a.effort)}` : '';
         const eligible = a.retry && !a.retry.handled && a.retry.eligible_at ? `<br>Earliest retry: ${esc(when(a.retry.eligible_at))}` : '';
-        if (a.retry) fields.push({key:'retry',label:'crash recovery',content:`${esc(a.retry.source)} · Same-model retries: ${esc(a.retry.same_model_attempts ?? 0)}${retryEffort}<br>${a.retry.replacement ? `Replacement agent #${esc(a.retry.replacement)}${retryStatus ? '<br>' : ''}` : ''}${retryStatus}${eligible}`});
+        if (a.retry) fields.push({key:'retry',label:'crash recovery',content:`${esc(a.retry.source)} · Same-model retries: ${esc(a.retry.same_model_attempts ?? 0)}${retryEffort}${retryStatus ? `<br>${retryStatus}` : ''}${eligible}`});
+        const replacement = a.replacement ?? a.retry?.replacement;
+        if (replacement) fields.push({key:'replacement',label:'replacement',content:`<button type="button" class="small" data-action="details" data-id="${esc(replacement)}">Replacement agent #${esc(replacement)}</button>`});
+        if (a.replacement_request) fields.push({key:'replacement_request',label:'pending replacement',content:`${esc(a.replacement_request.harness)} / ${esc(a.replacement_request.model)}<br>${a.replacement_request.blocked ? `Waiting: ${esc(a.replacement_request.blocked)}` : 'A new provider session after the current turn succeeds'}`});
+        if (a.continuation) fields.push({key:'continuation',label:'pending continuation',content:`${esc(a.continuation.text)}<br>${a.continuation.blocked ? `Waiting: ${esc(a.continuation.blocked)}` : 'One turn after the current turn succeeds'}`});
         updateAgentDetails(fields);
         if (a.state === 'replaced') $('#agent-config').replaceChildren();
         else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
+        $('#agent-config').dataset.continuationAllowed = String(a.state === 'working' && !a.done_req);
+        syncAgentContinuation();
         const el = $('#agent-log'), text = (log.lines || []).join('\n') || 'No activity yet';
         const selectingLog = hasSelectedText(el);
         if (el.textContent !== text && !selectingLog) {
@@ -818,11 +828,22 @@
     function renderAgentConfig(a) {
       const root = $('#agent-config');
       root.dataset.harness = a.harness;
-      root.innerHTML = `<h3>Next-turn model and effort</h3><p class="meta launch-project">The current turn is not interrupted. This keeps the same provider and native session. A different provider requires a new agent supplied with this agent's history.</p><div class="form-grid">
+      root.innerHTML = `<h3>Next-turn configuration</h3><p class="meta launch-project">The current turn is not interrupted. Saving model or effort alone does not start a turn. This keeps the same provider and native session. A different provider requires a new agent supplied with this agent's history.</p><div class="form-grid">
         <label>Model <select name="agent_model">${modelOptions(a.harness, providerModels(a.harness, a.model), a.model)}</select></label>
         <label data-agent-custom-model hidden>Custom model ID <input name="agent_custom_model"></label>
         <label>Effort <select name="agent_effort">${options(providerEfforts(a.harness, a.model), a.effort || 'medium')}</select></label>
-      </div><button type="button" id="save-agent-config">Apply to next turn</button>`;
+      </div><label class="inline-check" style="margin-top:12px"><input type="checkbox" name="agent_continue"> Continue once after this turn succeeds</label>
+      <label data-agent-continuation hidden>Continuation instruction <textarea name="agent_continuation" rows="3" disabled></textarea></label>
+      <p class="meta launch-project">An explicit continuation is available only while working and not finishing with done. It replaces any earlier pending instruction, uses another model turn and waits for allowed-model, effort and usage checks. Manual pause, done, close, crash or interruption of this turn cancels it; a between-turn usage pause keeps it queued. Choose model and effort for the task; cheaper or lower effort does not guarantee less total usage.</p>
+      <button type="button" id="save-agent-config">Apply to next turn</button>`;
+    }
+    function syncAgentContinuation() {
+      const root = $('#agent-config'), checkbox = $('[name=agent_continue]', root);
+      if (!checkbox) return;
+      checkbox.disabled = root.dataset.continuationAllowed !== 'true' && !checkbox.checked;
+      const text = $('[name=agent_continuation]', root);
+      $('[data-agent-continuation]', root).hidden = !checkbox.checked;
+      text.disabled = !checkbox.checked; text.required = checkbox.checked;
     }
     function syncDefaultEfforts(root) {
       const supported = modelEfforts(root.dataset.harness, $('[name=model]', root).value);
@@ -994,8 +1015,21 @@
         if (!$('#agent-dialog form').reportValidity()) return;
         saveAgentConfig.disabled = true;
         try {
-          await api('/agent-config', {method:'POST',body:JSON.stringify({id:selectedAgent, model:model.value === '__custom__' ? customModel($('[name=agent_custom_model]',root).value) : model.value, effort:$('[name=agent_effort]',root).value})});
-          toast('Model and effort saved for the next turn'); await refresh();
+          const checkbox = $('[name=agent_continue]', root), text = $('[name=agent_continuation]', root), draft = text.value;
+          const request = {id:selectedAgent, model:model.value === '__custom__' ? customModel($('[name=agent_custom_model]',root).value) : model.value, effort:$('[name=agent_effort]',root).value};
+          if (checkbox.checked) {
+            if (root.dataset.continuationAllowed !== 'true') throw new Error('Continuation requires a working agent that is not finishing with done.');
+            if (!draft.trim()) throw new Error('Enter a continuation instruction.');
+            request.continuation = draft.trim();
+          }
+          const save = body => api('/agent-config', {method:'POST',body:JSON.stringify(body)});
+          try { await save(request); }
+          catch (error) {
+            if (error.status !== 409 || !error.message.startsWith('Previous crashes for ') || !confirm(`${error.message}\n\nHave you reviewed these failures and want to acknowledge them?`)) throw error;
+            await save({...request, ack_crashes:true});
+          }
+          if (request.continuation && text.value === draft) { checkbox.checked = false; text.value = ''; syncAgentContinuation(); }
+          toast(request.continuation ? 'Configuration saved; one continuation queued' : 'Model and effort saved for the next turn'); await refresh();
         } catch (error) { toast(error.message, true); }
         finally { saveAgentConfig.disabled = false; }
         return;
@@ -1127,6 +1161,7 @@
       if (event.target.id !== 'config-select') updateSettingsDirty();
     });
     $('#agent-config').addEventListener('change', event => {
+      if (event.target.name === 'agent_continue') { syncAgentContinuation(); return; }
       const root = $('#agent-config'), model = $('[name=agent_model]', root);
       showCustom(model, $('[data-agent-custom-model]', root));
       const effort = $('[name=agent_effort]', root), values = providerEfforts(root.dataset.harness, model.value);

@@ -101,7 +101,14 @@ async function fixture(run) {
       return send({ id: 1, warnings: [] });
     }
     if (req.url === '/agent-config') {
-      Object.assign(data.agents.find(a => a.id === body.id), {model:body.model,effort:body.effort});
+      if (data.agentConfigError && !body.ack_crashes) {
+        res.statusCode = data.agentConfigError.status; return send({error:data.agentConfigError.message});
+      }
+      if (data.agentConfigDelay) await new Promise(resolve => setTimeout(resolve, data.agentConfigDelay));
+      const agent = data.agents.find(a => a.id === body.id);
+      if (body.model != null) agent.model = body.model;
+      if (body.effort != null) agent.effort = body.effort;
+      if (typeof body.continuation === 'string') agent.continuation = {text:body.continuation,blocked:null};
       return send({});
     }
     if (/^\/agents\/\d+\/resume$/.test(req.url)) {
@@ -1415,6 +1422,145 @@ test('agent details preserve model drafts while polling and save provider-fixed 
   assert.equal(data.requests.length, writes, 'close ignores an empty custom-model draft');
 }));
 
+test('details distinguish the actual running configuration from next-turn choices without clearing selections', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6-luna',effort:'max',running_configuration:{model:'gpt-6.1-sol',effort:'ultra'}}];
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const details = page.locator('#agent-details');
+  const current = details.locator('dt[data-key=running_configuration] + dd');
+  await current.waitFor();
+  assert.equal(await details.locator('dt[data-key=model]').textContent(), 'next-turn model');
+  assert.equal(await details.locator('dt[data-key=effort]').textContent(), 'next-turn effort');
+  assert.equal(await details.locator('dt[data-key=model] + dd').textContent(), 'gpt-6-luna');
+  assert.equal(await current.textContent(), 'codex / gpt-6.1-sol / effort ultra');
+  await page.evaluate(() => {
+    const el = document.querySelector('dt[data-key=running_configuration]').nextElementSibling;
+    window.selectedConfiguration = el;
+    const range = document.createRange(); range.selectNodeContents(el);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+  });
+  data.agents[0].model = 'gpt-6-sol';
+  data.agents[0].effort = 'high';
+  await page.evaluate(() => refresh());
+  assert.equal(await current.textContent(), 'codex / gpt-6.1-sol / effort ultra');
+  assert.equal(await details.locator('dt[data-key=model] + dd').textContent(), 'gpt-6-sol');
+  assert.equal(await page.evaluate(() => getSelection().toString()), 'codex / gpt-6.1-sol / effort ultra');
+  data.agents[0].running_configuration = null;
+  data.agents[0].state = 'idle';
+  await page.evaluate(() => refresh());
+  assert.equal(await current.textContent(), 'codex / gpt-6.1-sol / effort ultra', 'selected changed region waits for deselection');
+  assert.equal(await page.evaluate(() => document.querySelector('dt[data-key=running_configuration]').nextElementSibling === window.selectedConfiguration), true);
+  await page.evaluate(() => { getSelection().removeAllRanges(); document.dispatchEvent(new Event('selectionchange')); });
+  assert.equal(await current.textContent(), '— (no running turn)');
+}));
+
+test('continuation is an explicit working-agent opt-in and its pending instruction and blocked reason are visible safely', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const config = page.locator('#agent-config');
+  await config.locator('#save-agent-config').waitFor();
+  assert.equal(await config.locator('[name=agent_continue]').isChecked(), false);
+  assert.match(await config.textContent(), /alone does not start a turn/);
+  await config.locator('[name=agent_continue]').check();
+  await config.locator('[name=agent_continuation]').fill('   ');
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Enter a continuation instruction.');
+  assert.equal(data.requests.length, 0);
+  await config.locator('[name=agent_continuation]').fill(' Continue <review> & finish ');
+  await page.evaluate(() => refresh());
+  assert.equal(await config.locator('[name=agent_continue]').isChecked(), true);
+  assert.equal(await config.locator('[name=agent_continuation]').inputValue(), ' Continue <review> & finish ');
+  await config.locator('#save-agent-config').click();
+  await page.locator('dt[data-key=continuation]').waitFor();
+  assert.deepEqual(data.requests.at(-1).body, {id:1,model:'gpt-6.1-sol',effort:'medium',continuation:'Continue <review> & finish'});
+  assert.equal(await config.locator('[name=agent_continue]').isChecked(), false);
+  const pending = page.locator('dt[data-key=continuation] + dd');
+  assert.match(await pending.textContent(), /Continue <review> & finish.*One turn after/);
+  assert.equal(await pending.locator('review').count(), 0);
+  data.agents[0].continuation.blocked = 'Usage <waiting>';
+  await page.evaluate(() => refresh());
+  assert.match(await pending.textContent(), /Waiting: Usage <waiting>/);
+  await config.locator('[name=agent_effort]').selectOption('high');
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('saved for the next turn'));
+  assert.equal(Object.hasOwn(data.requests.at(-1).body, 'continuation'), false);
+  assert.equal(data.agents[0].continuation.text, 'Continue <review> & finish', 'ordinary configuration does not cancel a pending request');
+  data.agents[0].state = 'idle'; data.agents[0].continuation = null;
+  await page.evaluate(() => refresh());
+  assert.equal(await config.locator('[name=agent_continue]').isDisabled(), true);
+  assert.equal(await page.locator('dt[data-key=continuation]').count(), 0);
+}));
+
+test('a delayed configuration save keeps newer continuation drafts and rejects continuation after the turn stops', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agentConfigDelay = 500;
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const config = page.locator('#agent-config');
+  await config.locator('#save-agent-config').waitFor();
+  await config.locator('[name=agent_continue]').check();
+  await config.locator('[name=agent_continuation]').fill('Submitted continuation');
+  await config.locator('#save-agent-config').click();
+  await config.locator('[name=agent_continuation]').fill('Newer instruction draft');
+  await page.waitForFunction(() => !document.querySelector('#save-agent-config').disabled);
+  assert.equal(data.agents[0].continuation.text, 'Submitted continuation');
+  assert.equal(await config.locator('[name=agent_continuation]').inputValue(), 'Newer instruction draft');
+  assert.equal(await config.locator('[name=agent_continue]').isChecked(), true);
+  data.agents[0].state = 'idle';
+  await page.evaluate(() => refresh());
+  const writes = data.requests.length;
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Continuation requires a working agent'));
+  assert.equal(data.requests.length, writes);
+  assert.equal(await config.locator('[name=agent_continuation]').inputValue(), 'Newer instruction draft');
+  await config.locator('[name=agent_continue]').uncheck();
+  assert.equal(await config.locator('[name=agent_continue]').isDisabled(), true);
+}));
+
+test('prior-crash warnings require explicit confirmation before a single acknowledged configure retry', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agentConfigError = {status:409,message:'Previous crashes for gpt-6-luna: agent 8, history /history/8.jsonl. Review before acknowledging.'};
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const config = page.locator('#agent-config');
+  await config.locator('#save-agent-config').waitFor();
+  await config.locator('[name=agent_model]').selectOption('gpt-6-luna');
+  await config.locator('[name=agent_effort]').selectOption('max');
+  await config.locator('[name=agent_continue]').check();
+  await config.locator('[name=agent_continuation]').fill('Review new task');
+  let confirmations = 0;
+  page.once('dialog', dialog => { confirmations++; const message = dialog.message(); dialog.dismiss(); assert.match(message, /agent 8.*history.*reviewed/is); });
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => !document.querySelector('#save-agent-config').disabled);
+  assert.equal(data.requests.length, 1);
+  assert.equal(data.agents[0].model, 'gpt-6.1-sol');
+  assert.equal(await config.locator('[name=agent_continuation]').inputValue(), 'Review new task');
+  page.once('dialog', dialog => { confirmations++; dialog.accept(); });
+  await config.locator('#save-agent-config').click();
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('one continuation queued'));
+  assert.equal(confirmations, 2);
+  assert.equal(data.requests.length, 3);
+  assert.equal(Object.hasOwn(data.requests[1].body, 'ack_crashes'), false);
+  assert.deepEqual(data.requests[2].body, {...data.requests[1].body,ack_crashes:true});
+  assert.equal(data.agents[0].model, 'gpt-6-luna');
+  assert.equal(data.agents[0].continuation.text, 'Review new task');
+}));
+
+test('configure errors outside the specific HTTP409 prior-crash warning never prompt or retry', async () => fixture(async (page, data) => {
+  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  await page.reload(); await page.locator('[data-action=details]').click();
+  const config = page.locator('#agent-config');
+  await config.locator('#save-agent-config').waitFor();
+  let confirmations = 0;
+  page.on('dialog', dialog => { confirmations++; dialog.dismiss(); });
+  for (const error of [{status:409,message:'Usage limit: confirm after reset'}, {status:500,message:'Previous crashes for gpt-6-luna: unavailable history'}]) {
+    data.agentConfigError = error;
+    const count = data.requests.length;
+    await config.locator('#save-agent-config').click();
+    await page.waitForFunction(message => document.querySelector('#toast').textContent === message, error.message);
+    assert.equal(data.requests.length, count + 1);
+    assert.equal(Object.hasOwn(data.requests.at(-1).body,'ack_crashes'), false);
+  }
+  assert.equal(confirmations, 0);
+}));
+
 test('agent details expose pending, blocked and replacement retry status safely', async () => fixture(async (page, data) => {
   data.agents = [{id:1,project:1,name:'Worker',state:'crashed',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null,same_model_attempts:1,effort:'medium',eligible_at:Date.now()/1000+120}}];
   await page.reload(); await page.locator('[data-action=details]').click();
@@ -1437,7 +1583,37 @@ test('agent details expose pending, blocked and replacement retry status safely'
   assert.match(await details.textContent(), /Replacement agent #2/);
   data.agents[0].retry.blocked = 'cannot start replacement';
   await page.evaluate(() => refresh());
-  assert.match(await details.textContent(), /Replacement agent #2.*Stopped: cannot start replacement/);
+  assert.match(await details.textContent(), /Replacement agent #2/);
+  assert.match(await details.textContent(), /Stopped: cannot start replacement/);
+}));
+
+test('details show queued cross-provider replacements and link the explicit successor', async () => fixture(async (page, data) => {
+  data.agents = [
+    {id:1,project:1,name:'Predecessor',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:null}},
+    {id:2,project:1,name:'Old recovery target',state:'closed',harness:'claude',model:'claude-haiku-5-5',effort:'medium'},
+    {id:3,project:1,name:'Successor',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
+  ];
+  await page.reload(); await page.locator('[data-agent="1"] [data-action=details]').click();
+  const details = page.locator('#agent-details');
+  await details.locator('dt[data-key=replacement_request]').waitFor();
+  assert.match(await details.textContent(), /pending replacement.*claude \/ claude-sonnet-5-5.*current turn succeeds/s);
+  data.agents[0].state = 'done';
+  data.agents[0].replacement_request.blocked = 'Hard <target> limit';
+  await page.evaluate(() => refresh());
+  assert.match(await details.textContent(), /Waiting: Hard <target> limit/);
+  assert.equal(await details.locator('target').count(), 0);
+  data.agents[0].state = 'replaced';
+  data.agents[0].replacement_request = null;
+  data.agents[0].replacement = 3;
+  data.agents[0].retry = {source:'gpt-6.1-sol',handled:1,replacement:2,blocked:null};
+  await page.evaluate(() => refresh());
+  assert.equal(await details.locator('dt[data-key=replacement_request]').count(), 0);
+  assert.equal(await page.locator('#save-agent-config').count(), 0);
+  assert.equal(await details.locator('[data-action=details]').textContent(), 'Replacement agent #3');
+  await details.locator('[data-action=details]').click();
+  await page.waitForFunction(() => document.querySelector('#agent-details').textContent.includes('Successor'));
+  assert.equal(await page.locator('#save-agent-config').count(), 1);
+  assert.equal(data.requests.length, 0);
 }));
 
 test('replaced agents expose history and replacement details without restart or configure controls', async () => fixture(async (page, data) => {
@@ -1449,7 +1625,7 @@ test('replaced agents expose history and replacement details without restart or 
   await page.reload();
   assert.deepEqual(await page.locator('[data-agent="1"] [data-action]').evaluateAll(buttons => buttons.map(button => button.dataset.action)), ['details']);
   await page.locator('[data-agent="1"] [data-action=details]').click();
-  await page.locator('#agent-details dt[data-key=retry]').waitFor();
+  await page.locator('#agent-details dt[data-key=replacement]').waitFor();
   assert.match(await page.locator('#agent-details').textContent(), /\/history\/old.jsonl.*Replacement agent #2/s);
   assert.equal(await page.locator('#agent-log').textContent(), 'Retained predecessor history');
   assert.equal(await page.locator('#agent-config').textContent(), '');
