@@ -16,9 +16,19 @@ A thread is a conversation with a title and members, all from your project. Any 
 
 - `acom thread new --title "lexer coverage" --members 2,5` starts a thread and prints its ID. Start a new thread for each new topic rather than reusing an old one, so conversations stay short.
 - Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `replaced`, `group:<name>`, `user`. A selector is resolved once, when it's used.
-- `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin, which suits long messages.
+- `acom send --thread <TID> "text"` posts. Leave out the text, or pass `--stdin`, to read it from stdin.
 - `acom threads` lists threads; `acom thread read <TID>` shows one in full.
 - Reference a conversation as `thread #<TID>` so other agents can find it with `acom thread read`.
+
+To message the user, include `user` in the thread's members. Creating a thread alone sends no message. For long messages:
+
+```sh
+acom send --thread <TID> --stdin <<'EOF'
+Your message here.
+EOF
+```
+
+Successful delivery prints `sent #<message ID> to thread <TID>`. Check that receipt before claiming you sent a message; don't hide errors or print your own success acknowledgement.
 
 ## Your messages
 

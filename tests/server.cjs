@@ -125,8 +125,8 @@ process.stdin.on('end', async () => {
     assert.equal(res.status, status, `${method} ${route}: ${JSON.stringify(result)}`);
     return result;
   };
-  const cli = (cwd, args, extra = {}) => {
-    const result = spawnSync(binary, args, { cwd, env: { ...env, ...extra }, encoding: 'utf8' });
+  const cli = (cwd, args, extra = {}, input) => {
+    const result = spawnSync(binary, args, { cwd, env: { ...env, ...extra }, encoding: 'utf8', input });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
   };
@@ -260,6 +260,38 @@ process.stdin.on('end', async () => {
     await api('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 400);
     await api('POST', `/projects/${a.id}/remove`, {}, 409);
     await finished(one.id); await finished(two.id);
+    const cliThread=await api('POST','/threads',{project:a.id,title:'CLI stdin delivery',members:[]});
+    const actor={ACOM_ID:String(one.id),ACOM_URL:url};
+    const multiline='First line from stdin\nSecond line from stdin\n';
+    const acknowledged=cli(first,['send','--thread',String(cliThread.id),'--stdin'],actor,multiline);
+    const sent=acknowledged.match(/^sent #(\d+) to thread (\d+)$/m);
+    assert.ok(sent,'success reports the real message ID');
+    assert.equal(Number(sent[2]),cliThread.id);
+    const explicitStdin=await api('GET',`/threads/${cliThread.id}`);
+    assert.equal(explicitStdin.messages.at(-1).id,Number(sent[1]));
+    assert.equal(explicitStdin.messages.at(-1).sender,one.id);
+    assert.equal(explicitStdin.messages.at(-1).text,multiline);
+    assert.ok(explicitStdin.members.includes(one.id),'sending joins the sender to the thread');
+    assert.ok(explicitStdin.members.includes(0));
+    assert.equal(explicitStdin.unread,1);
+    assert.match(cli(first,['send','--thread',String(cliThread.id)],actor,'Implicit stdin still works\n'),/^sent #\d+ to thread/m);
+    assert.match(cli(first,['send','--thread',String(cliThread.id),'Positional','text'],actor),/^sent #\d+ to thread/m);
+    const delivered=await api('GET',`/threads/${cliThread.id}`);
+    assert.deepEqual(delivered.messages.map(m=>m.text),[multiline,'Implicit stdin still works\n','Positional text']);
+    assert.ok(delivered.messages.every(m=>m.sender===one.id));
+    assert.equal(delivered.unread,3);
+    for(const failure of [
+      {args:['send','--thread',String(cliThread.id),'--stdin','Conflicting text'],input:multiline,error:/cannot be used with/},
+      {args:['send','--thread',String(cliThread.id),'--stdin'],input:' \n\t',error:/message is empty/},
+      {args:['send','--thread','99999','--stdin'],input:multiline,error:/no thread/},
+    ]) {
+      const failed=spawnSync(binary,failure.args,{cwd:first,env:{...env,...actor},encoding:'utf8',input:failure.input});
+      assert.notEqual(failed.status,0,'failed sends return a failing exit status');
+      assert.match(failed.stderr,failure.error);
+      assert.doesNotMatch(failed.stdout,/sent #/,'failed sends never claim delivery');
+      assert.equal((await api('GET',`/threads/${cliThread.id}`)).messages.length,3,'failed sends do not write a message');
+    }
+    await api('POST',`/threads/${cliThread.id}/read`,{message:delivered.messages.at(-1).id});
     const firstMessage = await api('POST', '/messages', { agent: one.id, thread: thread.id, text: 'Unread for the user' });
     const snapshot = await api('GET', `/threads/${thread.id}`);
     assert.equal(snapshot.unread, 1);
@@ -717,6 +749,18 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     await page.locator(`[data-message="${message.id}"]`).waitFor();
     await until(async () => (await api('GET', `/threads/${thread}`)).unread === 0, 'open thread clears new reply');
     assert.equal(await page.locator('#message-form textarea').inputValue(), 'Preserve this draft');
+    page.once('dialog',dialog=>dialog.accept());
+    await page.locator('#close-thread').click();
+    await page.waitForFunction(()=>document.querySelector('#thread-main').textContent==='Select a thread');
+    assert.equal(await page.locator('.thread-row.active').count(),0,'closing clears the selected thread');
+    const closedMessage=await api('POST','/messages',{agent,thread,text:'Keep unread while the thread is closed'});
+    await page.waitForFunction(thread=>document.querySelector(`[data-thread="${thread}"]`)?.textContent.includes('1 unread'),thread);
+    await page.waitForTimeout(1200);
+    assert.equal((await api('GET',`/threads/${thread}`)).unread,1,'closed panes never acknowledge new messages');
+    assert.equal(await page.locator('#message-form').count(),0);
+    await page.locator(`[data-thread="${thread}"]`).click();
+    await page.locator(`[data-message="${closedMessage.id}"]`).waitFor();
+    await until(async()=>(await api('GET',`/threads/${thread}`)).unread===0,'reopening marks the displayed message read');
     await page.locator('[data-page=overview]').click();
     await page.locator(`[data-action=details][data-id="${agent}"]`).click();
     await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));

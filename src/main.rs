@@ -36,7 +36,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   thread new --title <text> [--members <ID or selector,...>]
   thread read <TID>                       A thread's full history
   thread add <TID> <ID or selector,...>   Add members
-  send --thread <TID> [text]              Post in a thread (text from stdin if left out)
+  send --thread <TID> [text] [--stdin]    Post in a thread (stdin if text is left out)
   inbox [--mark new|in-progress|handled]  Your messages with that mark (default new)
   read <msg ID>                           One message in full
   mark <msg ID,...> new|in-progress|handled
@@ -53,7 +53,7 @@ User commands (they act on the project the current folder is in):
   project remove <ID>                     Remove a project that has no agents
   launch ... [--force]                    Launch an agent in this folder's project (added if
                                           needed); --force confirms past a hard limit
-  send --thread <TID> [text]              Post as user
+  send --thread <TID> [text] [--stdin]    Post as user
   pause <ID> [--release-locks|--keep-locks]
   pause-all / resume-all
   resume <ID,...>
@@ -127,6 +127,9 @@ enum Cmd {
     Send {
         #[arg(long)]
         thread: i64,
+        /// Read the message from stdin instead of positional text.
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
         text: Vec<String>,
     },
     Inbox {
@@ -721,7 +724,7 @@ fn main() {
                 println!("added {} to thread {id}", m.join(", "));
             }
         },
-        Cmd::Send { thread, text } => {
+        Cmd::Send { thread, text, .. } => {
             let text = text_or_stdin(text);
             let mut b = json!({ "thread": thread, "text": text });
             match my_id() {

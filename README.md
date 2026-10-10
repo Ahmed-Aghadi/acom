@@ -25,7 +25,7 @@ Threads have a searchable member picker. **Mine**, **All** and **Agent-only** se
 
 The list and open conversation show each thread's ID. **Copy reference** copies `thread #<ID>` for use in another conversation; agents can look it up with `acom thread read <ID>`.
 
-Unread counts appear on Threads, individual conversations, project choices and the browser tab. **Unread** filters the current project's conversations. Only other people's messages in threads you've joined count. Read status is saved when a focused, visible conversation reaches the latest message (or you run `acom thread read` as the user); background pages, dialogs and scrolling older history don't clear it. **Jump to latest** catches up without losing your draft. Leaving stops notifications; rejoining keeps your previous read position.
+Unread counts appear on Threads, individual conversations, project choices and the browser tab. **Unread** filters the current project's conversations. Only other people's messages in threads you've joined count. Read status is saved when a focused, visible conversation reaches the latest message (or you run `acom thread read` as the user); background pages, dialogs and scrolling older history don't clear it. **Jump to latest** catches up without losing your draft. **Close thread** dismisses the conversation without leaving it; later replies stay unread until you reopen it. Closing doesn't undo messages already read. Leaving stops notifications; rejoining keeps your previous read position.
 
 ## Agents
 

@@ -477,13 +477,14 @@
 
     async function refreshThread(showError = true) {
       const selected = state.selectedThread;
+      if (selected == null) return;
       const request = ++state.threadRequest;
       try {
         const t = await api(`/threads/${selected}`);
         if (request !== state.threadRequest || selected !== state.selectedThread) return;
         const sameThread = state.thread?.id === t.id && $('#messages');
         if (!sameThread) {
-          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta"></div><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button></div><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><h2>${esc(t.title)}</h2><div class="meta"></div><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button><button type="button" id="close-thread">Close thread</button></div><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
             <form class="composer" id="message-form"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
           const messages = $('#messages');
@@ -853,6 +854,10 @@
       }
       const threadFilter = event.target.closest('[data-thread-filter]');
       if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; localStorage.setItem('thread-filter',state.threadFilter); renderThreads(); return; }
+      if (event.target.closest('#close-thread')) {
+        if ($('#message-form textarea')?.value && !confirm('Discard your unsent message and close this thread?')) return;
+        resetThread(); renderThreads(); return;
+      }
       if(event.target.closest('#thread-membership')) {
         try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); await refreshThread(); } catch(error) {toast(error.message,true);} return;
       }

@@ -778,6 +778,75 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
   assert.doesNotMatch(await page.title(), /^\(/);
 }));
 
+test('closing a thread keeps membership and read history while future messages stay unread until reopened', async () => fixture(async (page, data) => {
+  data.threads = [conversation([incoming(1)])];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  assert.equal(data.reads[1], 1);
+  await page.locator('#close-thread').click();
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('.thread-row.active').count(), 0);
+  assert.deepEqual(data.threads[0].members, [0, 1]);
+  assert.equal(data.reads[1], 1, 'closing does not undo an acknowledged read');
+  const readsBefore = data.requests.filter(r => r.url.endsWith('/read')).length;
+  data.threads[0].messages.push(incoming(2, 'After closing'));
+  // Normal polling updates badges, but must not reopen or acknowledge the thread.
+  await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '1 unread');
+  await page.waitForTimeout(2100);
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(data.reads[1], 1);
+  assert.equal(data.requests.filter(r => r.url.endsWith('/read')).length, readsBefore);
+  assert.equal(data.requests.filter(r => r.url.endsWith('/user')).length, 0, 'Close is not Leave');
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  assert.equal(data.reads[1], 2);
+  assert.equal(await page.locator('[data-message="2"] .message-text').textContent(), 'After closing');
+}));
+
+test('closing a thread confirms before discarding an unsent draft and cancellation keeps it open', async () => fixture(async (page, data) => {
+  data.threads = [conversation([])];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep my draft');
+  let confirmations = 0;
+  page.once('dialog', dialog => { confirmations++; assert.match(dialog.message(), /unsent message/); dialog.dismiss(); });
+  await page.locator('#close-thread').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
+  assert.equal(await page.locator('.thread-row.active').count(), 1);
+  page.once('dialog', dialog => { confirmations++; dialog.accept(); });
+  await page.locator('#close-thread').click();
+  assert.equal(confirmations, 2);
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.deepEqual(data.threads[0].members, [0, 1]);
+  assert.equal(data.requests.length, 0);
+}));
+
+test('a pending thread fetch cannot reopen or auto-read a thread after Close', async () => fixture(async (page, data) => {
+  data.threads = [conversation([incoming(1)])];
+  await page.reload(); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  await page.route('**/threads/1', async route => { await gate; await route.continue(); });
+  data.threads[0].messages.push(incoming(2, 'While fetch was pending'));
+  const pending = page.waitForRequest(r => new URL(r.url()).pathname === '/threads/1');
+  await page.evaluate(() => { window.pendingThread = refreshThread(); });
+  await pending;
+  await page.locator('#close-thread').click();
+  release();
+  await page.evaluate(async () => { await window.pendingThread; });
+  await page.unroute('**/threads/1');
+  await page.evaluate(() => refresh());
+  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
+  assert.equal(data.reads[1], 1);
+  assert.deepEqual(data.threads[0].members, [0, 1]);
+  assert.equal(data.requests.filter(r => r.url.endsWith('/read')).length, 1);
+}));
+
 test('background, other pages and dialogs do not clear unread messages', async () => fixture(async (page, data) => {
   data.threads = [conversation([])];
   await page.reload(); await page.locator('[data-page=threads]').click();
