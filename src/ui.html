@@ -4,211 +4,394 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>acom</title>
+  <script>
+    (() => {
+      let theme;
+      try { theme = localStorage.getItem('acom:theme'); } catch (_) {}
+      document.documentElement.dataset.theme = ['light','dark'].includes(theme) ? theme : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    })();
+  </script>
   <style>
+
     :root {
       color-scheme: light;
-      --bg: #f4f2ec;
-      --panel: #fffefa;
-      --ink: #21211e;
-      --muted: #6d6b63;
-      --line: #d9d5ca;
-      --accent: #27615b;
-      --accent-soft: #e2efeb;
-      --warn: #9a5c17;
-      --danger: #a43934;
-      --shadow: 0 10px 28px rgba(54, 50, 40, .08);
+      --bg: #f3f5f9; --panel: #ffffff; --surface: #f8fafc; --ink: #172335;
+      --muted: #617087; --line: #e1e7ef; --accent: #365ce5; --accent-soft: #edf1ff;
+      --warn: #9a620d; --danger: #bd3549; --success: #168467;
+      --shadow: 0 3px 16px rgba(24,39,75,.035); --sidebar: #111b2e;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0e1523; --panel: #172133; --surface: #1c293d; --ink: #e5ecf7;
+      --muted: #a2b0c7; --line: #2c3a50; --accent: #95adff; --accent-soft: #253353;
+      --warn: #edba6b; --danger: #ff97a5; --success: #6cdbb6; --shadow: none;
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
-    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
+    html { scroll-padding-top: 100px; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     button, input, select, textarea { font: inherit; }
     button { cursor: pointer; }
-    .top { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 18px; padding: 14px 24px; border-bottom: 1px solid var(--line); background: rgba(255,254,250,.94); backdrop-filter: blur(12px); }
-    .brand { font: 700 21px/1 ui-monospace, monospace; letter-spacing: -.5px; }
-    .live { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #419176; box-shadow: 0 0 0 3px #dfeee9; }
-    .dot.off { background: var(--danger); box-shadow: 0 0 0 3px #f4dfdd; }
-    .usage { display: flex; flex-wrap: wrap; gap: 14px; margin-left: auto; }
-    .meter { width: 132px; }
-    button.meter { text-align: left; background: transparent; border: 0; padding: 0; }
-    .folder-list, .member-list { max-height: 280px; overflow: auto; margin: 12px 0; border: 1px solid var(--line); border-radius: 7px; }
-    .folder-row { display: flex; width: 100%; gap: 9px; padding: 8px 10px; border: 0; border-radius: 0; text-align: left; overflow-wrap: anywhere; }
-    .folder-row span:last-child { margin-left: auto; color: var(--muted); }
-    .member-list label { display: flex; align-items: center; gap: 9px; padding: 9px; border-bottom: 1px solid var(--line); }
-    .member-list input, .inline-check input { width: auto; }
-    .inline-check { display: flex; align-items: center; gap: 7px; }
-    .filter-actions { display: flex; gap: 5px; padding: 10px; flex-wrap: wrap; }
-    .filter-actions .active { background: var(--accent-soft); color: var(--accent); }
-    .inline-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; }
-    .meter-label { display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
-    .track { position: relative; height: 6px; overflow: hidden; border-radius: 9px; background: #e6e2d9; }
-    .fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s; }
-    .mark { position: absolute; top: 0; bottom: 0; z-index: 1; width: 1px; background: rgba(255,255,255,.9); box-shadow: 0 0 0 1px rgba(40,40,35,.28); }
-    .fill.warn { background: var(--warn); }
-    .fill.hard { background: var(--danger); }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
-    .project-banner { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; margin-bottom: 18px; }
-    .project-banner code, .launch-project { overflow-wrap: anywhere; white-space: normal; }
-    .project-banner .meta { margin-left: auto; }
-    .project-banner label { max-width: 100%; }
-    .project-banner select { min-width: 180px; max-width: 100%; width: auto; }
-    button { min-height: 34px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: var(--ink); }
-    button:hover { border-color: #a9a59a; background: #faf8f2; }
+    button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    .skip-link { position: fixed; top: 10px; left: 10px; z-index: 50; padding: 10px 16px; background: var(--panel); border-radius: 8px; transform: translateY(-150%); }
+    .skip-link:focus { transform: none; }
+    .app-shell { display: grid; grid-template-columns: 244px minmax(0,1fr); min-height: 100dvh; }
+    .sidebar { position: sticky; top: 0; height: 100dvh; overflow-y: auto; display: flex; flex-direction: column; padding: 28px 18px 18px; background: var(--sidebar); color: #e8edf7; }
+    .brand { display: flex; align-items: center; gap: 11px; padding: 0 9px; font-size: 24px; font-weight: 750; letter-spacing: -.8px; }
+    .brand-mark { display: grid; place-items: center; width: 35px; height: 35px; border-radius: 10px; background: #4968ef; color: #fff; font: 700 19px ui-monospace, monospace; box-shadow: 0 4px 14px #4968ef30; }
+    .brand-subtitle { margin: 9px 9px 31px; color: #91a1ba; font-size: 12px; }
+    .sidebar-label, .eyebrow { font-size: 10px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .sidebar-label { margin: 0 10px 10px; color: #95a5bf; }
+    .project-banner { margin-bottom: 26px; min-width: 0; }
+    .project-banner label { margin: 0 8px 10px; color: #aebbd0; }
+    .project-banner select { padding: 10px; border-color: #35425a; background: #1d2b43; color: #f0f4ff; }
+    .project-banner code { display: block; margin: 9px; color: #aebbd0; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
+    .project-actions { display: flex; gap: 6px; margin: 12px 8px 0; }
+    .sidebar button { border-color: #35425a; background: transparent; color: #d4def0; }
+    .sidebar button:hover { background: #263650; border-color: #637495; }
+    .project-actions button { flex: 1; padding: 7px 4px; font-size: 11px; }
+    .navigation { display: grid; gap: 6px; margin-bottom: 25px; }
+    .navigation button { display: flex; align-items: center; gap: 11px; width: 100%; padding: 11px 13px; border: 1px solid transparent; text-align: left; font-weight: 600; color: #aebbd0; }
+    .navigation button.active { border-color: #3d5487; background: #263859; color: #fff; }
+    .icon { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .navigation .pill { margin-left: auto; font-size: 10px; padding: 2px 5px; }
+    .system-controls { margin-top: auto; padding-top: 30px; }
+    .system-menu > summary { display: none; }
+    .system-controls .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 0 8px; }
+    .system-controls button { font-size: 11px; }
+    #resume-restart { grid-column: 1/-1; white-space: normal; text-align: left; padding: 10px; }
+    #restart-paused-count { display: block; color: #aebbd0; font-size: 10px; margin-top: 3px; }
+    .sidebar-footer { display: flex; align-items: center; gap: 7px; margin: 20px 9px 0; color: #95a5bf; font-size: 11px; }
+    .sidebar-footer .dot { width: 6px; height: 6px; box-shadow: none; }
+    .workspace { min-width: 0; }
+    .top { min-height: 76px; display: flex; align-items: center; gap: 18px; padding: 16px 34px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    .breadcrumb { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+    .breadcrumb strong { color: var(--ink); font-weight: 600; }
+    .top .actions { margin-left: auto; align-items: center; }
+    .live { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+    .dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #35ba8e; box-shadow: 0 0 0 3px #35ba8e15; }
+    .dot.off { background: var(--danger); box-shadow: 0 0 0 3px #bd354915; }
+    button { min-height: 38px; padding: 8px 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font-weight: 550; transition: background .15s, border-color .15s; }
+    button:hover { background: var(--surface); border-color: var(--muted); }
     button:disabled { cursor: default; opacity: .5; }
-    button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    button.primary { background: #365ce5; border-color: #365ce5; color: white; box-shadow: 0 2px 4px #365ce51a; }
+    button.primary:hover { background: #2848c5; border-color: #2848c5; }
     button.danger { color: var(--danger); }
-    button.small { min-height: 27px; padding: 3px 8px; font-size: 12px; }
-    main { max-width: 1500px; margin: 0 auto; padding: 22px 24px 48px; }
-    nav { display: flex; flex-wrap: wrap; gap: 3px; margin-bottom: 17px; }
-    nav button { border-color: transparent; background: transparent; color: var(--muted); }
-    nav button.active { background: var(--accent-soft); color: var(--accent); }
+    button.small { min-height: 32px; padding: 5px 9px; font-size: 11px; }
+    .icon-button { display: grid; place-items: center; width: 38px; padding: 8px; }
+    main { max-width: 1740px; margin: 0 auto; padding: 28px 34px 44px; }
     .page { display: none; }
     .page.active { display: block; }
-    .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(310px, 1fr); gap: 18px; align-items: start; }
-    .stack { display: grid; gap: 18px; }
-    .panel { overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
-    #locks { overflow-x: auto; }
-    .panel-head { display: flex; align-items: center; gap: 10px; min-height: 50px; padding: 10px 15px; border-bottom: 1px solid var(--line); }
-    .panel-head h2 { margin: 0; font-size: 15px; }
-    .panel-head .count { color: var(--muted); font-size: 12px; }
+    .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+    .eyebrow { margin: 0 0 8px; color: var(--muted); }
+    h1 { margin: 0; font-size: clamp(23px, 2.4vw, 30px); font-weight: 700; letter-spacing: -.8px; line-height: 1.3; overflow-wrap: anywhere; }
+    .page-description { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+    .page-heading .scope-note { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .usage-bar { display: flex; align-items: center; gap: 22px; margin-bottom: 28px; padding: 15px 20px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
+    .usage-heading { min-width: 95px; }
+    .usage-heading strong { display: block; font-size: 12px; }
+    .usage-heading span { color: var(--muted); font-size: 10px; }
+    .usage { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 24px; flex: 1; min-width: 0; }
+    button.meter { width: 100%; min-height: 0; text-align: left; background: transparent; border: 0; padding: 0 3px; border-radius: 4px; }
+    .meter-label { display: flex; justify-content: space-between; gap: 5px; margin-bottom: 7px; color: var(--muted); font-size: 10px; }
+    .meter-label span:last-child { color: var(--ink); font-weight: 650; }
+    .meter .meta { font-size: 10px; margin-top: 5px; }
+    .track { position: relative; height: 4px; overflow: hidden; border-radius: 9px; background: var(--line); }
+    .fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s; }
+    .mark { position: absolute; top: 0; bottom: 0; z-index: 1; width: 1px; background: var(--panel); box-shadow: 0 0 0 1px #61708766; }
+    .fill.warn { background: var(--warn); } .fill.hard { background: var(--danger); }
+    .stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 16px; margin-bottom: 25px; }
+    .stat { padding: 18px 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); }
+    .stat-label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .stat-value { margin-top: 10px; font-size: 28px; font-weight: 650; letter-spacing: -1px; line-height: 1.2; }
+    .stat-note { margin-top: 6px; font-size: 11px; color: var(--muted); }
+    .stat.attention .stat-value { color: var(--warn); }
+    .grid { display: grid; grid-template-columns: minmax(0,2.4fr) minmax(265px,1fr); gap: 22px; align-items: start; }
+    .stack { display: grid; gap: 22px; min-width: 0; }
+    .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow); }
+    .panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; min-height: 62px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
+    .panel-head h2 { margin: 0; font-size: 14px; font-weight: 650; }
+    .panel-head .count { padding: 2px 7px; border-radius: 5px; color: var(--muted); background: var(--surface); font-size: 10px; }
     .panel-head button { margin-left: auto; }
-    .empty { padding: 30px 18px; color: var(--muted); text-align: center; }
-    .group-title { padding: 11px 15px 7px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    .agent { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(170px, 1.2fr) auto; gap: 14px; align-items: center; padding: 11px 15px; border-top: 1px solid #ebe8df; }
-    .agent:hover { background: #fbfaf5; }
-    .agent-name { display: flex; align-items: center; gap: 8px; font-weight: 650; }
-    .pill { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 20px; background: #ece9e1; color: #55534d; font-size: 11px; font-weight: 600; }
-    .pill.working { background: #dceee8; color: #1f6658; }
-    .pill.paused, .pill.crashed { background: #f5dfdc; color: #923b34; }
-    .pill.idle { background: #e3eaf2; color: #3b5878; }
-    .pill.unread { background: var(--accent); color: white; }
-    .pill.waiting { background: #f5ead7; color: #855510; }
+    .panel-head .panel-caption { margin-left: auto; color: var(--muted); font-size: 10px; }
+    .agent-toolbar { padding: 14px 20px; border-bottom: 1px solid var(--line); }
+    .search-field { position: relative; display: block; }
+    .search-field .icon { position: absolute; top: 12px; left: 12px; color: var(--muted); width: 16px; height: 16px; }
+    .search-field input { padding-left: 36px; background: var(--surface); }
+    .filter-actions { display: flex; gap: 5px; padding: 12px 0 0; flex-wrap: wrap; }
+    .filter-actions button { background: transparent; border-color: transparent; color: var(--muted); }
+    .filter-actions .active { background: var(--accent-soft); color: var(--accent); }
+    .agent-toolbar .filter-actions { gap: 8px; }
+    .agent-toolbar .filter-actions button { font-size: 11px; }
+    .empty { padding: 40px 24px; color: var(--muted); text-align: center; }
+    .empty-symbol { display: grid; place-items: center; width: 46px; height: 46px; margin: 0 auto 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); color: var(--accent); }
+    .empty strong { display: block; margin-bottom: 5px; color: var(--ink); font-size: 14px; font-weight: 600; }
+    .empty p { max-width: 330px; margin: 5px auto 0; font-size: 12px; }
+    .group-title { display: flex; align-items: center; gap: 7px; padding: 15px 20px 10px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; background: var(--surface); border-bottom: 1px solid var(--line); }
+    .group-title:before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--muted); }
+    .agent { display: grid; grid-template-columns: minmax(0,.85fr) minmax(0,1.1fr); gap: 12px 22px; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+    .agent:last-child { border-bottom: 0; }
+    .agent:hover { background: var(--surface); }
+    .agent-name { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-bottom: 6px; font-size: 13px; font-weight: 650; }
+    .agent-name > span:first-child { overflow-wrap: anywhere; }
+    .agent .meta { font-size: 11px; }
+    .agent > div:first-child > .meta { white-space: normal; overflow-wrap: anywhere; }
+    .agent-task { color: var(--ink) !important; white-space: normal !important; margin-bottom: 7px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow-wrap: anywhere; line-height: 1.55; }
+    .agent div.meta:has(> .pill.waiting), .agent .meta:has(> div), .agent .wait-reason { white-space: normal; overflow-wrap: anywhere; }
+    .agent-buttons { display: flex; flex-wrap: wrap; justify-content: flex-start; gap: 7px; grid-column: 1/-1; }
+    .agent-buttons button:first-child { color: var(--accent); }
+    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 5px; background: var(--surface); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0; }
+    .pill.working { background: #16846715; color: var(--success); }
+    .pill.working:before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .pill.paused, .pill.crashed { background: #bd354915; color: var(--danger); }
+    .pill.idle { background: var(--accent-soft); color: var(--accent); }
+    .pill.unread { background: #365ce5; color: #fff; }
+    .pill.waiting { background: #b6791315; color: var(--warn); }
     .meta { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-    .meta.launch-project { white-space: normal; overflow-wrap: anywhere; }
-    .agent-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
-    .problem { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; white-space: normal; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 9px 12px; border-bottom: 1px solid #ebe8df; text-align: left; vertical-align: top; }
-    th { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    .meta.launch-project, .launch-project { white-space: normal; overflow-wrap: anywhere; }
+    .problem { margin-top: 6px; padding: 7px 9px; border-left: 2px solid var(--danger); background: #bd354908; color: var(--danger); font-size: 11px; overflow-wrap: anywhere; white-space: normal; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 12px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
     tr:last-child td { border-bottom: 0; }
-    .activity { max-height: 365px; overflow: auto; }
-    .event { display: grid; grid-template-columns: 58px 1fr; gap: 8px; padding: 8px 14px; border-bottom: 1px solid #ebe8df; }
-    .event time { color: var(--muted); font: 11px/1.6 ui-monospace, monospace; }
-    .actor { color: var(--muted); }
-    .thread-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 610px; }
-    .thread-list { border-right: 1px solid var(--line); }
-    .thread-row { display: block; width: 100%; min-height: 0; padding: 12px 14px; border: 0; border-bottom: 1px solid #ebe8df; border-radius: 0; background: transparent; text-align: left; }
-    .thread-row.active { background: var(--accent-soft); }
-    .thread-row strong { display: block; margin-bottom: 3px; }
-    .thread-main { display: flex; min-width: 0; flex-direction: column; }
-    .thread-header { position: relative; padding: 13px 48px 13px 16px; border-bottom: 1px solid var(--line); }
-    #close-thread { position: absolute; top: 10px; right: 10px; font-size: 20px; padding: 0 8px; }
-    .thread-header h2 { margin: 0 0 3px; font-size: 16px; }
-    .messages { flex: 1; min-height: 400px; max-height: 580px; padding: 16px; overflow: auto; }
-    .message { max-width: 780px; margin-bottom: 13px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; }
-    .message.user { margin-left: auto; background: var(--accent-soft); }
-    .message-head { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 5px; color: var(--muted); font-size: 11px; }
+    #locks { overflow-x: auto; }
+    #locks table { min-width: 640px; }
+    .activity { max-height: 600px; overflow: auto; }
+    .event { position: relative; display: grid; grid-template-columns: 52px minmax(0,1fr); gap: 13px; padding: 15px 20px; border-bottom: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
+    .event time { padding-top: 2px; color: var(--muted); font: 10px/1.6 ui-monospace, monospace; }
+    .activity .event time { white-space: nowrap; }
+    .actor { color: var(--accent); font-size: 11px; }
+    .thread-layout { display: grid; grid-template-columns: 300px minmax(0,1fr); min-height: 630px; height: calc(100dvh - 310px); max-height: 950px; }
+    .thread-list { min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); background: var(--surface); }
+    .thread-list .panel-head { padding: 15px; background: var(--panel); }
+    .thread-tools { padding: 13px 14px; border-bottom: 1px solid var(--line); }
+    .thread-tools input { background: var(--panel); font-size: 12px; }
+    .thread-tools .filter-actions { gap: 1px; }
+    .thread-row { display: block; width: 100%; min-height: 0; padding: 16px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; text-align: left; }
+    .thread-row:hover { background: var(--panel); }
+    .thread-row.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+    .thread-row strong { display: block; margin-bottom: 7px; font-size: 12px; overflow-wrap: anywhere; }
+    .thread-row .meta { font-size: 10px; margin-top: 7px; }
+    .thread-main { display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--panel); }
+    .thread-main > .empty { margin: auto; }
+    .thread-header { position: relative; padding: 20px 50px 17px 22px; border-bottom: 1px solid var(--line); }
+    #close-thread { position: absolute; top: 13px; right: 12px; font-size: 21px; width: 32px; min-height: 32px; padding: 0; border-color: transparent; color: var(--muted); }
+    .thread-header h2 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.3px; overflow-wrap: anywhere; }
+    .thread-header > .meta { white-space: normal; font-size: 11px; }
+    .thread-header .actions { margin-top: 13px; gap: 5px; }
+    .thread-header .actions button { min-height: 30px; padding: 5px 8px; font-size: 10px; }
+    .thread-header details { font-size: 11px; margin-top: 12px; }
+    #thread-events { max-height: 180px; overflow: auto; }
+    #thread-events .event { grid-template-columns: 115px minmax(0,1fr); padding: 10px 0; font-size: 11px; }
+    .thread-main > .actions { padding: 8px 18px; align-items: center; }
+    .thread-main > .actions:has(> button[hidden]):has(> span:empty) { display: none; }
+    .messages { flex: 1; min-height: 160px; padding: 22px; overflow: auto; background: var(--surface); }
+    .message { max-width: min(88%,760px); width: fit-content; margin-bottom: 18px; padding: 13px 16px; border: 1px solid var(--line); border-radius: 3px 12px 12px 12px; background: var(--panel); font-size: 13px; }
+    .message.user { margin-left: auto; border-color: transparent; border-radius: 12px 3px 12px 12px; background: var(--accent-soft); }
+    .message-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 22px; margin-bottom: 7px; color: var(--muted); font-size: 10px; }
+    .message-head > span:first-child { font-weight: 650; color: var(--ink); }
     .message-text, .record-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .composer { display: flex; gap: 9px; padding: 12px; border-top: 1px solid var(--line); }
-    .composer textarea { flex: 1; min-height: 58px; resize: vertical; }
-    input, select, textarea { width: 100%; padding: 8px 9px; border: 1px solid #c9c5ba; border-radius: 7px; background: white; color: var(--ink); }
-    label { display: grid; min-width: 0; gap: 5px; color: var(--muted); font-size: 12px; }
-    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
-    .wide { grid-column: 1 / -1; }
-    dialog { width: min(560px, calc(100% - 30px)); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 80px rgba(20,20,15,.25); }
-    dialog::backdrop { background: rgba(30,29,25,.36); backdrop-filter: blur(2px); }
-    dialog form { padding: 18px; }
-    dialog h2 { margin: 0 0 16px; font-size: 18px; }
-    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-    .details { display: grid; grid-template-columns: 130px 1fr; gap: 8px 13px; }
+    .composer { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px 12px; padding: 15px 20px 12px; border-top: 1px solid var(--line); align-items: center; }
+    .composer textarea { min-height: 66px; max-height: 200px; resize: vertical; background: var(--surface); }
+    .composer-hint { grid-column: 1/-1; color: var(--muted); font-size: 10px; }
+    #back-to-threads { display: none; }
+    input, select, textarea { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); }
+    input::placeholder, textarea::placeholder { color: var(--muted); opacity: .8; }
+    input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); flex: none; }
+    label { display: grid; min-width: 0; gap: 7px; color: var(--muted); font-size: 12px; }
+    label > span:not(.meta) { font-size: 11px; }
+    .inline-check { display: flex; align-items: center; gap: 9px; padding: 7px 0; }
+    .form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 17px; }
+    .wide { grid-column: 1/-1; }
+    dialog { width: min(620px,calc(100% - 32px)); max-height: 88dvh; padding: 0; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); color: var(--ink); box-shadow: 0 30px 100px #07132640; }
+    dialog::backdrop { background: #07132688; backdrop-filter: blur(4px); }
+    dialog form { padding: 26px; }
+    dialog h2 { margin: 0 0 18px; font-size: 21px; letter-spacing: -.5px; }
+    dialog h3 { font-size: 14px; margin-top: 24px; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 25px; padding-top: 18px; border-top: 1px solid var(--line); }
+    #agent-dialog { width: min(800px,calc(100% - 32px)); }
+    .details { display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 0 16px; font-size: 12px; }
+    .details dt, .details dd { padding: 8px 0; border-bottom: 1px solid var(--line); }
     .details dt { color: var(--muted); }
-    .details dd { margin: 0; overflow-wrap: anywhere; }
-    .agent-log { max-height: 180px; margin: 4px 0 0; padding: 9px; overflow: auto; border-radius: 7px; background: #292925; color: #efeee8; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
-    .settings { padding: 18px; }
-    .settings h3 { margin: 22px 0 10px; font-size: 14px; }
-    .settings h3:first-child { margin-top: 0; }
-    .harness-settings { margin-bottom: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; }
-    .harness-settings h4 { margin: 0 0 11px; text-transform: capitalize; }
-    .model-picker { border: 1px solid var(--line); border-radius: 7px; padding: 9px; }
-    .model-picker summary { cursor: pointer; color: var(--ink); }
-    .model-options { display: grid; gap: 7px; max-height: 280px; overflow: auto; margin: 12px 0; }
-    .model-options label, .effort-options label { display: flex; align-items: center; gap: 7px; }
-    .model-options input, .effort-options input { width: auto; }
+    .details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .agent-log { max-height: 260px; margin: 9px 0 0; padding: 15px; overflow: auto; border: 1px solid #2c3a50; border-radius: 8px; background: #101b2d; color: #ccdaec; font: 11px/1.7 ui-monospace, monospace; white-space: pre-wrap; }
+    #record-content { font: 12px/1.6 ui-monospace,monospace; }
+    .settings-panel { overflow: visible; }
+    .settings-panel > .panel-head { position: sticky; top: 0; z-index: 3; border-radius: 12px 12px 0 0; background: var(--panel); }
+    .settings-save-state { margin-left: auto; font-size: 11px; color: var(--muted); }
+    .settings-panel > .panel-head button { margin-left: 0; }
+    .settings-jump { display: flex; flex-wrap: wrap; gap: 7px 18px; padding: 15px 24px; border-bottom: 1px solid var(--line); background: var(--surface); font-size: 11px; }
+    .settings-jump a { color: var(--muted); text-decoration: none; }
+    .settings-jump a:hover { color: var(--accent); }
+    .settings { padding: 0 26px 26px; max-width: 1100px; }
+    .settings-section { padding: 25px 0; border-bottom: 1px solid var(--line); scroll-margin-top: 85px; }
+    .settings-section:last-child { border-bottom: 0; padding-bottom: 0; }
+    .settings h3 { margin: 0 0 18px; font-size: 15px; font-weight: 650; }
+    .settings p { max-width: 800px; font-size: 12px; line-height: 1.7; }
+    .settings #config-applied { margin-top: 0; color: var(--accent); font-size: 12px; font-weight: 600; }
+    .harness-settings { margin-bottom: 16px; padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .harness-settings h4 { margin: 0 0 18px; text-transform: capitalize; font-size: 14px; }
+    .model-picker { border: 1px solid var(--line); border-radius: 7px; padding: 12px; background: var(--panel); }
+    summary { cursor: pointer; color: var(--ink); font-size: 12px; font-weight: 550; }
+    .model-options { display: grid; gap: 9px; max-height: 280px; overflow: auto; margin: 15px 0; }
+    .model-options label, .effort-options label { display: flex; align-items: center; gap: 8px; }
     .model-options code { margin-left: auto; }
-    .custom-model-row { display: flex; align-items: end; gap: 8px; }
+    .custom-model-row { display: flex; align-items: end; gap: 9px; }
     .custom-model-row label { flex: 1; }
-    .effort-options { display: flex; flex-wrap: wrap; gap: 10px; }
-    .limit-row { display: grid; max-width: 620px; grid-template-columns: minmax(140px, 1fr) 110px 110px; gap: 10px; align-items: end; margin-bottom: 9px; }
-    .toast { position: fixed; right: 20px; bottom: 20px; z-index: 20; max-width: 430px; padding: 11px 14px; border-radius: 8px; background: #282824; color: white; box-shadow: var(--shadow); opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; white-space: pre-line; }
+    .effort-options { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 3px; }
+    .limit-row { display: grid; max-width: 700px; grid-template-columns: minmax(140px,1fr) 130px 130px; gap: 16px; align-items: center; margin-bottom: 13px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+    .limit-row strong { font-size: 12px; font-weight: 550; }
+    .limit-row input { background: var(--surface); }
+    .folder-list, .member-list { max-height: 300px; overflow: auto; margin: 14px 0; border: 1px solid var(--line); border-radius: 8px; }
+    .folder-row { display: flex; width: 100%; gap: 10px; padding: 11px 13px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left; overflow-wrap: anywhere; font-size: 12px; }
+    .folder-row span:last-child { margin-left: auto; color: var(--muted); font-size: 10px; }
+    .member-list label { display: flex; align-items: center; gap: 11px; padding: 12px; border-bottom: 1px solid var(--line); }
+    .member-list .meta { white-space: normal; overflow-wrap: anywhere; }
+    .inline-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+    .connection-banner { display: flex; align-items: center; gap: 15px; padding: 12px 18px; margin-bottom: 20px; background: #b6791310; border: 1px solid #b6791355; border-radius: 9px; color: var(--warn); font-size: 12px; }
+    .connection-banner button { margin-left: auto; flex: none; }
+    #result-notice { padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 12px; }
+    .toast { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(460px,calc(100vw - 32px)); padding: 15px 19px; border: 1px solid #344563; border-radius: 10px; background: #15233a; color: #fff; box-shadow: 0 10px 35px #07132630; opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; white-space: pre-line; overflow-wrap: anywhere; font-size: 13px; }
     .toast.show { opacity: 1; transform: none; }
-    .toast.error { background: var(--danger); }
-    code { font: 12px ui-monospace, monospace; }
-    @media (max-width: 900px) {
-      .top { flex-wrap: wrap; padding: 12px 15px; }
-      .usage { order: 3; width: 100%; margin: 0; }
-      .meter { flex: 1; }
-      main { padding: 15px; }
-      .grid, .thread-layout { grid-template-columns: 1fr; }
-      .thread-list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 220px; overflow: auto; }
-      .agent { grid-template-columns: 1fr; gap: 5px; }
-      .agent-buttons { justify-content: flex-start; }
+    .toast.error { background: #9f293d; border-color: #d4566a; }
+    code { font: 11px/1.5 ui-monospace,SFMono-Regular,monospace; }
+    .panel > [data-more] { margin: 12px 20px; }
+    @media (min-width: 1600px) { .agent { grid-template-columns: minmax(0,1fr) minmax(0,1.3fr) auto; } .agent-buttons { grid-column: auto; justify-content: flex-end; max-width: 245px; } }
+    @media (max-width: 1200px) {
+      .app-shell { grid-template-columns: 210px minmax(0,1fr); }
+      .sidebar { padding-left: 12px; padding-right: 12px; }
+      main { padding: 26px 24px; } .top { padding: 16px 24px; }
+      .grid { grid-template-columns: minmax(0,1fr); } .activity { max-height: 320px; }
+      .usage { gap: 14px; } .usage-bar { gap: 15px; padding: 15px; }
+      .thread-layout { grid-template-columns: 260px minmax(0,1fr); }
+      .stat { padding: 16px; } .stat-note { font-size: 10px; }
     }
-    @media (max-width: 600px) {
-      .form-grid, .limit-row { grid-template-columns: minmax(0, 1fr); }
-      .model-options label { flex-wrap: wrap; }
-      .model-options code { margin-left: 0; overflow-wrap: anywhere; }
+    @media (max-width: 800px) {
+      html { scroll-padding-top: 14px; }
+      .app-shell { display: block; }
+      .sidebar { position: static; height: auto; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px; padding: 18px 20px 0; overflow: visible; }
+      .brand { padding: 0; font-size: 22px; } .brand-subtitle { display: none; }
+      .project-banner { grid-column: 1/-1; margin: 0; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 5px 12px; }
+      .project-banner label { margin: 0; } .project-banner code { margin: 0; grid-column: 1/-1; }
+      .project-actions { margin: 0; align-self: end; } .project-actions button { padding: 9px; }
+      .navigation { grid-column: 1/-1; display: flex; margin: 0 -4px; gap: 8px; }
+      .navigation button { width: auto; padding: 10px 13px; border-radius: 7px 7px 0 0; font-size: 12px; }
+      .navigation .icon { width: 16px; }
+      .system-controls { grid-column: 2; grid-row: 1; padding: 0; align-self: center; }
+      .system-controls .sidebar-label, .sidebar-footer { display: none; }
+      .system-menu { position: relative; }
+      .system-menu > summary { display: block; padding: 8px 11px; border: 1px solid #35425a; border-radius: 7px; color: #d4def0; font-size: 11px; }
+      .system-controls .actions { position: absolute; top: 44px; right: 0; z-index: 10; display: grid; width: 235px; padding: 12px; gap: 8px; border: 1px solid #35425a; border-radius: 9px; background: var(--sidebar); box-shadow: 0 10px 30px #07132640; }
+      .system-controls button { min-height: 36px; padding: 8px; font-size: 11px; }
+      #resume-restart { max-width: none; padding: 10px; font-size: 11px; } #restart-paused-count { font-size: 10px; }
+      .top { min-height: 62px; padding: 12px 20px; gap: 12px; }
+      .breadcrumb { font-size: 11px; } .top .live { margin-left: auto; } .top .actions { margin-left: 0; }
+      main { padding: 23px 20px 35px; }
+      .usage-bar { display: block; } .usage-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; }
+      .usage { gap: 15px; } .usage .meta { font-size: 9px; }
+      .page-heading .scope-note { display: none; } .page-heading { margin-bottom: 20px; }
+      .stats { gap: 10px; } .stat { padding: 14px; } .stat-value { font-size: 24px; } .stat-label { font-size: 10px; gap: 6px; } .stat-label .icon { width: 14px; }
+      .thread-layout { grid-template-columns: 1fr; height: calc(100dvh - 180px); min-height: 580px; }
+      .thread-list { border-right: 0; } .thread-main { display: none; }
+      .thread-layout.conversation-open .thread-list { display: none; }
+      .thread-layout.conversation-open .thread-main { display: flex; }
+      .thread-layout.conversation-open { height: calc(100dvh - 28px); min-height: 0; }
+      #back-to-threads { display: inline-flex; margin-bottom: 12px; min-height: 32px; padding: 5px 9px; font-size: 11px; }
+      .thread-header { padding: 14px 45px 14px 18px; } .messages { padding: 18px; }
+      .settings { padding: 0 20px 20px; } .settings-jump { padding: 14px 20px; }
     }
+    @media (max-width: 480px) {
+      .sidebar { padding: 15px 14px 0; gap: 14px 6px; } .brand { gap: 7px; font-size: 19px; } .brand-mark { width: 28px; height: 28px; font-size: 16px; border-radius: 8px; }
+      .navigation { gap: 2px; } .navigation button { padding: 10px 8px; font-size: 11px; gap: 6px; } .navigation .pill { font-size: 8px; }
+      .top { padding: 11px 14px; } .breadcrumb > span:first-child, .breadcrumb > span:nth-child(2) { display: none; } .top .live { margin-left: 0; } .top .actions { margin-left: auto; }
+      main { padding: 20px 14px 28px; } .usage { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px 24px; } .usage-bar { margin-bottom: 23px; }
+      .stats { grid-template-columns: repeat(2,minmax(0,1fr)); } .stat-note { font-size: 10px; }
+      .agent { grid-template-columns: minmax(0,1fr); gap: 10px; padding: 16px; } .agent-buttons { grid-column: auto; }
+      .panel-head { padding: 14px 16px; } .agent-toolbar { padding: 12px 16px; }
+      .form-grid { grid-template-columns: minmax(0,1fr); }
+      .limit-row { grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; } .limit-row strong { grid-column: 1/-1; }
+      .model-options label { flex-wrap: wrap; } .model-options code { margin-left: 0; overflow-wrap: anywhere; }
+      dialog form { padding: 20px; } .details { grid-template-columns: 100px minmax(0,1fr); gap: 0 10px; font-size: 11px; }
+      .composer { padding: 12px; gap: 8px; } .message { max-width: 95%; } .message-head { gap: 3px; }
+      .settings-save-state { max-width: 125px; text-align: right; font-size: 10px; } .settings-jump { gap: 8px 15px; }
+      .connection-banner { align-items: start; padding: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *:before, *:after { transition: none !important; scroll-behavior: auto !important; } }
   </style>
 </head>
 <body>
-  <header class="top">
-    <div class="brand">acom</div>
-    <div class="live"><span class="dot" id="live-dot"></span><span id="live-text">connecting</span></div>
-    <div class="usage" id="usage"></div>
-    <div class="actions">
-      <button class="primary" data-open="launch-dialog">Launch</button>
-      <button id="pause-all" title="All projects; stop processes, then release every held lock">Pause all</button>
-      <button id="resume-all" title="All projects">Resume all</button>
-      <button id="resume-restart" title="All projects on this machine; only agents paused by a server restart" disabled>Resume restart-paused <span id="restart-paused-count">(checking · all projects)</span></button>
-    </div>
-  </header>
-
-  <main>
-    <div class="project-banner"><label>Project <select id="project-select" aria-label="Project"></select></label><button class="small" data-more="projects" hidden>More projects</button><code id="project-path">Connecting…</code><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button><span class="meta" id="project-url"></span></div>
-    <nav>
-      <button class="active" data-page="overview" aria-current="page">Overview</button>
-      <button data-page="threads">Threads <span id="unread-total" class="pill unread" hidden></span></button>
-      <button data-page="settings">Settings</button>
-    </nav>
+  <a class="skip-link" href="#main-content">Skip to workspace</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Workspace navigation">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">a.</span>acom</div>
+      <p class="brand-subtitle">Your agents. One workspace.</p>
+      <div class="project-banner">
+        <label>Project <select id="project-select" aria-label="Project"></select></label>
+        <button class="small" data-more="projects" hidden>More projects</button>
+        <code id="project-path">Connecting…</code>
+        <div class="project-actions"><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button></div>
+      </div>
+      <nav class="navigation" aria-label="Project views">
+        <button class="active" data-page="overview" aria-current="page"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>Overview</button>
+        <button data-page="threads"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z"/></svg>Threads <span id="unread-total" class="pill unread" hidden></span></button>
+        <button data-page="settings"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z"/><circle cx="12" cy="12" r="3"/></svg>Settings</button>
+      </nav>
+      <div class="system-controls">
+        <p class="sidebar-label">All projects</p>
+        <details class="system-menu" id="system-menu" open><summary>All projects <span aria-hidden="true">⌄</span></summary>
+        <div class="actions">
+          <button id="pause-all" title="All projects; stop processes, then release every held lock">Pause all</button>
+          <button id="resume-all" title="All projects">Resume all</button>
+          <button id="resume-restart" title="All projects on this machine; only agents paused by a server restart" disabled>Resume restart-paused <span id="restart-paused-count">(checking · all projects)</span></button>
+        </div>
+        </details>
+      </div>
+      <div class="sidebar-footer"><span class="dot"></span><span>Local workspace</span><span id="project-url" hidden></span></div>
+    </aside>
+    <div class="workspace">
+      <header class="top">
+        <div class="breadcrumb"><span>Workspace</span><span aria-hidden="true">/</span><strong id="current-view">Overview</strong></div>
+        <div class="live" role="status"><span class="dot" id="live-dot"></span><span id="live-text">connecting</span></div>
+        <div class="actions"><button class="icon-button" id="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z"/></svg></button><button class="primary" data-open="launch-dialog"><span aria-hidden="true">＋ </span>Launch</button></div>
+      </header>
+      <main id="main-content" tabindex="-1">
+        <div class="connection-banner" id="connection-banner" role="status" hidden><span id="connection-message">Connection interrupted. Your last view is still available. Retrying automatically.</span><button class="small" id="retry-connection">Retry now</button></div>
     <p class="launch-project" id="result-notice" role="status" hidden></p>
 
-    <section class="page active" id="page-overview">
+    <section class="page active" id="page-overview" aria-labelledby="overview-title">
+      <div class="page-heading"><div><p class="eyebrow">Project workspace</p><h1 id="overview-title">Workspace overview</h1><p class="page-description">A clear view of your agents and the work moving between them.</p></div><span class="scope-note"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="13" rx="3"/><path d="M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4"/></svg><span id="overview-scope">Current project</span></span></div>
+      <section class="usage-bar" aria-label="Account usage"><div class="usage-heading"><strong>Account usage</strong><span>Shared across projects</span></div><div class="usage" id="usage"></div></section>
+      <div class="stats" id="workspace-stats" aria-label="Project summary"></div>
       <div class="grid">
         <div class="stack">
           <section class="panel">
-            <div class="panel-head"><h2>Agents</h2><span class="count" id="agent-count"></span></div>
+            <div class="panel-head"><h2>Agents</h2><span class="count" id="agent-count"></span><span class="panel-caption">Your project team</span></div>
+            <div class="agent-toolbar"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="agent-search" aria-label="Search agents" placeholder="Search by name, task, model or group…"></label><div class="filter-actions" aria-label="Filter agents"><button class="small active" data-agent-filter="all" aria-pressed="true">All</button><button class="small" data-agent-filter="active" aria-pressed="false">Active</button><button class="small" data-agent-filter="attention" aria-pressed="false">Needs attention</button><button class="small" data-agent-filter="finished" aria-pressed="false">Finished</button></div></div>
             <div id="agents"></div>
             <button class="small" data-more="agents" hidden>Load more agents</button>
           </section>
           <section class="panel">
-            <div class="panel-head"><h2>Locks</h2><span class="count" id="lock-count"></span></div>
+            <div class="panel-head"><h2>Shared locks</h2><span class="count" id="lock-count"></span><span class="panel-caption">Coordinate access to shared work</span></div>
             <div id="locks"></div>
             <button class="small" data-more="locks" hidden>Load more locks</button>
           </section>
         </div>
         <section class="panel">
-          <div class="panel-head"><h2>Activity</h2></div>
-          <div class="activity" id="activity"></div>
+          <div class="panel-head"><h2>Recent activity</h2><span class="panel-caption">Live updates</span></div>
+          <div class="activity" id="activity" role="region" aria-label="Project activity" tabindex="0"></div>
           <button class="small" data-more="activity" hidden>Load older activity</button>
         </section>
       </div>
     </section>
 
-    <section class="page" id="page-threads">
+    <section class="page" id="page-threads" aria-labelledby="threads-title"><div class="page-heading"><div><p class="eyebrow">Conversations</p><h1 id="threads-title">Threads</h1><p class="page-description">Keep people and agents in sync, one conversation at a time.</p></div></div>
       <section class="panel thread-layout">
         <div class="thread-list">
           <div class="panel-head"><h2>Threads</h2><span class="count" id="thread-count"></span><button class="small" data-open="thread-dialog">New</button></div>
-          <div class="filter-actions"><button class="small" data-thread-filter="mine">Mine</button><button class="small" data-thread-filter="unread">Unread</button><button class="small" data-thread-filter="all">All</button><button class="small" data-thread-filter="agents">Agent-only</button></div>
+          <div class="thread-tools"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="thread-search" aria-label="Search threads" placeholder="Find a conversation…"></label><div class="filter-actions"><button class="small" data-thread-filter="mine">Mine</button><button class="small" data-thread-filter="unread">Unread</button><button class="small" data-thread-filter="all">All</button><button class="small" data-thread-filter="agents">Agent-only</button></div></div>
           <div id="thread-list"></div>
           <button class="small" data-more="threads" hidden>Load more threads</button>
         </div>
@@ -216,13 +399,15 @@
       </section>
     </section>
 
-    <section class="page" id="page-settings">
-      <section class="panel">
-        <div class="panel-head"><h2>Settings</h2><button class="primary" form="settings-form">Save</button></div>
+    <section class="page" id="page-settings" aria-labelledby="settings-title"><div class="page-heading"><div><p class="eyebrow">Project configuration</p><h1 id="settings-title">Settings</h1><p class="page-description">Choose how your agents work, coordinate, and recover.</p></div></div>
+      <section class="panel settings-panel">
+        <div class="panel-head"><h2>Configuration</h2><span class="settings-save-state" id="settings-save-state" role="status">All changes saved</span><button class="primary" form="settings-form">Save</button></div><div class="settings-jump" id="settings-jump" aria-label="Settings sections"></div>
         <form class="settings" id="settings-form"></form>
       </section>
     </section>
   </main>
+    </div>
+  </div>
 
   <dialog id="launch-dialog" aria-labelledby="launch-title">
     <form method="dialog" id="launch-form">
@@ -311,7 +496,7 @@
     </form>
   </dialog>
 
-  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
@@ -321,6 +506,7 @@
       try { if (value) localStorage.setItem(key, value); else localStorage.removeItem(key); return true; }
       catch (_) { return false; }
     }
+    const pendingSends = new Set(), pendingMembership = new Set(), pendingUsage = new Set();
     const drafts = new Map();
     const draftEdits = new Map();
     const draftKey = (project, thread) => `acom:draft:${project}:${thread}`;
@@ -338,10 +524,33 @@
       if (form) saveDraft(form.dataset.draftProject, form.dataset.draftThread, $('[name=text]', form).value);
     }
     const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
+    const icons = {"overview": "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>", "chat": "<path d=\"M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z\"/>", "settings": "<path d=\"m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>", "search": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/>", "agents": "<rect x=\"4\" y=\"7\" width=\"16\" height=\"13\" rx=\"3\"/><path d=\"M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4\"/>", "warning": "<path d=\"m12 3 10 18H2zM12 9v4M12 17h.01\"/>", "lock": "<rect x=\"4\" y=\"10\" width=\"16\" height=\"11\" rx=\"2\"/><path d=\"M8 10V7a4 4 0 0 1 8 0v3M12 14v3\"/>", "moon": "<path d=\"M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z\"/>", "sun": "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5\"/>", "check": "<path d=\"m5 12 4 4L19 6\"/>"};
+    const svgIcon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || ''}</svg>`;
+    const emptyState = (icon, title, description = '') => `<div class="empty"><div class="empty-symbol">${svgIcon(icon)}</div><strong>${esc(title)}</strong>${description ? `<p>${esc(description)}</p>` : ''}</div>`;
+    state.agentFilter = 'all';
+    const themeMedia = matchMedia('(prefers-color-scheme: dark)');
+    let explicitTheme = ['light','dark'].includes(stored('acom:theme'));
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      const next = theme === 'dark' ? 'light' : 'dark';
+      const button = document.getElementById('theme-toggle');
+      button.setAttribute('aria-label', `Switch to ${next} theme`); button.title = `Switch to ${next} theme`;
+      button.innerHTML = svgIcon(next === 'dark' ? 'moon' : 'sun');
+    }
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      explicitTheme = true;
+      const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+      storeValue('acom:theme', theme); applyTheme(theme);
+    });
+    themeMedia.addEventListener('change', event => { if (!explicitTheme) applyTheme(event.matches ? 'dark' : 'light'); });
+    applyTheme(document.documentElement.dataset.theme);
+    const compactNavigation = matchMedia('(max-width: 800px)');
+    document.getElementById('system-menu').open = !compactNavigation.matches;
+    compactNavigation.addEventListener('change', event => { document.getElementById('system-menu').open = !event.matches; });
     const reading = new Set();
     let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null;
     const agentTransitions = new Set();
-    let resumingRestart = false, pausingAll = false;
+    let resumingRestart = false, pausingAll = false, resumingAll = false;
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
@@ -528,7 +737,7 @@
       el.textContent = message;
       el.className = `toast show${error ? ' error' : ''}`;
       clearTimeout(toast.timer);
-      toast.timer = setTimeout(() => el.className = 'toast', 3400);
+      toast.timer = setTimeout(() => el.className = 'toast', error ? 10000 : 5000);
     }
 
     let refreshPending = 0;
@@ -539,7 +748,7 @@
     }
     async function refreshOverview(initial = false) {
       const details = refreshAgentDetails();
-      let healthy = false;
+      let healthy = false, connectionError = null;
       const request = ++state.overviewRequest;
       try {
         const overview = await record(query('/overview', {project:state.selectedProject, since:state.overviewRevision}));
@@ -575,10 +784,12 @@
         }
         if (request !== state.overviewRequest) return;
         healthy = true;
-      } catch (_) {}
+      } catch (error) { connectionError = error; }
       if (request !== state.overviewRequest) return;
       $('#live-dot').classList.toggle('off', !healthy);
       setText($('#live-text'), healthy ? 'live' : 'connection error');
+      $('#connection-banner').hidden = healthy;
+      setText($('#connection-message'), healthy ? '' : `Connection interrupted. Your last view is still available. Retrying automatically. ${connectionError?.message || ''}`);
       render();
       syncSettings(initial);
       await Promise.all([
@@ -587,8 +798,23 @@
       ]);
     }
 
-    function render() { renderProject(); renderUsage(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); updatePaging(); }
+    function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); updatePaging(); }
 
+    function renderStats() {
+      const total = state.pages.agents?.total ?? state.agents.length;
+      const project = state.projects.find(p => p.id === state.selectedProject) || state.project;
+      const active = project?.active ?? state.agents.filter(a => ['working','idle'].includes(a.state)).length;
+      const attention = state.agents.filter(a => ['paused','crashed'].includes(a.state) || a.stopping || a.wake_queued_at || a.replacement_start_pending || a.replacement_start).length;
+      const held = state.locks.filter(l => l.holder || l.holder_stopping).length;
+      const partialAgents = state.pages.agents?.has_more, partialLocks = state.pages.locks?.has_more;
+      const metrics = [
+        ['agents','Active agents',active,`${fmt(total)} agents in this project`,''],
+        ['warning','Needs attention',attention,partialAgents ? 'In loaded agents · load more below' : attention ? 'Paused, failed or waiting agents' : 'No agents need intervention','attention'],
+        ['chat','Unread messages',project?.unread ?? 0,'Conversations you have joined',''],
+        ['lock','Locks held',held,partialLocks ? 'In loaded locks · load more below' : `${fmt(state.pages.locks?.total ?? state.locks.length)} shared locks`,''],
+      ];
+      setHTML($('#workspace-stats'), metrics.map(([icon,label,value,note,kind]) => `<div class="stat ${kind}"><div class="stat-label">${svgIcon(icon)}${label}</div><div class="stat-value">${fmt(value)}${(label === 'Needs attention' && partialAgents || label === 'Locks held' && partialLocks) ? '+' : ''}</div><div class="stat-note">${note}</div></div>`).join(''));
+    }
     function renderRestartResume() {
       const count = state.restartPaused;
       const known = Number.isInteger(count) && count >= 0;
@@ -603,6 +829,8 @@
       $('#project-select').disabled = state.saving || !state.projects.length;
       setText($('#project-path'), p?.path || (p?.truncated ? 'Loading project details…' : 'Add a project folder to get started'));
       setText($('#project-url'), state.url || '');
+      setText($('#overview-title'), p?.name || (p ? `Project #${p.id}` : 'Workspace overview'));
+      setText($('#overview-scope'), p ? 'Project overview' : 'Getting started');
       $('#remove-project').disabled = state.saving || !p || p.truncated || (p.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
       $('#remove-project').title = state.agents.length ? 'Projects with agents cannot be removed' : 'Remove the registration, not files';
       const unread = state.unreadTotal ?? state.projects.reduce((n, p) => n + (p.unread || 0), 0);
@@ -622,7 +850,8 @@
       saveVisibleDraft();
       closeThreadDialogs();
       state.selectedThread = null; state.thread = null; state.threadRequest++;
-      $('#thread-main').innerHTML = '<div class="empty">Select a thread</div>';
+      $('.thread-layout').classList.remove('conversation-open');
+      $('#thread-main').innerHTML = emptyState('chat', 'Select a thread', 'Open a conversation on the left, or create a new thread to bring your team together.');
     }
     function closeThreadDialogs() {
       for (const id of ['members-dialog', 'remove-members-dialog', 'thread-owner-dialog']) {
@@ -630,6 +859,26 @@
         dialog._session = (dialog._session || 0) + 1;
         if (dialog.open) dialog.close('cancel');
       }
+    }
+    function rememberThreadScroll() {
+      const messages = $('#messages');
+      if (!messages?.getClientRects().length) return;
+      const bounds = messages.getBoundingClientRect();
+      const anchor = [...messages.querySelectorAll('[data-message]')].find(node => node.getBoundingClientRect().bottom > bounds.top);
+      messages._followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36;
+      messages._hiddenScroll = {top:messages.scrollTop, id:anchor?.dataset.message, offset:anchor ? anchor.getBoundingClientRect().top - bounds.top : 0};
+    }
+    function restoreThreadScroll() {
+      const messages = $('#messages');
+      if (!messages?.getClientRects().length) return;
+      const saved = messages._hiddenScroll;
+      if (messages._followLatest) messages.scrollTop = messages.scrollHeight;
+      else if (saved) {
+        messages.scrollTop = saved.top;
+        const anchor = saved.id && $(`[data-message="${saved.id}"]`, messages);
+        if (anchor) messages.scrollTop += anchor.getBoundingClientRect().top - messages.getBoundingClientRect().top - saved.offset;
+      }
+      delete messages._hiddenScroll;
     }
 
     function renderUsage() {
@@ -658,7 +907,7 @@
         const check = state.limits?.checks?.find(c => c.provider === state.usageProvider);
         setHTML($('#usage-details'), `<p>${esc(state.usageProvider)} · Last checked: ${esc(when(check?.checked_at))}<br>Next check: ${esc(when(check?.next_check))}</p>
           ${usages.filter(u=>u.provider===state.usageProvider).map(u=>`<p><strong>${esc(u.win === 'five_hour' ? '5-hour' : u.win === 'seven_day' ? 'Weekly' : u.win === 'seven_day_fable' ? 'Fable weekly' : u.win)}: ${esc(u.used_pct)}%</strong><br>Reported reset: ${esc(when(u.resets_at))}${u.resets_at && u.resets_at <= Date.now()/1000 ? ' · awaiting confirmation' : ''}</p>`).join('') || '<p>Usage is unknown.</p>'}
-          ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}">Check now</button>`);
+          ${check?.error ? `<p class="inline-error">${esc(check.error)}</p>` : ''}<p class="meta launch-project">Checks use account status, not a paid model turn. A reset time alone never proves usage is available. Auto-resume is controlled by the project's config.</p><button type="button" data-check-usage="${esc(state.usageProvider)}"${pendingUsage.has(state.usageProvider) ? ' disabled' : ''}>Check now</button>`);
       }
     }
 
@@ -669,9 +918,20 @@
     function renderAgents() {
       const root = $('#agents');
       setText($('#agent-count'), `${state.pages.agents?.total ?? state.agents.length} total`);
-      if (!state.agents.length) { setHTML(root, '<div class="empty">No agents yet</div>'); return; }
+      const search = $('#agent-search').value.trim().toLowerCase();
+      document.querySelectorAll('[data-agent-filter]').forEach(button => {
+        const active = button.dataset.agentFilter === state.agentFilter;
+        button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
+      });
+      if (!state.agents.length) { setHTML(root, emptyState('agents', 'No agents yet', state.project ? 'Launch your first agent with a task. Its progress and status will appear here.' : 'Add a project folder, then launch an agent to start working.')); return; }
+      const filtered = state.agents.filter(a => {
+        const matches = [a.name, a.id, a.harness, a.model, a.group, a.status, a.task_preview ?? a.task].join(' ').toLowerCase().includes(search);
+        const active = ['working','idle'].includes(a.state), attention = ['paused','crashed'].includes(a.state) || a.stopping || a.wake_queued_at || a.replacement_start_pending || a.replacement_start;
+        return matches && (state.agentFilter === 'all' || state.agentFilter === 'active' && active || state.agentFilter === 'attention' && attention || state.agentFilter === 'finished' && ['done','closed','replaced'].includes(a.state));
+      });
+      if (!filtered.length) { setHTML(root, emptyState('search', 'No agents match', `Try a different search or state filter.${state.pages.agents?.has_more ? ' Load more agents to search earlier records.' : ''}`)); return; }
       const groups = new Map();
-      state.agents.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
+      filtered.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
       setHTML(root, [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join(''));
     }
 
@@ -702,19 +962,19 @@
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}"${disabled}>${starting ? 'Reopen replacement' : 'Reopen'}</button>` : '';
       const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}"${disabled}>${starting ? 'Close replacement' : 'Close'}</button>` : '';
       const waiting = !starting && a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
-      const waitReason = !starting && a.wake_reason ? `<div class="meta">${esc(a.wake_reason)}</div>` : '';
+      const waitReason = !starting && a.wake_reason ? `<div class="meta wait-reason">${esc(a.wake_reason)}</div>` : '';
       const problem = a.has_problem || problemText ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
-      const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
+      const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta wait-reason">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta agent-task" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
 
     function renderLocks() {
       setText($('#lock-count'), `${state.pages.locks?.total ?? state.locks.length} total`);
-      if (!state.locks.length) { setHTML($('#locks'), '<div class="empty">No locks</div>'); return; }
+      if (!state.locks.length) { setHTML($('#locks'), emptyState('lock', 'No locks', 'Agents create locks when they need exclusive access to shared work.')); return; }
       setHTML($('#locks'), `<table><thead><tr><th>Name</th><th>Purpose</th><th>Holder</th><th>Since</th><th>Expires</th><th></th></tr></thead><tbody>${state.locks.map(l => l.truncated ? `<tr><td colspan="6">Lock #${l.id}${l.holder_stopping ? ' · Releasing after stop' : ''} · Details exceed the preview budget. <button type="button" class="small" data-record="locks" data-record-id="${l.id}">Load full lock</button></td></tr>` : `<tr>
         <td><code>${esc(l.name)}</code></td><td>${esc(l.about)}</td>
         <td>${l.holder ? `#${l.holder} ${esc(l.holder_name || '')}` : 'free'}${l.queue?.length ? `<div class="meta">queue: ${l.queue.map(x => `#${x}`).join(', ')}</div>` : ''}</td>
@@ -723,7 +983,7 @@
     }
 
     function renderActivity() {
-      setHTML($('#activity'), state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div>${e.truncated ? `<button type="button" class="small" data-record="activity" data-record-id="${e.id}">Load activity #${e.id}</button> · Details exceed the preview budget.` : `<span class="actor">${esc(e.actor)}</span> ${esc(e.what)}`}</div></div>`).join('') : '<div class="empty">No activity yet</div>');
+      setHTML($('#activity'), state.activity.length ? state.activity.map(e => `<div class="event"><time>${new Date(e.at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</time><div>${e.truncated ? `<button type="button" class="small" data-record="activity" data-record-id="${e.id}">Load activity #${e.id}</button> · Details exceed the preview budget.` : `<span class="actor">${esc(e.actor)}</span> ${esc(e.what)}`}</div></div>`).join('') : emptyState('overview', 'No activity yet', 'Agent launches, messages and coordination events will appear here.'));
     }
 
     function renderThreads() {
@@ -733,8 +993,9 @@
         b.classList.toggle('active', active); b.setAttribute('aria-pressed', String(active));
       });
       const joined = t => typeof t.user_member === 'boolean' ? t.user_member : Array.isArray(t.members) ? t.members.includes(0) : null;
-      const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
-      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} messages`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
+      const search = $('#thread-search').value.trim().toLowerCase();
+      const threads = state.threads.filter(t => !search || `${t.title || ''} ${t.id}`.toLowerCase().includes(search)).filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
+      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"${state.selectedThread === t.id ? ' aria-current="true"' : ''}><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} messages`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${search ? 'No threads match your search. Try another title or thread ID.' : state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
 
     function threadAccess(thread) {
@@ -803,17 +1064,25 @@
         }
         if (!sameThread) {
           saveVisibleDraft();
-          $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><button type="button" id="back-to-threads">← All threads</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span></div>
-            <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
-            <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
+            <div class="messages" id="messages" role="region" aria-label="Conversation messages" tabindex="0">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
+            <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary"${pendingSends.has(draftKey(t.project, t.id)) ? ' disabled' : ''}>Send</button><span class="composer-hint">Enter for a new line · Ctrl / ⌘ + Enter to send</span></form>`;
+          $('.thread-layout').classList.add('conversation-open');
           $('#message-form textarea').value = threadDraft(t.project, t.id);
           const messages = $('#messages');
           messages.scrollTop = messages.scrollHeight;
-          messages.addEventListener('scroll', markThreadRead);
+          messages._followLatest = true;
+          messages.addEventListener('scroll', () => {
+            if (!messages.getClientRects().length) return;
+            messages._followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36;
+            markThreadRead();
+          });
+          if (compactNavigation.matches && $('#page-threads').classList.contains('active')) $('.thread-layout').scrollIntoView({block:'start'});
         } else {
           const messages = $('#messages');
-          const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36;
+          const visible = !!messages.getClientRects().length;
+          const atBottom = visible ? messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36 : messages._followLatest;
           if (added.length) {
             const anchor = messages.querySelector('[data-message]'), top = anchor?.getBoundingClientRect().top;
             $('.empty', messages)?.remove();
@@ -822,14 +1091,15 @@
               if (before) before.insertAdjacentHTML('beforebegin', messageHtml(message));
               else messages.insertAdjacentHTML('beforeend', messageHtml(message));
             }
-            if (atBottom) messages.scrollTop = messages.scrollHeight;
-            else if (anchor) messages.scrollTop += anchor.getBoundingClientRect().top - top;
+            if (visible && atBottom) messages.scrollTop = messages.scrollHeight;
+            else if (visible && anchor) messages.scrollTop += anchor.getBoundingClientRect().top - top;
           }
           setText($('.thread-header h2', $('#thread-main')), t.title);
         }
         setHTML($('.thread-header .meta', $('#thread-main')), `Thread #${t.id} · ${threadAccess(t)} · Owner: ${esc(threadOwner(t))} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`);
         if ($('#thread-owner-dialog').open && Number($('#thread-owner-form').dataset.ownerThread) === t.id) setText($('#thread-owner-current'), `Current owner: ${threadOwner(t)}`);
         setText($('#thread-membership'), t.members?.includes(0) ? 'Leave thread' : 'Join thread');
+        $('#thread-membership').disabled = pendingMembership.has(t.id);
         const live = !!t.watch?.length;
         $('#add-thread-members').hidden = live && !t.excluded_members?.length;
         setText($('#add-thread-members'), live ? 'Restore members' : 'Add members');
@@ -897,13 +1167,13 @@
         $('#thread-unread').hidden = !unread;
         setText($('#thread-unread'), `${fmt(unread)} unread · Jump to latest`);
       }
-      renderProject(); renderThreads();
+      renderProject(); renderStats(); renderThreads();
     }
 
     async function markThreadRead() {
       const t = state.thread, messages = $('#messages');
       const through = t?.messages?.at(-1)?.id || 0;
-      if (!t?.unread || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(t.id) || !messages ||
+      if (!t?.unread || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(t.id) || !messages || !messages.getClientRects().length ||
           !$('#page-threads').classList.contains('active') || document.visibilityState !== 'visible' ||
           !document.hasFocus() || $('dialog[open]') || messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 36) return;
       reading.add(t.id);
@@ -1106,6 +1376,7 @@
         <div id="retry-rules">${Object.entries(s.crash_retries || {}).map(([source,rule]) => retryRule(source,rule)).join('')}</div><button type="button" id="add-retry-rule">Add retry rule</button>
         <details data-prompt-editor><summary>Prompt guidance (advanced)</summary><p class="meta launch-project">These are literal text blocks, not templates. Nothing is substituted, even if you type {task} or {updates}. Identity, task, guide, updates and interruption warnings are always supplied separately by the server.</p>${['launch','wake','resume'].map(name=>`<label style="margin-top:12px">${capital(name)} guidance <textarea rows="3" name="prompt_${name}">${esc(s.prompts?.[name] ?? '')}</textarea></label>`).join('')}</details>
         <p class="meta launch-project">Permission flags apply to new turns. The default bypasses approvals and sandbox restrictions; only launch agents in projects you trust.</p>`;
+      organizeSettings();
       $('#settings-form').querySelectorAll('[data-harness]').forEach(syncHarnessChoices);
       $('#retry-rules').querySelectorAll('[data-retry-rule]').forEach(root => syncRetryChoices(root));
       try { state.editor.baseline = settingsFingerprint(collectSettings()); } catch (_) { state.editor.baseline = null; }
@@ -1115,6 +1386,23 @@
       updatePaging();
     }
 
+    function organizeSettings() {
+      const form = $('#settings-form'), nodes = [...form.childNodes];
+      let section = document.createElement('section');
+      section.className = 'settings-section'; section.id = 'settings-configuration';
+      const links = [{id:section.id, title:'Configuration'}];
+      form.append(section);
+      for (const node of nodes) {
+        if (node.nodeName === 'H3') {
+          const title = node.childNodes[0].textContent.trim();
+          section = document.createElement('section'); section.className = 'settings-section';
+          section.id = 'settings-' + title.toLowerCase().replace(/[^a-z0-9]+/g,'-');
+          links.push({id:section.id, title}); form.append(section);
+        }
+        section.append(node);
+      }
+      setHTML($('#settings-jump'), links.map(link => `<a href="#${link.id}">${esc(link.title)}</a>`).join(''));
+    }
     function splitList(value) { return value.split(',').map(x => x.trim()).filter(Boolean); }
     function flagsText(flags) {
       return flags.map(x => !x || /[\s"\\]/.test(x) ? JSON.stringify(x) : x).join(' ');
@@ -1341,6 +1629,17 @@
     }
 
     document.addEventListener('click', async event => {
+      if (event.target.closest('#retry-connection')) {
+        const button = $('#retry-connection'); if (button.disabled) return; button.disabled = true;
+        try { await refresh(); } finally { button.disabled = false; } return;
+      }
+      if (event.target.closest('#back-to-threads')) {
+        saveVisibleDraft(); rememberThreadScroll(); $('.thread-layout').classList.remove('conversation-open');
+        const selected = $(`[data-thread="${state.selectedThread}"]`);
+        (selected || $('#thread-search')).focus({preventScroll:true}); return;
+      }
+      const agentFilter = event.target.closest('[data-agent-filter]');
+      if (agentFilter) { state.agentFilter = agentFilter.dataset.agentFilter; renderAgents(); return; }
       const full = event.target.closest('[data-record]');
       if (full) {
         const dialog = $('#record-dialog'); openDialog(dialog); const session = dialog._session;
@@ -1421,7 +1720,11 @@
       if (usage) { state.usageProvider=usage.dataset.usage; renderUsage(); openDialog($('#usage-dialog')); return; }
       const checkUsage = event.target.closest('[data-check-usage]');
       if (checkUsage) {
-        try { await mutate('/usage/check', {provider:checkUsage.dataset.checkUsage}); toast('Usage check scheduled'); } catch(error) {toast(error.message,true);} return;
+        const provider = checkUsage.dataset.checkUsage;
+        if (pendingUsage.has(provider)) return;
+        pendingUsage.add(provider); checkUsage.disabled = true;
+        try { await mutate('/usage/check', {provider}); toast('Usage check scheduled'); } catch(error) {toast(error.message,true);}
+        finally { pendingUsage.delete(provider); renderUsage(); } return;
       }
       const threadFilter = event.target.closest('[data-thread-filter]');
       if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; storeValue('thread-filter',state.threadFilter); renderThreads(); return; }
@@ -1429,7 +1732,11 @@
         resetThread(); renderThreads(); return;
       }
       if(event.target.closest('#thread-membership')) {
-        try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); } catch(error) {toast(error.message,true);} return;
+        const thread = state.thread, id = state.selectedThread;
+        if (!thread || thread.id !== id || pendingMembership.has(id)) return;
+        pendingMembership.add(id); $('#thread-membership').disabled = true;
+        try { await mutate(`/threads/${id}/user`, {joined:!thread.members?.includes(0)}); } catch(error) {toast(error.message,true);}
+        finally { pendingMembership.delete(id); if (state.selectedThread === id && $('#thread-membership')) $('#thread-membership').disabled = false; } return;
       }
       if(event.target.closest('#add-thread-members')) {
         if (!state.thread || state.thread.id !== state.selectedThread) return;
@@ -1555,7 +1862,8 @@
           if (x === page) x.setAttribute('aria-current', 'page'); else x.removeAttribute('aria-current');
         });
         document.querySelectorAll('.page').forEach(x => x.classList.toggle('active', x.id === `page-${page.dataset.page}`));
-        if (page.dataset.page === 'threads' && state.selectedThread) await refreshThread(false);
+        setText($('#current-view'), page.textContent.trim().split(' ')[0]);
+        if (page.dataset.page === 'threads' && state.selectedThread) { restoreThreadScroll(); await refreshThread(false); }
         return;
       }
       const thread = event.target.closest('[data-thread]');
@@ -1565,7 +1873,12 @@
           resetThread(); state.selectedThread = id;
           $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>Thread #${id}</h2></div><div class="empty" role="status">Loading conversation…</div>`;
         }
-        renderThreads(); await refreshThread(); return;
+        $('.thread-layout').classList.add('conversation-open');
+        restoreThreadScroll();
+        renderThreads(); await refreshThread();
+        const back = $('#back-to-threads');
+        if (back?.getClientRects().length) { $('.thread-layout').scrollIntoView({block:'start'}); back.focus({preventScroll:true}); }
+        await markThreadRead(); return;
       }
       const action = event.target.closest('[data-action]');
       if (!action) return;
@@ -1592,7 +1905,7 @@
           await agentTransition(action, id);
         } else if (['close','reopen'].includes(action.dataset.action)) {
           if (action.dataset.action !== 'close' || confirm(`Close agent ${id}?`)) {
-            await mutate(`/agents/${id}/${action.dataset.action}`);
+            await agentTransition(action, id);
           }
         } else if (action.dataset.action === 'free-lock') {
           if (state.locks.find(lock => lock.name === action.dataset.name)?.holder_stopping) return;
@@ -1607,7 +1920,12 @@
       try { await mutate('/pause-all'); } catch (e) { toast(e.message, true); }
       finally { pausingAll = false; $('#pause-all').disabled = false; }
     });
-    $('#resume-all').addEventListener('click', async () => { try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); } });
+    $('#resume-all').addEventListener('click', async () => {
+      if (resumingAll) return;
+      resumingAll = true; $('#resume-all').disabled = true;
+      try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); }
+      finally { resumingAll = false; $('#resume-all').disabled = false; }
+    });
     $('#resume-restart').addEventListener('click', async () => {
       if (resumingRestart || !(state.restartPaused > 0)) return;
       resumingRestart = true; renderRestartResume();
@@ -1854,6 +2172,8 @@
       const form = event.target, button = $('button', form);
       const { draftProject: project, draftThread: thread } = form.dataset, text = $('[name=text]', form).value;
       const key = draftKey(project, thread), edits = draftEdits.get(key) || 0;
+      if (pendingSends.has(key) || !text.trim()) return;
+      pendingSends.add(key);
       saveDraft(project, thread, text);
       button.disabled = true;
       try {
@@ -1866,7 +2186,23 @@
         if (result.result_truncated && result.counts?.not_woken) toast(`Message sent; ${fmt(result.counts.not_woken)} agents weren't woken. See the completed-action result below.`);
         else if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}.`).join('\n'));
       } catch (error) { toast(error.message, true); }
-      finally { button.disabled = false; }
+      finally {
+        pendingSends.delete(key); button.disabled = false;
+        const current = $('#message-form');
+        if (current?.dataset.draftProject === project && current.dataset.draftThread === thread) $('button', current).disabled = false;
+      }
+    });
+    $('#agent-search').addEventListener('input', renderAgents);
+    $('#thread-search').addEventListener('input', renderThreads);
+    window.addEventListener('resize', () => {
+      const messages = $('#messages');
+      if (messages?._followLatest && messages.getClientRects().length && !hasSelectedText(messages)) messages.scrollTop = messages.scrollHeight;
+    });
+    document.addEventListener('keydown', event => {
+      if (event.target.matches('#message-form textarea') && event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+        event.preventDefault(); const form = event.target.form;
+        if (!$('button', form).disabled) form.requestSubmit($('button', form));
+      }
     });
     document.addEventListener('input', event => {
       if (event.target.matches('#message-form textarea')) {
@@ -1941,6 +2277,7 @@
     }
     function setSettingsControls() {
       const busy = state.saving, readOnly = state.editor?.config === 1;
+      setText($('#settings-save-state'), busy ? 'Saving…' : state.editor?.dirty ? 'Unsaved changes' : state.editor?.pending ? 'Selection not applied' : readOnly ? 'Default · read-only' : 'All changes saved');
       $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (readOnly && !el.dataset.more && !['config-select','save-config-as'].includes(el.id)));
       $('[form="settings-form"]').disabled = busy || !(state.editor?.dirty || state.editor?.pending);
       const config = state.configs.find(c => c.id === state.editor?.config);
@@ -1993,6 +2330,7 @@
       } catch (error) { toast(error.message, true); }
     });
 
+    resetThread();
     refresh(true).catch(e => toast(e.message, true));
     setInterval(() => { if (!refreshPending && document.visibilityState === 'visible') refresh(false); }, 2000);
   </script>

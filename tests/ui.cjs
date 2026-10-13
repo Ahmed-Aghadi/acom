@@ -193,6 +193,18 @@ async function fixture(run) {
       Object.assign(agent, {state:'working',pause_reason:null,problem:null});
       return send({warnings:[]});
     }
+    if (/^\/agents\/\d+\/(close|reopen)$/.test(req.url)) {
+      const agent=data.agents.find(a=>a.id===Number(req.url.split('/')[2]));
+      if(data.agentTransitionError)return send({status:503,error:data.agentTransitionError});
+      Object.assign(agent,{state:req.url.endsWith('/close')?'closed':'idle',pause_reason:null,problem:null});
+      return send({});
+    }
+    if (req.url === '/resume-all') {
+      if(data.resumeAllError)return send({status:503,error:data.resumeAllError});
+      const ids=data.agents.filter(a=>a.state==='paused').map(a=>a.id);
+      for(const id of ids)Object.assign(data.agents.find(a=>a.id===id),{state:'working',pause_reason:null});
+      return send({ids});
+    }
     if (req.url === '/resume-restart') {
       if(data.resumeRestartError)return send({status:503,error:data.resumeRestartError});
       const eligible=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart');
@@ -304,17 +316,18 @@ async function fixture(run) {
     res.statusCode = 404; send({ error: 'not found' });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
-  const page = await browser.newPage();
-  const errors = [];
-  page.on('pageerror', error => errors.push(error.message));
+  let browser;
   try {
+    browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
+    const page = await browser.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
     await run(page, data);
     assert.deepEqual(errors, [], 'no uncaught page errors');
   } finally {
-    await browser.close();
+    await browser?.close();
     await new Promise(resolve => server.close(resolve));
   }
 }
@@ -1131,6 +1144,8 @@ test('live threads expose escaped membership history and mark outside-membership
   assert.match(await page.locator('#thread-events').textContent(), /agent 1 left.*state changed/);
   assert.equal(await page.locator('#thread-history').evaluate(el=>el.open), true, 'polling preserves the opened history');
   await page.evaluate(() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); });
+  // Expanded membership history can make the two-message timeline scrollable.
+  await page.locator('#thread-unread').click();
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
   assert.equal(data.reads[1], 2);
   assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length, 1);
@@ -1273,7 +1288,7 @@ test('closing a thread keeps membership and read history while future messages s
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
   assert.equal(data.reads[1], 1);
   await page.locator('#close-thread').click();
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   assert.equal(await page.locator('.thread-row.active').count(), 0);
   assert.deepEqual(data.threads[0].members, [0, 1]);
   assert.equal(data.reads[1], 1, 'closing does not undo an acknowledged read');
@@ -1283,7 +1298,7 @@ test('closing a thread keeps membership and read history while future messages s
   await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '1 unread');
   await page.waitForTimeout(2100);
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   assert.equal(data.reads[1], 1);
   assert.equal(data.requests.filter(r => r.url.endsWith('/read')).length, readsBefore);
   assert.equal(data.requests.filter(r => r.url.endsWith('/user')).length, 0, 'Close is not Leave');
@@ -1306,14 +1321,14 @@ test('X dismissal preserves separate thread and project drafts across switching 
   assert.equal(await page.locator('#message-form textarea').inputValue(), '');
   await page.locator('#message-form textarea').fill('Second thread draft');
   await page.locator('#close-thread').click();
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
   await page.locator('#project-select').selectOption('2');
   await page.locator('[data-thread="3"]').click();
   await page.locator('#message-form textarea').fill('Other project draft');
   await reloadPage(page); await page.locator('[data-page=threads]').click();
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   await page.locator('[data-thread="3"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Other project draft');
   await page.locator('#project-select').selectOption('1');
@@ -1403,7 +1418,7 @@ test('a pending thread fetch cannot reopen or auto-read a thread after Close', a
   await page.evaluate(async () => { await window.pendingThread; });
   await page.unroute(threadPattern);
   await page.evaluate(() => refresh());
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
   assert.equal(data.reads[1], 1);
   assert.deepEqual(data.threads[0].members, [0, 1]);
@@ -2228,7 +2243,7 @@ test('switching threads removes old controls immediately and closing the loading
   for (const selector of ['#message-form','#thread-membership','#add-thread-members','#copy-thread']) assert.equal(await page.locator(selector).count(), 0);
   await page.locator('#close-thread').click(); next.release(); await next.remove();
   await page.waitForTimeout(100);
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'First draft');
   await page.locator('[data-thread="2"]').click();
@@ -2268,7 +2283,7 @@ test('late thread creation keeps reopened drafts and cannot open another project
   assert.equal(data.threads[0].project, 1);
   assert.equal(await page.locator('#thread-dialog').isVisible(), true);
   assert.equal(await page.locator('#thread-form [name=title]').inputValue(), 'New draft in second');
-  assert.equal(await page.locator('#thread-main').textContent(), 'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   assert.equal(await page.locator('#project-path').textContent(), '/projects/other');
 }));
 
@@ -2384,7 +2399,7 @@ test('late removal keeps reopened selections and never removes members from a di
   await page.locator('#remove-thread-members').click();
   await page.evaluate(()=>resetThread());
   assert.equal(await page.locator('#remove-members-dialog').isVisible(),false);
-  assert.equal(await page.locator('#thread-main').textContent(),'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(),'Select a thread');
 }));
 
 test('late ownership transfers preserve edited or reopened owner drafts and never target another thread', async () => fixture(async (page, data) => {
@@ -2423,7 +2438,7 @@ test('project switching invalidates ownership dialogs and prevents stale owner f
   assert.equal(await page.locator('#thread-owner-dialog').isVisible(),false);
   await page.evaluate(()=>document.querySelector('#thread-owner-form').dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true})));
   assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,0);
-  assert.equal(await page.locator('#thread-main').textContent(),'Select a thread');
+  assert.equal(await page.locator('#thread-main .empty strong').textContent(),'Select a thread');
 }));
 
 test('switching projects invalidates open add and removal dialogs before a stale form can submit', async () => fixture(async (page, data) => {
@@ -3275,4 +3290,310 @@ test('truncated restart-paused results report full failure counts even when the 
   await page.evaluate(()=>refresh());
   assert.equal(data.requests.filter(r=>r.url==='/resume-restart').length,1,'reading the receipt and polling do not repeat a partially completed action');
   assert.deepEqual(data.agents.map(a=>a.state),['working','working','paused']);
+}));
+
+test('workspace agent search combines with accessible state filters and preserves the query through polling', async () => fixture(async (page,data) => {
+  data.agents=[
+    {id:1,project:1,name:'Alpha review',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
+    {id:2,project:1,name:'Beta review',state:'paused',harness:'codex',model:'gpt-6.1-sol',effort:'high',pause_reason:'user'},
+    {id:3,project:1,name:'Review complete',state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'medium'},
+    {id:4,project:1,name:'Available worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},
+    {id:5,project:1,name:'Broken worker',state:'crashed',harness:'claude',model:'claude-sonnet-5-5',effort:'medium'},
+    {id:6,project:1,name:'Waiting replacement',state:'done',harness:'codex',model:'gpt-6.1-sol',effort:'medium',replacement_start:{predecessor:3,blocked:'Capacity is full',attempted:0}},
+    {id:7,project:1,name:'Stopping worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',stopping:true},
+    {id:8,project:1,name:'Closed worker',state:'closed',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},
+    {id:9,project:1,name:'Replaced worker',state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'medium',replacement:6},
+  ];
+  await manualPolling(page); await reloadPage(page);
+  const ids=()=>page.locator('#agents [data-agent]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.agent)).sort((a,b)=>a-b));
+  assert.deepEqual(await ids(),[1,2,3,4,5,6,7,8,9]);
+  for(const [filter,expected] of [['active',[1,4,7]],['attention',[2,5,6,7]],['finished',[3,6,8,9]],['all',[1,2,3,4,5,6,7,8,9]]]) {
+    await page.locator(`[data-agent-filter=${filter}]`).click();
+    assert.deepEqual(await ids(),expected);
+    assert.equal(await page.locator('[data-agent-filter][aria-pressed=true]').count(),1);
+    assert.equal(await page.locator(`[data-agent-filter=${filter}]`).getAttribute('aria-pressed'),'true');
+  }
+  const search=page.locator('#agent-search');
+  assert.ok(await search.getAttribute('aria-label') || await search.evaluate(el=>el.labels?.length));
+  await search.fill('REVIEW');
+  assert.deepEqual(await ids(),[1,2,3]);
+  await page.locator('[data-agent-filter=active]').click();
+  assert.deepEqual(await ids(),[1]);
+  await search.fill('Beta');
+  assert.deepEqual(await ids(),[]);
+  assert.match(await page.locator('#agents').textContent(),/no .*match/i);
+  await page.evaluate(()=>refresh());
+  assert.equal(await search.inputValue(),'Beta');
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');
+  await page.locator('[data-agent-filter=attention]').click();
+  assert.deepEqual(await ids(),[2]);
+  await search.fill('');
+  await page.locator('[data-agent-filter=all]').click();
+  assert.deepEqual(await ids(),[1,2,3,4,5,6,7,8,9]);
+  assert.equal(data.requests.length,0,'search and filters never change agent state');
+}));
+
+test('workspace thread search scopes participation filters without discarding an open conversation draft', async () => fixture(async (page,data) => {
+  data.threads=[
+    conversation([],{id:1,title:'Design review'}),
+    conversation([],{id:2,title:'Review between agents',members:[1,2]}),
+    conversation([],{id:3,title:'Release plan'}),
+  ];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep the design notes');
+  const search=page.locator('#thread-search');
+  assert.ok(await search.getAttribute('aria-label') || await search.evaluate(el=>el.labels?.length));
+  await search.fill('REVIEW');
+  assert.equal(await page.locator('#thread-list [data-thread]').count(),1);
+  await page.locator('[data-thread-filter=all]').click();
+  assert.equal(await page.locator('#thread-list [data-thread]').count(),2);
+  await page.locator('[data-thread-filter=agents]').click();
+  assert.equal(await page.locator('#thread-list [data-thread="2"]').count(),1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep the design notes');
+  await search.fill('nothing matches this query');
+  assert.equal(await page.locator('#thread-list [data-thread]').count(),0);
+  assert.match(await page.locator('#thread-list').textContent(),/no .*match/i);
+  await page.evaluate(()=>refresh());
+  assert.equal(await search.inputValue(),'nothing matches this query');
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep the design notes');
+  await search.fill('');
+  await page.locator('[data-thread-filter=mine]').click();
+  assert.equal(await page.locator('#thread-list [data-thread]').count(),2);
+  assert.equal(data.requests.length,0,'browsing empty conversations does not write to the API');
+}));
+
+test('workspace theme follows the system until changed and persists the explicit choice across reloads', async () => fixture(async page => {
+  const background=()=>page.locator('body').evaluate(el=>getComputedStyle(el).backgroundColor);
+  await manualPolling(page); await page.emulateMedia({colorScheme:'dark'}); await reloadPage(page);
+  const dark=await background();
+  await page.emulateMedia({colorScheme:'light'});
+  await page.waitForFunction(dark=>getComputedStyle(document.body).backgroundColor!==dark,dark);
+  const light=await background();
+  await page.locator('#theme-toggle').click();
+  assert.equal(await background(),dark);
+  assert.equal(await page.evaluate(()=>localStorage.getItem('acom:theme')),'dark');
+  await reloadPage(page);
+  assert.equal(await background(),dark);
+  await page.emulateMedia({colorScheme:'dark'}); await page.emulateMedia({colorScheme:'light'});
+  assert.equal(await background(),dark,'a saved preference takes priority over later system changes');
+  await page.locator('#theme-toggle').click();
+  assert.equal(await background(),light);
+  assert.equal(await page.evaluate(()=>localStorage.getItem('acom:theme')),'light');
+  await page.emulateMedia({colorScheme:'dark'}); await reloadPage(page);
+  assert.equal(await background(),light);
+}));
+
+test('workspace theme stays usable when browser storage is unavailable', async () => fixture(async (page,data) => {
+  await page.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new Error('Storage blocked');}}));
+  await page.emulateMedia({colorScheme:'light'}); await reloadPage(page);
+  const before=await page.locator('body').evaluate(el=>getComputedStyle(el).backgroundColor);
+  await page.locator('#theme-toggle').click();
+  assert.notEqual(await page.locator('body').evaluate(el=>getComputedStyle(el).backgroundColor),before);
+  await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('#page-threads').isVisible(),true);
+  assert.equal(data.requests.length,0);
+}));
+
+test('workspace mobile Back preserves the selected conversation and draft without reading hidden arrivals', async () => fixture(async (page,data) => {
+  const history=Array.from({length:30},(_,i)=>incoming(i+1,`Earlier reply ${i+1}. ${'A useful update from the project team. '.repeat(3)}`));
+  data.threads=[conversation(history),conversation([],{id:2,title:'Other discussion'})];
+  await manualPolling(page); await page.setViewportSize({width:390,height:844}); await reloadPage(page);
+  await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('.thread-list').isVisible(),true);
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>{
+    const button=document.querySelector('#message-form button');
+    return button && button.getBoundingClientRect().top>=0 && button.getBoundingClientRect().bottom<=innerHeight;
+  });
+  assert.ok(await page.locator('#messages').evaluate(el=>el.clientHeight>=100),'the mobile conversation leaves useful reading space above the composer');
+  await page.waitForFunction(()=>document.querySelector('#thread-unread').hidden);
+  assert.equal(data.reads[1],30);
+  await page.locator('#message-form textarea').fill('Keep this mobile draft');
+  assert.equal(await page.locator('.thread-list').isHidden(),true);
+  assert.equal(await page.locator('.thread-layout').evaluate(el=>el.classList.contains('conversation-open')),true);
+  await page.locator('#back-to-threads').click();
+  assert.equal(await page.locator('.thread-list').isVisible(),true);
+  assert.equal(await page.locator('#thread-main').isHidden(),true);
+  assert.equal(await page.evaluate(()=>state.selectedThread),1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this mobile draft');
+  data.threads[0].messages.push({id:31,sender:1,at:Date.now()/1000,text:'Arrived while browsing threads'});
+  await page.evaluate(()=>refresh());
+  assert.equal(data.reads[1],30,'a hidden conversation does not acknowledge unseen messages');
+  assert.match(await page.locator('[data-thread="1"]').textContent(),/1 unread/);
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').waitFor();
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this mobile draft');
+  await page.waitForFunction(()=>document.querySelector('[data-message="31"] .message-text')?.textContent==='Arrived while browsing threads');
+  await page.waitForFunction(()=>!document.querySelector('#thread-unread') || document.querySelector('#thread-unread').hidden);
+  assert.equal(data.reads[1],31);
+  await page.locator('#messages').evaluate(el=>{el.scrollTop=0;});
+  const historyScroll=await page.locator('#messages').evaluate(el=>el.scrollTop);
+  await page.locator('#back-to-threads').click();
+  data.threads[0].messages.push(incoming(32,'Arrived while reading earlier history'));
+  await page.evaluate(()=>refresh());
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('[data-message="32"]').waitFor();
+  assert.equal(await page.locator('#messages').evaluate(el=>el.scrollTop),historyScroll,'Back and reopen preserve a reader’s earlier history position');
+  assert.equal(await page.locator('#thread-unread').isVisible(),true);
+  assert.equal(data.reads[1],31,'returning to earlier history does not acknowledge a reply at the bottom');
+  await page.locator('#thread-unread').click();
+  await page.waitForFunction(()=>document.querySelector('#thread-unread').hidden);
+  assert.equal(data.reads[1],32);
+  await page.setViewportSize({width:1280,height:900});
+  assert.equal(await page.locator('.thread-list').isVisible(),true);
+  assert.equal(await page.locator('#thread-main').isVisible(),true);
+  assert.equal(await page.locator('#message-form button').evaluate(el=>el.getBoundingClientRect().bottom<=innerHeight),true,'the composer stays in view after changing to a desktop viewport');
+  await page.waitForFunction(()=>{
+    const messages=document.querySelector('#messages');
+    return messages.scrollHeight-messages.scrollTop-messages.clientHeight<36;
+  });
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this mobile draft');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  assert.equal(data.requests.filter(r=>r.url==='/messages').length,0);
+}));
+
+test('workspace composer keeps Enter as a newline and submits validated messages with Ctrl or Command Enter', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  const composer=page.locator('#message-form textarea');
+  await composer.fill('First line');
+  await composer.press('End'); await composer.press('Enter'); await composer.press('A');
+  assert.equal(await composer.inputValue(),'First line\nA');
+  assert.equal(data.requests.length,0);
+  await composer.press('Control+Enter');
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.deepEqual(data.threads[0].messages.map(m=>m.text),['First line\nA']);
+  await composer.press('Control+Enter');
+  assert.equal(data.requests.filter(r=>r.url==='/messages').length,1,'an empty required composer does not send');
+  await composer.fill('Sent using Command'); await composer.press('Meta+Enter');
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.deepEqual(data.threads[0].messages.map(m=>m.text),['First line\nA','Sent using Command']);
+  assert.equal(data.requests.filter(r=>r.url==='/messages').length,2);
+}));
+
+test('workspace a pending send stays single-flight after close and reopen and retains a newer persistent draft', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Submitted message');
+  const pending=await holdRequest(page,'**/messages');
+  await page.locator('#message-form button').click(); await pending.started;
+  await page.locator('#close-thread').click(); await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form button').isDisabled(),true);
+  await page.locator('#message-form textarea').fill('Newer unsent draft');
+  await page.evaluate(()=>document.querySelector('#message-form').requestSubmit());
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#message-form button').isDisabled(),true,'polling cannot unlock an in-flight send in the reopened pane');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>!document.querySelector('#message-form button').disabled);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Newer unsent draft');
+  assert.deepEqual(data.threads[0].messages.map(m=>m.text),['Submitted message']);
+  assert.equal(data.requests.filter(r=>r.url==='/messages').length,1);
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Newer unsent draft');
+  await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.deepEqual(data.threads[0].messages.map(m=>m.text),['Submitted message','Newer unsent draft']);
+}));
+
+test('workspace Resume all stays single-flight across polling and recovers from failure without retrying', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Paused worker',state:'paused',pause_reason:'user'}];
+  await manualPolling(page); await reloadPage(page);
+  const pending=await holdRequest(page,'**/resume-all');
+  await page.locator('#resume-all').click(); await pending.started;
+  assert.equal(await page.locator('#resume-all').isDisabled(),true);
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#resume-all').isDisabled(),true);
+  await page.locator('#resume-all').dispatchEvent('click');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>!document.querySelector('#resume-all').disabled);
+  assert.equal(data.requests.filter(r=>r.url==='/resume-all').length,1);
+  assert.equal(data.agents[0].state,'working');
+  data.resumeAllError='Resume all unavailable';
+  await page.locator('#resume-all').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Resume all unavailable');
+  assert.equal(await page.locator('#resume-all').isEnabled(),true);
+  await page.evaluate(()=>refresh());
+  assert.equal(data.requests.filter(r=>r.url==='/resume-all').length,2,'an error and later polling never repeat the action');
+}));
+
+test('workspace Close and Reopen lock all lifecycle actions while pending and release them after completion or failure', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Lifecycle worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  await manualPolling(page); await reloadPage(page);
+  let confirmations=0;
+  page.on('dialog',dialog=>{confirmations++;dialog.accept();});
+  for(const action of ['close','reopen']) {
+    const pending=await holdRequest(page,`**/agents/1/${action}`);
+    await page.locator(`[data-agent="1"] [data-action=${action}]`).click(); await pending.started;
+    await page.evaluate(()=>refresh());
+    const actions=page.locator('[data-agent="1"] [data-action]:not([data-action=details])');
+    assert.equal(await actions.evaluateAll(nodes=>nodes.every(node=>node.disabled)),true);
+    assert.equal(await page.locator('[data-agent="1"] [data-action=details]').isEnabled(),true);
+    await page.locator(`[data-agent="1"] [data-action=${action}]`).dispatchEvent('click');
+    pending.release(); await pending.remove();
+    await page.waitForFunction(()=>document.querySelector('[data-agent="1"] [data-action]:not([data-action=details])')?.disabled===false);
+    assert.equal(data.requests.filter(r=>r.url===`/agents/1/${action}`).length,1);
+    assert.equal(data.agents[0].state,action==='close'?'closed':'idle');
+  }
+  assert.equal(confirmations,1,'only Close asks for confirmation, once');
+  data.agentTransitionError='Close unavailable';
+  await page.locator('[data-agent="1"] [data-action=close]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Close unavailable');
+  assert.equal(await page.locator('[data-agent="1"] [data-action=close]').isEnabled(),true);
+  await page.evaluate(()=>refresh());
+  assert.equal(data.requests.filter(r=>r.url==='/agents/1/close').length,2);
+  assert.equal(data.agents[0].state,'idle');
+}));
+
+test('workspace membership and usage scheduling remain single-flight through pane and dialog reopening', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
+  await page.locator('[data-thread="1"]').click();
+  const membership=await holdRequest(page,'**/threads/1/user');
+  await page.locator('#thread-membership').click(); await membership.started;
+  await page.locator('#close-thread').click(); await page.locator('[data-thread="1"]').click();
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#thread-membership').isDisabled(),true);
+  await page.locator('#thread-membership').dispatchEvent('click');
+  membership.release(); await membership.remove();
+  await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread' && !document.querySelector('#thread-membership').disabled);
+  assert.equal(data.requests.filter(r=>r.url==='/threads/1/user').length,1);
+  assert.equal(data.threads[0].members.includes(0),false);
+  await page.locator('[data-page=overview]').click(); await page.locator('[data-usage=codex]').click();
+  const usage=await holdRequest(page,'**/usage/check');
+  await page.locator('[data-check-usage=codex]').click(); await usage.started;
+  await page.locator('#usage-dialog').getByRole('button',{name:'Close',exact:true}).click();
+  await page.locator('[data-usage=codex]').click(); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-check-usage=codex]').isDisabled(),true);
+  await page.locator('[data-check-usage=codex]').dispatchEvent('click');
+  usage.release(); await usage.remove();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Usage check scheduled');
+  assert.equal(await page.locator('[data-check-usage=codex]').isEnabled(),true);
+  assert.equal(data.requests.filter(r=>r.url==='/usage/check').length,1);
+}));
+
+test('workspace connection failures retain the last view and Retry now recovers without overlapping requests', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Visible worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  await manualPolling(page); await reloadPage(page);
+  const unavailable=route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Workspace is temporarily unavailable'})});
+  await page.route('**/overview*',unavailable);
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#connection-banner').isVisible(),true);
+  assert.match(await page.locator('#connection-message').textContent(),/retry|reconnect|connection/i);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Visible worker/);
+  assert.equal(await page.locator('#project-select').inputValue(),'1');
+  await page.unroute('**/overview*',unavailable);
+  const before=data.getRequests.filter(url=>url.startsWith('/overview')).length;
+  const retry=await holdRequest(page,'**/overview*','GET');
+  await page.locator('#retry-connection').click(); await retry.started;
+  assert.equal(await page.locator('#retry-connection').isDisabled(),true);
+  await page.locator('#retry-connection').dispatchEvent('click');
+  retry.release(); await retry.remove();
+  await page.waitForFunction(()=>document.querySelector('#connection-banner').hidden && !document.querySelector('#retry-connection').disabled);
+  assert.equal(await page.locator('#live-text').textContent(),'live');
+  assert.equal(await page.locator('#project-select').inputValue(),'1');
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/overview')).length-before,1);
+  assert.equal(data.requests.length,0);
 }));

@@ -13,6 +13,10 @@ acom serve
 
 Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it; acom keeps none of its own state in your projects (the agents, of course, work on their files).
 
+The web workspace has project navigation, searchable agents with **Active**, **Needs attention** and **Finished** filters, and an overview of active agents, unread messages and held locks. Search and filters cover loaded records; use **Load more** to include earlier records. Summary counts for attention and held locks explicitly identify a partial loaded window. Account usage stays separate from project work; global Pause/Resume controls are under **All projects** (a menu on smaller screens).
+
+Threads have title/ID search and a mobile conversation view with **All threads** to return to the list while keeping the draft. **Ctrl/Cmd + Enter** sends; Enter adds a line. Settings have section links and a persistent save-state indicator. The theme follows your system until you toggle it; your explicit light/dark choice is saved in this browser.
+
 Incompatible development databases are left untouched; startup explains how to use a separate data folder.
 
 Before upgrading an older running instance, pause or stop its agents through the old server. If a worker without a data-home marker remains live, new startup refuses and identifies its PID; stop that worker before retrying.

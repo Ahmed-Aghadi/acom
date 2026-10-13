@@ -2203,13 +2203,19 @@ impl App {
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
         }
-        self.finish_pause(st, id)?;
+        self.finish_stop(st, id, "pause", "you were paused")?;
         self.cv.notify_all();
         Ok(())
     }
 
     /// Stop asynchronously: the process waiter needs this mutex to record exit.
-    fn finish_pause(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
+    fn finish_stop(
+        self: &Arc<Self>,
+        st: &mut St,
+        id: i64,
+        action: &'static str,
+        reason: &'static str,
+    ) -> R<()> {
         if st.stopping_agents.contains(&id) {
             return Ok(());
         }
@@ -2235,7 +2241,7 @@ impl App {
                 let result = stopped.and_then(|_| {
                     let mut st = app.lock();
                     st.atomic(|st| {
-                        st.release_all(id, "you were paused")?;
+                        st.release_all(id, reason)?;
                         st.db.execute(
                             "UPDATE view_revisions SET value=value+1 WHERE name='agents'",
                             [],
@@ -2250,11 +2256,14 @@ impl App {
                     Ok(()) => break,
                     Err(e) => {
                         if last_error.as_deref() != Some(e.1.as_str()) {
-                            eprintln!("agent {id}: pause cleanup incomplete; retrying: {}", e.1);
+                            eprintln!("agent {id}: {action} cleanup incomplete; retrying: {}", e.1);
                             let _ = app.lock().log_for(
                                 id,
                                 "acom",
-                                &format!("agent {id}: pause cleanup incomplete; retrying: {}", e.1),
+                                &format!(
+                                    "agent {id}: {action} cleanup incomplete; retrying: {}",
+                                    e.1
+                                ),
                             );
                             last_error = Some(e.1);
                         }
@@ -2495,7 +2504,6 @@ impl App {
         }
         st.atomic(|st| {
             Self::cancel_followups(st, id, "the agent was closed")?;
-            st.release_all(id, "you were closed")?;
             st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, rest='idle' WHERE id=?1", [id])?;
             st.set_state(id, "closed")?;
             st.log_for(id, by, &format!("closed agent {id}"))?;
@@ -2503,8 +2511,8 @@ impl App {
         })?;
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
-            run::stop(p.pid);
         }
+        self.finish_stop(&mut st, id, "close", "you were closed")?;
         self.cv.notify_all();
         Ok(())
     }
@@ -7310,6 +7318,90 @@ mod tests {
             false
         );
         assert_eq!(app.thread_metadata(tid, None).unwrap()["unread"], 1);
+    }
+
+    #[test]
+    fn close_reserves_locks_until_owned_background_tools_have_stopped() {
+        use std::os::unix::process::CommandExt;
+
+        struct Worker(std::process::Child);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    run::kill_group(self.0.id(), libc::SIGKILL);
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        let app = app_with_two_projects();
+        let ready = app.home.join("close-ready");
+        let stopping = app.home.join("close-stopping");
+        let finish = app.home.join("close-finish");
+        let mut worker = Worker(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap 'printf stopping > \"$2\"; while [ ! -e \"$3\" ]; do :; done; exit' TERM; printf ready > \"$1\"; while :; do :; done",
+                    "close-worker",
+                ])
+                .arg(&ready)
+                .arg(&stopping)
+                .arg(&finish)
+                .env("ACOM_ID", "1")
+                .env("ACOM_URL", &app.url)
+                .env("ACOM_HOME", &app.home)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "worker did not become ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let st = app.lock();
+            st.db
+                .execute_batch("UPDATE agents SET project=1,state='working'")
+                .unwrap();
+            hold(&st, "guarded", 1, Some(now() + 60));
+        }
+
+        app.close(1, "user").unwrap();
+        assert_eq!(app.agent_view(1).unwrap()["state"], "closed");
+        assert_eq!(lock(&app.lock(), "guarded").0, Some(1));
+        assert_eq!(app.agent_view(1).unwrap()["stopping"], true);
+        assert_eq!(app.acquire(2, "guarded", 0, Some(60)).unwrap_err().0, 409);
+        assert_eq!(app.free(1, "guarded", "user").unwrap_err().0, 409);
+        while !stopping.exists() {
+            assert!(Instant::now() < deadline, "close did not stop owned tools");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.0.try_wait().unwrap().is_none());
+        {
+            let mut st = app.lock();
+            st.db
+                .execute("UPDATE locks SET expires_at=?1", [now() - 1])
+                .unwrap();
+            assert!(!st.expire_locks().unwrap());
+            assert_eq!(lock(&st, "guarded").0, Some(1));
+        }
+        std::fs::write(&finish, "finish").unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        assert!(worker.0.try_wait().unwrap().is_some());
+        assert_eq!(lock(&app.lock(), "guarded").0, None);
+        assert_eq!(app.agent_view(1).unwrap()["stopping"], false);
+        assert!(app.acquire(2, "guarded", 0, Some(60)).is_ok());
+        let st = app.lock();
+        let notice: String = st
+            .db
+            .query_row("SELECT text FROM notices WHERE agent_id=1 AND text LIKE 'You no longer hold lock `guarded`:%'", [], |r| r.get(0))
+            .unwrap();
+        assert!(notice.contains("you were closed"));
     }
 
     #[test]

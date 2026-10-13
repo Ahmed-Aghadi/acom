@@ -43,10 +43,10 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 **Lock.** A named lock that agents create when they need one, with a description of what it's for. Any number of locks, one holder each.
 
 - `acquire` takes the lock if it's free. If someone else holds it, it fails at once, or with `--wait` it queues (first come, first served) until it gets it or the wait runs out.
-- Every acquisition or renewal has a positive TTL, at most the project's `max_lock_ttl_secs` (default 900s). Omitted or null TTL uses that maximum; zero, negative, fractional or larger values are rejected. Acquiring a lock you already hold succeeds and restarts its TTL. Lowering the maximum shortens existing oversized or untimed leases to at most that much time remaining, including frozen time left, and notifies their holders. Increasing it never extends existing leases. This is a per-lease ceiling, not a total holding-time limit across renewals or user-frozen pauses. Legacy held locks are bounded on the next tick.
+- Every acquisition or renewal has a positive TTL, at most the project's `max_lock_ttl_secs` (default 900s). Omitted or null TTL uses that maximum; zero, negative, fractional or larger values are rejected. Acquiring a lock you already hold succeeds and restarts its TTL. Lowering the maximum shortens existing oversized or untimed leases to at most that much time remaining and notifies their holders. Increasing it never extends existing leases. This is a per-lease ceiling, not a total holding-time limit across renewals. Legacy held locks are bounded on the next tick.
 - `release` frees a lock you hold, and fails if you don't hold it (e.g. its TTL ran out and someone else has it now).
 - You can free any lock from the UI or with `acom lock free`.
-- A lock can be **frozen** (see Pausing): it stays with its holder and its TTL clock stops until the holder resumes.
+- Pausing or explicitly closing an agent releases held locks after its commands and background tools stop. A lock held by a stopping agent remains reserved until cleanup finishes; it cannot expire or be freed during that cleanup.
 
 ## Agent states
 
@@ -58,11 +58,11 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 | `done` | It ran `acom done`: task finished | Any new message in its threads, when there's room (see Limits) |
 | `closed` | You closed it, or it marked done under the default setting | Only you explicitly reopening it; messages wait |
 | `crashed` | Its process exited with an error or reported a failed turn (the error is shown) | Manual retry, or a configured crash-recovery rule |
-| `replaced` | A cross-provider recovery successfully started its successor | Never; terminal and inspectable |
+| `replaced` | Ownership of its work committed to its successor before startup | Never; terminal and inspectable |
 
 A **turn** is one stretch of work: it starts when the agent gets a prompt (its task, or a wake-up) and lasts until it stops and waits. Under the hood a turn is one run of `claude -p` or `codex exec`; waking a done agent or explicitly reopening a closed one resumes the same session. A woken done agent returns to done when its turn finishes; an explicitly reopened agent is idle unless it marks done again.
 
-When an agent becomes `done`, `closed` or `crashed`, its locks are released and it leaves any lock queue. By default an agent's own `acom done` makes it `closed`, so no message wakes it; a setting makes it `done` instead. Agents are told which rule applies, in their briefing, in `acom limits`, and again if you change it. When anyone posts in a thread, they're told which members weren't woken and why (closed, paused, crashed, replaced, or waiting for room). Replaced agents retain their records but reject resume, reopen, configure, pause, close, status, group and done mutations; use the successor instead.
+When an agent becomes `done`, `closed` or `crashed`, its locks are released and it leaves any lock queue. An explicit Close first reserves held locks until the agent's commands and background tools have stopped. By default an agent's own `acom done` makes it `closed`, so no message wakes it; a setting makes it `done` instead. Agents are told which rule applies, in their briefing, in `acom limits`, and again if you change it. When anyone posts in a thread, they're told which members weren't woken and why (closed, paused, crashed, replaced, or waiting for room). Replaced agents retain their records but reject resume, reopen, configure, pause, close, status, group and done mutations; use the successor instead.
 
 ## Talking to agents while they work
 
@@ -127,22 +127,21 @@ An unexpected process exit or harness-reported failed turn becomes a crash regar
 
 Pausing stops the agent's process. The conversation is saved by the harness, so resuming continues the same conversation. Anything it was running at that moment is killed; its resume prompt says it was paused, so it can redo that step. A resume waits a few seconds for the old process to exit, so two turns of one agent never overlap.
 
-**Pause one agent** (you, from the UI or `acom pause`). If it holds locks, you choose:
+**Pause one agent** (you, from the UI or `acom pause`). Held locks are released automatically after its commands and background tools have stopped. The UI shows the agent and its locks as stopping until cleanup finishes; keeping or freezing locks is not supported.
 
-- **Release its locks** (recommended).
-- **Keep its locks.** They're frozen: they stay with the agent and their TTL clocks stop until it resumes, so nobody else can get them meanwhile.
+**Close one agent** uses the same cleanup and lock reservation. Its state becomes closed immediately; it can be reopened after cleanup finishes, and messages remain pending until then.
 
-**Pause all.** Every agent in every project is paused, and every held lock is frozen with the time it had left. **Resume all** brings everything back with the same holders and the same time left. You can also resume only some agents; then you're warned which still-paused agents in the same project hold frozen locks, and the UI offers to release them.
+**Pause all.** Working, idle and done agents in every project are paused, with the same cleanup and lock-release behavior. **Resume all** resumes paused agents across every project, including manual and limit pauses. Resuming does not restore released locks or their old TTLs; agents must acquire any required locks again. An agent whose cleanup is still pending cannot resume yet.
 
 **Limit pause.** An agent paused by a hard limit always releases its locks, since other agents may still be running and need them.
 
-**Server restart.** Agents that were mid-turn when the server stopped are treated like pause all: their leftover processes are stopped (only if the process still carries that agent's `ACOM_ID` and this server's `ACOM_URL`), they're paused, and their locks are frozen. Resume them when you're ready.
+**Server restart.** Agents that were mid-turn when the server stopped become restart-paused, their owned leftover processes and tools are stopped, and their locks are released after cleanup. Linux process identity, `ACOM_ID`, the saved server address and data-home markers prevent unrelated processes from being stopped. Idle agents and existing manual or limit pauses stay unchanged. Starting the server does not resume interrupted turns automatically; `acom resume-restart` resumes only restart-paused agents across all projects and reports any failures.
 
 An agent waiting in `lock acquire --wait` when it's paused leaves the queue.
 
 **Resuming.** The agent gets a prompt saying when it was interrupted and resumed, that commands may have only partially executed and unsaved work may be lost, that its old commands, background tasks and monitors are gone (so it doesn't wait for them), which locks it lost while paused ("You no longer hold lock `install`: you were paused at 14:02. Acquire it again if you still need it."), and a summary of what's new.
 
-**No races.** Freezing a lock, expiring it, and releasing it all happen inside the server under one mutex, so one always finishes before the other starts. Freezing checks the deadline first: a lock whose TTL has already run out counts as expired and isn't frozen. Lost locks are recorded at the moment they're released, so the resume prompt is always accurate. Resuming sets the new deadline to now plus the time that was left.
+**Cleanup and locks.** Lock expiry, acquisition and release are serialized under the server mutex. A stopping agent's locks remain reserved while cleanup runs, including after their TTL passes; manual Free is refused until its tools stop. Cleanup failures remain visible and are retried, without allowing another agent to enter protected work. Lost locks are recorded when they are released, and resuming tells the agent to acquire required locks again.
 
 ## Commands
 
@@ -174,7 +173,7 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | `acom inbox [--mark new\|in-progress\|handled]` | Your messages with that mark (default `new`) |
 | `acom read <msg ID>` | One message in full |
 | `acom mark <msg ID,...> new\|in-progress\|handled` | Mark messages |
-| `acom locks` | List locks: name, description, holder, since, expires, frozen, queue |
+| `acom locks` | List locks: name, description, holder, since, expires, stopping, queue |
 | `acom lock new <name> --about <text>` | Create a lock |
 | `acom lock acquire <name> [--wait <dur>] [--ttl <dur>]` | Take a lock |
 | `acom lock release <name>` | Release a lock you hold |
@@ -188,8 +187,9 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | `acom project add [path]` / `acom project remove <ID>` | Add a folder as a project (default: this folder), or remove one without agents |
 | `acom launch ... [--force]` | Launch an agent in this folder's project (added if needed); `--force` confirms past a hard limit |
 | `acom send --thread <TID> [text]` | Post as `user` |
-| `acom pause <ID> [--release-locks\|--keep-locks]` | Pause one agent (you must choose if it holds locks) |
+| `acom pause <ID>` | Pause one agent and release its locks after cleanup |
 | `acom pause-all` / `acom resume-all` | Pause or resume everything |
+| `acom resume-restart` | Resume only restart-paused agents across all projects |
 | `acom resume <ID,...>` | Resume agents |
 | `acom close <ID>` / `acom reopen <ID>` | Close or reopen an agent |
 | `acom lock free <name>` | Release a lock whoever holds it |
@@ -222,16 +222,21 @@ The launch guide covers:
 Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshing every 2 seconds.
 
 - **Project picker:** every project with its folder, plus adding and removing projects. The folder browser starts at Home, shows files and folders, navigates up and into folders, and creates new folders; exact-path entry remains available. Agents, threads, locks and activity below are for the selected project.
-- **Top bar:** separate Claude five-hour, weekly and weekly Fable subscription usage meters, plus Codex (or "unknown"); click for reset/check times, errors and **Check now**. Each Claude window has its own soft/hard config fields. General windows block all Claude models; Fable's only blocks Fable. Resetting one doesn't clear another. **Launch** (into the selected project, which the dialog shows and lets you change); **Pause all** / **Resume all** (every project).
+- **Workspace:** project navigation in a sidebar, clear page headings, light/dark themes, and project summary cards for active agents, unread messages, attention states and held locks. Attention and held-lock counts label partial loaded windows. **Launch** stays in the workspace header. **Pause all** / **Resume all** act on every project; smaller screens group them under **All projects**. The theme follows the system until the user saves an explicit browser preference. Connection failures retain the last view and show an error banner with Retry now.
+- **Account usage:** a separate overview strip shows Claude five-hour, weekly and weekly Fable subscription usage, plus Codex (or "unknown"); click for reset/check times, errors and **Check now**. Each Claude window has its own soft/hard config fields. General windows block all Claude models; Fable's only blocks Fable. Resetting one doesn't clear another.
 - **Agents**, grouped by group: ID, name, harness/model/effort, state, status text, context size, tokens, launched by and when, whether it's waiting in the wake line and why, and any problem with its reason. Buttons to pause, resume, close and reopen; crashed agents offer Retry same model and Launch another model. Replaced agents are inspectable without ordinary control buttons. Details show the task, launch details, usage, held and lost locks, native conversation-history path (when created), raw output-log path, crash-recovery state and live recent activity. Polling updates changed fields without replacing unchanged task text or drafts; selected log text defers log updates.
 - **Threads:** **Mine**, **All**, **Unread** and **Agent-only** filters, membership labels, and join/leave controls distinguish user participation. List rows and the open thread show its ID; **Copy reference** copies `thread #<ID>` for another conversation. Click one to read it; a box at the bottom posts as `user`. A top-right **×** dismisses the pane without leaving or undoing read status; later replies stay unread until reopened. Drafts save per project/thread in browser storage as you type and survive pane switches, reloads and same-address server restarts; unavailable storage shows a warning. Successful sends clear only the submitted, unchanged draft. **New thread** chooses access mode and fixed members (searchable checkboxes and advanced selectors) or live state/group filters, with separate user membership. Add/remove controls manage members and live exclusions. The header shows the current owner; **Change owner** transfers ownership without changing membership. Recent bounded membership/ownership history and outside-membership/unknown-context labels are visible. After posting you're told who couldn't be woken yet; a failed wake never turns a persisted message into a failed-send receipt.
-- **Locks:** name, description, holder, since, expires (or frozen with the time left), queue, and a **Free** button.
+- **Locks:** name, description, holder, since, expires, queue, and a **Free** button. Locks held by stopping agents remain reserved and cannot be freed until cleanup finishes.
 - **Activity:** launches, pauses, resumes, limits reached, wake-line changes, locks freed by you, and who did each.
 - **Settings:** for the selected project: which config it uses (Default, a saved config, or Custom), and the editor for it, saying which projects a saved config affects; "Save as new config". Models are chosen from acom's catalog (full IDs) with a custom option for newer ones; efforts follow what the chosen model supports. An empty limit field means no limit.
 
+Agent search covers loaded names, IDs, tasks, status, provider, model and groups, with All/Active/Needs attention/Finished filters. Thread search covers loaded titles and IDs. Load more explicitly expands either search's scope. Search and filter choices survive polling. Settings have section links and a persistent saved/unsaved/read-only/pending-selection indicator.
+
+On mobile, opening a conversation shows a single pane and scrolls it into view. All threads returns to the list without losing the selected conversation or draft, and hidden conversations never acknowledge unread arrivals. Ctrl/Cmd + Enter submits a validated message; Enter adds a new line. Pending sends are tracked per project/thread, so reopening a pane cannot submit the same in-flight draft twice. Activity, messages and logs have named keyboard-scrollable regions, and the workspace provides a skip link, focus indicators and reduced-motion styling.
+
 Every dialog can be cancelled without filling it in.
 
-Confirmations: launching past a hard limit; pausing an agent that holds locks (release, keep, or cancel); resuming one agent while other paused agents hold frozen locks (resume and release those, resume only, or cancel).
+Confirmations explain actions such as launching past a hard limit or closing an agent. Pausing releases locks automatically after cleanup and does not offer a keep-locks option.
 
 ## Settings
 
@@ -269,9 +274,9 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 
 | Area | Requests |
 |---|---|
-| UI | `GET /` (the page), `GET /overview?project=` (projects, the selected project's agents, threads, locks, activity, limits and settings, plus the configs and the model catalog, in one call) |
+| UI | `GET /` (the page), `GET /overview?project=&since=` (selected project, limits, subscription usage/checks, unread totals, restart-paused count and collection revisions); settings, catalog and collections are fetched separately |
 | Projects | `GET /projects`, `GET /projects?path=` (the project a folder is in), `POST /projects` (`path`), `POST /projects/{id}/remove`, `GET /folders?path=&hidden=1` (defaults to Home), `POST /folders` (`parent`, single-folder `name`) |
-| Agents | `GET /agents?project=`, `GET /agents/{id}` (adds the project's name and path, `limits` text and `lost_locks`), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (`locks`: `release` or `keep`), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all` |
+| Agents | `GET /agents?project=`, `GET /agents/{id}` (adds the project's name and path, `limits` text and `lost_locks`), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (automatically releases locks after cleanup), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all`, `POST /resume-restart` |
 | Threads & messages | `GET /threads?project=&viewer=`, `POST /threads` (`members` snapshot or `watch` live selectors; optional `private`, `joinable`; `include_user` defaults true for users, false for agents), `GET /threads/{tid}?agent=` (personalized context, recent thread events), `GET /threads/{tid}/metadata?agent=` (includes `owner`, `created_by`, access and members), `POST /threads/{tid}/members`, `POST /threads/{tid}/members/remove` (`members`: IDs/user), `POST /threads/{tid}/owner` (`owner`: positive same-project non-replaced agent ID; caller `agent`, default user), `POST /threads/{tid}/user` (`joined`: boolean), `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}?agent=`, `GET /inbox/{agent}?mark=`, `POST /marks` |
 | Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
 | Configs | `GET /configs` (virtual Default plus saved configs, each with settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: `1` for Default or a saved config's id, or `custom`: settings) |
@@ -319,6 +324,8 @@ summary_cursors (agent_id, event_id)                   -- lifecycle summary posi
 history_origin (id, message_id)                       -- messages before tracking have unknown context
 configs  (id, name, settings)                          -- saved configs only, IDs >= 2; settings is JSON
 ```
+
+The lock table retains `frozen` and `frozen_left` as legacy storage fields; current controls never freeze a lease.
 
 ## Not included
 
