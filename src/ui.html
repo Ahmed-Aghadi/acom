@@ -259,7 +259,8 @@
       <h2 id="thread-title">New thread</h2>
       <div class="form-grid">
         <label class="wide">Title <input name="title" required></label>
-        <label class="wide">Membership <select id="thread-mode" name="membership_mode"><option value="fixed">Fixed members</option><option value="live">Live filters</option></select></label>
+        <label class="wide">Access <select id="thread-access" name="access"><option value="open">Public · open to join</option><option value="invite">Public · invite-only</option><option value="private">Private · invite-only</option></select><span id="thread-access-help">Anyone can read this thread and join it.</span></label>
+        <label class="wide">Membership <select id="thread-mode" name="membership_mode"><option value="fixed">Fixed members</option><option value="live">Live filters</option></select><span id="thread-mode-help" hidden>Invite-only threads use fixed members; live filters would admit new agents automatically.</span></label>
         <label class="inline-check wide"><input type="checkbox" name="include_user" checked> Include me in this thread</label>
         <div class="wide" id="thread-fixed-members">
         <div class="wide" id="thread-member-picker"></div>
@@ -288,8 +289,12 @@
     <div class="dialog-actions"><button type="button" data-close="folder-dialog">Cancel</button><button type="button" class="primary" id="folder-use">Use this folder</button></div>
   </form></dialog>
 
-  <dialog id="members-dialog" aria-labelledby="members-title"><form id="members-form"><h2 id="members-title">Add thread members</h2><div id="add-member-picker"></div>
+  <dialog id="members-dialog" aria-labelledby="members-title"><form id="members-form"><h2 id="members-title">Add thread members</h2><p class="meta" id="members-help" hidden>Only agents matching the live filters can be restored now.</p><div id="add-member-picker"></div>
     <div class="dialog-actions"><button type="button" data-close="members-dialog">Cancel</button><button class="primary">Add members</button></div>
+  </form></dialog>
+
+  <dialog id="remove-members-dialog" aria-labelledby="remove-members-title"><form id="remove-members-form"><h2 id="remove-members-title">Remove thread members</h2><p class="meta" id="remove-members-help"></p><div id="remove-member-picker"></div>
+    <div class="dialog-actions"><button type="button" data-close="remove-members-dialog">Cancel</button><button class="danger">Remove members</button></div>
   </form></dialog>
 
   <dialog id="usage-dialog" aria-labelledby="usage-title"><form method="dialog"><h2 id="usage-title">Subscription usage</h2><div id="usage-details"></div><div class="dialog-actions"><button>Close</button></div></form></dialog>
@@ -611,8 +616,16 @@
     }
     function resetThread() {
       saveVisibleDraft();
+      closeMemberDialogs();
       state.selectedThread = null; state.thread = null; state.threadRequest++;
       $('#thread-main').innerHTML = '<div class="empty">Select a thread</div>';
+    }
+    function closeMemberDialogs() {
+      for (const id of ['members-dialog', 'remove-members-dialog']) {
+        const dialog = document.getElementById(id);
+        dialog._session = (dialog._session || 0) + 1;
+        if (dialog.open) dialog.close('cancel');
+      }
     }
 
     function renderUsage() {
@@ -717,7 +730,12 @@
       });
       const joined = t => typeof t.user_member === 'boolean' ? t.user_member : Array.isArray(t.members) ? t.members.includes(0) : null;
       const threads = state.threads.filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
-      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} messages`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
+      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} messages`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
+    }
+
+    function threadAccess(thread) {
+      if (thread.truncated && (typeof thread.private !== 'boolean' || typeof thread.joinable !== 'boolean')) return 'Access unavailable';
+      return thread.private ? 'Private · invite-only' : thread.joinable === false ? 'Public · invite-only' : 'Public · open to join';
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
@@ -775,7 +793,7 @@
         }
         if (!sameThread) {
           saveVisibleDraft();
-          $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Membership history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Membership history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span></div>
             <div class="messages" id="messages">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary">Send</button></form>`;
@@ -799,10 +817,12 @@
           }
           setText($('.thread-header h2', $('#thread-main')), t.title);
         }
-        setHTML($('.thread-header .meta', $('#thread-main')), `Thread #${t.id} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`);
+        setHTML($('.thread-header .meta', $('#thread-main')), `Thread #${t.id} · ${threadAccess(t)} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`);
         setText($('#thread-membership'), t.members?.includes(0) ? 'Leave thread' : 'Join thread');
         const live = !!t.watch?.length;
-        $('#add-thread-members').hidden = live;
+        $('#add-thread-members').hidden = live && !t.excluded_members?.length;
+        setText($('#add-thread-members'), live ? 'Restore members' : 'Add members');
+        $('#remove-thread-members').disabled = !t.members?.some(id => Number(id) !== 0);
         $('#thread-watch').hidden = !live;
         setText($('#thread-watch'), live ? `Live filters: ${t.watch.join(', ')}. Agent membership updates automatically.` : '');
         $('#thread-history').hidden = !live && !t.events?.length;
@@ -1268,9 +1288,31 @@
       if (includeUser) $('[name=include_user]',root).checked=userSelected;
       updatePaging();
     }
+    function selectedMemberPicker(root, members) {
+      const previous = checked(root, 'member');
+      const ids = members.map(Number).filter(id => id !== 0).sort((a,b) => a-b);
+      root.innerHTML = `<label>Find members <input type="search" data-member-search placeholder="Name, ID or group"></label><div class="member-list">${ids.map(id => {
+        const agent = state.agents.find(a => a.id === id);
+        const name = agent?.name || `Agent #${id}`;
+        return `<label data-member-row data-search="${esc(`${name} ${id} ${agent?.group || ''}`.toLowerCase())}"><input type="checkbox" name="member" value="${id}"><span><strong>${esc(name)}</strong><br><span class="meta">#${id}${agent?.state ? ` · ${esc(agent.state)}` : ''}${agent?.group ? ` · ${esc(agent.group)}` : ''}</span></span></label>`;
+      }).join('') || '<div class="empty">No agents available</div>'}</div>`;
+      root.querySelectorAll('[name=member]').forEach(input => input.checked = previous.includes(input.value));
+    }
+    function addMemberPicker(thread) {
+      const root = $('#add-member-picker'), live = !!thread.watch?.length;
+      setText($('#members-title'), live ? 'Restore thread members' : 'Add thread members');
+      setText($('#members-form button.primary'), live ? 'Restore members' : 'Add members');
+      $('#members-help').hidden = !live;
+      if (live) selectedMemberPicker(root, thread.excluded_members || []);
+      else memberPicker(root, thread.members);
+    }
+    function removeMemberPicker(thread) {
+      selectedMemberPicker($('#remove-member-picker'), thread.members || []);
+      setText($('#remove-members-help'), thread.watch?.length ? 'Removed agents stay excluded from these live filters until explicitly added again.' : `Removed agents stop receiving this thread’s messages.${!thread.private && thread.joinable !== false ? ' They can join again because this thread is open.' : ''}`);
+    }
     document.addEventListener('input', event=> {
       if (!event.target.matches('[data-member-search]')) return;
-      const root = event.target.closest('#thread-member-picker, #add-member-picker');
+      const root = event.target.closest('#thread-member-picker, #add-member-picker, #remove-member-picker');
       root.querySelectorAll('[data-member-row]').forEach(row=>row.hidden=!row.dataset.search.includes(event.target.value.toLowerCase()));
     });
 
@@ -1314,7 +1356,7 @@
           }
           if (more.dataset.more === 'agents') {
             if ($('#thread-dialog').open) memberPicker($('#thread-member-picker'));
-            if ($('#members-dialog').open) memberPicker($('#add-member-picker'), state.thread?.members);
+            if ($('#members-dialog').open && state.thread?.id === Number($('#members-form').dataset.memberThread)) addMemberPicker(state.thread);
           }
         } catch (error) { toast(error.message, true); }
         finally { updatePaging(); }
@@ -1373,7 +1415,20 @@
       if(event.target.closest('#thread-membership')) {
         try { await mutate(`/threads/${state.selectedThread}/user`,{joined:!state.thread?.members?.includes(0)}); } catch(error) {toast(error.message,true);} return;
       }
-      if(event.target.closest('#add-thread-members')) { memberPicker($('#add-member-picker'),state.thread?.members); $('#members-form').dataset.memberThread = state.thread.id; openDialog($('#members-dialog')); return; }
+      if(event.target.closest('#add-thread-members')) {
+        if (!state.thread || state.thread.id !== state.selectedThread) return;
+        if ($('#members-form').dataset.memberThread !== String(state.thread.id) || $('#members-form').dataset.memberProject !== String(state.selectedProject)) $('#add-member-picker').replaceChildren();
+        addMemberPicker(state.thread);
+        Object.assign($('#members-form').dataset, {memberThread:state.thread.id, memberProject:state.selectedProject});
+        openDialog($('#members-dialog')); return;
+      }
+      if(event.target.closest('#remove-thread-members')) {
+        if (!state.thread || state.thread.id !== state.selectedThread) return;
+        if ($('#remove-members-form').dataset.memberThread !== String(state.thread.id) || $('#remove-members-form').dataset.memberProject !== String(state.selectedProject)) $('#remove-member-picker').replaceChildren();
+        removeMemberPicker(state.thread);
+        Object.assign($('#remove-members-form').dataset, {memberThread:state.thread.id, memberProject:state.selectedProject});
+        openDialog($('#remove-members-dialog')); return;
+      }
       if(event.target.closest('#copy-thread')) {
         const reference = `thread #${state.selectedThread}`;
         try { await navigator.clipboard.writeText(reference); toast(`Copied ${reference}`); }
@@ -1464,7 +1519,7 @@
         if (open.dataset.open === 'thread-dialog' && !state.project) { toast('Add a project first.', true); return; }
         if (open.dataset.open === 'thread-dialog') {
           if ($('#thread-member-picker').dataset.project !== String(state.selectedProject)) $('#thread-form [name=include_user]').checked = true;
-          memberPicker($('#thread-member-picker')); syncThreadMode();
+          memberPicker($('#thread-member-picker')); syncThreadAccess();
         }
         openDialog(document.getElementById(open.dataset.open));
         return;
@@ -1680,9 +1735,10 @@
       try {
         const membership = $('#thread-mode').value === 'live' ? {watch:[...data.getAll('watch_state'), ...splitList(data.get('watch_groups') || '').map(group => `group:${group}`)]} : {members:[...data.getAll('member'),...splitList(data.get('members') || '')]};
         if (membership.watch && !membership.watch.length) throw new Error('Choose at least one state or group for live filters.');
-        const result = await mutate('/threads', { project, title: data.get('title'), ...membership, include_user: data.has('include_user') });
+        const access = data.get('access');
+        const result = await mutate('/threads', { project, title: data.get('title'), ...membership, include_user: data.has('include_user'), private:access === 'private', joinable:access === 'open' });
         if (!submission.current() || project !== state.selectedProject) return;
-        $('#thread-dialog').close(); form.reset(); syncThreadMode();
+        $('#thread-dialog').close(); form.reset(); syncThreadAccess();
         if(!data.has('include_user')) {state.threadFilter='all';storeValue('thread-filter','all');renderThreads();}
         state.selectedThread = Number(result.id ?? result.thread_id); await refreshThread();
       } catch (error) { toast(error.message, true); }
@@ -1697,6 +1753,15 @@
         root.querySelectorAll('input, button').forEach(el => el.disabled = disabled);
       }
     }
+    function syncThreadAccess() {
+      const access = $('#thread-access').value, restricted = access !== 'open';
+      $('#thread-mode option[value=live]').disabled = restricted;
+      if (restricted) $('#thread-mode').value = 'fixed';
+      $('#thread-mode-help').hidden = !restricted;
+      setText($('#thread-access-help'), access === 'private' ? 'Only member agents can read it. You can always manage it and invite agents.' : access === 'invite' ? 'Anyone can read it; agents cannot join themselves.' : 'Anyone can read this thread and join it.');
+      syncThreadMode();
+    }
+    $('#thread-access').addEventListener('change', syncThreadAccess);
     $('#thread-mode').addEventListener('change', syncThreadMode);
 
     $('#folder-hidden').addEventListener('change',()=>browseFolder(state.folder?.path));
@@ -1715,10 +1780,20 @@
     });
     $('#members-form').addEventListener('submit',async event=> {
       event.preventDefault(); const form = event.currentTarget, button = event.submitter, submission = dialogSubmission(form);
-      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread);
+      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread), project = Number(form.dataset.memberProject);
+      if (thread !== state.selectedThread || project !== state.selectedProject) return;
       if(!members.length) {toast('Choose at least one member.',true);return;}
       if (button) button.disabled = true;
-      try {await mutate(`/threads/${thread}/members`,{members}); if (submission.current()) $('#members-dialog').close();} catch(error) {toast(error.message,true);}
+      try {await mutate(`/threads/${thread}/members`,{members}); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) $('#members-dialog').close();} catch(error) {if (submission.current()) toast(error.message,true);}
+      finally {if(button && submission.latest()) button.disabled=false;}
+    });
+    $('#remove-members-form').addEventListener('submit',async event=> {
+      event.preventDefault(); const form = event.currentTarget, button = event.submitter, submission = dialogSubmission(form);
+      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread), project = Number(form.dataset.memberProject);
+      if (thread !== state.selectedThread || project !== state.selectedProject) return;
+      if (!members.length) {toast('Choose at least one member.',true);return;}
+      if (button) button.disabled = true;
+      try {await mutate(`/threads/${thread}/members/remove`,{members}); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) $('#remove-members-dialog').close();} catch(error) {if (submission.current()) toast(error.message,true);}
       finally {if(button && submission.latest()) button.disabled=false;}
     });
 

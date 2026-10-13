@@ -1993,10 +1993,9 @@ async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defau
   for(const thread of [active,grouped,combined]) assert.ok(firstRun.membership_snapshot.threads.includes(thread.id),'the committed membership is visible when the task reaches the harness');
   assert.match(firstRun.prompt,/\[acom\] Coordination:/,'launch receives compact coordination context');
   assert.deepEqual(await members(active),[0,agent.id]);
-  for(const route of [`/threads/${active.id}/members`,`/threads/${active.id}/members/remove`]) {
-    await api('POST',route,{members:[String(agent.id)]},409);
-    assert.deepEqual(await members(active),[0,agent.id],'live membership cannot be manually pinned or removed');
-  }
+  await api('POST',`/threads/${active.id}/members`,{agent:agent.id,members:[String(agent.id)]},403);
+  await api('POST',`/threads/${active.id}/members/remove`,{agent:agent.id,members:['user']},403);
+  assert.deepEqual(await members(active),[0,agent.id],'an agent cannot override live invitations or remove another member');
   for(const thread of [grouped,combined]) assert.deepEqual(await members(thread),[agent.id]);
   assert.deepEqual(await members(done),[]);
   const fixed=await api('POST','/threads',{project:project.id,title:'Fixed membership intervals',members:[String(agent.id)],include_user:false});

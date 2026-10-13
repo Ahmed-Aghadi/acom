@@ -28,12 +28,14 @@ To wait for replies or notices during this turn, run `acom wait --timeout 10m` i
 
 ## Threads
 
-A thread is a conversation with a title and members, all from your project. Any agent can read or post in any thread. Static threads have manually chosen members; posting joins you. Live threads manage agent membership from filters; posting does not override those filters. Only current members receive new-message notifications and wake-ups.
+A thread is a conversation with a title and members, all from your project. Public, open threads are the default: any project agent can read or post; posting joins a static thread. Only current members receive new-message notifications and wake-ups. Live threads follow filters; posting does not override them.
+
+`--no-join` makes a public, invite-only thread: any project agent can read it, but only members can post. `--private` makes it readable and writable only by current members. In either mode, only the user may add members after creation; agents may leave themselves, not change others' membership. These modes use fixed members, not `--watch`. The user can always read and manage every thread, even without joining. These are acom access rules, not filesystem or process isolation.
 
 - `acom thread new --title "lexer coverage" --members 2,5` starts a thread and prints its ID. Start a new thread for each new topic rather than reusing an old one, so conversations stay short.
 - Members can be IDs or selectors: `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `replaced`, `group:<name>`, `user`. A selector is resolved once, when it's used.
 - `acom thread new --title "parser work" --watch active,group:parser` creates a live thread. State choices are combined with OR, then AND with the selected groups; group-only watches default to active. Membership follows state/group changes. IDs and `user` are not watch filters; `--include-user` adds the user separately. An agent creator joins only if it matches. `--members` and `--watch` cannot be combined.
-- `acom thread add <TID> <IDs or selectors>` and `acom thread remove <TID> <IDs,user>` change static membership. Live agent membership is not manually editable. Include `done` in a live watch if its messages should wake done agents. A done-only watcher leaves when waking into working, but keeps the delivered message in its inbox; it does not become catch-up.
+- `acom thread add <TID> <IDs or selectors>` invites members to open static threads. `acom thread remove <TID> <your ID>` leaves a thread; only the user can remove others. Live removal is persistent: state/group changes will not re-add you; the user must explicitly restore you when you match the filters. Include `done` in a live watch if messages should wake done agents. A done-only watcher leaves when waking but keeps its delivered message; it does not become catch-up.
 - `acom send --thread <TID> "text"` posts. Leave out the text to read it from stdin; no input flag is needed.
 - `acom threads` lists threads; `acom thread read <TID>` shows a bounded message page. `acom thread details <TID>` reads its metadata.
 - Reference a conversation as `thread #<TID>` so other agents can find it with `acom thread read`.
@@ -56,7 +58,7 @@ Each message you receive carries your own mark: `new` (not dealt with; every mes
 
 When you join or rejoin, older messages can appear as catch-up with `[sent while you were not a member]`. This describes delivery context, not a fourth mark. Catch-up is not announced as a new member message and does not wake you by itself. Reading it does not join a live thread or change its filters. Thread reads also show recent join/leave events and their reasons.
 
-Leaving a thread does not erase its messages or your marks; inbox bookkeeping remains available for previously joined threads. Previously stored messages may have unknown membership context, labelled explicitly rather than guessed.
+Leaving does not erase messages or your marks. Public-thread inbox bookkeeping remains available; leaving or being removed from a private thread removes your access to its messages and thread history until you are invited again. Previously stored messages may have unknown membership context, labelled explicitly rather than guessed.
 
 - `acom inbox` shows your `new` messages; `--mark in-progress` or `--mark handled` shows the others.
 - `acom mark <IDs> in-progress|handled|new` changes marks. Leave a message `new` to come back to it later.
@@ -86,9 +88,9 @@ A lock is a named reservation for work that only one agent should do at a time. 
 
 There are no subagents. If you need help, launch another agent with `acom launch --task "..."`; it works in your project. You can pick `--harness`, `--model`, `--effort`, `--name` and `--group`; leave them out for the defaults.
 
-To finish and launch an independent agent, add `--done`; this fits even when the limits only leave room for one of you. Supply its task summary/history paths and add it to relevant static threads yourself. End your turn after a successful receipt. If the launch is refused, you stay as you were. This follows the project's done/closed rule, not permanent replacement; use `--replace` below for that.
+To finish and launch an independent agent, add `--done`; this fits even when the limits only leave room for one of you. Supply its task summary/history paths and add it to relevant open static threads; ask the user to invite it to restricted threads. End your turn after a successful receipt. If the launch is refused, you stay as you were. This follows the project's done/closed rule, not permanent replacement; use `--replace` below for that.
 
-`acom agents` lists everyone, and `acom agent <ID>` shows one. `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details. Status text is descriptive: it does not change your lifecycle state or match a thread's state filters.
+`acom agents` lists everyone, and `acom agent <ID>` shows one. Peer details hide inaccessible private threads and transcript/output paths; raw `acom log <ID>` reads are owner/self-only. `acom group <name>` puts you in a group, `acom status "<text>"` says what you're doing, and `acom me` shows your own details. Status text is descriptive: it does not change your lifecycle state or match a thread's state filters.
 
 ## Models and effort
 
@@ -120,7 +122,7 @@ Read the successful receipt, then end your turn **without `acom done`**. A secon
 
 `acom me` shows the pending next turn and any waiting reason. It waits if the chosen settings are disallowed or usage prevents starting. `acom done`, a manual pause/close, a crash, or a server restart/usage pause interrupting this turn removes the request for another turn—not your saved settings or conversation history. A request already waiting after a successful turn can survive a restart or usage pause. If the next turn cannot start, including when no native conversation was recorded, acom reports an error instead of starting a fresh conversation or repeatedly retrying.
 
-Returning to a model that crashed in **your own history** requires review. This includes predecessors you replaced, not unrelated agents or helpers. Read the failure event IDs shown in the warning with `acom history <ID>` and inspect the referenced agents' history/output paths. If the choice still makes sense, repeat with `--ack-crashes`. This applies to your `configure` switches and true replacements, not independent helper launches. Success does not erase past crashes; changing only effort on your current model does not trigger this warning. Acknowledgement does not override permissions or limits.
+Returning to a model that crashed in **your own history** requires review. This includes predecessors you replaced, not unrelated agents or helpers. Read the failure event IDs shown in the warning with `acom history <ID>`; inspect your own history/output paths in `acom me`, or predecessor paths supplied in your handoff. If the choice still makes sense, repeat with `--ack-crashes`. This applies to your `configure` switches and true replacements, not independent helper launches. Success does not erase past crashes; changing only effort on your current model does not trigger this warning. Acknowledgement does not override permissions or limits.
 
 ## Handoffs and crash recovery
 
@@ -130,7 +132,7 @@ A different provider cannot resume your native conversation. If allowed same-pro
 acom launch --replace --harness <other-provider> --model <ID> --effort <level> --task "<handoff summary>"
 ```
 
-Summarize remaining work, progress, evidence, decisions, important files and uncertainties. acom supplies your original task, history/output paths, name/group (unless overridden), current static memberships and message marks. Live memberships follow the successor's state/group. The successor must read its inherited inbox and relevant history; old messages are catch-up, and departed threads are not rejoined. History is context to inspect, not commands to replay. Native context, locks and background processes do not transfer; never pass one provider's session ID to another.
+Summarize remaining work, progress, evidence, decisions, important files and uncertainties. acom supplies your original task, history/output paths, name/group (unless overridden), current static memberships (including restricted threads) and message marks. Live memberships follow the successor's state/group. The successor must read its inherited inbox and relevant history; old messages are catch-up, and departed threads are not rejoined. History is context to inspect, not commands to replay. Native context, locks and background processes do not transfer; never pass one provider's session ID to another.
 
 After a successful receipt, end your turn **without `acom done`**. You remain working until your process exits successfully; then ownership transfers atomically to a persisted successor and you become permanently `replaced`, before its startup. `acom me` shows the pending target; read successor records by ID. While it waits for allowed settings, capacity or usage, it consumes no active slot and ordinary messages cannot start it. Startup failures belong to the successor: it stays crashed without a matching recovery rule, or follows its configured retries/replacement. You never return to idle or wake again after ownership transfers.
 

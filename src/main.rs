@@ -37,11 +37,11 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
                                           so you hand over without needing a second slot
                                           --replace queues a terminal cross-provider handoff
   threads                                 List threads
-  thread new --title <text> [--members <ID or selector,...> | --watch <states,group:name,...>] [--include-user]
+  thread new --title <text> [--members <ID or selector,...> | --watch <states,group:name,...>] [--include-user] [--private|--no-join]
   thread read <TID>                       A bounded page of thread messages
   thread details <TID>                   Thread metadata, without message bodies
   thread add <TID> <ID or selector,...>   Add members
-  thread remove <TID> <IDs,user>          Remove members from a static thread
+  thread remove <TID> <IDs,user>          Leave (your own ID); the user may remove others
   history [ID] [--agent ID | --all-agents] [--thread TID] [--lock name] [--kind kind]
           [--before ID | --after ID] [--limit N] [--max-bytes N]
                                           Bounded coordination events; ID reads one event
@@ -182,6 +182,33 @@ mod cli_tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["acom", "thread", "remove", "1", "2,user"]).is_ok());
+    }
+
+    #[test]
+    fn restricted_threads_have_explicit_flags_and_no_live_audience() {
+        for flag in ["--private", "--no-join"] {
+            assert!(
+                Cli::try_parse_from(["acom", "thread", "new", "--title", "team", flag]).is_ok()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "acom", "thread", "new", "--title", "team", flag, "--watch", "active"
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "acom",
+                "thread",
+                "new",
+                "--title",
+                "team",
+                "--private",
+                "--no-join"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -638,6 +665,10 @@ enum ThreadCmd {
         watch: Option<String>,
         #[arg(long)]
         include_user: bool,
+        #[arg(long, conflicts_with_all = ["watch", "no_join"])]
+        private: bool,
+        #[arg(long, conflicts_with = "watch")]
+        no_join: bool,
     },
     Read {
         id: i64,
@@ -845,6 +876,20 @@ fn scope() -> String {
         None => project_here(),
     };
     project.map(|p| format!("project={p}")).unwrap_or_default()
+}
+
+fn viewer_query(key: &str) -> String {
+    my_id().map(|id| format!("&{key}={id}")).unwrap_or_default()
+}
+
+fn thread_access(thread: &Value) -> &'static str {
+    if thread["private"] == true {
+        "private"
+    } else if thread["joinable"] == false {
+        "public · invite-only"
+    } else {
+        "public · open"
+    }
 }
 
 fn get(path: &str) -> Value {
@@ -1378,7 +1423,12 @@ fn main() {
             }
         }
         Cmd::Threads { page } => {
-            let result = get(&format!("/threads?{}&{}", scope(), page.query()));
+            let result = get(&format!(
+                "/threads?{}&{}{}",
+                scope(),
+                page.query(),
+                viewer_query("viewer")
+            ));
             for th in page_items(&result) {
                 if item_truncated(th, &format!("acom thread read {}", th["id"])) {
                     continue;
@@ -1396,9 +1446,10 @@ fn main() {
                     })
                     .collect();
                 println!(
-                    "{:>3}  \"{}\" · members {} · {} messages · last {}",
+                    "{:>3}  \"{}\" · {} · members {} · {} messages · last {}",
                     th["id"],
                     th["title"].as_str().unwrap_or(""),
+                    thread_access(th),
                     members.join(","),
                     th["messages"],
                     t(&th["last_at"])
@@ -1412,6 +1463,8 @@ fn main() {
                 members,
                 watch,
                 include_user,
+                private,
+                no_join,
             } => {
                 let members: Vec<String> = members
                     .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
@@ -1419,7 +1472,7 @@ fn main() {
                 let watch: Vec<String> = watch
                     .map(|w| w.split(',').map(|s| s.trim().to_string()).collect())
                     .unwrap_or_default();
-                let mut b = json!({ "title": title, "members": members, "watch": watch });
+                let mut b = json!({ "title": title, "members": members, "watch": watch, "private": private, "joinable": !private && !no_join });
                 match my_id() {
                     Some(id) => {
                         b["agent"] = json!(id);
@@ -1503,9 +1556,10 @@ fn main() {
                     })
                     .collect();
                 println!(
-                    "Thread {} \"{}\" · members {}\n",
+                    "Thread {} \"{}\" · {} · members {}\n",
                     th["id"],
                     th["title"].as_str().unwrap_or(""),
+                    thread_access(&th),
                     m.join(", ")
                 );
                 for event in th["events"].as_array().into_iter().flatten() {
@@ -1558,7 +1612,7 @@ fn main() {
                     members.split(',').map(|s| s.trim().to_string()).collect();
                 let v = post(
                     &format!("/threads/{id}/members"),
-                    json!({ "members": members }),
+                    json!({ "agent": my_id().unwrap_or(0), "members": members }),
                 );
                 let m: Vec<String> = v["members"]
                     .as_array()
@@ -1587,7 +1641,7 @@ fn main() {
                     members.split(',').map(|s| s.trim().to_string()).collect();
                 let v = post(
                     &format!("/threads/{id}/members/remove"),
-                    json!({ "members": members }),
+                    json!({ "agent": my_id().unwrap_or(0), "members": members }),
                 );
                 if v["result_truncated"] == true {
                     println!(
@@ -1666,6 +1720,9 @@ fn main() {
             version,
         } => {
             let mut query = vec![scope()];
+            if let Some(viewer) = my_id() {
+                query.push(format!("viewer={viewer}"));
+            }
             let path = if let Some(id) = id {
                 query.push(format!("max_bytes={max_bytes}"));
                 if let Some(offset) = offset {
@@ -1773,12 +1830,22 @@ fn main() {
                     version,
                     max_bytes: page.max_bytes,
                 };
-                let result = get(&format!("/activity/{id}?{}&{}", scope(), args.query()));
+                let result = get(&format!(
+                    "/activity/{id}?{}&{}{}",
+                    scope(),
+                    args.query(),
+                    viewer_query("agent")
+                ));
                 if !record_output(&result, &args, &format!("acom activity {id}")) {
                     println!("{result}");
                 }
             } else {
-                let result = get(&format!("/activity?{}&{}", scope(), page.query()));
+                let result = get(&format!(
+                    "/activity?{}&{}{}",
+                    scope(),
+                    page.query(),
+                    viewer_query("agent")
+                ));
                 println!("{result}");
                 page_hint(&result, &page, "acom activity");
             }

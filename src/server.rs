@@ -1,7 +1,7 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, acom_home, actor, bad,
+    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, ThreadReq, acom_home, actor, bad,
     bounded_record, not_found,
 };
 use crate::harness::catalog;
@@ -288,6 +288,25 @@ fn list(b: &Value, key: &str) -> Vec<String> {
         _ => vec![],
     }
 }
+
+fn boolean(b: &Value, key: &str, default: bool) -> R<bool> {
+    match b.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| bad(format!("{key} must be true or false"))),
+    }
+}
+
+fn identity(b: &Value, key: &str) -> R<i64> {
+    match b.get(key) {
+        None => Ok(0),
+        Some(value) => value
+            .as_i64()
+            .filter(|id| *id >= 0)
+            .ok_or_else(|| bad(format!("{key} must be 0 (user) or a positive agent ID"))),
+    }
+}
 fn settings(b: &Value, key: &str) -> R<Settings> {
     serde_json::from_value(b[key].clone()).map_err(|e| bad(format!("bad settings: {e}")))
 }
@@ -327,16 +346,17 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
     if app.lock().shutting_down {
         return Err(Fail(503, "the server is stopping".into()));
     }
-    // Zero identifies the user; negative identities must never reach a write.
-    for key in ["agent", "via"] {
-        if opt_int(b, key).is_some_and(|id| id < 0) {
+    // Malformed callers must not silently become the user.
+    identity(b, "agent")?;
+    if opt_int(b, "via").is_some_and(|id| id < 0) {
+        return Err(bad("via must be 0 (user) or a positive agent ID"));
+    }
+    for key in ["agent", "viewer"] {
+        if q.int(key)?.is_some_and(|id| id < 0) {
             return Err(bad(format!(
                 "{key} must be 0 (user) or a positive agent ID"
             )));
         }
-    }
-    if q.int("agent")?.is_some_and(|id| id < 0) {
-        return Err(bad("agent must be 0 (user) or a positive agent ID"));
     }
     let reply = match (method, p) {
         ("GET", []) => Reply::Html(UI),
@@ -389,11 +409,15 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["agents", a, "project"]) => J(json!({"project":app.agent_project(id(a)?)?})),
         ("GET", ["agents", a, "log"]) => {
             let aid = id(a)?;
-            let project = app.agent_project(aid)?;
-            if let Some(actor) = q.int("agent")?.filter(|a| *a > 0)
-                && app.agent_project(actor)? != project
-            {
-                return Err(bad("agent is in another project"));
+            app.agent_project(aid)?;
+            if let Some(viewer) = q.int("agent")?.filter(|a| *a > 0) {
+                app.agent_project(viewer)?;
+                if viewer != aid {
+                    return Err(Fail(
+                        403,
+                        "agents can only read their own output log".into(),
+                    ));
+                }
             }
             J(log_page(&crate::run::log_path(app, aid, "txt"), q)?)
         }
@@ -477,21 +501,29 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // threads and messages
-        ("GET", ["threads"]) => {
-            J(app.threads_page(q.int("project")?, q.int("agent")?, page(q)?)?)
-        }
+        ("GET", ["threads"]) => J(app.threads_page(
+            q.int("project")?,
+            q.int("agent")?,
+            q.int("viewer")?,
+            page(q)?,
+        )?),
         ("POST", ["threads"]) => {
-            let (tid, members) = app.new_thread(
-                opt_int(b, "agent").unwrap_or(0),
+            let by = opt_int(b, "agent").unwrap_or(0);
+            let private = boolean(b, "private", false)?;
+            let joinable = boolean(b, "joinable", true)? && !private;
+            let (tid, members) = app.create_thread(
+                by,
                 opt_int(b, "project"),
-                &text(b, "title")?,
-                &list(b, "members"),
-                b["include_user"]
-                    .as_bool()
-                    .unwrap_or_else(|| opt_int(b, "agent").unwrap_or(0) == 0),
-                &list(b, "watch"),
+                ThreadReq {
+                    title: text(b, "title")?,
+                    members: list(b, "members"),
+                    include_user: boolean(b, "include_user", by == 0)?,
+                    watch: list(b, "watch"),
+                    private,
+                    joinable,
+                },
             )?;
-            J(json!({ "id": tid, "members": members }))
+            J(json!({ "id": tid, "members": members, "private": private, "joinable": joinable }))
         }
         ("GET", ["threads", t]) => J(record(
             app.thread_page(id(t)?, q.int("agent")?, page(q)?)?,
@@ -514,13 +546,16 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                     .ok_or_else(|| bad("message must be an integer"))?,
             )?)
         }
-        ("POST", ["threads", t, "members"]) => {
-            J(json!({ "members": app.add_members(id(t)?, &list(b, "members"))? }))
-        }
-        ("POST", ["threads", t, "members", "remove"]) => {
-            J(json!({ "members": app.remove_members(id(t)?, &list(b, "members"))? }))
-        }
+        ("POST", ["threads", t, "members"]) => J(
+            json!({ "members": app.add_members(id(t)?, &list(b, "members"), opt_int(b, "agent").unwrap_or(0))? }),
+        ),
+        ("POST", ["threads", t, "members", "remove"]) => J(
+            json!({ "members": app.remove_members(id(t)?, &list(b, "members"), opt_int(b, "agent").unwrap_or(0))? }),
+        ),
         ("POST", ["threads", t, "user"]) => {
+            if b.get("agent").is_some_and(|a| a.as_i64() != Some(0)) {
+                return Err(bad("only the user can change user membership"));
+            }
             app.user_membership(
                 id(t)?,
                 b["joined"]
@@ -630,10 +665,16 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
 
         // limits, activity, settings
         ("GET", ["limits"]) => J(record(app.limits(q.int("project")?)?, q)?),
-        ("GET", ["activity"]) => J(app.activity_page(q.int("project")?, page(q)?)?),
-        ("GET", ["activity", a]) => J(record(app.activity_view(id(a)?, q.int("project")?)?, q)?),
+        ("GET", ["activity"]) => {
+            J(app.activity_page(q.int("project")?, page(q)?, q.int("agent")?)?)
+        }
+        ("GET", ["activity", a]) => J(record(
+            app.activity_view(id(a)?, q.int("project")?, q.int("agent")?)?,
+            q,
+        )?),
         ("GET", ["history"]) => J(app.history(
             q.int("project")?,
+            q.int("viewer")?,
             HistoryQuery {
                 agent: q.int("agent")?,
                 thread: q.int("thread")?,
@@ -646,7 +687,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             },
         )?),
         ("GET", ["history", event]) => J(record(
-            app.history_event(q.int("project")?, id(event)?)?,
+            app.history_event(q.int("project")?, id(event)?, q.int("viewer")?)?,
             q,
         )?),
         ("GET", ["receipts", event]) => {
@@ -981,6 +1022,54 @@ fn folders(path: Option<&str>, hidden: bool, q: &Query) -> R<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_agent_identity_cannot_default_to_the_user() {
+        assert_eq!(super::identity(&serde_json::json!({}), "agent").unwrap(), 0);
+        for id in [0, 1, i64::MAX] {
+            assert_eq!(
+                super::identity(&serde_json::json!({"agent":id}), "agent").unwrap(),
+                id
+            );
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("1"),
+            serde_json::json!(-1),
+            serde_json::json!(1.0),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            let error = super::identity(&serde_json::json!({"agent":value}), "agent").unwrap_err();
+            assert_eq!(error.0, 400);
+            assert_eq!(error.1, "agent must be 0 (user) or a positive agent ID");
+        }
+    }
+
+    #[test]
+    fn thread_access_booleans_only_default_when_absent() {
+        for key in ["private", "joinable", "include_user"] {
+            assert!(super::boolean(&serde_json::json!({}), key, true).unwrap());
+            assert!(!super::boolean(&serde_json::json!({}), key, false).unwrap());
+            for value in [true, false] {
+                assert_eq!(
+                    super::boolean(&serde_json::json!({ key: value }), key, !value).unwrap(),
+                    value
+                );
+            }
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!("false"),
+                serde_json::json!(0),
+                serde_json::json!([]),
+            ] {
+                let error =
+                    super::boolean(&serde_json::json!({ key: value }), key, true).unwrap_err();
+                assert_eq!(error.0, 400);
+                assert_eq!(error.1, format!("{key} must be true or false"));
+            }
+        }
+    }
+
     #[test]
     fn log_cursors_reject_partial_utf8_boundaries() {
         let path = std::env::temp_dir().join(format!(

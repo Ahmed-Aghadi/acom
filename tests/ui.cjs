@@ -64,7 +64,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','holder_stopping','user_member','unread','messages','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','holder_stopping','user_member','unread','messages','private','joinable','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -247,7 +247,7 @@ async function fixture(run) {
       return send(value);
     }
     if (req.url === '/threads') {
-      const t = { id: data.threads.length + 1, ...body, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
+      const t = { id: data.threads.length + 1, ...body, private:!!body.private, joinable:body.joinable !== false && !body.private, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
       data.threads.push(t);
       return send({ id: t.id });
     }
@@ -269,7 +269,17 @@ async function fixture(run) {
         return send({last_read:data.reads[t.id],unread:unread(t)});
       }
       if(req.url.endsWith('/user')) t.members=body.joined ? [...new Set([0,...t.members])] : t.members.filter(id=>id!==0);
-      if(req.url.endsWith('/members')) t.members=[...new Set([...t.members,...body.members])];
+      if(req.url.endsWith('/members/remove')) {
+        if(data.removeMembersFailure) return send({status:409,error:'Members could not be removed'});
+        const ids=new Set(body.members.map(Number)), removed=t.members.filter(id=>ids.has(Number(id)));
+        t.members=t.members.filter(id=>!ids.has(Number(id)));
+        if(t.watch?.length)t.excluded_members=[...new Set([...(t.excluded_members || []),...body.members.map(Number)])];
+        for(const id of removed) (t.events ||= []).push({id:Math.max(0,...t.events.map(e=>e.id))+1,at:Date.now()/1000,kind:'thread.left',agent:Number(id),actor:'user',details:{reason:'Removed by user'}});
+      }
+      if(req.url.endsWith('/members')) {
+        t.members=[...new Set([...t.members,...body.members])];
+        if(t.watch?.length)t.excluded_members=(t.excluded_members || []).filter(id=>!body.members.map(Number).includes(Number(id)));
+      }
       return send({...t,last_read:data.reads[t.id] || 0,unread:unread(t)});
     }
     if (req.url === '/messages') {
@@ -878,7 +888,110 @@ test('empty live filters are rejected locally and switching back to fixed member
   await page.locator('#thread-mode').selectOption('fixed');
   await page.locator('#thread-form button.primary').click();
   await page.locator('#message-form').waitFor();
-  assert.deepEqual(data.requests.find(r => r.url === '/threads').body, {project:1,title:'Chosen members',members:[],include_user:true});
+  assert.deepEqual(data.requests.find(r => r.url === '/threads').body, {project:1,title:'Chosen members',members:[],include_user:true,private:false,joinable:true});
+}));
+
+test('thread creation distinguishes public open, public invite-only and private access', async () => fixture(async (page, data) => {
+  await page.locator('[data-page=threads]').click();
+  for (const [index,access] of ['open','invite','private'].entries()) {
+    await page.locator('[data-open=thread-dialog]').click();
+    await page.locator('#thread-access').selectOption(access);
+    await page.locator('#thread-form [name=title]').fill(`${access} conversation`);
+    if (access === 'private') await page.locator('#thread-form [name=include_user]').uncheck();
+    assert.equal(await page.locator('#thread-mode option[value=live]').evaluate(option=>option.disabled), access !== 'open');
+    if (access === 'private') assert.match(await page.locator('#thread-access-help').textContent(), /Only member agents can read it.*always manage/);
+    await page.locator('#thread-form button.primary').click();
+    await page.waitForFunction(id => state.thread?.id === id, index + 1);
+    const body=data.requests.filter(r=>r.url==='/threads').at(-1).body;
+    assert.equal(body.private, access === 'private');
+    assert.equal(body.joinable, access === 'open');
+    assert.equal(Object.hasOwn(body,'watch'), false);
+    assert.match(await page.locator('.thread-header > div.meta').textContent(), access === 'private' ? /Private · invite-only/ : access === 'invite' ? /Public · invite-only/ : /Public · open to join/);
+    assert.equal(await page.locator('#thread-access').inputValue(), 'open', 'successful creation resets access for the next thread');
+  }
+  assert.equal(data.threads.at(-1).members.includes(0), false, 'not including the user does not hide the administrative thread view');
+}));
+
+test('invite-only access switches live membership to fixed without discarding its filter selections', async () => fixture(async (page, data) => {
+  data.agents=[{id:1,project:1,name:'Reviewer',state:'working'}];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
+  await page.locator('#thread-member-picker [name=member][value="1"]').check();
+  await page.locator('#thread-mode').selectOption('live');
+  await page.locator('[name=watch_groups]').fill('review');
+  await page.locator('#thread-access').selectOption('private');
+  assert.equal(await page.locator('#thread-mode').inputValue(), 'fixed');
+  assert.equal(await page.locator('#thread-live-filters').isHidden(), true);
+  assert.match(await page.locator('#thread-mode-help').textContent(), /fixed members.*admit new agents automatically/);
+  assert.equal(await page.locator('#thread-member-picker [name=member][value="1"]').isChecked(), true);
+  await page.locator('#thread-access').selectOption('open'); await page.locator('#thread-mode').selectOption('live');
+  assert.equal(await page.locator('[name=watch_groups]').inputValue(), 'review');
+  await page.locator('#thread-access').selectOption('invite');
+  await page.locator('#thread-form [name=title]').fill('Fixed invite-only'); await page.locator('#thread-form button.primary').click();
+  await page.waitForFunction(()=>state.thread?.id===1);
+  const body=data.requests.find(r=>r.url==='/threads').body;
+  assert.deepEqual(body.members,['1']);
+  assert.equal(Object.hasOwn(body,'watch'),false);
+  assert.equal(body.joinable,false);
+}));
+
+test('user removal includes members absent from the bounded agent preview and preserves messages and history', async () => fixture(async (page, data) => {
+  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.threads=[conversation([incoming(1,'Existing conversation')],{members:[0,1,3],private:true,joinable:false})]; data.reads[1]=1;
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#remove-thread-members').click();
+  assert.deepEqual(await page.locator('#remove-member-picker [name=member]').evaluateAll(nodes=>nodes.map(n=>Number(n.value))),[1,3]);
+  assert.match(await page.locator('#remove-member-picker').textContent(), /Agent #1/);
+  assert.equal(await page.locator('#remove-member-picker [name=member][value="0"]').count(),0);
+  await page.locator('#remove-member-picker [data-member-search]').fill('1');
+  assert.equal(await page.locator('#remove-member-picker [data-member-row]').filter({hasText:'Worker 3'}).isVisible(),false);
+  await page.locator('#remove-member-picker [name=member][value="1"]').check();
+  await page.locator('#remove-members-form button.danger').click();
+  await page.waitForFunction(()=>!document.querySelector('#remove-members-dialog').open);
+  assert.deepEqual(data.threads[0].members,[0,3]);
+  assert.deepEqual(data.requests.find(r=>r.url==='/threads/1/members/remove').body,{members:['1']});
+  assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),'Existing conversation');
+  await page.locator('#thread-history summary').click();
+  assert.match(await page.locator('#thread-events').textContent(), /agent 1 left · by user.*Removed by user/);
+  await page.locator('#remove-thread-members').click();
+  assert.deepEqual(await page.locator('#remove-member-picker [name=member]').evaluateAll(nodes=>nodes.map(n=>Number(n.value))),[3]);
+}));
+
+test('live member removals explain durable exclusions and offer explicit restoration by ID', async () => fixture(async (page, data) => {
+  data.threads=[conversation([],{watch:['working','idle'],excluded_members:[]})];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#remove-thread-members').click();
+  assert.match(await page.locator('#remove-members-help').textContent(),/stay excluded.*until explicitly added/);
+  await page.locator('#remove-member-picker [name=member][value="1"]').check(); await page.locator('#remove-members-form button.danger').click();
+  await page.waitForFunction(()=>!document.querySelector('#remove-members-dialog').open);
+  assert.deepEqual(data.threads[0].excluded_members,[1]);
+  assert.equal(await page.locator('#remove-thread-members').isDisabled(),true);
+  assert.equal(await page.locator('#add-thread-members').textContent(),'Restore members');
+  await page.locator('#add-thread-members').click();
+  assert.equal(await page.getByRole('dialog',{name:'Restore thread members',exact:true}).count(),1);
+  assert.match(await page.locator('#members-help').textContent(),/matching the live filters/);
+  assert.match(await page.locator('#add-member-picker').textContent(),/Agent #1/);
+  await page.locator('#add-member-picker [name=member][value="1"]').check(); await page.locator('#members-form button.primary').click();
+  await page.waitForFunction(()=>!document.querySelector('#members-dialog').open);
+  assert.deepEqual(data.threads[0].excluded_members,[]);
+  assert.equal(await page.locator('#add-thread-members').isHidden(),true);
+  assert.equal(await page.locator('#remove-thread-members').isDisabled(),false);
+  assert.deepEqual(data.requests.find(r=>r.url==='/threads/1/members').body,{members:['1']});
+}));
+
+test('failed and empty member removals retain the dialog selection and do not retry mutations', async () => fixture(async (page, data) => {
+  data.threads=[conversation([])]; data.removeMembersFailure=true;
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#remove-thread-members').click();
+  assert.match(await page.locator('#remove-members-help').textContent(), /join again because this thread is open/);
+  await page.locator('#remove-members-form button.danger').click();
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/members/remove')).length,0);
+  await page.locator('#remove-member-picker [name=member][value="1"]').check(); await page.locator('#remove-members-form button.danger').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('could not be removed'));
+  assert.equal(await page.locator('#remove-members-dialog').isVisible(),true);
+  assert.equal(await page.locator('#remove-member-picker [name=member][value="1"]').isChecked(),true);
+  assert.equal(await page.locator('#remove-members-form button.danger').isDisabled(),false);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/members/remove')).length,1);
+  assert.deepEqual(data.threads[0].members,[0,1]);
 }));
 
 test('live threads expose escaped membership history and mark outside-membership messages without counting them unread', async () => fixture(async (page, data) => {
@@ -2141,6 +2254,45 @@ test('late config and member saves preserve newer dialog input', async () => fix
   assert.deepEqual(data.requests.find(r=>r.url === '/threads/1/members').body.members, ['1']);
 }));
 
+test('late removal keeps reopened selections and never removes members from a different thread', async () => fixture(async (page, data) => {
+  data.threads=[conversation([]),conversation([],{id:2,title:'Second',members:[0,2]})];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="1"]').check();
+  const pending=await holdRequest(page,'**/threads/1/members/remove');
+  await page.locator('#remove-members-form button.danger').click(); await pending.started;
+  await page.locator('[data-close=remove-members-dialog]').click(); await page.locator('[data-thread="2"]').click();
+  await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="2"]').check();
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>!document.querySelector('#remove-members-form button.danger').disabled);
+  assert.equal(await page.locator('#remove-members-dialog').isVisible(),true);
+  assert.equal(await page.locator('#remove-member-picker [name=member][value="2"]').isChecked(),true);
+  assert.deepEqual(data.threads[0].members,[0]);
+  assert.deepEqual(data.threads[1].members,[0,2]);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/members/remove')).length,1);
+  await page.locator('[data-close=remove-members-dialog]').click();
+  await page.locator('#remove-thread-members').click();
+  await page.evaluate(()=>resetThread());
+  assert.equal(await page.locator('#remove-members-dialog').isVisible(),false);
+  assert.equal(await page.locator('#thread-main').textContent(),'Select a thread');
+}));
+
+test('switching projects invalidates open add and removal dialogs before a stale form can submit', async () => fixture(async (page, data) => {
+  data.agents=[{id:2,project:1,name:'Additional',state:'idle'}]; data.threads=[conversation([])];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  for(const [control,dialog,form] of [['#add-thread-members','#members-dialog','#members-form'],['#remove-thread-members','#remove-members-dialog','#remove-members-form']]) {
+    await page.locator(control).click();
+    await page.locator(`${form} [name=member]`).check();
+    const before=data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length;
+    await page.locator('#project-select').selectOption('2');
+    await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
+    assert.equal(await page.locator(dialog).isVisible(),false);
+    await page.evaluate(form=>document.querySelector(form).dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true})),form);
+    assert.equal(data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length,before);
+    await page.locator('#project-select').selectOption('1');
+    await page.locator('[data-thread="1"]').click();
+  }
+}));
+
 test('mobile locks can scroll every control into view and dialogs and feedback have accessible names', async () => fixture(async (page, data) => {
   data.locks = [{name:'write-lock',project:1,about:'Editing important shared content',holder:1,holder_name:'Worker',acquired_at:1,expires_at:Date.now()/1000+600,queue:[2,3]}];
   await page.setViewportSize({width:390,height:844}); await reloadPage(page); await page.locator('[data-action=free-lock]').waitFor();
@@ -2148,7 +2300,7 @@ test('mobile locks can scroll every control into view and dialogs and feedback h
   await page.locator('#locks').evaluate(el => { el.scrollLeft = el.scrollWidth; });
   assert.equal(await page.locator('[data-action=free-lock]').evaluate(el => el.getBoundingClientRect().right <= innerWidth), true);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members',usage:'Subscription usage',config:'Save as new config',agent:'Agent'};
+  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members','remove-members':'Remove thread members',usage:'Subscription usage',config:'Save as new config',agent:'Agent'};
   for (const [id,name] of Object.entries(names)) {
     await page.evaluate(id => openDialog(document.getElementById(id+'-dialog')), id);
     assert.equal(await page.getByRole('dialog', {name,exact:true}).count(), 1);

@@ -61,6 +61,95 @@ async function mock(handler, run) {
   }
 }
 
+test('CLI thread creation sends explicit access settings', async t => {
+  for (const [flags, expected] of [
+    [[], { private: false, joinable: true }],
+    [['--private'], { private: true, joinable: false }],
+    [['--no-join'], { private: false, joinable: false }],
+  ]) await t.test(flags[0] || 'public open default', async () => {
+    let body;
+    await mock((req, res) => {
+      let raw = ''; req.on('data', chunk => raw += chunk);
+      req.on('end', () => {
+        body = JSON.parse(raw); res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ id: 4, members: [7, 2, 3], ...expected }));
+      });
+    }, async fixture => {
+      fixture.env.ACOM_ID = '7';
+      const result = await cli(['thread', 'new', '--title', 'team', '--members', '2,3', ...flags], fixture);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(body, { title: 'team', members: ['2', '3'], watch: [], agent: 7, include_user: false, ...expected });
+      assert.deepEqual(fixture.requests, [{ method: 'POST', url: '/threads' }]);
+    });
+  });
+  for (const flags of [['--private', '--watch', 'active'], ['--no-join', '--watch', 'active'], ['--private', '--no-join']]) {
+    await t.test(`rejects conflicting ${flags.join(' ')}`, async () => {
+      await mock((_, res) => res.end('{}'), async fixture => {
+        const result = await cli(['thread', 'new', '--title', 'team', ...flags], fixture);
+        assert.notEqual(result.status, 0); assert.match(result.stderr, /cannot be used with/);
+        assert.deepEqual(fixture.requests, [], 'invalid audience options must not create a thread');
+      });
+    });
+  }
+});
+
+test('CLI thread membership commands identify their caller and preserve permission errors', async t => {
+  for (const command of ['add', 'remove']) for (const identity of [0, 7]) await t.test(`${command} as ${identity || 'user'}`, async () => {
+    let body;
+    await mock((req, res) => {
+      let raw = ''; req.on('data', chunk => raw += chunk);
+      req.on('end', () => {
+        body = JSON.parse(raw); res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ members: [2] }));
+      });
+    }, async fixture => {
+      if (identity) fixture.env.ACOM_ID = String(identity);
+      const result = await cli(['thread', command, '4', '2'], fixture);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(body, { agent: identity, members: ['2'] });
+      assert.deepEqual(fixture.requests, [{ method: 'POST', url: `/threads/4/members${command === 'remove' ? '/remove' : ''}` }]);
+    });
+  });
+  await t.test('denied invitation is not claimed successful or retried', async () => {
+    await mock((req, res) => {
+      req.resume(); res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'only the user may invite members to this thread' }));
+    }, async fixture => {
+      fixture.env.ACOM_ID = '7';
+      const result = await cli(['thread', 'add', '4', '2'], fixture);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /only the user may invite/);
+      assert.doesNotMatch(result.stdout, /added/); assert.equal(fixture.requests.length, 1);
+    });
+  });
+});
+
+test('CLI privacy viewer is separate from membership and history filters', async t => {
+  for (const [args, endpoint, identityKey, filter] of [
+    [['threads'], '/threads', 'viewer', null],
+    [['activity'], '/activity', 'agent', null],
+    [['activity', '3'], '/activity/3', 'agent', null],
+    [['history'], '/history', 'viewer', '7'],
+    [['history', '--all-agents'], '/history', 'viewer', null],
+    [['history', '--agent', '2'], '/history', 'viewer', '2'],
+    [['history', '3'], '/history/3', 'viewer', null],
+  ]) await t.test(args.join(' '), async () => {
+    await mock((req, res) => {
+      req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/agents/7/project' ? { project: 9 } : { items: [], events: [], has_more: false }));
+    }, async fixture => {
+      fixture.env.ACOM_ID = '7';
+      const result = await cli(args, fixture);
+      assert.equal(result.status, 0, result.stderr);
+      const request = fixture.requests.find(request => new URL(request.url, 'http://fixture').pathname === endpoint);
+      assert.ok(request, JSON.stringify(fixture.requests));
+      const query = new URL(request.url, 'http://fixture').searchParams;
+      assert.equal(query.get('project'), '9'); assert.equal(query.get(identityKey), '7');
+      if (identityKey === 'viewer') assert.equal(query.get('agent'), filter, 'caller identity must not overwrite or introduce a membership/history filter');
+      assert.ok(fixture.requests.every(request => request.method === 'GET'));
+    });
+  });
+});
+
 test('CLI pause has no lock-preservation options or payload',async t=>{
   for(const flag of ['--keep-locks','--release-locks']) await t.test(`rejects ${flag}`,async()=>{
     await mock((_,res)=>{res.writeHead(200,{'Content-Type':'application/json'});res.end('{}');},async fixture=>{
