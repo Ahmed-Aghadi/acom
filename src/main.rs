@@ -42,6 +42,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   thread details <TID>                   Thread metadata, without message bodies
   thread add <TID> <ID or selector,...>   Add members
   thread remove <TID> <IDs,user>          Leave (your own ID); the user may remove others
+  thread transfer-owner <TID> <AGENT_ID>  Transfer ownership; membership stays unchanged
   history [ID] [--agent ID | --all-agents] [--thread TID] [--lock name] [--kind kind]
           [--before ID | --after ID] [--limit N] [--max-bytes N]
                                           Bounded coordination events; ID reads one event
@@ -209,6 +210,14 @@ mod cli_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn ownership_transfer_targets_a_positive_agent_id() {
+        assert!(Cli::try_parse_from(["acom", "thread", "transfer-owner", "4", "2"]).is_ok());
+        for owner in ["0", "-1", "user", "2.0"] {
+            assert!(Cli::try_parse_from(["acom", "thread", "transfer-owner", "4", owner]).is_err());
+        }
     }
 
     #[test]
@@ -691,6 +700,11 @@ enum ThreadCmd {
     Remove {
         id: i64,
         members: String,
+    },
+    TransferOwner {
+        id: i64,
+        #[arg(value_name = "AGENT_ID", value_parser = clap::value_parser!(i64).range(1..))]
+        owner: i64,
     },
 }
 
@@ -1652,6 +1666,16 @@ fn main() {
                 } else {
                     println!("removed {} from thread {id}", v["members"]);
                 }
+            }
+            ThreadCmd::TransferOwner { id, owner } => {
+                let response = post(
+                    &format!("/threads/{id}/owner"),
+                    json!({"agent":my_id().unwrap_or(0), "owner":owner}),
+                );
+                let saved_owner = response["owner"].as_i64().filter(|id| *id > 0).unwrap_or_else(|| {
+                    die("invalid ownership response; inspect the thread before retrying the transfer")
+                });
+                println!("thread {id} ownership transferred to agent {saved_owner}");
             }
         },
         Cmd::Send { thread, text } => {

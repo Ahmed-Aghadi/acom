@@ -552,6 +552,11 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("POST", ["threads", t, "members", "remove"]) => J(
             json!({ "members": app.remove_members(id(t)?, &list(b, "members"), opt_int(b, "agent").unwrap_or(0))? }),
         ),
+        ("POST", ["threads", t, "owner"]) => {
+            let owner = int(b, "owner")?;
+            app.transfer_thread_owner(id(t)?, owner, identity(b, "agent")?)?;
+            J(json!({"owner":owner}))
+        }
         ("POST", ["threads", t, "user"]) => {
             if b.get("agent").is_some_and(|a| a.as_i64() != Some(0)) {
                 return Err(bad("only the user can change user membership"));

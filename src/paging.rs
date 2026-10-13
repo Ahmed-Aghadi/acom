@@ -126,6 +126,8 @@ fn stub(item: &Value) -> Value {
         "replacement_start_pending",
         "private",
         "joinable",
+        "owner",
+        "created_by",
     ] {
         if let Some(value) = item.get(key).filter(|v| !v.is_null()) {
             result[key] = value.clone();

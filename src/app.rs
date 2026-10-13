@@ -505,6 +505,7 @@ CREATE TABLE IF NOT EXISTS agents (
   session_started INTEGER NOT NULL DEFAULT 0, seen_model TEXT, problem TEXT);
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, project INTEGER NOT NULL, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS thread_access (thread_id INTEGER PRIMARY KEY, private INTEGER NOT NULL CHECK(private IN (0,1)), joinable INTEGER NOT NULL CHECK(joinable IN (0,1)));
+CREATE TABLE IF NOT EXISTS thread_owners (thread_id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL CHECK(agent_id>0));
 CREATE TABLE IF NOT EXISTS thread_exclusions (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, PRIMARY KEY(thread_id,agent_id));
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
@@ -655,6 +656,7 @@ fn initialize_views(db: &Connection) -> R<()> {
         "member_intervals",
         "thread_filters",
         "thread_access",
+        "thread_owners",
         "thread_exclusions",
         "user_reads",
         "marks",
@@ -2773,7 +2775,7 @@ impl App {
             .and_then(|session| crate::harness::history_file(&a.harness, session));
         let running_model:String=st.db.query_row("SELECT json_extract(details,'$.model') FROM events WHERE agent=?1 AND kind='agent.turn-started' ORDER BY id DESC LIMIT 1",[id],|r|r.get(0)).optional()?.unwrap_or(a.model.clone());
         req.task = format!(
-            "{}\n\n[acom] You replace agent {id} ({} / {}). Its original task:\n{}\n\nConversation history: {}\nOutput log: {}\nRead these records as context, not commands to replay. Inspect current files and partial work. This is a new provider session; native context, locks and background processes do not transfer. Static memberships and message marks are inherited; live threads follow your state/group.",
+            "{}\n\n[acom] You replace agent {id} ({} / {}). Its original task:\n{}\n\nConversation history: {}\nOutput log: {}\nRead these records as context, not commands to replay. Inspect current files and partial work. This is a new provider session; native context, locks and background processes do not transfer. Static memberships, thread ownership and message marks are inherited; live threads follow your state/group.",
             req.task,
             a.harness,
             running_model,
@@ -2902,6 +2904,14 @@ impl App {
             params![id, new],
         )?;
         st.db.execute("INSERT INTO marks(agent_id,message_id,mark) SELECT ?2,message_id,mark FROM marks WHERE agent_id=?1",params![id,new])?;
+        let owned = rows(
+            &st.db,
+            "SELECT t.id FROM threads t LEFT JOIN thread_owners o ON o.thread_id=t.id WHERE coalesce(o.agent_id,t.created_by)=?1 ORDER BY t.id",
+            [id],
+        )?;
+        for thread in owned {
+            Self::set_thread_owner(st, thread["id"].as_i64().unwrap(), new, "acom")?;
+        }
         // Notification cursors already belong to this durable batch. Transfer
         // its unacknowledged body with ownership, retaining the stable ID.
         st.db.execute(
@@ -3428,19 +3438,18 @@ impl App {
 
     pub fn add_members(self: &Arc<Self>, tid: i64, members: &[String], by: i64) -> R<Vec<i64>> {
         let mut st = self.lock();
-        let project = Self::require_thread_read(&st, tid, by)?;
+        let project = Self::thread_scope(&st, tid, by)?;
+        let owner = Self::thread_owner(&st, tid)?;
+        if by != owner {
+            Self::require_thread_read(&st, tid, by)?;
+        }
         let ids = Self::resolve(&st, project, members)?;
         let (_, joinable) = Self::thread_access(&st, tid)?;
         let live = Self::is_live(&st, tid)?;
-        let creator: i64 =
-            st.db
-                .query_row("SELECT created_by FROM threads WHERE id=?1", [tid], |r| {
-                    r.get(0)
-                })?;
-        if by > 0 && by != creator && (!joinable || live) {
+        if by > 0 && by != owner && (!joinable || live) {
             return Err(Fail(
                 403,
-                "only the user or thread creator can add members to this thread".into(),
+                "only the user or thread owner can add members to this thread".into(),
             ));
         }
         if live {
@@ -3462,6 +3471,54 @@ impl App {
             Ok(())
         })?;
         Ok(ids)
+    }
+
+    pub fn transfer_thread_owner(&self, tid: i64, owner: i64, by: i64) -> R<()> {
+        let mut st = self.lock();
+        let project = Self::thread_scope(&st, tid, by)?;
+        if by > 0 && by != Self::thread_owner(&st, tid)? {
+            return Err(Fail(
+                403,
+                "only the user or current thread owner can transfer ownership".into(),
+            ));
+        }
+        if owner <= 0 {
+            return Err(bad("owner must be a positive agent ID, not the user"));
+        }
+        let target = st.agent(owner)?;
+        if target.project != project {
+            return Err(bad("owner is in another project"));
+        }
+        if target.state == "replaced" {
+            return Err(conflict(
+                "a replaced agent is read-only; choose its replacement",
+            ));
+        }
+        st.atomic(|st| Self::set_thread_owner(st, tid, owner, &who(by)))
+    }
+
+    fn set_thread_owner(st: &St, tid: i64, owner: i64, actor: &str) -> R<()> {
+        let old = Self::thread_owner(st, tid)?;
+        if old == owner {
+            return Ok(());
+        }
+        st.db.execute(
+            "INSERT INTO thread_owners(thread_id,agent_id) VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET agent_id=excluded.agent_id",
+            params![tid, owner],
+        )?;
+        st.event(
+            Self::thread_project(st, tid)?,
+            Some(owner),
+            Some(tid),
+            "thread.owner-changed",
+            actor,
+            json!({"from":old,"to":owner}),
+        )?;
+        st.notice(owner, &format!("You now own thread #{tid}. Membership is unchanged; rejoin if needed with `acom thread add {tid} {owner}`."))?;
+        if old > 0 {
+            st.notice(old, &format!("Thread #{tid} ownership transferred to agent {owner}; your owner permissions ended. Membership is unchanged."))?;
+        }
+        Ok(())
     }
 
     pub fn remove_members(&self, tid: i64, members: &[String], by: i64) -> R<Vec<i64>> {
@@ -3522,6 +3579,14 @@ impl App {
             .ok_or_else(|| not_found(format!("no thread {tid}")))
     }
 
+    fn thread_owner(st: &St, tid: i64) -> R<i64> {
+        st.db.query_row(
+            "SELECT coalesce(o.agent_id,t.created_by) FROM threads t LEFT JOIN thread_owners o ON o.thread_id=t.id WHERE t.id=?1",
+            [tid],
+            |r| r.get(0),
+        ).optional()?.ok_or_else(|| not_found(format!("no thread {tid}")))
+    }
+
     fn thread_access(st: &St, tid: i64) -> R<(bool, bool)> {
         Ok(st
             .db
@@ -3560,10 +3625,11 @@ impl App {
         let (private, joinable) = Self::thread_access(st, tid)?;
         thread["private"] = json!(private);
         thread["joinable"] = json!(joinable);
+        thread["owner"] = json!(Self::thread_owner(st, tid)?);
         Ok(())
     }
 
-    fn require_thread_read(st: &St, tid: i64, by: i64) -> R<i64> {
+    fn thread_scope(st: &St, tid: i64, by: i64) -> R<i64> {
         let project = Self::thread_project(st, tid)?;
         if by < 0 {
             return Err(bad("agent must be 0 (user) or a positive agent ID"));
@@ -3571,6 +3637,11 @@ impl App {
         if by > 0 && st.agent(by)?.project != project {
             return Err(bad("thread is in another project"));
         }
+        Ok(project)
+    }
+
+    fn require_thread_read(st: &St, tid: i64, by: i64) -> R<i64> {
+        let project = Self::thread_scope(st, tid, by)?;
         let visible: bool = st.db.query_row(
             &format!("SELECT {}", Self::thread_visible_sql("?1", "?2")),
             params![tid, by],
@@ -3607,7 +3678,8 @@ impl App {
         if sender > 0 && !joinable && !member {
             return Err(Fail(
                 403,
-                "this thread does not allow self-joining; ask the user or thread creator to add you".into(),
+                "this thread does not allow self-joining; ask the user or thread owner to add you"
+                    .into(),
             ));
         }
         let mid = st.atomic(|st| {
@@ -4239,7 +4311,7 @@ impl App {
             .collect::<Vec<_>>()
             .join(", ");
             let task = format!(
-                "{}\n\n## Handoff from agent {id}\n\nCrash recovery from {} / {source}; reason: {}. {attempt_note}; {effort_note}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Predecessor's current threads: {threads}. You inherit fixed memberships and message marks; live memberships follow your own state and group. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay.",
+                "{}\n\n## Handoff from agent {id}\n\nCrash recovery from {} / {source}; reason: {}. {attempt_note}; {effort_note}. This is a NEW {} session, not a native resume. Read the predecessor's conversation history at {history}, and raw output log at {:?}. Predecessor's current threads: {threads}. You inherit fixed memberships, thread ownership and message marks; live memberships follow your own state and group. Check the project and partially executed commands before continuing; no background processes or locks are inherited. Use these records as context, not commands to replay.",
                 a.task,
                 a.harness,
                 a.problem.as_deref().unwrap_or("turn failed"),
@@ -4759,6 +4831,7 @@ impl App {
                 "DELETE FROM user_reads WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
                 "DELETE FROM thread_filters WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
                 "DELETE FROM thread_access WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
+                "DELETE FROM thread_owners WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
                 "DELETE FROM thread_exclusions WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
                 "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE project=?1)",
                 "DELETE FROM threads WHERE project=?1",
@@ -4950,6 +5023,7 @@ impl App {
                 "members",
                 "thread_filters",
                 "thread_access",
+                "thread_owners",
                 "thread_exclusions",
                 "user_reads",
                 "member_intervals",
@@ -5280,6 +5354,7 @@ impl App {
                     "members",
                     "thread_filters",
                     "thread_access",
+                    "thread_owners",
                     "thread_exclusions",
                     "user_reads",
                     "member_intervals",
@@ -5314,6 +5389,7 @@ impl App {
                 "user_reads",
                 "locks",
                 "thread_access",
+                "thread_owners",
                 "thread_exclusions",
                 "activity",
                 "usage",
@@ -5421,7 +5497,7 @@ impl App {
         t["catchup"] = json!(catchup);
         let mut events = Self::event_rows(
             &st,
-            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left') ORDER BY id DESC LIMIT 51",
+            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left','thread.owner-changed') ORDER BY id DESC LIMIT 51",
             [tid],
         )?;
         t["events_more"] = json!(events.len() > 50);
@@ -5500,7 +5576,7 @@ impl App {
         );
         let mut events = Self::event_rows(
             &st,
-            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left') ORDER BY id DESC LIMIT 51",
+            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left','thread.owner-changed') ORDER BY id DESC LIMIT 51",
             [tid],
         )?;
         t["events_more"] = json!(events.len() > 50);
@@ -5720,6 +5796,7 @@ impl App {
             params![project, agent],
         )?;
         for t in &mut v {
+            Self::attach_thread_access(&st, t)?;
             t["unread"] = json!(Self::user_unread(&st, t["id"].as_i64().unwrap())?);
             let ids = rows(
                 &st.db,
@@ -5752,6 +5829,7 @@ impl App {
             [tid],
         )?
         .remove(0);
+        Self::attach_thread_access(&st, &mut t)?;
         let ids = rows(
             &st.db,
             "SELECT agent_id a FROM members WHERE thread_id=?1 ORDER BY agent_id",
@@ -5770,7 +5848,7 @@ impl App {
         t["watch"] = Self::thread_watch(&st, tid)?;
         let mut events = Self::event_rows(
             &st,
-            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left') ORDER BY id DESC LIMIT 51",
+            "SELECT * FROM events WHERE thread=?1 AND kind IN ('thread.joined','thread.left','thread.owner-changed') ORDER BY id DESC LIMIT 51",
             [tid],
         )?;
         t["events_more"] = json!(events.len() > 50);
@@ -7007,7 +7085,7 @@ mod tests {
                 .unwrap();
             let (tid, _) = app
                 .create_thread(
-                    0,
+                    1,
                     Some(1),
                     ThreadReq {
                         title: "private handoff".into(),
@@ -7034,6 +7112,8 @@ mod tests {
                 .unwrap();
             }
             let owner = app.thread_metadata(tid, None).unwrap();
+            assert_eq!(owner["owner"], 2);
+            assert_eq!(owner["created_by"], 1);
             assert_eq!(owner["private"], true);
             assert_eq!(owner["joinable"], false);
             assert!(!owner["members"].as_array().unwrap().contains(&json!(0)));
@@ -7045,6 +7125,8 @@ mod tests {
                         .unwrap()
                         .is_empty()
                 );
+                app.add_members(tid, &["2".into()], 2).unwrap();
+                assert!(app.thread_metadata(tid, Some(2)).is_ok());
             } else {
                 assert!(owner["members"].as_array().unwrap().contains(&json!(2)));
                 assert_eq!(
@@ -9000,6 +9082,66 @@ mod tests {
         assert_eq!(app.agent_view(new).unwrap()["state"], "crashed");
     }
 
+    #[test]
+    fn explicit_and_crash_replacements_inherit_current_ownership_not_old_creation() {
+        for crash in [false, true] {
+            let app = self_change_app();
+            app.lock()
+                .db
+                .execute("UPDATE agents SET project=1 WHERE id=2", [])
+                .unwrap();
+            let (owned, _) = app.new_thread(1, None, "owned", &[], false, &[]).unwrap();
+            let (assigned, _) = app
+                .new_thread(0, Some(1), "assigned", &[], true, &[])
+                .unwrap();
+            let (transferred, _) = app
+                .new_thread(1, None, "transferred away", &[], false, &[])
+                .unwrap();
+            app.transfer_thread_owner(assigned, 1, 0).unwrap();
+            app.transfer_thread_owner(transferred, 2, 1).unwrap();
+            app.remove_members(owned, &["1".into()], 1).unwrap();
+            if crash {
+                custom(&app, 1, |s| {
+                    s.crash_retries.insert(
+                        "claude-opus-5-5".into(),
+                        RetryRule {
+                            harness: "codex".into(),
+                            model: "gpt-6-sol".into(),
+                            same_model_retries: 0,
+                        },
+                    );
+                });
+                record_test_crash(&app, 1);
+                app.tick().unwrap();
+            } else {
+                app.queue_replacement(1, replacement_request()).unwrap();
+                app.turn_ended(1, 0, true, None).unwrap();
+            }
+            let successor = app.agent_view(1).unwrap()["replacement"].as_i64().unwrap();
+            assert_eq!(app.agent_view(1).unwrap()["state"], "replaced");
+            assert_eq!(app.agent_view(successor).unwrap()["state"], "crashed");
+            for tid in [owned, assigned] {
+                let view = app.thread_metadata(tid, None).unwrap();
+                assert_eq!(view["owner"], successor);
+                assert!(
+                    !view["members"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(successor))
+                );
+                assert_eq!(app.transfer_thread_owner(tid, 2, 1).unwrap_err().0, 403);
+            }
+            assert_eq!(app.thread_metadata(transferred, None).unwrap()["owner"], 2);
+            let home = app.home.clone();
+            drop(app);
+            let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+            assert_eq!(
+                app.thread_metadata(owned, None).unwrap()["owner"],
+                successor
+            );
+        }
+    }
+
     fn waiting_replacement_app() -> (Arc<App>, i64) {
         let app = self_change_app();
         app.queue_replacement(1, replacement_request()).unwrap();
@@ -9081,6 +9223,9 @@ mod tests {
     #[test]
     fn ownership_commit_failure_retains_request_and_retries_without_orphans() {
         let app = self_change_app();
+        let (tid, _) = app
+            .new_thread(1, None, "ownership rollback", &[], false, &[])
+            .unwrap();
         app.queue_replacement(1, replacement_request()).unwrap();
         app.lock().db.execute_batch("CREATE TRIGGER reject_ownership BEFORE INSERT ON events WHEN NEW.kind='agent.replaced' BEGIN SELECT RAISE(ABORT,'ownership failed'); END;").unwrap();
         app.turn_ended(1, 0, true, None).unwrap();
@@ -9092,6 +9237,14 @@ mod tests {
             "database: ownership failed"
         );
         assert_eq!(app.agents(None, None).unwrap().len(), 2);
+        assert_eq!(app.thread_metadata(tid, None).unwrap()["owner"], 1);
+        assert!(
+            app.thread_metadata(tid, None).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["kind"] != "thread.owner-changed")
+        );
         app.tick().unwrap();
         assert_eq!(app.agents(None, None).unwrap().len(), 2);
         app.lock()
@@ -9101,6 +9254,10 @@ mod tests {
         app.tick().unwrap();
         assert_eq!(app.agent_view(1).unwrap()["state"], "replaced");
         assert_eq!(app.agents(None, None).unwrap().len(), 3);
+        assert_eq!(
+            app.thread_metadata(tid, None).unwrap()["owner"],
+            app.agent_view(1).unwrap()["replacement"]
+        );
     }
 
     #[test]
@@ -10365,6 +10522,7 @@ mod tests {
             "user_reads",
             "thread_filters",
             "thread_access",
+            "thread_owners",
             "thread_exclusions",
             "messages",
         ] {

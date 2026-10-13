@@ -113,12 +113,58 @@ test('CLI thread membership commands identify their caller and preserve permissi
   await t.test('denied addition is not claimed successful or retried', async () => {
     await mock((req, res) => {
       req.resume(); res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'only the user or thread creator can add members to this thread' }));
+      res.end(JSON.stringify({ error: 'only the user or current thread owner can add members to this thread' }));
     }, async fixture => {
       fixture.env.ACOM_ID = '7';
       const result = await cli(['thread', 'add', '4', '2'], fixture);
-      assert.notEqual(result.status, 0); assert.match(result.stderr, /only the user or thread creator can add/);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /only the user or current thread owner can add/);
       assert.doesNotMatch(result.stdout, /added/); assert.equal(fixture.requests.length, 1);
+    });
+  });
+});
+
+test('CLI thread ownership transfer identifies its caller and validates the result', async t => {
+  for (const identity of [0, 7]) await t.test(`transfer as ${identity || 'user'}`, async () => {
+    let body;
+    await mock((req, res) => {
+      let raw = ''; req.on('data', chunk => raw += chunk);
+      req.on('end', () => {
+        body = JSON.parse(raw); res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ owner: 2 }));
+      });
+    }, async fixture => {
+      if (identity) fixture.env.ACOM_ID = String(identity);
+      const result = await cli(['thread', 'transfer-owner', '4', '2'], fixture);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /thread 4 ownership transferred to agent 2/);
+      assert.deepEqual(body, { agent: identity, owner: 2 });
+      assert.deepEqual(fixture.requests, [{ method: 'POST', url: '/threads/4/owner' }]);
+    });
+  });
+  for (const owner of ['0', '-1', 'user', '2.0']) await t.test(`rejects destination ${owner}`, async () => {
+    await mock((_, res) => res.end('{}'), async fixture => {
+      const result = await cli(['thread', 'transfer-owner', '4', owner], fixture);
+      assert.notEqual(result.status, 0); assert.deepEqual(fixture.requests, []);
+    });
+  });
+  for (const body of [{}, { owner: null }, { owner: 0 }, { owner: '2' }, { owner: 2.5 }]) await t.test(`rejects incomplete response ${JSON.stringify(body)}`, async () => {
+    await mock((req, res) => {
+      req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body));
+    }, async fixture => {
+      const result = await cli(['thread', 'transfer-owner', '4', '2'], fixture);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /invalid ownership response; inspect the thread before retrying/);
+      assert.doesNotMatch(result.stdout, /ownership transferred/); assert.equal(fixture.requests.length, 1);
+    });
+  });
+  await t.test('permission errors do not claim success or repeat the transfer', async () => {
+    await mock((req, res) => {
+      req.resume(); res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'only the user or current thread owner can transfer ownership' }));
+    }, async fixture => {
+      fixture.env.ACOM_ID = '7';
+      const result = await cli(['thread', 'transfer-owner', '4', '2'], fixture);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /only the user or current thread owner/);
+      assert.doesNotMatch(result.stdout, /ownership transferred/); assert.equal(fixture.requests.length, 1);
     });
   });
 });

@@ -82,7 +82,7 @@ async function isolated(run) {
     const create = (extra = {}) => api('POST', '/threads', {
       project: project.id, title: 'audience fixture', members: ['1'], include_user: true, ...extra,
     });
-    await run({ api, denied, db, cli, create, project, home, start, stop });
+    await run({ api, request, denied, db, cli, create, project, home, start, stop });
   } finally {
     await stop();
     fs.rmSync(root, { recursive: true, force: true });
@@ -201,20 +201,175 @@ test('thread access and removal remain consistent across API, CLI and restart', 
       }
     });
 
-    await t.test('a removed private creator has no read or self-rejoin bypass', async () => {
+    await t.test('a private owner can rejoin after leaving without bypassing private read access', async () => {
       const thread = await api('POST', '/threads', { agent: 2, title: 'removed creator', private: true, members: ['1'] });
       const message = await send(thread.id, 'private creator context', 2);
       await members(thread.id, [2], 0, true);
       const before = events(thread.id);
       for (const route of [`/threads/${thread.id}?agent=2`, `/threads/${thread.id}/metadata?agent=2`,
         `/messages/${message.id}?agent=2&offset=0&max_bytes=512`]) await denied('GET', route);
-      await denied('POST', `/threads/${thread.id}/members`, { agent: 2, members: ['2', '3'] });
+      await denied('POST', '/messages', { agent: 2, thread: thread.id, text: 'ownership is not posting membership' });
       await denied('POST', `/threads/${thread.id}/members`, { agent: 1, members: ['2'] });
       assert.deepEqual(events(thread.id), before);
       assert.deepEqual((await metadata(thread.id, 0)).members, [1]);
-      await members(thread.id, [2]);
       await members(thread.id, [3], 2);
+      assert.deepEqual((await metadata(thread.id, 3)).members, [1, 3], 'ownership allows adding without automatically joining');
+      await denied('GET', `/messages/${message.id}?agent=2`);
+      await members(thread.id, [2], 2);
       assert.deepEqual((await metadata(thread.id, 3)).members, [1, 2, 3]);
+      assert.equal((await metadata(thread.id, 2)).owner, 2);
+      assert.equal((await api('GET', `/messages/${message.id}?agent=2`)).text, 'private creator context');
+    });
+
+    await t.test('ownership transfer is exclusive, immediate and independent of membership', async () => {
+      for (const flags of [{ private: true }, { joinable: false }]) {
+        const thread = await api('POST', '/threads', { agent: 2, title: 'exclusive ownership', members: ['1'], ...flags });
+        const message = await send(thread.id, 'private transfer message must not enter notices', 2);
+        const before = await metadata(thread.id, 0);
+        const beforeList = await list(0);
+        const beforeOverview = await api('GET', `/overview?project=${project.id}`);
+        const noticeCursor = db(connection => connection.prepare('SELECT coalesce(max(id),0) id FROM notices').get().id);
+        assert.deepEqual(await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 3 }), { owner: 3 });
+        const after = await metadata(thread.id, 0);
+        assert.equal(after.owner, 3);
+        assert.equal(after.created_by, 2, 'creator history does not change when ownership changes');
+        assert.deepEqual(after.members, before.members, 'transferring to a nonmember does not add anyone');
+        assert.deepEqual(after.events.find(event => event.kind === 'thread.owner-changed').details, { from: 2, to: 3 });
+        const refreshed = await api('GET', `/threads?project=${project.id}&viewer=0&since=${beforeList.revision}`);
+        assert.notEqual(refreshed.unchanged, true);
+        assert.equal(refreshed.items.find(item => item.id === thread.id).owner, 3);
+        assert.notEqual((await api('GET', `/overview?project=${project.id}&since=${beforeOverview.revision}`)).unchanged, true);
+        const notices = db(connection => connection.prepare('SELECT agent_id,text FROM notices WHERE id>? ORDER BY id').all(noticeCursor));
+        assert.ok(notices.some(notice => notice.agent_id === 2 && new RegExp(`\\b${thread.id}\\b`).test(notice.text)));
+        assert.ok(notices.some(notice => notice.agent_id === 3 && new RegExp(`\\b${thread.id}\\b`).test(notice.text)));
+        assert.ok(notices.every(notice => !notice.text.includes('private transfer message must not enter notices')));
+        const noOpEvents = events(thread.id);
+        await api('POST', `/threads/${thread.id}/owner`, { agent: 3, owner: 3 });
+        assert.deepEqual(events(thread.id), noOpEvents);
+        assert.deepEqual(db(connection => connection.prepare('SELECT agent_id,text FROM notices WHERE id>? ORDER BY id').all(noticeCursor)), notices,
+          'repeating the current owner must not create duplicate notices');
+        await denied('POST', `/threads/${thread.id}/members`, { agent: 2, members: ['4'] });
+        await denied('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 4 });
+        await denied('POST', `/threads/${thread.id}/owner`, { agent: 1, owner: 4 });
+        assert.equal((await metadata(thread.id, 0)).owner, 3);
+        if (flags.private) await denied('GET', `/messages/${message.id}?agent=3`);
+        await denied('POST', '/messages', { agent: 3, thread: thread.id, text: 'new owner is not automatically a member' });
+        await members(thread.id, [4], 3);
+        assert.deepEqual((await metadata(thread.id, 4)).members, [1, 2, 4]);
+        await denied('POST', `/threads/${thread.id}/members/remove`, { agent: 3, members: ['1'] });
+        assert.deepEqual(await api('POST', `/threads/${thread.id}/owner`, { agent: 3, owner: 4 }), { owner: 4 });
+        await denied('POST', `/threads/${thread.id}/members`, { agent: 3, members: ['3'] });
+        await members(thread.id, [3], 4);
+        assert.deepEqual((await metadata(thread.id, 3)).members, [1, 2, 3, 4]);
+        assert.equal((await metadata(thread.id, 3)).owner, 4);
+        await api('POST', `/threads/${thread.id}/owner`, { agent: 0, owner: 2 });
+        assert.equal((await metadata(thread.id, 0)).owner, 2, 'the user always retains management authority');
+      }
+    });
+
+    await t.test('ownership targets must be agents in the same project and invalid requests change nothing', async () => {
+      const thread = await api('POST', '/threads', { agent: 2, title: 'validated ownership', private: true, members: ['1'] });
+      const foreignPath = path.join(path.dirname(f.home), 'foreign-project');
+      fs.mkdirSync(foreignPath);
+      const foreign = await api('POST', '/projects', { path: foreignPath });
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(7,?,'foreign owner fixture','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(foreign.id));
+      const before = await metadata(thread.id, 0), beforeEvents = events(thread.id);
+      for (const owner of [0, -1, 1.5, '3', null, true, [], {}]) {
+        await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner }, 400);
+      }
+      await api('POST', `/threads/${thread.id}/owner`, { agent: 2 }, 400);
+      await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 7 }, 400);
+      await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 99999 }, 404);
+      state(4, 'replaced');
+      try { await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 4 }, 409); }
+      finally { state(4, 'closed'); }
+      for (const agent of [null, '2', 2.5, true, -1, []]) {
+        await api('POST', `/threads/${thread.id}/owner`, { agent, owner: 3 }, 400);
+      }
+      assert.equal((await metadata(thread.id, 0)).owner, before.owner);
+      assert.deepEqual((await metadata(thread.id, 0)).members, before.members);
+      assert.deepEqual(events(thread.id), beforeEvents);
+      for (const targetState of ['paused', 'closed', 'crashed']) {
+        state(3, targetState);
+        try {
+          await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 3 });
+          assert.equal((await metadata(thread.id, 0)).owner, 3);
+          await api('POST', `/threads/${thread.id}/owner`, { agent: 0, owner: 2 });
+        } finally { state(3, 'closed'); }
+      }
+      const humanCreated = await create({ private: true });
+      assert.equal((await metadata(humanCreated.id, 0)).owner, 0);
+      await api('POST', `/threads/${humanCreated.id}/owner`, { owner: 3 });
+      assert.equal((await metadata(humanCreated.id, 0)).owner, 3);
+      assert.equal((await metadata(humanCreated.id, 0)).created_by, 0);
+    });
+
+    await t.test('concurrent ownership transfers have one winner and bounded previews preserve ownership', async () => {
+      const thread = await api('POST', '/threads', { agent: 2, title: 'one ownership winner', private: true, members: ['1'] });
+      const before = await metadata(thread.id, 0);
+      const results = await Promise.all([3, 4].map(owner => f.request('POST', `/threads/${thread.id}/owner`, { agent: 2, owner })));
+      assert.deepEqual(results.map(result => result.status).sort(), [200, 403]);
+      const winner = results.find(result => result.status === 200).value.owner;
+      assert.ok([3, 4].includes(winner));
+      const after = await metadata(thread.id, 0);
+      assert.equal(after.owner, winner);
+      assert.deepEqual(after.members, before.members);
+      const changes = after.events.filter(event => event.kind === 'thread.owner-changed');
+      assert.equal(changes.length, 1);
+      assert.deepEqual(changes[0].details, { from: 2, to: winner });
+
+      const large = await api('POST', '/threads', { agent: 2, title: 'ownership preview ' + 'x'.repeat(1000), private: true, members: ['1'] });
+      await api('POST', `/threads/${large.id}/owner`, { agent: 2, owner: 3 });
+      const page = await api('GET', `/threads?project=${project.id}&viewer=0&limit=1&max_bytes=512`);
+      assert.equal(page.items[0].id, large.id);
+      assert.equal(page.items[0].truncated, true);
+      assert.equal(page.items[0].owner, 3);
+      assert.equal(page.items[0].created_by, 2);
+      assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 512);
+    });
+
+    await t.test('ownership, membership and notices roll back together on a failed transfer', async () => {
+      const thread = await api('POST', '/threads', { agent: 2, title: 'atomic ownership', private: true, members: ['1'] });
+      const before = await metadata(thread.id, 0), beforeEvents = events(thread.id);
+      const notices = () => db(connection => connection.prepare('SELECT id,agent_id,text FROM notices ORDER BY id').all());
+      const beforeNotices = notices();
+      db(connection => connection.exec("CREATE TRIGGER injected_owner_notice_failure BEFORE INSERT ON notices WHEN NEW.agent_id=3 BEGIN SELECT RAISE(ABORT,'atomic ownership fixture'); END;"));
+      try {
+        await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 3 }, 500);
+        assert.equal((await metadata(thread.id, 0)).owner, before.owner);
+        assert.deepEqual((await metadata(thread.id, 0)).members, before.members);
+        assert.deepEqual(events(thread.id), beforeEvents);
+        assert.deepEqual(notices(), beforeNotices);
+      } finally { db(connection => connection.exec('DROP TRIGGER injected_owner_notice_failure')); }
+      await members(thread.id, [3], 2);
+      assert.ok((await metadata(thread.id, 3)).members.includes(3), 'a failed transfer must leave the original owner authorized');
+    });
+
+    await t.test('transferred ownership survives restart but live owners still obey filters', async () => {
+      const privateThread = await api('POST', '/threads', { agent: 2, title: 'persistent ownership', private: true, members: ['1'] });
+      await api('POST', `/threads/${privateThread.id}/owner`, { agent: 2, owner: 3 });
+      await f.stop(); await f.start();
+      const after = await metadata(privateThread.id, 0);
+      assert.equal(after.owner, 3);
+      assert.equal(after.created_by, 2);
+      assert.deepEqual(after.members, [1, 2]);
+      await denied('GET', `/threads/${privateThread.id}/metadata?agent=3`);
+      await denied('POST', `/threads/${privateThread.id}/members`, { agent: 2, members: ['4'] });
+      await members(privateThread.id, [3], 3);
+      const live = await api('POST', '/threads', { agent: 2, title: 'live owner filters', watch: ['closed', 'group:team'] });
+      const group = value => db(connection => connection.prepare('UPDATE agents SET grp=? WHERE id=3').run(value));
+      await members(live.id, [3], 0, true);
+      await api('POST', `/threads/${live.id}/owner`, { agent: 2, owner: 3 });
+      try {
+        group('other');
+        await denied('POST', `/threads/${live.id}/members`, { agent: 3, members: ['3'] });
+        assert.ok(!(await metadata(live.id, 0)).members.includes(3));
+        await denied('POST', `/threads/${live.id}/members`, { agent: 2, members: ['4'] });
+        group('team');
+        assert.ok(!(await metadata(live.id, 0)).members.includes(3), 'ownership alone does not clear a live exclusion');
+        await members(live.id, [3], 3);
+        assert.ok((await metadata(live.id, 3)).members.includes(3));
+      } finally { group('team'); }
     });
 
     await t.test('public readers never join through headers or record chunks; a departed creator can still add', async () => {
@@ -458,6 +613,28 @@ test('thread access and removal remain consistent across API, CLI and restart', 
       assert.equal(cli(['thread', 'read', String(id)], 1).status, 1);
       const selfRemove = cli(['thread', 'remove', String(id), '0'], 2);
       assert.equal(selfRemove.status, 1);
+    });
+
+    await t.test('CLI transfers ownership without adding the target and lets the new private owner rejoin', async () => {
+      const created = cli(['thread', 'new', '--title', 'CLI transferable owner', '--members', '1', '--private'], 2);
+      assert.equal(created.status, 0, created.stderr);
+      const id = Number(created.stdout.match(/thread (\d+)/)?.[1]);
+      assert.ok(id > 0, created.stdout);
+      const transfer = cli(['thread', 'transfer-owner', String(id), '3'], 2);
+      assert.equal(transfer.status, 0, transfer.stderr);
+      assert.equal((await metadata(id, 0)).owner, 3);
+      assert.deepEqual((await metadata(id, 0)).members, [1, 2]);
+      assert.equal(cli(['thread', 'details', String(id)], 3).status, 1, 'ownership does not make a private read succeed');
+      assert.equal(cli(['thread', 'add', String(id), '4'], 2).status, 1, 'previous creator cannot retain owner management');
+      assert.equal(cli(['thread', 'transfer-owner', String(id), '4'], 2).status, 1);
+      assert.notEqual(cli(['thread', 'transfer-owner', String(id), '0'], 3).status, 0);
+      const rejoin = cli(['thread', 'add', String(id), '3'], 3);
+      assert.equal(rejoin.status, 0, rejoin.stderr);
+      assert.deepEqual((await metadata(id, 3)).members, [1, 2, 3]);
+      const humanTransfer = cli(['thread', 'transfer-owner', String(id), '4']);
+      assert.equal(humanTransfer.status, 0, humanTransfer.stderr);
+      assert.equal((await metadata(id, 0)).owner, 4);
+      assert.deepEqual((await metadata(id, 0)).members, [1, 2, 3]);
     });
   });
 });

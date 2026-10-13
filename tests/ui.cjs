@@ -45,7 +45,7 @@ async function fixture(run) {
   const collection = (key, project) => {
     if (key === 'projects') return projectRows();
     if (key === 'configs') return configs();
-    if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
+    if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,owner:t.owner ?? t.created_by ?? 0,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
     if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,stopping:!!a.stopping,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
     if (key === 'locks') return (data.locks || []).filter(lock=>lock.project == null || lock.project === project).map((lock,i)=>({id:i+1,...lock,holder_stopping:!!(lock.holder && (lock.holder_stopping || data.agents.find(agent=>agent.id===lock.holder)?.stopping))}));
     return (data[key] || []).filter(row => row.project == null || row.project === project).map((row,i) => ({id:i+1,...row}));
@@ -64,7 +64,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','holder_stopping','user_member','unread','messages','private','joinable','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -247,14 +247,14 @@ async function fixture(run) {
       return send(value);
     }
     if (req.url === '/threads') {
-      const t = { id: data.threads.length + 1, ...body, private:!!body.private, joinable:body.joinable !== false && !body.private, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
+      const t = { id: data.threads.length + 1, created_by:0, owner:0, ...body, private:!!body.private, joinable:body.joinable !== false && !body.private, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
       data.threads.push(t);
       return send({ id: t.id });
     }
     if (req.url.startsWith('/threads/')) {
       const t=data.threads.find(t=>t.id===Number(pathname.split('/')[2]));
       if(req.method==='GET') {
-        const metadata={...t,messages:undefined,last_read:data.reads[t.id] || 0,unread:unread(t),latest_message:Math.max(0,...t.messages.map(m=>m.id)),first_unread:unread(t)>0?t.messages.find(m=>m.sender!==0&&!m.outside_membership&&m.id>(data.reads[t.id] || 0)).id:null};
+        const metadata={...t,owner:t.owner ?? t.created_by ?? 0,messages:undefined,last_read:data.reads[t.id] || 0,unread:unread(t),latest_message:Math.max(0,...t.messages.map(m=>m.id)),first_unread:unread(t)>0?t.messages.find(m=>m.sender!==0&&!m.outside_membership&&m.id>(data.reads[t.id] || 0)).id:null};
         if(pathname.endsWith('/metadata'))return send(bounded(metadata,params));
         const p=new URLSearchParams(params),first=t.messages.find(m=>m.sender!==0 && !m.outside_membership && m.id>(data.reads[t.id] || 0)),catchup=!p.has('before')&&!p.has('after')&&unread(t)>0;
         if(catchup)p.set('after',first.id-1);
@@ -279,6 +279,16 @@ async function fixture(run) {
       if(req.url.endsWith('/members')) {
         t.members=[...new Set([...t.members,...body.members])];
         if(t.watch?.length)t.excluded_members=(t.excluded_members || []).filter(id=>!body.members.map(Number).includes(Number(id)));
+      }
+      if(req.url.endsWith('/owner')) {
+        if(data.ownerFailure) return send({status:503,error:'Ownership change unavailable'});
+        if(!Number.isSafeInteger(body.owner) || body.owner<1 || !data.agents.some(agent=>agent.id===body.owner && agent.project===t.project && agent.state!=='replaced'))return send({status:400,error:'Choose an agent from this project'});
+        const from=t.owner ?? t.created_by ?? 0;
+        t.owner=body.owner;
+        if(from!==body.owner) {
+          (t.events ||= []).push({id:Math.max(0,...t.events.map(e=>e.id))+1,at:Date.now()/1000,kind:'thread.owner-changed',agent:body.owner,actor:'user',details:{from,to:body.owner}});
+        }
+        return send({owner:t.owner});
       }
       return send({...t,last_read:data.reads[t.id] || 0,unread:unread(t)});
     }
@@ -899,8 +909,8 @@ test('thread creation distinguishes public open, public no-self-join and private
     await page.locator('#thread-form [name=title]').fill(`${access} conversation`);
     if (access === 'private') await page.locator('#thread-form [name=include_user]').uncheck();
     assert.equal(await page.locator('#thread-mode option[value=live]').evaluate(option=>option.disabled), access !== 'open');
-    if (access === 'private') assert.match(await page.locator('#thread-access-help').textContent(), /Only member agents can read it.*always have access.*you or the thread creator can add members directly/);
-    if (access === 'invite') assert.match(await page.locator('#thread-access-help').textContent(), /Anyone can read it.*you or the thread creator can add members directly/);
+    if (access === 'private') assert.match(await page.locator('#thread-access-help').textContent(), /Only member agents can read it.*always have access.*you or the thread owner can add members directly/);
+    if (access === 'invite') assert.match(await page.locator('#thread-access-help').textContent(), /Anyone can read it.*you or the thread owner can add members directly/);
     await page.locator('#thread-form button.primary').click();
     await page.waitForFunction(id => state.thread?.id === id, index + 1);
     const body=data.requests.filter(r=>r.url==='/threads').at(-1).body;
@@ -997,6 +1007,104 @@ test('failed and empty member removals retain the dialog selection and do not re
   assert.deepEqual(data.threads[0].members,[0,1]);
 }));
 
+test('ownership can transfer directly to an off-page agent without changing membership or creator', async () => fixture(async (page, data) => {
+  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.threads=[conversation([],{created_by:0,owner:0,private:true,joinable:false})];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  assert.match(await page.locator('.thread-header > div.meta').textContent(), /Owner: you/);
+  await page.locator('#change-thread-owner').click();
+  assert.equal(await page.getByRole('dialog',{name:'Change thread owner',exact:true}).count(),1);
+  assert.match(await page.locator('#thread-owner-form').textContent(),/Ownership changes do not add or remove members/);
+  assert.deepEqual(await page.locator('#thread-owner-options option').evaluateAll(nodes=>nodes.map(node=>Number(node.value))),[3]);
+  await page.locator('#thread-owner-form [name=owner]').fill('2'); await page.locator('#thread-owner-form button.primary').click();
+  await page.waitForFunction(()=>!document.querySelector('#thread-owner-dialog').open);
+  assert.deepEqual(data.requests.find(r=>r.url==='/threads/1/owner').body,{owner:2});
+  assert.equal(data.threads[0].owner,2);
+  assert.equal(data.threads[0].created_by,0);
+  assert.deepEqual(data.threads[0].members,[0,1]);
+  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: #2/);
+  await page.locator('#thread-history summary').click();
+  assert.match(await page.locator('#thread-events').textContent(),/Owner changed: user → agent 2 · by user/);
+  assert.equal(data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length,0);
+}));
+
+test('owner selection loads suggestions without clearing explicit IDs and rejects user or foreign-agent targets', async () => fixture(async (page, data) => {
+  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:['closed','paused','crashed'][id-1]}));
+  data.agents.push({id:4,project:2,name:'Other project agent',state:'idle'});
+  data.agents.push({id:5,project:1,name:'Replaced agent',state:'replaced'});
+  data.threads=[conversation([],{created_by:1})];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: #1/);
+  await page.locator('#change-thread-owner').click();
+  await page.locator('#thread-owner-form [name=owner]').fill('2');
+  for (const count of [1,2,3]) {
+    await page.locator('#thread-owner-dialog [data-more=agents]').click();
+    await page.waitForFunction(count=>document.querySelectorAll('#thread-owner-options option').length===count,count);
+  }
+  assert.deepEqual(await page.locator('#thread-owner-options option').evaluateAll(nodes=>nodes.map(node=>Number(node.value))),[1,2,3]);
+  assert.equal(await page.locator('#thread-owner-form [name=owner]').inputValue(),'2');
+  await page.locator('#thread-owner-form [name=owner]').fill('0'); await page.locator('#thread-owner-form button.primary').click();
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,0);
+  await page.locator('#thread-owner-form [name=owner]').fill('4'); await page.locator('#thread-owner-form button.primary').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Choose an agent from this project'));
+  assert.equal(await page.locator('#thread-owner-dialog').isVisible(),true);
+  assert.equal(await page.locator('#thread-owner-form [name=owner]').inputValue(),'4');
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,1);
+  assert.equal(data.threads[0].owner,undefined);
+}));
+
+test('ownership errors retain input without retrying and transfers remain single-flight during polling', async () => fixture(async (page, data) => {
+  data.agents=[{id:2,project:1,name:'Target',state:'idle'}]; data.threads=[conversation([])]; data.ownerFailure=true;
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  await page.locator('#thread-owner-form button.primary').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Ownership change unavailable');
+  assert.equal(await page.locator('#thread-owner-dialog').isVisible(),true);
+  assert.equal(await page.locator('#thread-owner-form [name=owner]').inputValue(),'2');
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,1);
+  data.ownerFailure=false;
+  const pending=await holdRequest(page,'**/threads/1/owner');
+  await page.locator('#thread-owner-form button.primary').click(); await pending.started;
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#thread-owner-form button.primary').isDisabled(),true);
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>!document.querySelector('#thread-owner-dialog').open);
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,2);
+  assert.equal(data.threads[0].owner,2);
+}));
+
+test('ownership history and names are escaped and selected ownership details survive polling', async () => fixture(async (page, data) => {
+  data.agents=[{id:1,project:1,name:'<img src=x onerror="window.ownerUnsafe=true">',state:'idle'}];
+  data.threads=[conversation([],{owner:1,events:[{id:1,at:1,kind:'thread.owner-changed',agent:1,actor:'<script>bad()</script>',details:{from:0,to:1,reason:'<b>new owner</b>'}}]})];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: #1 <img/);
+  assert.equal(await page.locator('.thread-header img').count(),0);
+  await page.locator('#thread-history summary').click();
+  assert.match(await page.locator('#thread-events').textContent(),/Owner changed: user → agent 1.*<script>bad\(\)<\/script>.*<b>new owner<\/b>/);
+  assert.equal(await page.locator('#thread-events script, #thread-events b').count(),0);
+  const selected=await selectText(page,'.thread-header > div.meta');
+  data.threads[0].owner=2; await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.waitForFunction(()=>document.querySelector('.thread-header > div.meta').textContent.includes('Owner: #2'));
+  assert.equal(await page.evaluate(()=>window.ownerUnsafe),undefined);
+}));
+
+test('missing owner metadata never implies that the original creator or user still owns the thread', async () => fixture(async (page, data) => {
+  data.threads=[conversation([],{created_by:1,owner:2})];
+  await manualPolling(page); await reloadPage(page);
+  await page.route(/\/threads\/1\/metadata(?:\?|$)/,async route=>{
+    const response=await route.fetch(), body=await response.json(); delete body.owner;
+    await route.fulfill({response,json:body});
+  });
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: unavailable/);
+  assert.doesNotMatch(await page.locator('.thread-header > div.meta').textContent(),/Owner: #1|Owner: you/);
+  await page.locator('#change-thread-owner').click();
+  assert.equal(await page.locator('#thread-owner-current').textContent(),'Current owner: unavailable');
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,0);
+}));
+
 test('live threads expose escaped membership history and mark outside-membership messages without counting them unread', async () => fixture(async (page, data) => {
   data.threads = [conversation([{...incoming(1,'Before you joined'),outside_membership:true},{...incoming(2,'Current reply'),membership_unknown:true}], {
     watch:['working','idle','group:review'],events_more:true,
@@ -1015,7 +1123,7 @@ test('live threads expose escaped membership history and mark outside-membership
   assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
   await page.locator('#thread-history summary').click();
   assert.match(await page.locator('#thread-events').textContent(), /agent 1 joined.*group <review> matched/);
-  assert.match(await page.locator('#thread-events').textContent(), /Earlier membership events are not shown/);
+  assert.match(await page.locator('#thread-events').textContent(), /Earlier thread events are not shown/);
   assert.equal(await page.locator('#thread-events review').count(), 0);
   data.threads[0].events.push({id:2,at:2,kind:'thread.left',agent:1,actor:'system',details:{reason:'state changed'}});
   data.threads[0].members = [0];
@@ -2279,6 +2387,45 @@ test('late removal keeps reopened selections and never removes members from a di
   assert.equal(await page.locator('#thread-main').textContent(),'Select a thread');
 }));
 
+test('late ownership transfers preserve edited or reopened owner drafts and never target another thread', async () => fixture(async (page, data) => {
+  data.agents=[2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.threads=[conversation([],{owner:0}),conversation([],{id:2,title:'Second',owner:0})];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  const first=await holdRequest(page,'**/threads/1/owner');
+  await page.locator('#thread-owner-form button.primary').click(); await first.started;
+  await page.locator('#thread-owner-form [name=owner]').fill('3');
+  first.release(); await first.remove();
+  await page.waitForFunction(()=>!document.querySelector('#thread-owner-form button.primary').disabled);
+  assert.equal(data.threads[0].owner,2);
+  assert.equal(await page.locator('#thread-owner-dialog').isVisible(),true);
+  assert.equal(await page.locator('#thread-owner-form [name=owner]').inputValue(),'3');
+  assert.match(await page.locator('#thread-owner-current').textContent(), /Current owner: #2 Worker 2/);
+  const second=await holdRequest(page,'**/threads/1/owner');
+  await page.locator('#thread-owner-form button.primary').click(); await second.started;
+  await page.locator('[data-close=thread-owner-dialog]').click(); await page.locator('[data-thread="2"]').click();
+  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  second.release(); await second.remove();
+  await page.waitForFunction(()=>!document.querySelector('#thread-owner-form button.primary').disabled);
+  assert.equal(data.threads[0].owner,3);
+  assert.equal(data.threads[1].owner,0);
+  assert.equal(await page.locator('#thread-owner-dialog').isVisible(),true);
+  assert.equal(await page.locator('#thread-owner-form [name=owner]').inputValue(),'2');
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,2);
+}));
+
+test('project switching invalidates ownership dialogs and prevents stale owner form submissions', async () => fixture(async (page, data) => {
+  data.agents=[{id:2,project:1,name:'Target',state:'idle'}]; data.threads=[conversation([])];
+  await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  await page.locator('#project-select').selectOption('2');
+  await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
+  assert.equal(await page.locator('#thread-owner-dialog').isVisible(),false);
+  await page.evaluate(()=>document.querySelector('#thread-owner-form').dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true})));
+  assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,0);
+  assert.equal(await page.locator('#thread-main').textContent(),'Select a thread');
+}));
+
 test('switching projects invalidates open add and removal dialogs before a stale form can submit', async () => fixture(async (page, data) => {
   data.agents=[{id:2,project:1,name:'Additional',state:'idle'}]; data.threads=[conversation([])];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
@@ -2303,7 +2450,7 @@ test('mobile locks can scroll every control into view and dialogs and feedback h
   await page.locator('#locks').evaluate(el => { el.scrollLeft = el.scrollWidth; });
   assert.equal(await page.locator('[data-action=free-lock]').evaluate(el => el.getBoundingClientRect().right <= innerWidth), true);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members','remove-members':'Remove thread members',usage:'Subscription usage',config:'Save as new config',agent:'Agent'};
+  const names = {launch:'Launch agent',project:'Add project',thread:'New thread',folder:'Choose a project folder',members:'Add thread members','remove-members':'Remove thread members','thread-owner':'Change thread owner',usage:'Subscription usage',config:'Save as new config',agent:'Agent'};
   for (const [id,name] of Object.entries(names)) {
     await page.evaluate(id => openDialog(document.getElementById(id+'-dialog')), id);
     assert.equal(await page.getByRole('dialog', {name,exact:true}).count(), 1);
