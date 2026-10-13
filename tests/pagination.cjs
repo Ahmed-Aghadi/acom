@@ -110,14 +110,14 @@ test('CLI thread membership commands identify their caller and preserve permissi
       assert.deepEqual(fixture.requests, [{ method: 'POST', url: `/threads/4/members${command === 'remove' ? '/remove' : ''}` }]);
     });
   });
-  await t.test('denied invitation is not claimed successful or retried', async () => {
+  await t.test('denied addition is not claimed successful or retried', async () => {
     await mock((req, res) => {
       req.resume(); res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'only the user may invite members to this thread' }));
+      res.end(JSON.stringify({ error: 'only the user or thread creator can add members to this thread' }));
     }, async fixture => {
       fixture.env.ACOM_ID = '7';
       const result = await cli(['thread', 'add', '4', '2'], fixture);
-      assert.notEqual(result.status, 0); assert.match(result.stderr, /only the user may invite/);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /only the user or thread creator can add/);
       assert.doesNotMatch(result.stdout, /added/); assert.equal(fixture.requests.length, 1);
     });
   });

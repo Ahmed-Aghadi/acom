@@ -160,7 +160,7 @@ test('thread access and removal remain consistent across API, CLI and restart', 
       await send(thread.id, 'current member can post', 1);
     });
 
-    await t.test('only the local user may invite to restricted threads or remove other agents', async () => {
+    await t.test('noncreator agents cannot add restricted members or remove other agents', async () => {
       for (const flags of [{ private: true }, { joinable: false }]) {
         const thread = await create(flags);
         await denied('POST', `/threads/${thread.id}/members`, { agent: 1, members: ['2'] });
@@ -177,6 +177,92 @@ test('thread access and removal remain consistent across API, CLI and restart', 
       await denied('POST', `/threads/${open.id}/members/remove`, { agent: 1, members: ['0'] });
       await members(open.id, [1], 1, true);
       assert.deepEqual((await metadata(open.id, 0)).members, [0]);
+    });
+
+    await t.test('creators add restricted members immediately without an acceptance step', async () => {
+      for (const flags of [{ private: true }, { joinable: false }]) {
+        const thread = await api('POST', '/threads', { agent: 2, title: 'creator-managed audience', members: ['1'], ...flags });
+        assert.equal((await metadata(thread.id, 2)).created_by, 2);
+        const previous = await send(thread.id, 'before new member', 2);
+        await denied('POST', `/threads/${thread.id}/members`, { agent: 1, members: ['3'] });
+        await denied('POST', `/threads/${thread.id}/members`, { agent: 3, members: ['3'] });
+        assert.deepEqual((await metadata(thread.id, 0)).members, [1, 2]);
+        assert.deepEqual(await members(thread.id, [3], 2), { members: [3] });
+        assert.deepEqual((await metadata(thread.id, 3)).members, [1, 2, 3], 'addition is already committed when the command returns');
+        assert.equal((await api('GET', `/messages/${previous.id}?agent=3`)).outside_membership, true);
+        assert.equal((await api('GET', '/agents/3?agent=3')).state, 'closed', 'adding a member does not launch an acceptance turn');
+        const after = await send(thread.id, 'new member can immediately post', 3);
+        assert.equal((await api('GET', `/messages/${after.id}?agent=3`)).outside_membership, false);
+        const history = events(thread.id);
+        await members(thread.id, [3], 2);
+        assert.deepEqual(events(thread.id), history, 'repeating the addition creates no extra membership event');
+        await denied('POST', `/threads/${thread.id}/members/remove`, { agent: 2, members: ['1'] });
+        assert.deepEqual((await metadata(thread.id, 0)).members, [1, 2, 3], 'creator addition authority does not grant removal authority');
+      }
+    });
+
+    await t.test('a removed private creator has no read or self-rejoin bypass', async () => {
+      const thread = await api('POST', '/threads', { agent: 2, title: 'removed creator', private: true, members: ['1'] });
+      const message = await send(thread.id, 'private creator context', 2);
+      await members(thread.id, [2], 0, true);
+      const before = events(thread.id);
+      for (const route of [`/threads/${thread.id}?agent=2`, `/threads/${thread.id}/metadata?agent=2`,
+        `/messages/${message.id}?agent=2&offset=0&max_bytes=512`]) await denied('GET', route);
+      await denied('POST', `/threads/${thread.id}/members`, { agent: 2, members: ['2', '3'] });
+      await denied('POST', `/threads/${thread.id}/members`, { agent: 1, members: ['2'] });
+      assert.deepEqual(events(thread.id), before);
+      assert.deepEqual((await metadata(thread.id, 0)).members, [1]);
+      await members(thread.id, [2]);
+      await members(thread.id, [3], 2);
+      assert.deepEqual((await metadata(thread.id, 3)).members, [1, 2, 3]);
+    });
+
+    await t.test('public readers never join through headers or record chunks; a departed creator can still add', async () => {
+      const thread = await api('POST', '/threads', { agent: 2, title: 'read without joining', joinable: false, members: ['1'] });
+      const message = await send(thread.id, 'large public record ' + 'x'.repeat(3000), 2);
+      const before = events(thread.id);
+      const cursors = () => db(connection => connection.prepare('SELECT agent_id,last_notified FROM members WHERE thread_id=? ORDER BY agent_id').all(thread.id));
+      const beforeCursors = cursors();
+      assert.ok((await list(4)).items.some(item => item.id === thread.id));
+      for (const route of [`/threads/${thread.id}`, `/threads/${thread.id}/metadata`,
+        `/threads/${thread.id}/messages`, `/messages/${message.id}`]) {
+        const preview = await api('GET', `${route}?agent=4&max_bytes=512`);
+        if (preview.truncated && preview.next_offset === 0) {
+          const chunk = await api('GET', `${route}?agent=4&max_bytes=512&offset=0&version=${preview.version}`);
+          assert.equal(typeof chunk.chunk, 'string');
+        }
+      }
+      assert.deepEqual((await metadata(thread.id, 0)).members, [1, 2]);
+      assert.deepEqual(events(thread.id), before, 'reading metadata or chunks cannot produce membership events');
+      assert.deepEqual(cursors(), beforeCursors, 'public reads cannot acknowledge members’ waiting messages');
+      await denied('POST', '/messages', { agent: 4, thread: thread.id, text: 'read access does not grant posting' });
+      await members(thread.id, [2], 0, true);
+      await members(thread.id, [3], 2);
+      assert.deepEqual((await metadata(thread.id, 0)).members, [1, 3], 'public creator management does not automatically rejoin the creator');
+      await denied('POST', '/messages', { agent: 2, thread: thread.id, text: 'creator role is not posting membership' });
+    });
+
+    await t.test('live creators restore matching exclusions but cannot override filters', async () => {
+      const live = await api('POST', '/threads', { agent: 2, title: 'creator live audience', watch: ['closed', 'group:team'] });
+      const group = (agent, value) => db(connection => connection.prepare('UPDATE agents SET grp=? WHERE id=?').run(value, agent));
+      await members(live.id, [3], 0, true);
+      await denied('POST', `/threads/${live.id}/members`, { agent: 1, members: ['3'] });
+      assert.ok(!(await metadata(live.id, 0)).members.includes(3));
+      await members(live.id, [3], 2);
+      assert.ok((await metadata(live.id, 3)).members.includes(3));
+      await members(live.id, [3], 0, true);
+      try {
+        group(3, 'other');
+        const before = events(live.id);
+        await denied('POST', `/threads/${live.id}/members`, { agent: 2, members: ['4', '3'] });
+        assert.deepEqual(events(live.id), before, 'invalid matching must not partially add or clear exclusions');
+        group(3, 'team');
+        assert.ok(!(await metadata(live.id, 0)).members.includes(3));
+        state(2, 'paused');
+        assert.ok(!(await metadata(live.id, 0)).members.includes(2));
+        await members(live.id, [3], 2);
+        assert.ok((await metadata(live.id, 0)).members.includes(3), 'a public creator may manage matching members without joining');
+      } finally { group(3, 'team'); state(2, 'closed'); }
     });
 
     await t.test('the local user can manage private threads without joining', async () => {

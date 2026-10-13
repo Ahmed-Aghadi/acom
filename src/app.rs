@@ -3318,7 +3318,7 @@ impl App {
         let (states, groups, watch) = Self::watch_filters(&watch)?;
         if !joinable && !watch.is_empty() {
             return Err(bad(
-                "private and invite-only threads need fixed members, not live filters",
+                "private and no-self-join threads need fixed members, not live filters",
             ));
         }
         if !watch.is_empty() && !members.is_empty() {
@@ -3432,10 +3432,15 @@ impl App {
         let ids = Self::resolve(&st, project, members)?;
         let (_, joinable) = Self::thread_access(&st, tid)?;
         let live = Self::is_live(&st, tid)?;
-        if by > 0 && (!joinable || live) {
+        let creator: i64 =
+            st.db
+                .query_row("SELECT created_by FROM threads WHERE id=?1", [tid], |r| {
+                    r.get(0)
+                })?;
+        if by > 0 && by != creator && (!joinable || live) {
             return Err(Fail(
                 403,
-                "only the user can invite members to this thread".into(),
+                "only the user or thread creator can add members to this thread".into(),
             ));
         }
         if live {
@@ -3602,7 +3607,7 @@ impl App {
         if sender > 0 && !joinable && !member {
             return Err(Fail(
                 403,
-                "this thread is invite-only; ask the user to add you".into(),
+                "this thread does not allow self-joining; ask the user or thread creator to add you".into(),
             ));
         }
         let mid = st.atomic(|st| {

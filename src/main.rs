@@ -886,7 +886,7 @@ fn thread_access(thread: &Value) -> &'static str {
     if thread["private"] == true {
         "private"
     } else if thread["joinable"] == false {
-        "public · invite-only"
+        "public · no self-join"
     } else {
         "public · open"
     }

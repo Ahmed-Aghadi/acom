@@ -891,7 +891,7 @@ test('empty live filters are rejected locally and switching back to fixed member
   assert.deepEqual(data.requests.find(r => r.url === '/threads').body, {project:1,title:'Chosen members',members:[],include_user:true,private:false,joinable:true});
 }));
 
-test('thread creation distinguishes public open, public invite-only and private access', async () => fixture(async (page, data) => {
+test('thread creation distinguishes public open, public no-self-join and private access', async () => fixture(async (page, data) => {
   await page.locator('[data-page=threads]').click();
   for (const [index,access] of ['open','invite','private'].entries()) {
     await page.locator('[data-open=thread-dialog]').click();
@@ -899,20 +899,23 @@ test('thread creation distinguishes public open, public invite-only and private 
     await page.locator('#thread-form [name=title]').fill(`${access} conversation`);
     if (access === 'private') await page.locator('#thread-form [name=include_user]').uncheck();
     assert.equal(await page.locator('#thread-mode option[value=live]').evaluate(option=>option.disabled), access !== 'open');
-    if (access === 'private') assert.match(await page.locator('#thread-access-help').textContent(), /Only member agents can read it.*always manage/);
+    if (access === 'private') assert.match(await page.locator('#thread-access-help').textContent(), /Only member agents can read it.*always have access.*you or the thread creator can add members directly/);
+    if (access === 'invite') assert.match(await page.locator('#thread-access-help').textContent(), /Anyone can read it.*you or the thread creator can add members directly/);
     await page.locator('#thread-form button.primary').click();
     await page.waitForFunction(id => state.thread?.id === id, index + 1);
     const body=data.requests.filter(r=>r.url==='/threads').at(-1).body;
     assert.equal(body.private, access === 'private');
     assert.equal(body.joinable, access === 'open');
     assert.equal(Object.hasOwn(body,'watch'), false);
-    assert.match(await page.locator('.thread-header > div.meta').textContent(), access === 'private' ? /Private · invite-only/ : access === 'invite' ? /Public · invite-only/ : /Public · open to join/);
+    const label=access === 'private' ? 'Private · members only' : access === 'invite' ? 'Public · no self-join' : 'Public · open to join';
+    assert.ok((await page.locator('.thread-header > div.meta').textContent()).includes(label));
+    assert.ok((await page.locator(`[data-thread="${index+1}"] .meta`).textContent()).includes(label));
     assert.equal(await page.locator('#thread-access').inputValue(), 'open', 'successful creation resets access for the next thread');
   }
   assert.equal(data.threads.at(-1).members.includes(0), false, 'not including the user does not hide the administrative thread view');
 }));
 
-test('invite-only access switches live membership to fixed without discarding its filter selections', async () => fixture(async (page, data) => {
+test('no-self-join access switches live membership to fixed without discarding its filter selections', async () => fixture(async (page, data) => {
   data.agents=[{id:1,project:1,name:'Reviewer',state:'working'}];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-member-picker [name=member][value="1"]').check();
@@ -926,7 +929,7 @@ test('invite-only access switches live membership to fixed without discarding it
   await page.locator('#thread-access').selectOption('open'); await page.locator('#thread-mode').selectOption('live');
   assert.equal(await page.locator('[name=watch_groups]').inputValue(), 'review');
   await page.locator('#thread-access').selectOption('invite');
-  await page.locator('#thread-form [name=title]').fill('Fixed invite-only'); await page.locator('#thread-form button.primary').click();
+  await page.locator('#thread-form [name=title]').fill('Fixed no-self-join'); await page.locator('#thread-form button.primary').click();
   await page.waitForFunction(()=>state.thread?.id===1);
   const body=data.requests.find(r=>r.url==='/threads').body;
   assert.deepEqual(body.members,['1']);

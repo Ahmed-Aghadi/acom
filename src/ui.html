@@ -259,8 +259,8 @@
       <h2 id="thread-title">New thread</h2>
       <div class="form-grid">
         <label class="wide">Title <input name="title" required></label>
-        <label class="wide">Access <select id="thread-access" name="access"><option value="open">Public · open to join</option><option value="invite">Public · invite-only</option><option value="private">Private · invite-only</option></select><span id="thread-access-help">Anyone can read this thread and join it.</span></label>
-        <label class="wide">Membership <select id="thread-mode" name="membership_mode"><option value="fixed">Fixed members</option><option value="live">Live filters</option></select><span id="thread-mode-help" hidden>Invite-only threads use fixed members; live filters would admit new agents automatically.</span></label>
+        <label class="wide">Access <select id="thread-access" name="access"><option value="open">Public · open to join</option><option value="invite">Public · no self-join</option><option value="private">Private · members only</option></select><span id="thread-access-help">Anyone can read this thread and join it.</span></label>
+        <label class="wide">Membership <select id="thread-mode" name="membership_mode"><option value="fixed">Fixed members</option><option value="live">Live filters</option></select><span id="thread-mode-help" hidden>Threads without self-join use fixed members; live filters would admit new agents automatically.</span></label>
         <label class="inline-check wide"><input type="checkbox" name="include_user" checked> Include me in this thread</label>
         <div class="wide" id="thread-fixed-members">
         <div class="wide" id="thread-member-picker"></div>
@@ -735,7 +735,7 @@
 
     function threadAccess(thread) {
       if (thread.truncated && (typeof thread.private !== 'boolean' || typeof thread.joinable !== 'boolean')) return 'Access unavailable';
-      return thread.private ? 'Private · invite-only' : thread.joinable === false ? 'Public · invite-only' : 'Public · open to join';
+      return thread.private ? 'Private · members only' : thread.joinable === false ? 'Public · no self-join' : 'Public · open to join';
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
@@ -1758,7 +1758,7 @@
       $('#thread-mode option[value=live]').disabled = restricted;
       if (restricted) $('#thread-mode').value = 'fixed';
       $('#thread-mode-help').hidden = !restricted;
-      setText($('#thread-access-help'), access === 'private' ? 'Only member agents can read it. You can always manage it and invite agents.' : access === 'invite' ? 'Anyone can read it; agents cannot join themselves.' : 'Anyone can read this thread and join it.');
+      setText($('#thread-access-help'), access === 'private' ? 'Only member agents can read it; you always have access. Only you or the thread creator can add members directly.' : access === 'invite' ? 'Anyone can read it. Only you or the thread creator can add members directly.' : 'Anyone can read this thread and join it.');
       syncThreadMode();
     }
     $('#thread-access').addEventListener('change', syncThreadAccess);
