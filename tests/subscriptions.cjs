@@ -259,7 +259,7 @@ test('deadline-second events cannot resolve early, but timely backlog still beat
 
 test('deferred waits resolve once with explicit early-message cause and cancel their deadline', async () => fixture(async ({ api, db, project }) => {
   const thread = await api('POST', '/threads', { project: project.id, title: 'PRIVATE_WAIT_CAUSE', members: ['1'], private: true, joinable: false });
-  await hook(api, 1); // Do not let the earlier membership update resolve the wait.
+  await hook(api, 1); // Consume the existing membership summary.
   const wait = await api('POST', '/subscriptions', { agent: 1, timeout: 2, agents: [2], states: ['done'] });
   assert.equal(wait.mode, 'once'); assert.equal(wait.state, 'active'); assert.ok(wait.deadline > 0);
   const message = await api('POST', '/messages', { thread: thread.id, text: 'PRIVATE_MESSAGE_BODY' });
@@ -300,6 +300,59 @@ test('registration-to-turn-end events wait for the old worker and wake exactly o
   assert.match(prompt, new RegExp(`(?:wait|Wait) #?${wait.id}\\b`)); assert.match(prompt, /done/);
   await sleep(1300);
   assert.equal(runs(agent.id).length, 2, 'committed startup consumes the wake trigger exactly once');
+}));
+
+test('membership changes do not resolve idle waits or bounce live-thread transitions', async () => fixture(async ({ api, db, home, project, runs }) => {
+  const agent = await api('POST', '/agents', { project: project.id, harness: 'codex', task: 'HOLD_EACH passive membership fixture' });
+  await until(() => runs(agent.id).length === 1, 'held membership first turn');
+  await until(async () => Boolean((await api('GET', `/agents/${agent.id}`)).session), 'membership native session');
+  const working = await api('POST', '/threads', { project: project.id, title: 'working membership', watch: ['working'] });
+  const idle = await api('POST', '/threads', { project: project.id, title: 'idle membership', watch: ['idle'] });
+  const wait = await api('POST', '/subscriptions', { agent: agent.id, timeout: 30 });
+  assert.equal(wait.state, 'active', 'existing joins are summary data, not deferred-wait causes');
+  fs.writeFileSync(path.join(home, `release-${agent.id}-0`), '');
+  await until(async () => (await api('GET', `/agents/${agent.id}`)).state === 'idle', 'membership owner becomes idle');
+  const member = thread => db(connection => Boolean(connection.prepare('SELECT 1 FROM members WHERE thread_id=? AND agent_id=?').get(thread, agent.id)));
+  assert.equal(member(working.id), false); assert.equal(member(idle.id), true);
+  const fixed = await api('POST', '/threads', { project: project.id, title: 'empty added membership', members: [] });
+  const catchup = await api('POST', '/messages', { thread: fixed.id, text: 'history before membership' });
+  await api('POST', `/threads/${fixed.id}/members`, { members: [String(agent.id)] });
+  await api('POST', `/threads/${fixed.id}/members/remove`, { members: [String(agent.id)] });
+  await api('POST', `/threads/${fixed.id}/members`, { members: [String(agent.id)] });
+  await sleep(1300);
+  assert.equal((await record(api, wait.id, agent.id)).state, 'active');
+  assert.equal(runs(agent.id).length, 1, 'empty membership changes and idle transition do not wake the worker');
+  assert.equal((await api('GET', `/messages/${catchup.id}?agent=${agent.id}`)).outside_membership, true, 'joining does not turn old history into a new-message trigger');
+
+  const raced = await api('POST', '/threads', { project: project.id, title: 'concurrent add and send', members: [] });
+  await Promise.all([
+    api('POST', `/threads/${raced.id}/members`, { members: [String(agent.id)] }),
+    api('POST', '/messages', { thread: raced.id, text: 'concurrent membership request' }),
+  ]);
+  const message = await api('POST', '/messages', { thread: fixed.id, text: 'request after membership is committed' });
+  await until(() => runs(agent.id).length === 2, 'message wakes exactly one held turn');
+  assert.equal((await record(api, wait.id, agent.id)).completion.kind, 'message');
+  assert.match(runs(agent.id)[1].prompt, new RegExp(`(?:wait|Wait) #?${wait.id}\\b`));
+  assert.match(runs(agent.id)[1].prompt, /Coordination:/);
+  assert.equal((await api('GET', `/messages/${message.id}?agent=${agent.id}`)).mark, 'new');
+  await hook(api, agent.id); // Consume any message that arrived after startup, not its contents.
+  fs.writeFileSync(path.join(home, `release-${agent.id}-1`), '');
+  await until(async () => (await api('GET', `/agents/${agent.id}`)).state === 'idle', 'message turn ends idle');
+  await sleep(1300);
+  assert.equal(runs(agent.id).length, 2, 'membership summaries and live re-entry do not create another wake');
+}));
+
+test('passive membership does not suppress lock-change completion of deferred waits', async () => fixture(async ({ api, project }) => {
+  const wait = await api('POST', '/subscriptions', { agent: 1, timeout: 30 });
+  await api('POST', '/threads', { project: project.id, title: 'passive before lock', members: ['1'] });
+  assert.equal((await record(api, wait.id, 1)).state, 'active');
+  await api('POST', '/locks', { project: project.id, name: 'deferred-regression', about: 'preserve lock events' });
+  await api('POST', '/locks/acquire', { agent: 1, name: 'deferred-regression' });
+  const update = (await hook(api, 1)).text;
+  assert.match(update, /lock\.acquired/);
+  assert.match(update, /Coordination: .*joined 1; locks 1/);
+  const resolved = await record(api, wait.id, 1);
+  assert.equal(resolved.state, 'resolved'); assert.equal(resolved.completion.kind, 'coordination');
 }));
 
 test('subscription events do not override paused or finished lifecycle states', async () => fixture(async ({ api, db, runs }) => {

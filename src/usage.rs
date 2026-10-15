@@ -79,18 +79,21 @@ pub fn parse(provider: &str, v: &Value) -> Result<Vec<Window>, String> {
                     });
                 }
             }
-            if b["spendControlReached"] == true || !b["rateLimitReachedType"].is_null() {
+            let blocked = b["spendControlReached"] == true || !b["rateLimitReachedType"].is_null();
+            let cleared = b["spendControlReached"] == false
+                && b.get("rateLimitReachedType").is_some_and(Value::is_null);
+            if blocked || cleared {
                 out.push(Window {
                     name: format!("{bucket} account limit"),
-                    used: 100.0,
+                    used: if blocked { 100.0 } else { 0.0 },
                     reset: None,
                 });
             }
         }
-        if v["ordinaryUsageAllowed"] == false {
+        if let Some(allowed) = v["ordinaryUsageAllowed"].as_bool() {
             out.push(Window {
                 name: "account limit".into(),
-                used: 100.0,
+                used: if allowed { 0.0 } else { 100.0 },
                 reset: None,
             });
         }
@@ -467,6 +470,62 @@ mod tests {
             .unwrap()[0]
                 .reset,
             Some(1791459001)
+        );
+    }
+
+    #[test]
+    fn codex_derived_account_windows_require_explicit_clear_evidence() {
+        let windows = parse(
+            "codex",
+            &json!({"rateLimits":{
+            "primary":{"usedPercent":10},"spendControlReached":false,"rateLimitReachedType":null
+        },"ordinaryUsageAllowed":true}),
+        )
+        .unwrap();
+        for name in ["codex account limit", "account limit"] {
+            assert!(
+                windows
+                    .iter()
+                    .any(|window| window.name == name && window.used == 0.0)
+            );
+        }
+        for flags in [
+            json!({}),
+            json!({"spendControlReached":false}),
+            json!({"rateLimitReachedType":null}),
+        ] {
+            let mut bucket = flags;
+            bucket["primary"] = json!({"usedPercent":10});
+            let windows = parse("codex", &json!({"rateLimits":bucket})).unwrap();
+            assert!(
+                windows
+                    .iter()
+                    .all(|window| !window.name.contains("account limit")),
+                "missing flags are not evidence of availability"
+            );
+        }
+        let windows = parse("codex",&json!({"rateLimitsByLimitId":{
+            "other":{"primary":{"usedPercent":10},"spendControlReached":false,"rateLimitReachedType":null}
+        },"ordinaryUsageAllowed":true})).unwrap();
+        assert!(
+            !windows
+                .iter()
+                .any(|window| window.name == "codex account limit"),
+            "an absent bucket is not recovered"
+        );
+        let windows = parse(
+            "codex",
+            &json!({"rateLimits":{
+            "primary":{"usedPercent":10},"spendControlReached":false,"rateLimitReachedType":"weekly"
+        },"ordinaryUsageAllowed":false}),
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .filter(|window| window.name.contains("account limit") && window.used == 100.0)
+                .count(),
+            2
         );
     }
 

@@ -1073,7 +1073,6 @@ mod tests {
                     },
                 )]
                 .into(),
-                over_soft: Default::default(),
                 reaped: Default::default(),
             }),
             cv: Condvar::new(),

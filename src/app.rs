@@ -5,7 +5,7 @@ use crate::run;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -532,7 +532,6 @@ pub struct St {
     pub procs: HashMap<i64, Proc>,
     /// Reaped workers can still have buffered failure events to drain.
     pub reaped: HashSet<i64>,
-    pub over_soft: HashSet<(i64, String)>,
 }
 
 pub struct App {
@@ -582,7 +581,10 @@ CREATE TABLE IF NOT EXISTS wait_watch_cursors (agent_id INTEGER NOT NULL, filter
   PRIMARY KEY(agent_id,filter));
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS usage_soft_warnings (agent_id INTEGER NOT NULL, provider TEXT NOT NULL, scope TEXT NOT NULL,
+  threshold REAL NOT NULL, windows TEXT NOT NULL, PRIMARY KEY(agent_id,provider,scope));
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS agent_quota_blocks (agent_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, win TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_continuations (agent_id INTEGER PRIMARY KEY, text TEXT NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_handoffs (agent_id INTEGER PRIMARY KEY, request TEXT NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_starts (agent_id INTEGER PRIMARY KEY, predecessor INTEGER NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
@@ -1126,39 +1128,84 @@ impl St {
                 }
             }
         }
-        if provider == "claude"
-            && model.is_some_and(is_fable)
-            && self
-                .window_pct(provider, "seven_day_fable")?
-                .is_some_and(|v| v >= 100.0)
-            && !checks
-                .iter()
-                .any(|c| c.what.contains("weekly Fable") && c.over(c.lim.hard))
-        {
-            checks.push(Check {
-                what: "claude weekly Fable subscription exhausted".into(),
-                value: 100.0,
-                lim: Limit {
-                    soft: None,
-                    hard: Some(100.0),
-                },
-                unit: "%",
-            });
-        }
-        if self.used_pct(provider)?.is_some_and(|used| used >= 100.0)
-            && !checks.iter().any(|c| c.over(c.lim.hard))
-        {
-            checks.push(Check {
-                what: format!("{provider} subscription exhausted"),
-                value: 100.0,
-                lim: Limit {
-                    soft: None,
-                    hard: Some(100.0),
-                },
-                unit: "%",
-            });
-        }
         Ok(checks)
+    }
+
+    fn soft_usage_notices(
+        &mut self,
+        agent: i64,
+        provider: &str,
+        model: Option<&str>,
+        limits: &Limits,
+    ) -> R<bool> {
+        self.atomic(|st| {
+            let readings = rows(&st.db, "SELECT win,used_pct FROM usage WHERE provider=?1 AND win<>'limit'", [provider])?;
+            let label = |scope: &str| {
+                if scope.is_empty() {
+                    format!("{provider} subscription usage")
+                } else {
+                    format!("{provider} {} subscription usage", window_label(scope))
+                }
+            };
+            let mut changed = false;
+            for warning in rows(&st.db, "SELECT scope,threshold,windows FROM usage_soft_warnings WHERE agent_id=?1 AND provider=?2", params![agent,provider])? {
+                let scope = warning["scope"].as_str().unwrap();
+                let threshold = warning["threshold"].as_f64().unwrap();
+                let threshold = limits.usage_limit(provider, scope).and_then(|l| l.soft)
+                    .map_or(threshold, |current| threshold.min(current));
+                let mut windows: Vec<String> = serde_json::from_str(warning["windows"].as_str().unwrap())
+                    .map_err(|e| Fail(500, format!("invalid soft-warning windows: {e}")))?;
+                let applicable: Vec<_> = readings.iter().filter(|r| {
+                    if scope.is_empty() { r["win"] != "seven_day_fable" } else { r["win"] == scope }
+                }).collect();
+                for reading in &applicable {
+                    let window = reading["win"].as_str().unwrap();
+                    if reading["used_pct"].as_f64().unwrap() >= threshold && !windows.iter().any(|w| w == window) {
+                        windows.push(window.into());
+                    }
+                }
+                // A missing bucket or an estimated reset cannot clear its last high observation.
+                let mut recovered = !windows.is_empty();
+                let mut used: f64 = 0.0;
+                for window in &windows {
+                    let observed: Option<f64> = st.db.query_row(
+                        "SELECT used_pct FROM usage_observations WHERE provider=?1 AND win=?2",
+                        params![provider,window], |r| r.get(0)).optional()?;
+                    recovered &= observed.is_some_and(|v| v < threshold);
+                    used = used.max(observed.unwrap_or(100.0));
+                }
+                recovered &= applicable.iter().all(|r| r["used_pct"].as_f64().unwrap() < threshold);
+                used = applicable.iter().map(|r|r["used_pct"].as_f64().unwrap()).fold(used,f64::max);
+                if recovered {
+                    st.notice(agent, &format!("Previous soft warning cleared: {} is now {used}%, below {threshold}%. Other limits may still apply.",label(scope)))?;
+                    st.db.execute("DELETE FROM usage_soft_warnings WHERE agent_id=?1 AND provider=?2 AND scope=?3",params![agent,provider,scope])?;
+                    changed = true;
+                } else {
+                    st.db.execute("UPDATE usage_soft_warnings SET windows=?4 WHERE agent_id=?1 AND provider=?2 AND scope=?3",params![agent,provider,scope,json!(windows).to_string()])?;
+                }
+            }
+            let scopes: BTreeSet<String> = readings.iter().filter_map(|r| {
+                let window = r["win"].as_str().unwrap();
+                if provider != "claude" { Some(String::new()) }
+                else if window != "seven_day_fable" || model.is_some_and(is_fable) { Some(window.into()) }
+                else { None }
+            }).collect();
+            for scope in scopes {
+                let Some(limit) = limits.usage_limit(provider, &scope) else { continue };
+                let Some(threshold) = limit.soft else { continue };
+                let offenders: Vec<_> = readings.iter().filter(|r| {
+                    (scope.is_empty() || r["win"] == scope) && r["used_pct"].as_f64().unwrap() >= threshold
+                }).collect();
+                if offenders.is_empty() { continue; }
+                let windows: Vec<_> = offenders.iter().map(|r| r["win"].as_str().unwrap()).collect();
+                if st.db.execute("INSERT OR IGNORE INTO usage_soft_warnings(agent_id,provider,scope,threshold,windows) VALUES(?1,?2,?3,?4,?5)",params![agent,provider,scope,threshold,json!(windows).to_string()])? == 1 {
+                    let check = Check {what:label(&scope),value:offenders.iter().map(|r|r["used_pct"].as_f64().unwrap()).fold(0.0,f64::max),lim:limit.clone(),unit:"%"};
+                    st.notice(agent, &check.line("Soft"))?;
+                    changed = true;
+                }
+            }
+            Ok(changed)
+        })
     }
 
     /// A project's limits and rules, with current usage, as agents are told them.
@@ -1289,6 +1336,32 @@ impl St {
             .iter()
             .find(|c| c.over(c.lim.hard))
             .map(|c| c.line("Hard")))
+    }
+
+    fn quota_ready(&self, agent: i64) -> R<bool> {
+        let a = self.agent(agent)?;
+        let blocked: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT provider,win FROM agent_quota_blocks WHERE agent_id=?1",
+                [agent],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match blocked {
+            Some((provider, win)) if win == "limit" => {
+                Ok(self.used_pct(&provider)?.is_some_and(|pct| pct < 100.0))
+            }
+            Some((provider, win)) if win == "seven_day_fable" && !is_fable(&a.model) => {
+                Ok(self.used_pct(&provider)?.is_some())
+            }
+            Some((provider, win)) => Ok(self
+                .window_pct(&provider, &win)?
+                .is_some_and(|pct| pct < 100.0)),
+            None => Ok(self.used_pct(&a.harness)?.is_some()
+                || (is_fable(&a.model)
+                    && self.window_pct(&a.harness, "seven_day_fable")?.is_some())),
+        }
     }
 
     // ---------- locks ----------
@@ -1742,7 +1815,6 @@ impl App {
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
-            over_soft: HashSet::new(),
         };
         // No requests are served until old workers stop and paused locks release.
         let interrupted = rows(
@@ -2230,7 +2302,7 @@ impl App {
         if st.procs.get(&id).is_some_and(|p| p.pid != pid) {
             return Ok(()); // not this process's entry; never happens since turns don't overlap
         }
-        let a = st.agent(id)?;
+        let mut a = st.agent(id)?;
         if st.shutting_down && a.state == "working" {
             // A shutdown save may have failed. Once persistence recovers, the
             // exit must still become a restart pause, not idle or a crash.
@@ -2244,6 +2316,16 @@ impl App {
             st.reaped.remove(&id);
             self.cv.notify_all();
             return Ok(());
+        }
+        if a.state == "working"
+            && st.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_quota_blocks WHERE agent_id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            self.pause_locked(&mut st, id, "limit", "acom")?;
+            a = st.agent(id)?;
         }
         let failure = st.procs.get(&id).and_then(|p| p.failure.clone());
         let stopping = st.procs.get(&id).is_some_and(|p| p.stopping);
@@ -2499,6 +2581,8 @@ impl App {
             st.db
                 .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
         }
+        st.db
+            .execute("DELETE FROM agent_quota_blocks WHERE agent_id=?1", [id])?;
         st.db.execute(
             "UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, problem=NULL, seen_model=NULL,done_req=0,rest='idle' WHERE id=?1",
             [id],
@@ -2660,6 +2744,7 @@ impl App {
         }
         st.atomic(|st| {
             Self::cancel_followups(st, id, "the agent was closed")?;
+            st.db.execute("DELETE FROM agent_quota_blocks WHERE agent_id=?1", [id])?;
             st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, rest='idle' WHERE id=?1", [id])?;
             st.set_state(id, "closed")?;
             st.log_for(id, by, &format!("closed agent {id}"))?;
@@ -3498,6 +3583,16 @@ impl App {
                     }
                     let (updates, subscription_updates) =
                         st.take_updates_batch(id, if watch.is_some() { 8000 } else { 11000 })?;
+                    let lock_changed: bool = st.db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events WHERE agent=?1
+                         AND id>coalesce((SELECT event_id FROM summary_cursors WHERE agent_id=?1),0)
+                         AND kind LIKE 'lock.%')",
+                        [id],
+                        |row| row.get(0),
+                    )?;
+                    if updates.is_empty() && watched.is_empty() && !lock_changed {
+                        return Ok(None);
+                    }
                     let summary = st.coordination_summary(id, false)?;
                     let text = [updates, summary, watched]
                         .into_iter()
@@ -4470,23 +4565,30 @@ impl App {
     ) -> R<()> {
         let mut st = self.lock();
         let a = st.agent(id)?;
-        if a.state == "paused" {
-            return Ok(()); // Never override a user's pause or an existing quota pause.
+        if matches!(a.state.as_str(), "closed" | "crashed" | "replaced") {
+            return Ok(());
         }
-        st.db.execute(
-            "UPDATE agents SET problem=?2 WHERE id=?1",
-            params![id, problem],
-        )?;
-        if why == "limit" {
+        if a.state == "paused" {
+            let needs_evidence: bool = st.db.query_row("SELECT coalesce(pause_reason='limit',0) AND NOT EXISTS(SELECT 1 FROM agent_quota_blocks WHERE agent_id=?1) FROM agents WHERE id=?1", [id], |r| r.get(0))?;
+            if why != "limit" || !needs_evidence {
+                return Ok(()); // Keep user pauses and the first recorded quota rejection.
+            }
+        }
+        st.atomic(|st| {
+            st.db.execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, problem])?;
+            if why == "limit" {
             // Only a fresh provider check can clear this marker; don't invent a reset time.
             let win = window.unwrap_or("limit");
             let reset:Option<i64>=st.db.query_row("SELECT coalesce((SELECT resets_at FROM usage WHERE provider=?1 AND win=?2),(SELECT resets_at FROM usage_observations WHERE provider=?1 AND win=?2))",params![a.harness,win],|r|r.get(0))?;
-            st.atomic(|st| subscriptions::observe_usage(st, &a.harness, win, 100.0, reset))?;
+            subscriptions::observe_usage(st, &a.harness, win, 100.0, reset)?;
+            st.db.execute("INSERT OR REPLACE INTO agent_quota_blocks(agent_id,provider,win) VALUES(?1,?2,?3)", params![id, a.harness, win])?;
             st.db.execute(
                 "UPDATE usage_checks SET next_check=?2 WHERE provider=?1",
                 params![a.harness, now()],
             )?;
-        }
+            }
+            Ok(())
+        })?;
         if matches!(a.state.as_str(), "working" | "idle" | "done") {
             self.pause_locked(&mut st, id, why, "acom")?;
         }
@@ -4856,19 +4958,10 @@ impl App {
                 let model = st
                     .procs
                     .get(&id)
-                    .map(|p| p.model.as_str())
-                    .or(r["model"].as_str());
-                let checks = st.usage_checks(&s.limits, p, model)?;
-                for check in &checks {
-                    let key = (project, format!("{id}:{}", check.what));
-                    if check.over(check.lim.soft) {
-                        if st.over_soft.insert(key) {
-                            st.notice(id, &check.line("Soft"))?;
-                        }
-                    } else {
-                        st.over_soft.remove(&key);
-                    }
-                }
+                    .map(|p| p.model.clone())
+                    .or_else(|| r["model"].as_str().map(str::to_owned));
+                let checks = st.usage_checks(&s.limits, p, model.as_deref())?;
+                changed |= st.soft_usage_notices(id, p, model.as_deref(), &s.limits)?;
                 let hard: Vec<_> = checks.iter().filter(|c| c.over(c.lim.hard)).collect();
                 if !hard.is_empty() && matches!(r["state"].as_str(), Some("working" | "idle")) {
                     self.pause_locked(st, id, "limit", "acom")?;
@@ -4886,8 +4979,7 @@ impl App {
                     changed = true;
                 }
             }
-            // Missing readings cannot prove that a subscription recovered.
-            if s.auto_resume && st.used_pct(p)?.is_some_and(|used| used < 100.0) {
+            if s.auto_resume {
                 changed |= self.resume_limited(st, project, p, 0)?;
             }
         }
@@ -4917,6 +5009,7 @@ impl App {
             if !st.procs.contains_key(id)
                 && !st.stopping_agents.contains(id)
                 && st.held_by(*id)?.is_empty()
+                && st.quota_ready(*id)?
                 && st.model_no_room(project, provider, &a.model)?.is_none()
             {
                 self.resume_locked(st, *id, "acom")?;
@@ -6708,7 +6801,6 @@ mod tests {
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
-            over_soft: HashSet::new(),
         }
     }
 
@@ -8743,6 +8835,486 @@ mod tests {
     }
 
     #[test]
+    fn full_usage_without_a_hard_limit_does_not_block_or_pause() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            for limit in s.limits.usage.values_mut() {
+                limit.hard = None;
+            }
+        });
+        app.lock()
+            .db
+            .execute("UPDATE agents SET model='claude-fable-5-1' WHERE id=1", [])
+            .unwrap();
+        for window in ["five_hour", "seven_day", "seven_day_fable"] {
+            app.record_usage("claude", window, 100.0, None).unwrap();
+        }
+        app.record_usage("codex", "codex primary", 100.0, None)
+            .unwrap();
+        {
+            let st = app.lock();
+            let limits = &st.settings_for(Some(1)).limits;
+            for (provider, model) in [("claude", "claude-fable-5-1"), ("codex", "gpt-6-sol")] {
+                let checks = st.usage_checks(limits, provider, Some(model)).unwrap();
+                assert!(!checks.is_empty());
+                assert!(checks.iter().all(|check| !check.over(check.lim.hard)));
+                assert!(st.model_no_room(1, provider, model).unwrap().is_none());
+            }
+        }
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+        assert_eq!(state(&app, 2).0, "paused");
+    }
+
+    #[test]
+    fn an_unconfigured_usage_limit_does_not_synthesize_percentage_cutoffs() {
+        let app = app_with_two_projects();
+        app.record_usage("claude", "five_hour", 100.0, None)
+            .unwrap();
+        app.record_usage("claude", "seven_day_fable", 100.0, None)
+            .unwrap();
+        app.record_usage("codex", "codex primary", 100.0, None)
+            .unwrap();
+        let mut limits = Settings::default().limits;
+        limits.usage.clear();
+        let st = app.lock();
+        assert!(st.usage_checks(&limits, "codex", None).unwrap().is_empty());
+        assert!(
+            st.usage_checks(&limits, "claude", Some("claude-fable-5-1"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn usage_notice_count(app: &App, agent: i64, prefix: &str) -> usize {
+        rows(
+            &app.lock().db,
+            "SELECT text FROM notices WHERE agent_id=?1 AND text LIKE ?2",
+            params![agent, format!("{prefix}%")],
+        )
+        .unwrap()
+        .len()
+    }
+
+    #[test]
+    fn soft_usage_warning_clears_once_survives_restart_and_rearms() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "claude_five_hour".into(),
+                Limit {
+                    soft: Some(80.0),
+                    hard: None,
+                },
+            );
+        });
+        app.record_usage("claude", "five_hour", 85.0, None).unwrap();
+        app.tick().unwrap();
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 1);
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 1);
+        // Samples can change within the same timestamp second.
+        app.record_usage("claude", "five_hour", 80.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0
+        );
+        app.record_usage("claude", "five_hour", 79.0, None).unwrap();
+        app.tick().unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1
+        );
+        assert_eq!(state(&app, 1).0, "idle");
+        assert!(
+            app.lock().procs.is_empty(),
+            "a notice alone must not wake an idle agent"
+        );
+        app.record_usage("claude", "five_hour", 90.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 2);
+    }
+
+    #[test]
+    fn soft_usage_windows_clear_independently_without_inventing_recovery() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            for name in ["claude_five_hour", "claude_seven_day"] {
+                s.limits.usage.insert(
+                    name.into(),
+                    Limit {
+                        soft: Some(80.0),
+                        hard: None,
+                    },
+                );
+            }
+        });
+        app.record_usage("claude", "five_hour", 85.0, Some(now() - 1))
+            .unwrap();
+        app.record_usage("claude", "seven_day", 90.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 2);
+        crate::usage::finish(&app, "claude", 120, Err("unavailable".into())).unwrap();
+        app.lock()
+            .db
+            .execute(
+                "DELETE FROM usage WHERE provider='claude' AND win='seven_day'",
+                [],
+            )
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0
+        );
+        app.record_usage("claude", "five_hour", 10.0, None).unwrap();
+        app.tick().unwrap();
+        let notices=rows(&app.lock().db,"SELECT text FROM notices WHERE agent_id=1 AND text LIKE 'Previous soft warning cleared%'",[]).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0]["text"].as_str().unwrap().contains("five-hour"));
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM usage_soft_warnings WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        app.record_usage("claude", "seven_day", 20.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            2
+        );
+    }
+
+    #[test]
+    fn soft_usage_codex_scope_retains_missing_and_later_offending_windows() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "codex".into(),
+                Limit {
+                    soft: Some(80.0),
+                    hard: None,
+                },
+            );
+        });
+        app.record_usage("codex", "primary", 85.0, None).unwrap();
+        app.record_usage("codex", "secondary", 10.0, None).unwrap();
+        app.tick().unwrap();
+        app.record_usage("codex", "secondary", 90.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 1);
+        app.record_usage("codex", "primary", 5.0, None).unwrap();
+        app.lock()
+            .db
+            .execute(
+                "DELETE FROM usage WHERE provider='codex' AND win='secondary'",
+                [],
+            )
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0
+        );
+        app.record_usage("codex", "secondary", 15.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1
+        );
+        let text=rows(&app.lock().db,"SELECT text FROM notices WHERE agent_id=1 AND text LIKE 'Previous soft warning cleared%'",[]).unwrap();
+        assert!(
+            text[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("codex subscription usage is now 15%")
+        );
+    }
+
+    #[test]
+    fn soft_usage_codex_stream_and_status_share_verified_window_identity() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "codex".into(),
+                Limit {
+                    soft: Some(80.0),
+                    hard: None,
+                },
+            );
+        });
+        let stream = |bucket: &str| {
+            for event in crate::harness::parse_line(
+                "codex",
+                &json!({"type":"event_msg","payload":{
+                    "type":"token_count","rate_limits":{"limit_id":bucket,
+                        "primary":{"used_percent":85,"window_minutes":300},
+                        "secondary":{"used_percent":95,"window_minutes":10080}}
+                }})
+                .to_string(),
+            ) {
+                if let crate::harness::Event::Usage {
+                    win,
+                    used_pct,
+                    resets_at,
+                } = event
+                {
+                    app.record_usage("codex", &win, used_pct, resets_at)
+                        .unwrap();
+                }
+            }
+        };
+        stream("codex");
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 1);
+        crate::usage::finish(
+            &app,
+            "codex",
+            120,
+            crate::usage::parse(
+                "codex",
+                &json!({"rateLimits":{
+                    "primary":{"usedPercent":10},"secondary":{"usedPercent":20}
+                }}),
+            ),
+        )
+        .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1
+        );
+
+        stream("other-model");
+        app.tick().unwrap();
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 2);
+        crate::usage::finish(
+            &app,
+            "codex",
+            120,
+            crate::usage::parse(
+                "codex",
+                &json!({"rateLimitsByLimitId":{
+                    "codex":{"primary":{"usedPercent":5},"secondary":{"usedPercent":10}}
+                }}),
+            ),
+        )
+        .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1,
+            "a genuinely omitted bucket is still unknown"
+        );
+        crate::usage::finish(
+            &app,
+            "codex",
+            120,
+            crate::usage::parse(
+                "codex",
+                &json!({"rateLimitsByLimitId":{
+                    "codex":{"primary":{"usedPercent":5},"secondary":{"usedPercent":10}},
+                    "other-model":{"primary":{"usedPercent":15},"secondary":{"usedPercent":20}}
+                }}),
+            ),
+        )
+        .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            2
+        );
+    }
+
+    #[test]
+    fn soft_usage_codex_derived_account_windows_clear_only_on_explicit_proof() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "codex".into(),
+                Limit {
+                    soft: Some(80.0),
+                    hard: None,
+                },
+            );
+        });
+        let observe = |value: Value| {
+            crate::usage::finish(&app, "codex", 120, crate::usage::parse("codex", &value)).unwrap();
+            app.tick().unwrap();
+        };
+        observe(json!({"rateLimits":{"primary":{"usedPercent":10},
+            "spendControlReached":true,"rateLimitReachedType":"weekly"},"ordinaryUsageAllowed":false}));
+        assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 1);
+        observe(json!({"rateLimits":{"primary":{"usedPercent":5}}}));
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0
+        );
+        observe(json!({"rateLimits":{"primary":{"usedPercent":5}},"ordinaryUsageAllowed":true}));
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0,
+            "global availability does not prove the bucket recovered"
+        );
+        observe(json!({"rateLimits":{"primary":{"usedPercent":5},
+            "spendControlReached":false,"rateLimitReachedType":null},"ordinaryUsageAllowed":true}));
+        observe(json!({"rateLimits":{"primary":{"usedPercent":5},
+            "spendControlReached":false,"rateLimitReachedType":null},"ordinaryUsageAllowed":true}));
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1
+        );
+        observe(
+            json!({"rateLimitsByLimitId":{"other-model":{"primary":{"usedPercent":5},
+            "spendControlReached":true,"rateLimitReachedType":null}},"ordinaryUsageAllowed":true}),
+        );
+        observe(
+            json!({"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":5},
+            "spendControlReached":false,"rateLimitReachedType":null}},"ordinaryUsageAllowed":true}),
+        );
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1,
+            "missing bucket flags cannot clear its previous warning"
+        );
+    }
+
+    #[test]
+    fn soft_usage_config_edits_do_not_claim_recovery_and_lower_limits_still_apply() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "claude_five_hour".into(),
+                Limit {
+                    soft: Some(80.0),
+                    hard: None,
+                },
+            );
+        });
+        app.record_usage("claude", "five_hour", 85.0, None).unwrap();
+        app.tick().unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "claude_five_hour".into(),
+                Limit {
+                    soft: Some(90.0),
+                    hard: None,
+                },
+            );
+        });
+        app.tick().unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.clear();
+        });
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0
+        );
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "claude_five_hour".into(),
+                Limit {
+                    soft: Some(60.0),
+                    hard: None,
+                },
+            );
+        });
+        app.record_usage("claude", "five_hour", 70.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            0
+        );
+        app.record_usage("claude", "five_hour", 50.0, None).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1
+        );
+    }
+
+    #[test]
+    fn soft_usage_notice_and_warning_state_commit_together() {
+        let app = app_with_two_projects();
+        app.record_usage("claude", "five_hour", 85.0, None).unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER reject_soft_notice BEFORE INSERT ON notices WHEN NEW.agent_id=1 BEGIN SELECT RAISE(ABORT,'injected notice failure'); END;").unwrap();
+        assert!(app.tick().is_err());
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM usage_soft_warnings WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_soft_notice")
+            .unwrap();
+        app.tick().unwrap();
+        app.record_usage("claude", "five_hour", 10.0, None).unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER reject_clear_notice BEFORE INSERT ON notices WHEN NEW.agent_id=1 BEGIN SELECT RAISE(ABORT,'injected clear failure'); END;").unwrap();
+        assert!(app.tick().is_err());
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM usage_soft_warnings WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_clear_notice")
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            usage_notice_count(&app, 1, "Previous soft warning cleared"),
+            1
+        );
+    }
+
+    #[test]
     fn claude_windows_have_independent_limits_and_both_must_clear() {
         let app = app_with_two_projects();
         custom(&app, 1, |s| {
@@ -10711,6 +11283,259 @@ mod tests {
         refresh(Some(0.0));
         app.tick().unwrap();
         assert_eq!(state(&app, 1).0, "idle");
+    }
+
+    #[test]
+    fn quota_evidence_is_scoped_durable_and_not_an_implicit_percentage_cap() {
+        let app = app_with_two_projects();
+        for project in [1, 2] {
+            custom(&app, project, |s| s.limits.usage.clear());
+        }
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET model='claude-fable-5-1',effort='medium' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        app.record_usage("claude", "five_hour", 100.0, None)
+            .unwrap();
+        app.window_limit_hit(1, "seven_day_fable", "scoped quota rejected")
+            .unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        assert_eq!(
+            state(&app, 2).0,
+            "idle",
+            "raw 100% must not pause another uncapped agent"
+        );
+        app.record_usage("claude", "seven_day_fable", 0.0, None)
+            .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "idle",
+            "the rejected window recovered; another uncapped reading is not a new hard cap"
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM agent_quota_blocks", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn quota_recovery_follows_the_next_turn_models_window_scope() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET model='claude-fable-5-1',effort='medium' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        app.record_usage("claude", "five_hour", 10.0, None).unwrap();
+        app.window_limit_hit(1, "seven_day_fable", "Fable rejected")
+            .unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        assert!(!app.lock().quota_ready(1).unwrap());
+        app.lock()
+            .db
+            .execute(
+                "DELETE FROM usage WHERE provider='claude' AND win='five_hour'",
+                [],
+            )
+            .unwrap();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET model='claude-opus-5-5' WHERE id=1", [])
+            .unwrap();
+        assert!(
+            !app.lock().quota_ready(1).unwrap(),
+            "switching models does not turn an unknown reading into recovery"
+        );
+        app.record_usage("claude", "five_hour", 10.0, None).unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "claude_five_hour".into(),
+                Limit {
+                    soft: None,
+                    hard: Some(5.0),
+                },
+            );
+        });
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "paused",
+            "a configured general hard limit still applies"
+        );
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "idle",
+            "Fable-only exhaustion must not hold an Opus turn"
+        );
+        assert_eq!(
+            app.lock().window_pct("claude", "seven_day_fable").unwrap(),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn quota_evidence_survives_failed_pause_and_prevents_crash_retries_at_exit() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.lock().db.execute_batch("UPDATE agents SET state='working' WHERE id=1;
+            CREATE TRIGGER reject_quota_pause BEFORE UPDATE OF state ON agents WHEN NEW.id=1 AND NEW.state='paused'
+            BEGIN SELECT RAISE(ABORT,'quota pause storage failure'); END;").unwrap();
+        assert!(
+            app.limit_hit(1, "explicit quota rejection")
+                .unwrap_err()
+                .1
+                .contains("quota pause storage failure")
+        );
+        assert_eq!(state(&app, 1).0, "working");
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_quota_pause")
+            .unwrap();
+        app.turn_ended(1, 0, false, Some("unsuccessful provider exit"))
+            .unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        assert_eq!(
+            app.agent_view(1).unwrap()["problem"],
+            "explicit quota rejection"
+        );
+        assert!(app.agent_view(1).unwrap()["retry"].is_null());
+        drop(app.wait_stopped(app.lock(), &[1]));
+    }
+
+    #[test]
+    fn quota_manual_override_clears_evidence_only_after_resume_commits() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.limit_hit(1, "quota rejected").unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        app.lock().db.execute_batch("CREATE TRIGGER reject_quota_resume BEFORE UPDATE OF state ON agents WHEN NEW.id=1 AND NEW.state='idle'
+            BEGIN SELECT RAISE(ABORT,'quota resume storage failure'); END;").unwrap();
+        assert!(
+            app.resume(1, "user")
+                .unwrap_err()
+                .1
+                .contains("quota resume storage failure")
+        );
+        assert!(!app.lock().quota_ready(1).unwrap());
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_quota_resume")
+            .unwrap();
+        app.resume(1, "user").unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM agent_quota_blocks WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn quota_rejection_after_hard_pause_is_retained_without_overriding_manual_pause() {
+        for manual in [false, true] {
+            let app = app_with_two_projects();
+            if manual {
+                app.pause(1, "user").unwrap();
+            } else {
+                app.record_usage("claude", "five_hour", 95.0, None).unwrap();
+                app.tick().unwrap();
+            }
+            drop(app.wait_stopped(app.lock(), &[1]));
+            app.limit_hit(1, "explicit late quota rejection").unwrap();
+            app.limit_hit(1, "duplicate quota frame").unwrap();
+            custom(&app, 1, |s| s.limits.usage.clear());
+            app.tick().unwrap();
+            let view = app.agent_view(1).unwrap();
+            assert_eq!(view["state"], "paused");
+            assert_eq!(view["pause_reason"], if manual { "user" } else { "limit" });
+            if manual {
+                assert!(view["problem"].is_null());
+            } else {
+                assert_eq!(view["problem"], "explicit late quota rejection");
+                assert!(!app.lock().quota_ready(1).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn quota_close_discards_recovery_hold_without_erasing_the_old_problem() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.limit_hit(1, "old quota rejection").unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        app.lock().db.execute_batch("CREATE TRIGGER reject_quota_close BEFORE UPDATE OF state ON agents WHEN NEW.id=1 AND NEW.state='closed'
+            BEGIN SELECT RAISE(ABORT,'quota close storage failure'); END;").unwrap();
+        assert!(app.close(1, "user").is_err());
+        assert!(!app.lock().quota_ready(1).unwrap());
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_quota_close")
+            .unwrap();
+        app.close(1, "user").unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        assert_eq!(app.agent_view(1).unwrap()["problem"], "old quota rejection");
+        app.limit_hit(1, "late quota frame from the closed turn")
+            .unwrap();
+        assert_eq!(app.agent_view(1).unwrap()["problem"], "old quota rejection");
+        app.reopen(1, "user").unwrap();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working' WHERE id=1", [])
+            .unwrap();
+        app.turn_ended(1, 0, true, None).unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "idle",
+            "a reopened successful turn must not inherit the old rejection hold"
+        );
+    }
+
+    #[test]
+    fn unknown_failure_at_one_hundred_percent_remains_a_crash() {
+        for harness in ["claude", "codex"] {
+            let app = app_with_two_projects();
+            custom(&app, 1, |s| s.limits.usage.clear());
+            app.lock()
+                .db
+                .execute(
+                    "UPDATE agents SET harness=?1,state='working' WHERE id=1",
+                    [harness],
+                )
+                .unwrap();
+            app.record_usage(harness, "five_hour", 100.0, None).unwrap();
+            app.tick().unwrap();
+            assert_eq!(state(&app, 1).0, "working");
+            app.turn_ended(1, 0, false, Some("unexplained process exit"))
+                .unwrap();
+            let view = app.agent_view(1).unwrap();
+            assert_eq!(view["state"], "crashed");
+            assert_eq!(view["problem"], "unexplained process exit");
+            assert!(view["retry"].is_object());
+        }
     }
 
     #[test]

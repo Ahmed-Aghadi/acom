@@ -192,7 +192,7 @@ pub(super) fn process(st: &St) -> R<()> {
                 Some(json!({"kind":"message","message":message["id"],"thread":message["thread_id"],"agent":message["sender"],"summary":format!("message #{} in thread #{}",message["id"],message["thread_id"])}))
             } else if let Some(notice)=rows(&st.db,"SELECT id FROM notices WHERE agent_id=?1 AND shown=0 AND (?2 IS NULL OR at<?2) ORDER BY id LIMIT 1",params![owner,deadline])?.pop() {
                 Some(json!({"kind":"notice","notice":notice["id"],"summary":format!("notice #{}",notice["id"])}))
-            } else if let Some(change)=rows(&st.db,"SELECT id,kind,thread FROM events WHERE agent=?1 AND id>coalesce((SELECT event_id FROM summary_cursors WHERE agent_id=?1),0) AND (kind IN ('thread.joined','thread.left') OR kind LIKE 'lock.%') AND (?2 IS NULL OR at<?2) ORDER BY id LIMIT 1",params![owner,deadline])?.pop() {
+            } else if let Some(change)=rows(&st.db,"SELECT id,kind,thread FROM events WHERE agent=?1 AND id>coalesce((SELECT event_id FROM summary_cursors WHERE agent_id=?1),0) AND kind LIKE 'lock.%' AND (?2 IS NULL OR at<?2) ORDER BY id LIMIT 1",params![owner,deadline])?.pop() {
                 Some(json!({"kind":"coordination","event":change["id"],"thread":change["thread"],"summary":format!("your {} update (event #{})",change["kind"].as_str().unwrap_or("coordination"),change["id"])}))
             } else {
                 rows(&st.db,"SELECT id FROM update_deliveries WHERE agent_id=?1 AND text IS NOT NULL ORDER BY id LIMIT 1",[owner])?.pop().filter(|_| deadline.is_none_or(|at| now()<at)).map(|receipt|

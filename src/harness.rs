@@ -606,15 +606,16 @@ fn codex_events(v: &Value) -> Vec<Event> {
             if context > 0 {
                 out.push(Event::Context(context));
             }
+            let limits = &payload["rate_limits"];
+            let bucket = limits["limit_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .unwrap_or("codex");
             for name in ["primary", "secondary"] {
-                let window = &payload["rate_limits"][name];
+                let window = &limits[name];
                 if let Some(used_pct) = window["used_percent"].as_f64() {
-                    let minutes = window["window_minutes"].as_u64();
-                    let win = minutes
-                        .map(|m| format!("{name} ({m}m)"))
-                        .unwrap_or_else(|| name.to_string());
                     out.push(Event::Usage {
-                        win,
+                        win: format!("{bucket} {name}"),
                         used_pct,
                         resets_at: window["resets_at"].as_i64(),
                     });
@@ -1055,8 +1056,36 @@ mod tests {
         ));
         assert!(matches!(&ev[1], Event::Context(71)));
         assert!(
-            matches!(&ev[2], Event::Usage { win, used_pct, resets_at: Some(123) } if win == "primary (300m)" && (*used_pct - 12.5).abs() < 1e-9)
+            matches!(&ev[2], Event::Usage { win, used_pct, resets_at: Some(123) } if win == "codex primary" && (*used_pct - 12.5).abs() < 1e-9)
         );
+    }
+
+    #[test]
+    fn codex_stream_windows_preserve_bucket_identity_not_duration_labels() {
+        for (bucket, minutes) in [("codex", 300), ("other-model", 10080)] {
+            let events = parse_line(
+                "codex",
+                &json!({
+                    "type":"event_msg","payload":{"type":"token_count","rate_limits":{
+                        "limit_id":bucket,
+                        "primary":{"used_percent":85,"window_minutes":minutes},
+                        "secondary":{"used_percent":20,"window_minutes":10080}
+                    }}
+                })
+                .to_string(),
+            );
+            let windows: Vec<_> = events
+                .into_iter()
+                .filter_map(|event| match event {
+                    Event::Usage { win, .. } => Some(win),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                windows,
+                [format!("{bucket} primary"), format!("{bucket} secondary")]
+            );
+        }
     }
 
     #[test]

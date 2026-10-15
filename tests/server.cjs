@@ -369,7 +369,17 @@ process.stdin.on('end', async () => {
   if (prompt.includes('CRASH_TEST') && !resume) { process.exitCode=1; return; }
   if (prompt.includes('REROUTE_TEST') && !resume) console.log(JSON.stringify({ type: 'model_reroute', from_model: 'gpt-6.1-sol', to_model: 'gpt-other', reason: 'high_risk_cyber_activity' }));
   if (prompt.includes('POLICY_TEST') && !resume) console.log(JSON.stringify({ type: 'turn.failed', error: { code: 'policy_violation', message: 'request blocked under the usage policy' } }));
-  if (prompt.includes('LIMIT_TEST') && !resume) console.log(JSON.stringify({type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
+  if (prompt.includes('LIMIT_TEST') && !resume) {
+    console.log(JSON.stringify(claude ? {type:'result',is_error:true,result:'Subscription usage limit reached'} : {type:'turn.failed',error:{code:'usage_limit_reached',message:'Subscription usage limit reached'}}));
+    process.exitCode=1; return;
+  }
+  if (task.includes('PERCENT_ONLY_TEST')) {
+    if(claude) console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:'allowed',unifiedWindows:{five_hour:{utilization:1}}}}));
+    else {
+      const file=path.join(process.env.CODEX_HOME,'sessions','2026','10','08','rollout-'+session+'.jsonl');
+      fs.appendFileSync(file,JSON.stringify({type:'event_msg',payload:{type:'token_count',rate_limits:{limit_id:'codex',primary:{used_percent:100,window_minutes:300}}}})+'\\n');
+    }
+  }
   if (prompt.includes('REFUSAL_OK_TEST')) console.log(JSON.stringify({type:'refusal',message:'Cannot complete this request'}));
   if (prompt.includes('UNSUPPORTED_TEST')) { console.log(JSON.stringify({type:'turn.failed',error:{message:JSON.stringify({error:{message:"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}})}})); process.exitCode=1;return; }
   if (['STARTUP_DIAGNOSTIC_TEST','STARTUP_DIAGNOSTIC_FAILURE_TEST','CYBER_FAILURE_TEST'].some(marker=>task.includes(marker))) console.log(JSON.stringify(${JSON.stringify(startupDiagnostic)}));
@@ -544,7 +554,7 @@ process.stdin.on('end', async () => {
       assert.ok(run.args.includes('--skip-git-repo-check'));
       assert.match(run.prompt, /messages wait until the user explicitly reopens/);
       assert.match(run.prompt, /# acom guide/);
-      assert.match(run.prompt, /Your agent ID is in `ACOM_ID`/);
+      assert.ok(run.prompt.includes(fs.readFileSync(path.resolve(__dirname,'../src/guide.md'),'utf8')),'launch includes the current complete guide');
       assert.match(run.prompt, /acom inbox/);
       assert.match(run.prompt, /acom lock acquire/);
       assert.match(run.prompt, new RegExp(`Lock TTL: maximum ${agent===one.id ? 900 : 60}s`));
@@ -1103,6 +1113,35 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,...waitProjects.map(p=>p.id),lifecycleProject.id,followupProject.id].sort((a,b)=>a-b));
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
     assert.equal(fs.existsSync(path.join(second, '.acom')), false);
+    // Percentages are not provider rejections. Exercise actual stream parsing
+    // and unsuccessful provider exits for both fake clients with no hard cap.
+    const uncapped=structuredClone(defaults);
+    uncapped.auto_resume=false; uncapped.usage_poll_secs=3600; uncapped.crash_retries={};
+    uncapped.limits.active={soft:null,hard:null};
+    for(const limits of [uncapped.limits.active_per_harness,uncapped.limits.usage]) for(const key of Object.keys(limits)) limits[key]={soft:null,hard:null};
+    await api('PUT',`/projects/${a.id}/config`,{custom:uncapped});
+    for(const harness of ['codex','claude']) {
+      const percent=await api('POST','/agents',{project:a.id,harness,task:'PERCENT_ONLY_TEST ordinary work'});
+      await finished(percent.id);
+      assert.equal((await api('GET',`/agents/${percent.id}`)).state,'closed',`${harness} reported100% must not synthesize a hard pause`);
+      assert.ok((await api('GET',`/limits?project=${a.id}`)).usage.some(row=>row.provider===harness && row.used_pct===100),`${harness} fake stream's100% reading was captured`);
+      const unknown=await api('POST','/agents',{project:a.id,harness,task:'CRASH_TEST unknown exit at100%'});
+      await until(async()=>(await api('GET',`/agents/${unknown.id}`)).state==='crashed',`${harness} unknown exit remains a crash`);
+      assert.equal((await api('GET',`/agents/${unknown.id}`)).pause_reason,null);
+      await api('POST',`/agents/${unknown.id}/close`,{});
+      const model=uncapped.harnesses[harness].model;
+      uncapped.crash_retries[model]={harness:harness==='codex'?'claude':'codex',model:harness==='codex'?'claude-sonnet-5-5':'gpt-6-luna',same_model_retries:1};
+      await api('PUT',`/projects/${a.id}/config`,{custom:uncapped});
+      const quota=await api('POST','/agents',{project:a.id,harness,task:'LIMIT_TEST explicit provider quota rejection'});
+      await until(async()=>(await api('GET',`/agents/${quota.id}`)).pause_reason==='limit',`${harness} quota interruption is not a crash`);
+      await new Promise(resolve=>setTimeout(resolve,2200));
+      const paused=await api('GET',`/agents/${quota.id}`);
+      assert.equal(paused.state,'paused'); assert.equal(paused.retry,null);
+      assert.equal(runs().filter(run=>run.id===quota.id).length,1,'quota must not consume configured crash retries');
+      await api('POST',`/agents/${quota.id}/close`,{});
+      uncapped.crash_retries={};
+      await api('PUT',`/projects/${a.id}/config`,{custom:uncapped});
+    }
     assert.equal(stderr.replace(/tick: database: TEST_REPLACEMENT_(OWNERSHIP|START)_FAILURE\n/g,''),'','only deliberately injected replacement persistence failures may reach stderr');
   } finally {
     await stop();

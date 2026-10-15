@@ -29,6 +29,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 - Alternatively, `--watch` accepts state/group selectors, not IDs or `user`, and cannot be combined with `--members`. Any selected state matches, AND any selected group; group-only watches default to `active`. Agent creation, state changes and group changes update membership atomically, recording joins/leaves and their reasons. A nonmatching owner is not pinned. Live `active` threads exclude done agents, so messages in them do not wake done agents; include `done` explicitly to do that. A done-only recipient leaves when waking into working, retaining the delivered message in its inbox without relabelling it as catch-up. Removal persists as an exclusion; the user or current owner can restore agents only when they match the filters.
 - To message one agent or a group, start a thread with them and post in it. Any number of threads can have the same members, so a new topic gets a new thread.
 - Joining/rejoining exposes earlier messages as catch-up without normal unread notifications or wake-ups. Personalized reads identify messages sent outside membership separately from their marks; reading does not change live membership. Thread reads include recent membership and ownership events.
+- Membership changes alone are passive: they do not resolve foreground/deferred waits or wake idle agents. They remain in history and hook/next-turn summaries, including live-filter changes caused by going idle. New messages from other members already notify working agents and wake idle ones without a subscription. Public reads without membership do not subscribe to messages.
 
 **Message.** Plain text, from an agent or from `user`. Each agent puts its own mark on each message in its threads:
 
@@ -40,7 +41,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 
 **Coordination history.** Durable structured events have monotonic IDs, timestamps, kind, actor, relevant agent/thread/lock and details. `agent.created` records a retained agent identity; `agent.turn-started` records a successfully started process, not a successful turn. `acom history` returns bounded JSON; agents default to their own events, `--all-agents` requests their project. Filters combine by agent/thread/lock/kind. Exclusive `before` or `after` event-ID cursors are positive and mutually exclusive. Defaults: 50 events / 16000 bytes; accepted limits: 1–200 events / 512–65536 bytes. One event is available with `acom history <ID>`. This is separate from provider conversation history. Lifecycle summaries at turn start and after membership/lock changes show only nonzero counts and point to history instead of repeating the log.
 
-**Lock.** A named lock that agents create when they need one, with a description of what it's for. Any number of locks, one holder each.
+**Lock.** A named cooperative reservation that agents create when needed, with an agreed description of what it protects. Any number of locks, one holder each; acom tracks ownership but does not prevent file writes. Agents should reuse agreed names, order multiple acquisitions consistently and avoid retaining a lock while waiting for work that needs it.
 
 - `acquire` takes the lock if it's free. If someone else holds it, it fails at once, or with `--wait` it queues (first come, first served) until it gets it or the wait runs out.
 - Every acquisition or renewal has a positive TTL, at most the project's `max_lock_ttl_secs` (default 900s). Omitted or null TTL uses that maximum; zero, negative, fractional or larger values are rejected. Acquiring a lock you already hold succeeds and restarts its TTL. Lowering the maximum shortens existing oversized or untimed leases to at most that much time remaining and notifies their holders. Increasing it never extends existing leases. This is a per-lease ceiling, not a total holding-time limit across renewals. Legacy held locks are bounded on the next tick.
@@ -75,11 +76,11 @@ Both harnesses run a hook after every tool call. acom uses it to tell a working 
 
 A long sender list is cut in the middle: `from agent 1, agent 2, agent 3, … agent 12, user`. An idle agent gets the same lines as the prompt that wakes it.
 
-`acom wait` receives ordinary notifications and selected events during the current working turn. `acom subscribe` instead registers persistent events that reach working hooks or wake an idle agent. `acom wait --idle --timeout <duration>` returns immediately with a one-shot deferred-wait ID: an ordinary notification (message, notice or own coordination change), selected event or deadline resolves it once. An early-resolution notice names its cause and says the timeout was canceled. The agent reads the receipt and any immediate update, then ends its turn normally without `acom done` if still waiting. Registration does not change lifecycle state until the worker exits or suspend shell/background commands; idle still counts as active and lock TTLs continue. Subscription events/deadlines do not wake done, paused, crashed, closed or replaced agents.
+`acom wait` receives ordinary notifications and selected events during the current working turn. `acom subscribe` instead registers persistent events that reach working hooks or wake an idle agent. `acom wait --idle --timeout <duration>` returns immediately with a one-shot deferred-wait ID: an ordinary notification (member message, notice, own lock update or pending event delivery), selected event or deadline resolves it once. Membership changes alone do not resolve waits. An early-resolution notice names its cause and says the timeout was canceled. The agent reads the receipt and any immediate update, then ends its turn normally without `acom done` if still waiting. Registration does not change lifecycle state until the worker exits or suspend shell/background commands; idle still counts as active and lock TTLs continue. Subscription events/deadlines do not wake done, paused, crashed, closed or replaced agents.
 
 All modes share event filters: `--agents all|IDs` selects project peers (`all` includes future agents, excludes self), `--states` filters destination states, and `--status-text` independently adds descriptive status changes. `--usage <provider> --window <raw name>` selects one `--above <percent>`, `--below <percent>`, `--reset` or `--reset-due` condition. Thresholds are strict; a qualifying latest known reading reports immediately, then only new crossings. Missing/unknown readings are not zero. `--reset` requires fresh observed rollover/recovery; `--reset-due` is an estimated deadline, not confirmation. Detection follows provider output/account checks. Agent and usage filters combine with OR. Persistent subscriptions require a filter; deferred waits need none.
 
-New ordinary-wait filters start now; repeat calls continue each filter's durable cursor. `acom agents --event-cursor` supplies a baseline for `--after` (requires `--agents`); explicitly repeating it rescans. Bounded deliveries replay unchanged by ID until acknowledged, before changed filters apply. Registration, matching, turn completion and notification consumption are serialized: matches consumed during work cannot also start a second turn, and arrivals before turn exit remain pending. Registrations, pending updates and IDs survive restart and transfer in true replacements. Cancellation stops future matches and withdraws undelivered updates, not already-issued immutable receipts.
+Peer watches select transitions, not current-state snapshots or messages. To avoid a check/register race, inspect `acom agents --event-cursor`, act if the condition already holds, otherwise register with its `--after` baseline (requires `--agents`). New ordinary-wait filters otherwise start now; repeat calls continue each filter's durable cursor, while explicitly repeating `--after` rescans. Bounded deliveries replay unchanged by ID until acknowledged, before changed filters apply. Registration, matching, turn completion and notification consumption are serialized: matches consumed during work cannot also start a second turn, and arrivals before turn exit remain pending. Registrations, pending updates and IDs survive restart and transfer in true replacements. Cancellation stops future matches and withdraws undelivered updates, not already-issued immutable receipts.
 
 Agents can inspect same-project waits/subscriptions; inaccessible private-message causes and IDs are redacted. The detector examines the latest 30 subscription wakes within 60 seconds for ordered causal cycles of 2–6 agents traversed three times, with bounded search and deduplicated warnings. Matches produce `coordination.suspected-loop` events, evidence IDs, notices and UI warnings. This is not general deadlock detection or proof of a mistaken loop; no automatic pause, unsubscribe, wake-rate cap or new policy setting is added. Agents should inspect peer dependencies and adjust their subscriptions when warned.
 
@@ -104,7 +105,7 @@ Every launched agent has subagents turned off (Claude Code: no `Agent`, `Workflo
 
 ## Limits
 
-Limits are part of each project's settings (see Settings) and apply to that project's agents. Each limit has a soft and a hard value, and either can be left unset (no limit). The soft value warns; the hard value acts.
+Limits are part of each project's settings (see Settings) and apply to that project's agents. Each limit has a soft and a hard value, and either can be left unset (no limit). The soft value warns; the hard value acts. An unset hard usage threshold imposes no acom percentage cutoff, including at 100%; explicit provider quota interruptions remain separate.
 
 | Limit | Soft | Hard |
 |---|---|---|
@@ -112,15 +113,17 @@ Limits are part of each project's settings (see Settings) and apply to that proj
 | **Subscription usage**, separate Claude five-hour/weekly/weekly Fable thresholds and Codex's highest window (in %) | Affected agents are told which window crossed its threshold | When any applicable window crosses its hard threshold, affected agents are paused. Their launches are refused and wakes wait in line while it's over; Fable's window doesn't block other Claude models |
 | **Context size**, per agent (tokens) | That agent is told its context is getting large | The harness auto-compacts at this size (Claude `--autocompact`, which takes 100k to 1M; Codex `model_auto_compact_token_limit`) |
 
-A subscription limit only affects that provider's agents: Claude hitting its limit doesn't pause Codex agents. The hard usage action happens when usage crosses the limit, so an agent you launch or resume past it afterwards keeps running: you've seen the warning and chosen to.
+A subscription limit only affects that provider's agents: Claude hitting its limit doesn't pause Codex agents. A user-confirmed launch or manual resume does not disable configured hard-limit enforcement on subsequent checks.
 
-Agents paused by a limit resume by themselves when usage is confirmed below the project's hard threshold and below 100%, and an active-agent slot is free. A setting turns that off, so they wait for you. An unknown reading or a passed reset timestamp is not confirmation. Quota checks run even when agents are paused: every 120 seconds by default (configurable 15–3600), and at reported reset times. Periodic checks find early/free resets; the reported time avoids an extra interval after a scheduled reset. Shared accounts use the shortest project's interval. Failed checks preserve the last reading and show an error; they don't wake agents blindly.
+Usage soft warnings are retained across restarts per agent and applicable scope: separate Claude windows, one aggregate Codex scope remembering offending raw windows. Fresh observations must show those windows and any current offenders strictly below the warned threshold (or a lower current soft threshold). Then one scoped clear notice is sent; other limits may still apply. Missing/failed checks, omitted windows, elapsed reset estimates or raising/removing thresholds alone do not establish recovery. A clear notice does not itself wake idle agents; an agent awaiting recovery can register an existing usage subscription/deferred wait before yielding.
 
-**The wake line.** Waking a done agent makes it active again, so it needs room under the hard limits. If there isn't any, the agent waits in line, the sender is told (`agent 5 wasn't woken: Hard limit reached: 1 active agents (soft none, hard 1). It will be woken when there's room.`), and the UI shows it waiting. Waiting agents are woken oldest first as soon as there's room; a new message never jumps the line. Idle agents already count as active, so they're always woken at once. Closed agents never enter the wake line until explicitly reopened.
+Agents paused by a configured hard limit resume automatically when confirmed readings satisfy the project's hard thresholds and an active-agent slot is free. A recognized provider quota interruption additionally requires fresh evidence that its affected usage is available, even without a configured hard threshold. A setting disables automatic resume. An unknown reading or a passed reset timestamp is not confirmation. Quota checks run even when agents are paused: every 120 seconds by default (configurable 15–3600), and at reported reset times. Periodic checks find early/free resets; the reported time avoids an extra interval after a scheduled reset. Shared accounts use the shortest project's interval. Failed checks preserve the last reading and show an error; they don't wake agents blindly.
+
+**The wake line.** Waking a done agent makes it active again, so it needs room under the hard limits. If there isn't any, the agent waits in line, the sender is told (`agent 5 wasn't woken: Hard limit reached: 1 active agents (soft none, hard 1). It will be woken when there's room.`), and the UI shows it waiting. Waiting agents are woken oldest first as soon as there's room; a new message never jumps the line. Idle agents already count as active but their wakes still respect applicable hard usage limits. Closed agents never enter the wake line until explicitly reopened.
 
 ## Crash recovery and model switches
 
-An unexpected process exit or harness-reported failed turn becomes a crash regardless of error wording. acom also guards against silent model substitutions:
+An unexpected process exit or harness-reported failed turn becomes a crash unless acom recognized a provider quota interruption or intentional stop. Usage at 100% alone does not classify an unexplained failure as quota exhaustion. acom also guards against silent model substitutions:
 
 - Claude agents run with `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` and `CLAUDE_CODE_NO_MODEL_FALLBACK=1`, so Claude Code doesn't switch models.
 - Codex has no switch for its safety reroute. acom treats a reported reroute as a failed turn, but cannot rule out a substitution Codex doesn't report.
@@ -153,7 +156,7 @@ An agent waiting in `lock acquire --wait` when it's paused leaves the queue.
 
 ## Commands
 
-`acom --help` and `acom guide` list commands in two groups, and state plainly: **agents never run user commands.**
+`acom --help` indexes agent commands and user controls; `acom guide` explains their boundaries: **agents never run user commands.**
 
 Agent commands use `ACOM_ID` to know who's calling, and act on the agent's project. User commands act on the project the current folder is in (the closest project folder at or above it); listings show every project when the folder isn't in one. Durations look like `30s`, `5m`, `1h`. Output is plain text; errors go to stderr with a non-zero exit code. If `send` gets no text argument, it reads stdin.
 
@@ -183,7 +186,10 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | `acom subscriptions [--agent ID]` / `acom subscription <ID>` | Bounded registration list or one record; same-project peer inspection is allowed |
 | `acom unsubscribe <ID>` | Cancel your own registration; the user can cancel any |
 | `acom inbox [--mark new\|in-progress\|handled]` | Your messages with that mark (default `new`) |
-| `acom read <msg ID>` | One message in full |
+| `acom read <msg ID>` | One bounded message record |
+| `acom notices [ID]` / `acom receipt <ID>` | Retained notices or a saved full command result, without repeating an action |
+| `acom activity [ID]` | Project-scoped activity or one record |
+| `acom log <own ID>` | Bounded raw-output byte chunks; peer logs are user-only |
 | `acom mark <msg ID,...> new\|in-progress\|handled` | Mark messages |
 | `acom locks` | List locks: name, description, holder, since, expires, stopping, queue |
 | `acom lock new <name> --about <text>` | Create a lock |
@@ -218,16 +224,17 @@ There's no authentication: the split is a convention, not a security boundary. W
 
 The launch guide covers:
 
-- your ID is in `ACOM_ID`; you never pass it; you only see your own project
+- `ACOM_ID` supplies caller identity automatically; agent-facing operations act on your project
 - your turn only ends when your process exits, so don't leave background tasks or monitors running
 - threads, picking members by ID or selector, starting a new thread per topic, marks, and reading messages when you're ready
 - the `[acom]` lines after tools, foreground waits, persistent event subscriptions and one-shot deferred waits; ending a turn normally makes an active agent idle for messages or registered triggers
 - locks: create, acquire with `--wait` and `--ttl`, renew by acquiring again, release; and that you may lose locks if you're paused
-- launching helpers through `acom launch` (there are no subagents), and handing over with `--done`
+- launching independent acom peers (harness-native subagent tools are disabled), and distinguishing `--done`, same-provider continuation and true replacement
 - limits, what soft and hard mean, that they may be unset, and the wake line
 - `acom done` when your task is finished, and that what happens next (closed or done) is in your briefing and `acom limits`
 - keep `--wait` shorter than your shell tool's timeout
-- the agent commands, and that agents never run user commands
+- automatic member messages versus explicit event filters, transition/snapshot races, acknowledgement versus work marks, passive membership changes, circular waits and wake-loop risks
+- generic examples are illustrations, not prescribed coordination workflows; agent commands are distinct from user controls
 
 ## UI
 
@@ -333,6 +340,8 @@ locks    (project, name, about, created_at, holder, acquired_at, expires_at, fro
 notices  (id, agent_id, text, at, shown)                -- what to tell an agent next, incl. lost locks
 usage    (provider, win, used_pct, resets_at, at)
 usage_checks (provider, checked_at, attempted_at, next_check, error, in_flight)
+usage_soft_warnings (agent_id, provider, scope, threshold, windows) -- warned usage scopes awaiting observed recovery
+agent_quota_blocks (agent_id, provider, win)          -- explicit provider interruption, not percentage enforcement
 activity (id, project, at, actor, what)                -- project NULL: about all projects
 events   (id, project, at, kind, actor, agent, thread, lock, details) -- coordination history
 summary_cursors (agent_id, event_id)                   -- lifecycle summary position

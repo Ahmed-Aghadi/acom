@@ -254,7 +254,6 @@ mod tests {
             queues: HashMap::new(),
             procs: HashMap::new(),
             reaped: HashSet::new(),
-            over_soft: HashSet::new(),
         }
     }
 

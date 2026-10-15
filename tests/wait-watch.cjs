@@ -163,3 +163,40 @@ test('wait watches integrate CLI cursors, live descriptors, stable ACKs and deta
     });
   });
 });
+
+test('foreground waits keep membership changes passive without consuming their summary', { timeout: 20000 }, async () => {
+  await fixture(async ({ api, db, until }) => {
+    const cursor = () => db.prepare('SELECT event_id FROM summary_cursors WHERE agent_id=1').get()?.event_id ?? 0;
+    const before = cursor();
+    const waiting = api('POST', '/wait/1', { timeout: 1 });
+    await until(async () => Boolean((await api('GET', '/agents/1')).waiting));
+    const fixed = await api('POST', '/threads', { project: 1, title: 'empty fixed roster', members: ['1'] });
+    await api('POST', `/threads/${fixed.id}/members/remove`, { members: ['1'] });
+    await api('POST', `/threads/${fixed.id}/members`, { members: ['1'] });
+    await api('POST', '/threads', { project: 1, title: 'empty live roster', watch: ['working'] });
+    assert.deepEqual(await waiting, { text: '', delivery_id: null, timed_out: true });
+    assert.equal(cursor(), before, 'a membership-only timeout must preserve unreported changes');
+    const summary = (await api('POST', '/hook/1', {})).text;
+    assert.match(summary, /Coordination: .*joined 3; left 1/);
+    assert.equal((await api('POST', '/hook/1', {})).text, '', 'hooks consume the summary once');
+
+    const next = api('POST', '/wait/1', { timeout: 5 });
+    await until(async () => Boolean((await api('GET', '/agents/1')).waiting));
+    await api('POST', `/threads/${fixed.id}/members/remove`, { members: ['1'] });
+    await api('POST', `/threads/${fixed.id}/members`, { members: ['1'] });
+    const message = await api('POST', '/messages', { thread: fixed.id, text: 'an actual request after joining' });
+    const result = await next;
+    assert.equal(result.timed_out, false);
+    assert.match(result.text, /1 new message.*user/);
+    assert.match(result.text, /Coordination: .*joined 1; left 1/);
+    assert.equal((await api('GET', `/messages/${message.id}?agent=1`)).mark, 'new');
+    await api('POST', '/wait/1/ack', { delivery_id: result.delivery_id });
+    assert.equal((await api('POST', '/hook/1', {})).text, '');
+    await api('POST', '/locks', { project: 1, name: 'wait-regression', about: 'preserve lock notifications' });
+    await api('POST', '/locks/acquire', { agent: 1, name: 'wait-regression' });
+    const lock = await api('POST', '/wait/1', { timeout: 1 });
+    assert.equal(lock.timed_out, false);
+    assert.match(lock.text, /Coordination: .*locks 1/);
+    await api('POST', '/wait/1/ack', { delivery_id: lock.delivery_id });
+  });
+});

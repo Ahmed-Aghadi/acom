@@ -53,6 +53,10 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   send --thread <TID> [text]              Post in a thread (stdin if text is left out)
   inbox [--mark new|in-progress|handled]  Your messages with that mark (default new)
   notices [ID]                            Retained notices / one full notice
+  receipt <ID>                            Full saved command result; never repeats the action
+  activity [ID]                           Project activity / one full activity record
+  log <ID> [--before BYTE | --after BYTE] [--through BYTE] [--version V] [--since R]
+           [--lines N] [--max-bytes N]    Bounded raw log chunks (JSON); agents only their own
   read <msg ID>                           One bounded message record
   mark <msg ID,...> new|in-progress|handled
   locks                                   List locks
@@ -66,11 +70,7 @@ User commands (they act on the project the current folder is in):
   serve [--port N]                        Run the server (default port 7400; data in ~/.acom)
   projects                                List projects
   project read <ID>                       One project's details
-  receipt <ID>                            Full saved command result; never repeats the action
-  activity [ID]                           Recent activity / one full activity record
   configs / config <ID>                  Config summaries / one config's details
-  log <ID> [--before BYTE | --after BYTE] [--through BYTE] [--version V] [--since R]
-           [--lines N] [--max-bytes N]    Lossless bounded agent log chunks (JSON)
   project add [path]                      Add a folder as a project (default: this folder)
   project remove <ID>                     Remove a project that has no agents
   launch ... [--force]                    Launch an agent in this folder's project (added if
@@ -88,6 +88,8 @@ Durations: 30s, 5m, 1h.
 Watch flags (wait and subscribe; agent and usage conditions combine with OR):
   --agents all|IDs [--states states] [--status-text] [--after EVENT_ID]
   --usage provider --window name (--above PERCENT | --below PERCENT | --reset | --reset-due)
+  Peer watches report transitions, not current states. Member messages already notify/wake you;
+  joining/leaving alone does not resolve waits or wake idle agents.
   Usage is polled; --reset is confirmed recovery, --reset-due is only the estimated deadline.
   --idle returns a wait ID immediately; finish the turn without `acom done`. It does not stop tools.
 
