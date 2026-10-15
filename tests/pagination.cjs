@@ -692,6 +692,172 @@ test('mutable collection cursors reject changed views and conditional reads stay
   });
 });
 
+test('agent filters search the whole project and return exact bounded facets', async t => {
+  await isolated(async ({ api, db, project, root }) => {
+    const states = new Map([[1, 'paused'], [2, 'crashed'], [3, 'working'], [4, 'idle'], [5, 'done'], [6, 'replaced'], [7, 'paused'], [8, 'working']]);
+    const records = Array.from({ length: 130 }, (_, index) => ({ id: index + 1, state: states.get(index + 1) || 'closed' }));
+    const matches = (record, category) => category === 'all'
+      || category === 'active' && ['working', 'idle'].includes(record.state)
+      || category === 'attention' && (['paused', 'crashed'].includes(record.state) || record.id === 9)
+      || category === 'finished' && ['done', 'closed', 'replaced'].includes(record.state);
+    const counts = rows => Object.fromEntries(['all', 'active', 'attention', 'finished'].map(category => [category, rows.filter(record => matches(record, category)).length]));
+    const longTask = `${'x'.repeat(900)} ÄäDeepNeedle 東京🙂`;
+    db(connection => {
+      connection.exec('BEGIN');
+      const update = connection.prepare('UPDATE agents SET state=?,grp=?,task=?,pause_reason=? WHERE id=?');
+      for (const record of records) update.run(record.state, record.id <= 8 ? 'facet' : 'team', record.id === 1 ? longTask : `${record.id <= 9 ? 'cohort ' : ''}task ${record.id}`, record.id === 7 ? 'restart' : null, record.id);
+      // A pending start is attention even when its terminal row is also finished.
+      connection.prepare('INSERT INTO agent_starts(agent_id,predecessor) VALUES(9,6)').run();
+      connection.exec('COMMIT');
+    });
+    await t.test('off-page categories traverse without skips, duplicates or oversized metadata', async () => {
+      const initial = await api('GET', `/agents?project=${project.id}&limit=2&max_bytes=65536`);
+      assert.deepEqual(initial.items.map(item => item.id), [130, 129]);
+      for (const category of ['all', 'active', 'attention', 'finished']) {
+        const page = await api('GET', `/agents?project=${project.id}&category=${category}&limit=3&max_bytes=512`, undefined, 200, 512);
+        assert.deepEqual(page.counts, counts(records));
+        assert.equal(page.total, counts(records)[category]);
+        assert.equal(page.project_total, 130);
+        assert.equal(typeof page.event_cursor, 'number');
+        assert.equal(page.items[0].truncated, true);
+      }
+      const attention = await collect(api, `/agents?project=${project.id}&category=attention`, { limit: 3, max_bytes: 512 });
+      assert.deepEqual(attention.items.map(item => item.id), records.filter(record => matches(record, 'attention')).map(record => record.id).reverse());
+      assert.deepEqual(attention.page.counts, counts(records));
+      const all = await collect(api, `/agents?project=${project.id}`, { limit: 7, max_bytes: 512 });
+      assert.deepEqual(all.items.map(item => item.id), records.map(record => record.id).reverse());
+      assert.deepEqual(all.page.counts, counts(records));
+    });
+    await t.test('Unicode case-insensitive search finds text beyond the task preview', async () => {
+      const page = await api('GET', params('/agents', { project: project.id, search: '  äädeepNEEDLE 東京🙂  ', max_bytes: 65536 }));
+      assert.deepEqual(page.items.map(item => item.id), [1]);
+      assert.equal(page.items[0].task_preview.length, 400);
+      assert.equal(page.items[0].task_preview.includes('Needle'), false);
+      assert.deepEqual(page.counts, counts(records.slice(0, 1)));
+      assert.equal(page.project_total, 130);
+      const detail = await complete(api, '/agents/1', 512);
+      assert.equal(detail.value.task, longTask);
+    });
+    await t.test('group and search constrain every facet, but category only constrains items', async () => {
+      for (const [group, search, selected] of [
+        [null, 'cohort', records.slice(1, 9)],
+        ['facet', '', records.slice(0, 8)],
+        ['facet', 'cohort', records.slice(1, 8)],
+        ['missing', '', []],
+      ]) for (const category of ['all', 'active', 'attention', 'finished']) {
+        const page = await api('GET', params('/agents', { project: project.id, group, search, category, limit: 2, max_bytes: 512 }), undefined, 200, 512);
+        assert.deepEqual(page.counts, counts(selected));
+        assert.equal(page.total, counts(selected)[category]);
+        assert.equal(page.project_total, 130);
+        assert.ok(page.items.every(item => selected.some(record => record.id === item.id && matches(record, category))));
+      }
+    });
+    await t.test('changing search, category or group rejects the previous view cursor', async () => {
+      const page = await api('GET', `/agents?project=${project.id}&limit=2&max_bytes=512`);
+      const cursor = { project: project.id, before: page.next_before, through: page.through, revision: page.revision, limit: 2, max_bytes: 512 };
+      for (const changed of [{ category: 'attention' }, { search: 'cohort' }, { group: 'facet' }]) {
+        await api('GET', params('/agents', { ...cursor, ...changed }), undefined, 409);
+      }
+      const same = await api('GET', params('/agents', { ...cursor, category: 'all', search: '   ' }), undefined, 200, 512);
+      assert.equal(same.items[0].id, page.items.at(-1).id - 1);
+      await api('GET', params('/agents', { project: project.id, category: 'invalid' }), undefined, 400);
+      await api('GET', params('/agents', { project: project.id, search: 'é'.repeat(2049) }), undefined, 400);
+    });
+    await t.test('global bulk-action counts include other projects while facets do not', async () => {
+      const otherDir = path.join(root, 'other-project');
+      fs.mkdirSync(otherDir);
+      const other = await api('POST', '/projects', { path: otherDir });
+      db(connection => {
+        connection.exec('BEGIN');
+        const insert = connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(?,?,'foreign cohort','facet','cohort task','codex','gpt-6-sol','medium',?,?,0,0)");
+        ['paused', 'paused', 'paused', 'working', 'idle', 'done'].forEach((state, index) => insert.run(131 + index, other.id, state, index < 2 ? 'restart' : state === 'paused' ? 'user' : null));
+        connection.exec('COMMIT');
+      });
+      const overview = await api('GET', `/overview?project=${project.id}`);
+      assert.equal(overview.project.id, project.id);
+      assert.deepEqual(overview.agent_counts, counts(records));
+      assert.equal(overview.restart_paused, 3);
+      assert.equal(overview.resume_eligible, 5);
+      assert.equal(overview.pause_eligible, 7);
+      const page = await api('GET', params('/agents', { project: project.id, group: 'facet', search: 'cohort', max_bytes: 512 }), undefined, 200, 512);
+      assert.deepEqual(page.counts, counts(records.slice(1, 8)));
+      assert.equal(page.project_total, 130);
+      const all = await api('GET', '/agents?max_bytes=512', undefined, 200, 512);
+      assert.equal(all.project_total, 136);
+    });
+  });
+});
+
+test('runtime waits invalidate agent views and remain visible in bounded stubs', async t => {
+  await isolated(async ({ api, db, project }) => {
+    db(connection => connection.prepare("UPDATE agents SET state='working',name=?,task=? WHERE id=130").run('large waiting agent '.repeat(100), 'large task '.repeat(100)));
+    const before = await api('GET', `/agents?project=${project.id}&limit=1&max_bytes=65536`);
+    const oldOverview = await api('GET', `/overview?project=${project.id}`);
+    const eventsBefore = db(connection => connection.prepare('SELECT coalesce(max(id),0) AS id FROM events').get().id);
+    let pending;
+    try {
+      pending = api('POST', '/wait/130', { timeout: 30, agents: [1, 2], states: ['crashed', 'done'], status_text: true });
+      let waiting;
+      await until(async () => {
+        waiting = await api('GET', `/agents?project=${project.id}&limit=1&max_bytes=65536`);
+        return waiting.items[0].is_waiting;
+      }, 'working fixture entered foreground wait');
+      await t.test('full list and detail expose the same runtime watch and timeout', async () => {
+        const item = waiting.items[0];
+        assert.equal(item.state, 'working');
+        assert.deepEqual(item.waiting.agents, [1, 2]);
+        assert.deepEqual(item.waiting.states, ['crashed', 'done']);
+        assert.equal(item.waiting.status_text, true);
+        assert.equal(item.waiting.expires_at - item.waiting.started_at, 30);
+        assert.ok(item.waiting.remaining_secs > 0 && item.waiting.remaining_secs <= 30);
+        const detail = await api('GET', '/agents/130?max_bytes=65536');
+        assert.ok(detail.waiting, 'detail exposes the full wait descriptor, not the collection-only stub flag');
+        assert.equal(detail.waiting.started_at, item.waiting.started_at);
+        assert.equal(detail.waiting.expires_at, item.waiting.expires_at);
+      });
+      await t.test('small stubs preserve waiting state and full details are recoverable', async () => {
+        const page = await api('GET', `/agents?project=${project.id}&limit=1&max_bytes=512`, undefined, 200, 512);
+        assert.equal(page.items[0].id, 130);
+        assert.equal(page.items[0].truncated, true);
+        assert.equal(page.items[0].is_waiting, true);
+        assert.equal(page.items[0].state, 'working');
+        const detail = await api('GET', '/agents/130?max_bytes=512', undefined, 200, 512);
+        assert.equal(detail.truncated, true);
+        await new Promise(resolve => setTimeout(resolve, 1100));
+        const chunk = await api('GET', params('/agents/130', { offset: 0, version: detail.version, max_bytes: 512 }), undefined, 200, 512);
+        assert.equal(chunk.version, detail.version, 'a running countdown must not invalidate a pinned detail chunk');
+      });
+      await t.test('runtime-only transitions invalidate list and overview revisions', async () => {
+        assert.equal(db(connection => connection.prepare('SELECT coalesce(max(id),0) AS id FROM events').get().id), eventsBefore, 'waiting is not a fabricated lifecycle event');
+        assert.notEqual(waiting.revision, before.revision);
+        const fresh = await api('GET', params('/agents', { project: project.id, since: before.revision, limit: 1, max_bytes: 512 }), undefined, 200, 512);
+        assert.notEqual(fresh.unchanged, true);
+        await api('GET', params('/agents', { project: project.id, before: before.next_before, through: before.through, revision: before.revision }), undefined, 409);
+        const overview = await api('GET', params('/overview', { project: project.id, since: oldOverview.revision }));
+        assert.notEqual(overview.unchanged, true);
+        assert.notEqual(overview.revisions.agents, oldOverview.revisions.agents);
+      });
+      await api('POST', '/agents/1/status', { text: 'Release foreground wait fixture' });
+      const result = await pending;
+      pending = null;
+      assert.equal(result.timed_out, false);
+      assert.match(result.text, /Release foreground wait fixture/);
+      await api('POST', '/wait/130/ack', { delivery_id: result.delivery_id });
+      const after = await api('GET', `/agents?project=${project.id}&limit=1&max_bytes=65536`);
+      assert.equal(after.items[0].is_waiting, false);
+      assert.equal(after.items[0].waiting, null);
+      assert.equal(after.items[0].state, 'working');
+      assert.notEqual(after.revision, waiting.revision);
+    } finally {
+      if (pending) {
+        await api('POST', '/agents/1/status', { text: 'Release foreground wait fixture' });
+        await pending.catch(() => {});
+      }
+      db(connection => connection.prepare("UPDATE agents SET state='closed',pid=NULL WHERE id=130").run());
+    }
+  });
+});
+
 test('large detail types and agent logs remain recoverable without providers', async t => {
   await isolated(async ({ api, db, home, project, projectDir }) => {
     const longText='漢🙂"\\\n'.repeat(2000);

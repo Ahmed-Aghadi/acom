@@ -41,16 +41,19 @@ async function fixture(run) {
   const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
   const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > (data.reads[t.id] || 0)).length : 0;
   const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,16);
+  const agentCategory = (agent, category) => category==='active' ? ['working','idle'].includes(agent.state) : category==='attention' ? ['paused','crashed'].includes(agent.state)||!!(agent.stopping||agent.wake_queued_at||agent.replacement_start||agent.replacement_start_pending) : category==='finished' ? ['done','closed','replaced'].includes(agent.state) : true;
+  const agentCounts = agents => Object.fromEntries(['all','active','attention','finished'].map(category=>[category,agents.filter(agent=>agentCategory(agent,category)).length]));
+  const globalEligible = () => ({pause_eligible:data.agents.filter(agent=>['working','idle','done'].includes(agent.state)).length,resume_eligible:data.agents.filter(agent=>agent.state==='paused').length});
   const projectRows = () => data.projects.map(p => ({...p, agents:data.agents.filter(a => a.project === p.id).length, active:data.agents.filter(a => a.project === p.id && ['working','idle'].includes(a.state)).length, unread:data.threads.filter(t => t.project === p.id).reduce((n,t) => n + unread(t),0)}));
   const collection = (key, project) => {
     if (key === 'projects') return projectRows();
     if (key === 'configs') return configs();
     if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,owner:t.owner ?? t.created_by ?? 0,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
-    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,stopping:!!a.stopping,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task,problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
+    if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,stopping:!!a.stopping,is_waiting:!!a.waiting,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task?.slice(0,400),problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
     if (key === 'locks') return (data.locks || []).filter(lock=>lock.project == null || lock.project === project).map((lock,i)=>({id:i+1,...lock,holder_stopping:!!(lock.holder && (lock.holder_stopping || data.agents.find(agent=>agent.id===lock.holder)?.stopping))}));
     return (data[key] || []).filter(row => row.project == null || row.project === project).map((row,i) => ({id:i+1,...row}));
   };
-  const revision = (key, project) => hash([key,['projects','configs'].includes(key)?null:project,collection(key,project)]);
+  const revision = (key, project) => hash([key,['projects','configs'].includes(key)?null:project,collection(key,project),key==='agents'?data.agents.filter(agent=>agent.project===project):null]);
   function paged(rows, params, rev, snapshot = true) {
     const limit = Math.min(Number(params.get('limit') || 50),data.pageLimit || 200), budget = Number(params.get('max_bytes') || 16000);
     if (snapshot && params.has('revision') && params.get('revision') !== rev) return {error:'collection changed; restart paging',status:409};
@@ -64,7 +67,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -105,9 +108,9 @@ async function fixture(run) {
       const revisions = Object.fromEntries(['projects','configs','agents','threads','locks','activity'].map(key => [key,revision(key,project?.id)]));
       revisions.settings=hash([data.projects,configs()]);
       const restartPaused=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart').length;
-      const rev=hash([revisions,data.usage,data.checks,restartPaused]);
+      const rev=hash([revisions,data.usage,data.checks,restartPaused,globalEligible(),data.unknownGlobalCounts]);
       if(params.get('since')===rev) return send({unchanged:true,revision:rev});
-      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),restart_paused:restartPaused, limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
+      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),restart_paused:restartPaused,...(data.unknownGlobalCounts?{}:globalEligible()),agent_counts:agentCounts(data.agents.filter(agent=>agent.project===project?.id)), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
     }
     if(req.method==='GET' && pathname==='/catalog') return send(bounded(catalog,params));
     if(req.method==='GET' && pathname==='/settings') {
@@ -117,7 +120,20 @@ async function fixture(run) {
     }
     if(req.method==='GET' && /^\/(projects|configs|agents|threads|locks|activity)$/.test(pathname)) {
       const key=pathname.slice(1),project=Number(params.get('project')) || data.projects[0]?.id;
+      if(key==='agents') {
+        const category=params.get('category')||'all', search=(params.get('search')||'').trim().toLowerCase();
+        const matched=data.agents.filter(agent=>agent.project===project&&[agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].join(' ').toLowerCase().includes(search));
+        const ids=new Set(matched.filter(agent=>agentCategory(agent,category)).map(agent=>agent.id));
+        const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search]));
+        return send(result.error||result.unchanged ? result : {...result,counts:agentCounts(matched),project_total:data.agents.filter(agent=>agent.project===project).length});
+      }
       return send(paged(collection(key,project),params,revision(key,project),key!=='activity'));
+    }
+    if(req.method==='GET' && pathname==='/history') {
+      const selected=(data.history || []).filter(event=>(!params.has('agent')||event.agent===Number(params.get('agent')))&&(!params.has('kind')||event.kind===params.get('kind'))&&(!params.has('before')||event.id<Number(params.get('before')))&&(!params.has('after')||event.id>Number(params.get('after')))).sort((a,b)=>params.has('after')?a.id-b.id:b.id-a.id);
+      if(data.historyFailure)return send({status:503,error:'History offline'});
+      const events=selected.slice(0,Number(params.get('limit')||30));
+      return send({events,has_more:events.length<selected.length,next_before:params.has('after')?null:events.at(-1)?.id??null,next_after:params.has('after')?events.at(-1)?.id??null:null});
     }
     if(req.method==='GET' && /^\/(projects|configs|locks|activity)\/\d+$/.test(pathname)) {
       const [key,id]=pathname.slice(1).split('/'),project=Number(params.get('project')) || data.projects[0]?.id;
@@ -253,7 +269,11 @@ async function fixture(run) {
         while(start<end && (raw[start]&0xc0)===0x80)start++;
         while(end>start && end<total && (raw[end]&0xc0)===0x80)end--;
         value={text:raw.subarray(start,end).toString('utf8'),start,end,total_bytes:ceiling,next_before:start,next_after:end,has_more:params.has('after')?end<ceiling:start>0,eof:end===ceiling,version,revision:rev,start_partial:false,end_partial:false};
-      } else value=bounded({...data.agents.find(a=>a.id===id)},params);
+      } else {
+        const agent={...data.agents.find(a=>a.id===id)};
+        if(agent.waiting) {agent.waiting={...agent.waiting};delete agent.waiting.remaining_secs;}
+        value=bounded(agent,params);
+      }
       if (data.detailDelay) await new Promise(resolve => setTimeout(resolve, data.detailDelay));
       if (data.detailFailure) { res.statusCode = 503; return send({ error: 'Offline' }); }
       return send(value);
@@ -2607,13 +2627,13 @@ test('a mutable collection changing during Load more restarts a consistent windo
   data.pageLimit=2; data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:`Agent ${i+1}`,state:'working'}));
   await manualPolling(page); await reloadPage(page);
   const pending=await holdRequest(page,url=>url.pathname==='/agents'&&url.searchParams.get('before')==='5','GET');
-  await page.locator('#page-overview [data-more=agents]').click(); await pending.started;
+  await page.locator('#page-overview [data-more=agentBrowser]').click(); await pending.started;
   data.agents=data.agents.filter(a=>a.id!==5); data.agents.find(a=>a.id===2).name='Updated agent 2';
   pending.release(); await pending.remove();
   await page.waitForFunction(()=>document.querySelectorAll('[data-agent]').length===5);
   assert.deepEqual(await page.locator('[data-agent]').evaluateAll(nodes=>nodes.map(n=>Number(n.dataset.agent))),[6,4,3,2,1]);
   assert.match(await page.locator('[data-agent="2"]').textContent(),/Updated agent 2/);
-  assert.equal(await page.locator('#agent-count').textContent(),'5 total');
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 5 of 5 matches · 5 total');
 }));
 
 test('oversized UTF-8 message and config chunks stay lossless and incomplete text is not acknowledged', async () => fixture(async (page,data) => {
@@ -2994,8 +3014,9 @@ test('Pause all confirms stop-and-release scope, can be cancelled and stays sing
   assert.equal(await page.locator('#pause-all').isDisabled(),true);
   await page.evaluate(()=>document.querySelector('#pause-all').click());
   held.release(); await held.remove();
-  await page.waitForFunction(()=>!document.querySelector('#pause-all').disabled);
-  assert.deepEqual(confirmations,Array(2).fill('Pause all agents in all projects, stop their processes, and release every held lock?'));
+  await page.waitForFunction(()=>!pausingAll);
+  assert.equal(await page.locator('#pause-all').isDisabled(),true);
+  assert.deepEqual(confirmations,Array(2).fill('Pause all eligible agents in all projects, stop their processes, and release every held lock?'));
   assert.deepEqual(data.requests,[{url:'/pause-all',method:'POST',body:{}}]);
   assert.ok(data.locks.every(lock=>lock.holder===null));
   assert.deepEqual(data.agents.map(a=>a.pause_reason),['all','all','user']);
@@ -3115,6 +3136,7 @@ test('pending first startup uses replacement-specific suspended actions and allo
   await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Model and effort saved');
   assert.equal(data.requests[0].body.model,'gpt-6-luna');
   assert.equal(Object.hasOwn(data.requests[0].body,'continuation'),false);
+  await page.waitForFunction(()=>!refreshPending&&agentLoading===null&&document.querySelector('#agent-config').dataset.saving!=='true');
   Object.assign(data.agents[0],{state:'crashed',replacement_start:null,replacement_start_pending:false,problem:'First provider start failed',pause_reason:null});
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#agent-details dt[data-key=replacement_start]').count(),0);
@@ -3133,7 +3155,7 @@ test('bounded agent stubs retain replacement badges and links and Details hydrat
     {id:3,project:1,name:large,state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement:2},
   ];
   await manualPolling(page); await reloadPage(page);
-  while(await page.locator('#page-overview [data-more=agents]').isVisible()) {await page.locator('#page-overview [data-more=agents]').click();await page.waitForFunction(()=>!state.pages.agents.pending);}
+  while(await page.locator('#page-overview [data-more=agentBrowser]').isVisible()) {await page.locator('#page-overview [data-more=agentBrowser]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending);}
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Replacement pending.*See Details for the replacement target and reason/s);
   assert.match(await page.locator('[data-agent="2"]').textContent(),/Replacement waiting.*See Details for the startup reason/s);
   assert.doesNotMatch(await page.locator('#agents').textContent(),/undefined/);
@@ -3210,7 +3232,7 @@ test('Resume restart-paused uses an exact all-project count and leaves manual an
   assert.equal(await button.textContent(),'Resume restart-paused (0 · all projects)');
   assert.equal(await button.isDisabled(),true);
   assert.equal(await page.locator('#project-select').inputValue(),'1','global resume does not change the selected project');
-  assert.equal(await page.locator('#resume-all').textContent(),'Resume all');
+  assert.equal(await page.locator('#resume-all').textContent(),'Resume all (2 · all projects)');
 }));
 
 test('restart-paused counts refresh across projects without disturbing selected text and disable an empty action', async () => fixture(async (page,data) => {
@@ -3306,31 +3328,223 @@ test('workspace agent search combines with accessible state filters and preserve
   ];
   await manualPolling(page); await reloadPage(page);
   const ids=()=>page.locator('#agents [data-agent]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.agent)).sort((a,b)=>a-b));
-  assert.deepEqual(await ids(),[1,2,3,4,5,6,7,8,9]);
+  const expectIds=async expected=>{
+    await page.waitForFunction(()=>!agentSearchTimer&&state.pages.agentBrowser?.scope===collectionPath('agentBrowser')&&!!state.pages.agentBrowser.revision&&!state.pages.agentBrowser.pending);
+    assert.deepEqual(await ids(),expected);
+  };
+  await expectIds([1,2,3,4,5,6,7,8,9]);
   for(const [filter,expected] of [['active',[1,4,7]],['attention',[2,5,6,7]],['finished',[3,6,8,9]],['all',[1,2,3,4,5,6,7,8,9]]]) {
     await page.locator(`[data-agent-filter=${filter}]`).click();
-    assert.deepEqual(await ids(),expected);
+    await expectIds(expected);
     assert.equal(await page.locator('[data-agent-filter][aria-pressed=true]').count(),1);
     assert.equal(await page.locator(`[data-agent-filter=${filter}]`).getAttribute('aria-pressed'),'true');
   }
   const search=page.locator('#agent-search');
   assert.ok(await search.getAttribute('aria-label') || await search.evaluate(el=>el.labels?.length));
   await search.fill('REVIEW');
-  assert.deepEqual(await ids(),[1,2,3]);
+  await expectIds([1,2,3]);
   await page.locator('[data-agent-filter=active]').click();
-  assert.deepEqual(await ids(),[1]);
+  await expectIds([1]);
   await search.fill('Beta');
-  assert.deepEqual(await ids(),[]);
+  await expectIds([]);
   assert.match(await page.locator('#agents').textContent(),/no .*match/i);
   await page.evaluate(()=>refresh());
   assert.equal(await search.inputValue(),'Beta');
   assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');
   await page.locator('[data-agent-filter=attention]').click();
-  assert.deepEqual(await ids(),[2]);
+  await expectIds([2]);
   await search.fill('');
   await page.locator('[data-agent-filter=all]').click();
-  assert.deepEqual(await ids(),[1,2,3,4,5,6,7,8,9]);
+  await expectIds([1,2,3,4,5,6,7,8,9]);
   assert.equal(data.requests.length,0,'search and filters never change agent state');
+}));
+
+test('server facets and search include off-page agents and full tasks while pickers keep their unfiltered scope', async () => fixture(async (page,data) => {
+  data.pageLimit=1;
+  data.agents=Array.from({length:30},(_,i)=>({id:i+1,project:1,name:`Worker ${i+1}`,state:'closed'}));
+  for(const [id,state] of [[1,'working'],[2,'idle'],[3,'paused'],[4,'crashed'],[5,'done'],[6,'replaced'],[8,'working'],[9,'idle'],[10,'done']])data.agents[id-1].state=state;
+  data.agents[0].task='Earlier task content. '.repeat(30)+'Deep NeedLe%_ result';
+  data.agents[7].stopping=true; data.agents[8].wake_queued_at=1;
+  data.agents[9].replacement_start={predecessor:5,attempted:0};
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(await page.locator('#agents [data-agent]').count(),1);
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 30 matches · 30 total');
+  for(const [key,count] of [['all',30],['active',4],['attention',5],['finished',24]])assert.equal(await page.locator(`[data-agent-count=${key}]`).textContent(),String(count));
+  assert.equal(await page.locator('.stat.attention .stat-value').textContent(),'5');
+  await page.locator('[data-agent-filter=attention]').click();
+  await page.waitForFunction(()=>state.pages.agentBrowser?.counts?.attention===5&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===10);
+  assert.equal(await page.locator('#agents [data-agent]').count(),1,'a category change loads only its first bounded page');
+  await page.locator('#agent-search').fill('needle%_');
+  await page.waitForFunction(()=>!agentSearchTimer&&state.pages.agentBrowser?.counts?.all===1&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 0 of 0 matches · 30 total');
+  assert.equal(await page.locator('[data-agent-count=active]').textContent(),'1');
+  assert.equal(await page.locator('[data-agent-count=attention]').textContent(),'0');
+  await page.locator('[data-agent-filter=active]').click(); await page.locator('#agents [data-agent="1"]').waitFor();
+  assert.doesNotMatch(await page.locator('#agents').textContent(),/needle%_/i,'the server searched beyond the displayed task preview');
+  assert.deepEqual(await page.evaluate(()=>state.agents.map(agent=>agent.id)),[30]);
+  assert.equal(await page.locator('.stat.attention .stat-value').textContent(),'5','project summary is not narrowed by browser search');
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
+  assert.deepEqual(await page.locator('#thread-member-picker [name=member]').evaluateAll(nodes=>nodes.map(node=>Number(node.value))),[30]);
+  assert.equal(data.requests.length,0);
+}));
+
+test('debounced searches discard old pages after query and project switches without fetching every agent', async () => fixture(async (page,data) => {
+  data.pageLimit=1; data.agents=[{id:1,project:1,name:'Old target',state:'idle'},{id:2,project:1,name:'New target',state:'idle'},{id:3,project:2,name:'New elsewhere',state:'idle'}];
+  await manualPolling(page); await reloadPage(page);
+  const pending=await holdRequest(page,url=>url.pathname==='/agents'&&url.searchParams.get('search')==='old','GET');
+  await page.locator('#agent-search').fill('o'); await page.locator('#agent-search').fill('ol'); await page.locator('#agent-search').fill('old'); await pending.started;
+  await page.locator('#agent-search').fill('new');
+  await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===2&&!state.pages.agentBrowser.pending);
+  await page.locator('#project-select').selectOption('2'); await page.locator('#agents [data-agent="3"]').waitFor();
+  pending.release(); await pending.remove(); await page.waitForTimeout(100);
+  assert.deepEqual(await page.locator('#agents [data-agent]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.agent))),[3]);
+  assert.equal(await page.locator('#agent-search').inputValue(),'new');
+  const searches=data.getRequests.filter(url=>url.startsWith('/agents?')).map(url=>new URL(url,'http://test').searchParams.get('search'));
+  assert.equal(searches.filter(value=>value==='old').length,1);
+  assert.equal(searches.filter(value=>value==='o'||value==='ol').length,0);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/agents?')&&url.includes('before=')).length,0);
+  assert.equal(data.requests.length,0);
+}));
+
+test('server-classified oversized agents stay in filtered results and expose waiting without eager detail hydration', async () => fixture(async (page,data) => {
+  const now=Math.floor(Date.now()/1000);
+  data.agents=[{id:1,project:1,name:'Large queued '.repeat(1800),state:'idle',wake_queued_at:1},{id:2,project:1,name:'Large waiting '.repeat(1800),state:'working',waiting:{started_at:now,expires_at:now+30,remaining_secs:30,agents:'all',states:['idle'],status_text:true}}];
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('#agents [data-agent="2"]').textContent(),/Waiting for notifications.*See Details/);
+  assert.equal(data.detailRequests.length,0);
+  await page.locator('[data-agent-filter=attention]').click(); await page.locator('#agents [data-agent="1"]').waitFor();
+  assert.equal(await page.locator('#agents [data-agent]').count(),1);
+  assert.equal(await page.locator('[data-agent-count=attention]').textContent(),'1');
+  assert.equal(data.detailRequests.length,0,'the server classification does not require searchable preview fields');
+  await page.locator('[data-agent-filter=active]').click(); await page.locator('#agents [data-agent="2"]').waitFor();
+  await page.locator('#agents [data-agent="2"] [data-action=details]').click();
+  await page.waitForFunction(()=>document.querySelector('#agent-details dd [data-wait-agent="2"]'));
+  assert.match(await page.locator('#agent-details').textContent(),/Waiting for notifications.*\d+s left.*all project agents.*states: idle.*status changes/);
+}));
+
+test('notification waits retain working state and use a monotonic selection-safe countdown', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Watching',state:'working',waiting:{started_at:100,expires_at:200,remaining_secs:5,agents:[2],states:['idle','crashed'],status_text:true}},{id:2,project:1,name:'Watched',state:'closed'}];
+  await manualPolling(page); await reloadPage(page);
+  const wait=page.locator('#agents [data-agent="1"] .agent-wait');
+  assert.match(await wait.textContent(),/5s left.*agents #2.*states: idle, crashed.*status changes/);
+  assert.equal(await page.locator('#agents [data-agent="1"] .agent-name .pill').textContent(),'working');
+  await page.evaluate(()=>{window.waitRow=document.querySelector('#agents [data-agent="1"]');const original=Date.now;Date.now=()=>original()+86400000;});
+  await page.waitForTimeout(1100);
+  await page.evaluate(()=>updateWaitTimers());
+  assert.match(await wait.textContent(),/[34]s left/);
+  const selected=await selectText(page,'#agents [data-agent="1"] .agent-wait');
+  await page.waitForTimeout(1100); await page.evaluate(()=>updateWaitTimers());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  data.agents[0].waiting.remaining_secs=2; await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>window.waitRow===document.querySelector('#agents [data-agent="1"]')),true,'countdown updates do not rebuild the agent row');
+  await page.locator('#agents [data-agent="1"] [data-action=details]').click();
+  await page.waitForFunction(()=>document.querySelector('#agent-details dd [data-wait-agent="1"]'));
+  assert.equal(data.agents[0].state,'working');
+  data.agents[0].waiting=null; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agents [data-agent="1"] .agent-wait').count(),0);
+  assert.equal(await page.locator('#agent-details dd [data-wait-agent="1"]').count(),0);
+}));
+
+test('slow chunked waiting details stay version-stable and calibrate their timeout from HTTP Date rather than the browser clock', async () => fixture(async (page,data) => {
+  const now=Math.floor(Date.now()/1000);
+  data.agents=[{id:1,project:1,name:'Oversized waiting agent '.repeat(2000),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',waiting:{started_at:now,expires_at:now+30,remaining_secs:30,agents:'all',states:['idle'],status_text:true}}];
+  await manualPolling(page); await page.addInitScript(()=>{const original=Date.now;Date.now=()=>original()+864000000;}); await reloadPage(page);
+  assert.equal(await page.evaluate(()=>waitingClocks.has(1)),false,'the bounded list preview carries only is_waiting');
+  const pending=await holdRequest(page,url=>url.pathname==='/agents/1'&&url.searchParams.get('offset')==='0','GET');
+  await page.locator('[data-action=details]').click(); await pending.started;
+  data.agents[0].waiting.remaining_secs=28; await page.waitForTimeout(1100);
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>document.querySelector('#agent-details dd [data-wait-agent="1"]'));
+  const text=await page.locator('#agent-details dd [data-wait-agent="1"]').textContent(), remaining=Number.parseInt(text,10);
+  assert.ok(remaining>10&&remaining<=30,`server-calibrated timeout, got ${text}`);
+  assert.equal(await page.evaluate(()=>waitingClocks.get(1).waiting.remaining_secs),undefined,'chunkable details contain only stable absolute fields');
+  assert.equal(data.detailRequests.filter(url=>url==='/agents/1').length,1,'there was no version-change restart');
+  assert.ok(data.detailRequests.some(url=>url.startsWith('/agents/1?offset=')));
+  assert.equal(data.requests.length,0);
+}));
+
+test('typed log timestamps render locally while raw bytes, multiline chunks and selections remain intact', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Logged',state:'idle'}];
+  data.agentLogs[1]=Array.from({length:30},(_,i)=>`[2026-10-15T12:34:${String(i).padStart(2,'0')}Z] [${i%2?'tool':'message'}] Entry ${i} ${'☃ text '.repeat(130)}\nContinuation ${i}`);
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click(); await page.locator('#agent-log').filter({hasText:'Entry 29'}).waitFor();
+  while(await page.locator('#log-older').isVisible()) {await page.locator('#log-older').click();await page.waitForFunction(()=>!logLoading&&!document.querySelector('#log-older').disabled);}
+  const raw=data.agentLogs[1].join('\n');
+  assert.equal(await page.evaluate(()=>agentLog.text),raw);
+  assert.equal(await page.evaluate(()=>agentLog.end),Buffer.byteLength(raw));
+  const expected=await page.evaluate(raw=>raw.replace(/^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\] /gm,(_,iso)=>`[${new Date(iso).toLocaleString()}] `),raw);
+  assert.equal(await page.locator('#agent-log').textContent(),expected);
+  assert.match(await page.locator('#agent-log').textContent(),/\[tool\] Entry 29.*\nContinuation 29/);
+  const selected=await selectText(page,'#agent-log');
+  data.agentLogs[1].push('[2026-10-15T12:35:00Z] [error] Later failure'); await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.locator('#agent-log').textContent(),expected);
+  await page.evaluate(()=>getSelection().removeAllRanges()); await page.evaluate(()=>refresh());
+  assert.match(await page.locator('#agent-log').textContent(),/\[error\] Later failure$/);
+  assert.equal((await page.locator('#agent-log').textContent()).split('Entry 0 ').length-1,1);
+}));
+
+test('all-project Pause and Resume counts remain exact across pages and project switches and disable zero or unknown totals', async () => fixture(async (page,data) => {
+  data.pageLimit=1; data.agents=[{id:1,project:1,state:'working'},{id:2,project:2,state:'idle'},{id:3,project:2,state:'done'},{id:4,project:1,state:'paused',pause_reason:'limit'},{id:5,project:2,state:'paused',pause_reason:'restart'},{id:6,project:2,state:'crashed'},{id:7,project:1,state:'closed'},{id:8,project:1,state:'replaced'}];
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(await page.locator('#pause-all-count').textContent(),'(3 · all projects)');
+  assert.equal(await page.locator('#resume-all-count').textContent(),'(2 · all projects)');
+  assert.equal(await page.locator('#restart-paused-count').textContent(),'(1 · all projects)');
+  await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  assert.equal(await page.locator('#pause-all-count').textContent(),'(3 · all projects)');
+  assert.equal(await page.locator('#resume-all-count').textContent(),'(2 · all projects)');
+  data.unknownGlobalCounts=true; await page.evaluate(()=>refresh());
+  for(const action of ['pause','resume']) {assert.equal(await page.locator(`#${action}-all`).isDisabled(),true);assert.equal(await page.locator(`#${action}-all-count`).textContent(),'(checking · all projects)');}
+  await page.locator('#pause-all').dispatchEvent('click'); await page.locator('#resume-all').dispatchEvent('click');
+  data.unknownGlobalCounts=false; for(const agent of data.agents)agent.state='closed'; await page.evaluate(()=>refresh());
+  for(const action of ['pause','resume']) {assert.equal(await page.locator(`#${action}-all`).isDisabled(),true);assert.equal(await page.locator(`#${action}-all-count`).textContent(),'(0 · all projects)');}
+  assert.equal(data.requests.length,0);
+}));
+
+test('lifecycle history is on-demand, bounded, deduplicated and keeps state timestamps and selected text', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Lifecycle',state:'idle'}];
+  const change=id=>({id,agent:1,at:100+id,kind:'agent.state',details:{from:'working',to:'paused'}});
+  data.history=Array.from({length:35},(_,i)=>change(i+1));
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click(); await page.locator('#agent-log').waitFor();
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/history?')).length,0);
+  await page.locator('#agent-lifecycle summary').click();
+  await page.waitForFunction(()=>agentLifecycle?.events.length===30&&!lifecycleLoading);
+  assert.match(await page.locator('#agent-lifecycle-items').textContent(),/#35 · working → paused/);
+  assert.equal(await page.locator('#agent-lifecycle-items time').first().textContent(),await page.evaluate(()=>new Date(135000).toLocaleString()));
+  await page.locator('#lifecycle-older').click(); await page.waitForFunction(()=>agentLifecycle?.events.length===35&&!lifecycleLoading);
+  assert.equal(await page.locator('#lifecycle-older').isHidden(),true);
+  const selected=await selectText(page,'#agent-lifecycle-items .event > div');
+  data.history.push(change(36)); await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.waitForFunction(()=>document.querySelector('#agent-lifecycle-items').textContent.includes('#36 ·'));
+  assert.equal(await page.locator('#agent-lifecycle-items .event').count(),35);
+  assert.equal(new Set(await page.evaluate(()=>agentLifecycle.events.map(event=>event.id))).size,35);
+  await page.locator('#lifecycle-older').click(); await page.waitForFunction(()=>agentLifecycle?.events.length===36&&!lifecycleLoading);
+  assert.deepEqual(await page.evaluate(()=>agentLifecycle.events.map(event=>event.id)),Array.from({length:36},(_,i)=>36-i));
+  assert.ok(data.getRequests.filter(url=>url.startsWith('/history?')).every(url=>{const q=new URL(url,'http://test').searchParams;return q.get('agent')==='1'&&q.get('kind')==='agent.state'&&q.get('limit')==='30'&&q.get('max_bytes')==='16000';}));
+}));
+
+test('lifecycle history restarts a large burst without gaps, recovers from failure and ignores a closed agent pane', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Lifecycle',state:'idle'}];
+  const change=id=>({id,agent:1,at:id,kind:'agent.state',details:{from:'idle',to:'working'}});
+  data.history=[];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click(); await page.locator('#agent-log').waitFor();
+  await page.locator('#agent-lifecycle summary').click(); await page.waitForFunction(()=>agentLifecycle&&!lifecycleLoading);
+  data.history=Array.from({length:40},(_,i)=>change(i+1)); await page.evaluate(()=>refresh());
+  assert.deepEqual(await page.evaluate(()=>agentLifecycle.events.map(event=>event.id)),Array.from({length:30},(_,i)=>40-i));
+  data.history.push(...Array.from({length:40},(_,i)=>change(i+41))); await page.evaluate(()=>refresh());
+  assert.deepEqual(await page.evaluate(()=>agentLifecycle.events.map(event=>event.id)),Array.from({length:30},(_,i)=>80-i));
+  data.historyFailure=true; await page.evaluate(()=>refresh());
+  assert.match(await page.locator('#agent-lifecycle-error').textContent(),/History offline/);
+  assert.equal(await page.locator('#agent-lifecycle-items .event').count(),30);
+  data.historyFailure=false; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-lifecycle-error').isHidden(),true);
+  const pending=await holdRequest(page,url=>url.pathname==='/history'&&url.searchParams.has('before'),'GET');
+  await page.locator('#lifecycle-older').click(); await pending.started;
+  await page.locator('#agent-dialog .dialog-actions button').click(); pending.release(); await pending.remove(); await page.waitForTimeout(100);
+  assert.equal(await page.locator('#agent-dialog').isVisible(),false);
+  assert.equal(await page.locator('#agent-lifecycle-items .event').count(),30,'a late page cannot update a closed pane');
 }));
 
 test('workspace thread search scopes participation filters without discarding an open conversation draft', async () => fixture(async (page,data) => {
@@ -3508,9 +3722,11 @@ test('workspace Resume all stays single-flight across polling and recovers from 
   assert.equal(await page.locator('#resume-all').isDisabled(),true);
   await page.locator('#resume-all').dispatchEvent('click');
   pending.release(); await pending.remove();
-  await page.waitForFunction(()=>!document.querySelector('#resume-all').disabled);
+  await page.waitForFunction(()=>!resumingAll);
+  assert.equal(await page.locator('#resume-all').isDisabled(),true);
   assert.equal(data.requests.filter(r=>r.url==='/resume-all').length,1);
   assert.equal(data.agents[0].state,'working');
+  data.agents[0].state='paused'; await page.evaluate(()=>refresh());
   data.resumeAllError='Resume all unavailable';
   await page.locator('#resume-all').click();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Resume all unavailable');

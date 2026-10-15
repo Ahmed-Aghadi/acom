@@ -1,7 +1,8 @@
 // Starting turns, following their output, and stopping them.
 
-use crate::app::{App, Fail, Proc, R, St, now};
+use crate::app::{App, Fail, Proc, R, St};
 use crate::harness::{self, Event, Launch};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -13,7 +14,7 @@ use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub fn kill_group(pid: u32, sig: i32) {
     unsafe {
@@ -364,9 +365,26 @@ pub fn log_path(app: &App, id: i64, ext: &str) -> PathBuf {
     app.home.join("logs").join(format!("{id}.{ext}"))
 }
 
-fn append(path: &PathBuf, line: &str) {
+fn append(path: &Path, line: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+fn capture_time() -> String {
+    DateTime::<Utc>::from(SystemTime::now()).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Only the first line of a logical entry has a capture timestamp and type.
+fn append_entry(path: &Path, at: &str, kind: &str, text: &str) {
+    append(path, &format!("[{at}] [{kind}] {text}"));
+}
+
+fn stdout_line(app: &Arc<App>, id: i64, harness: &str, model: &str, line: &str) {
+    let at = capture_time();
+    append(&log_path(app, id, "jsonl"), line);
+    for event in harness::parse_line(harness, line) {
+        apply(app, id, harness, model, event, &at);
     }
 }
 
@@ -645,20 +663,17 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
         },
     );
     st.reaped.remove(&id);
+    append_entry(
+        &log_path(app, id, "txt"),
+        &capture_time(),
+        "turn-start",
+        &format!("turn {} started", turns + 1),
+    );
     if let (Some(text), Some(mut stdin)) = (turn.input.take(), child.stdin.take()) {
         thread::spawn(move || {
             let _ = stdin.write_all(text.as_bytes());
         });
     }
-    append(
-        &log_path(app, id, "txt"),
-        &format!(
-            "--- turn {} started at {}",
-            turns + 1,
-            crate::app::hhmm(now())
-        ),
-    );
-
     let app = app.clone();
     thread::spawn(move || {
         let done = Arc::new(AtomicBool::new(false));
@@ -673,31 +688,30 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             let app = app.clone();
             thread::spawn(move || {
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                let ended_at = capture_time();
                 cleanup_failed_group(&app, id, pid, ok);
-                ok
+                (ok, ended_at)
             })
         };
         if let Some(out) = out {
-            let raw = log_path(&app, id, "jsonl");
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                append(&raw, &line);
-                for ev in harness::parse_line(&harness, &line) {
-                    apply(&app, id, &harness, &model, ev);
-                }
+                stdout_line(&app, id, &harness, &model, &line);
             }
         }
-        let ok = waiter.join().unwrap_or(false);
+        let (ok, ended_at) = waiter.join().unwrap_or_else(|_| (false, capture_time()));
         let exit_error = (!ok)
             .then(|| last_line(&log_path(&app, id, "err"), err_from))
             .flatten();
         done.store(true, Ordering::SeqCst);
         let _ = side.join();
         cleanup_failed_group(&app, id, pid, ok);
-        append(
+        append_entry(
             &log_path(&app, id, "txt"),
+            &ended_at,
+            "turn-end",
             &format!(
-                "--- turn ended at {}{}",
-                crate::app::hhmm(now()),
+                "turn {} ended{}",
+                turns + 1,
                 if ok { "" } else { " (exit with error)" }
             ),
         );
@@ -749,7 +763,7 @@ fn last_line(path: &PathBuf, from: u64) -> Option<String> {
     Some(line.chars().take(300).collect())
 }
 
-fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event) {
+fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event, at: &str) {
     let r = match ev {
         Event::Session(s) => app.set_session(id, &s),
         Event::Tokens { t, add } => app.record_tokens(id, t, add),
@@ -760,18 +774,22 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event) {
             resets_at,
         } => app.record_usage(harness, &win, used_pct, resets_at),
         Event::Failed(reason) => {
-            append(&log_path(app, id, "txt"), &format!("error: {reason}"));
+            append_entry(&log_path(app, id, "txt"), at, "error", &reason);
             app.fail_turn(id, &reason)
         }
         Event::ModelSwitched(reason) => {
-            append(&log_path(app, id, "txt"), &reason);
+            append_entry(&log_path(app, id, "txt"), at, "error", &reason);
             app.fail_and_stop(id, &reason)
         }
         Event::LimitHit(text) => app.limit_hit(id, &text),
         Event::WindowLimitHit { win, text } => app.window_limit_hit(id, &win, &text),
         Event::Model(m) => app.check_model(id, asked, &m),
         Event::Text(t) => {
-            append(&log_path(app, id, "txt"), &t);
+            append_entry(&log_path(app, id, "txt"), at, "message", &t);
+            Ok(())
+        }
+        Event::Tool(t) => {
+            append_entry(&log_path(app, id, "txt"), at, "tool", &t);
             Ok(())
         }
     };
@@ -807,10 +825,11 @@ fn follow_side_file(
                 partial.extend_from_slice(&buf);
                 while let Some(i) = partial.iter().position(|&c| c == b'\n') {
                     let line: Vec<u8> = partial.drain(..=i).collect();
+                    let at = capture_time();
                     for ev in
                         harness::parse_line(harness, String::from_utf8_lossy(&line).trim_end())
                     {
-                        if !matches!(ev, Event::Text(_)) {
+                        if !matches!(ev, Event::Text(_) | Event::Tool(_)) {
                             // The running process keeps its original requested model even
                             // if the user/agent has changed the next-turn configuration.
                             let asked = app
@@ -819,7 +838,7 @@ fn follow_side_file(
                                 .get(&id)
                                 .map(|p| p.model.clone())
                                 .unwrap_or_default();
-                            apply(app, id, harness, &asked, ev);
+                            apply(app, id, harness, &asked, ev, &at);
                         }
                     }
                 }
@@ -835,7 +854,76 @@ fn follow_side_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::now;
     use std::sync::{Condvar, Mutex};
+
+    #[test]
+    fn readable_entries_preserve_multiline_text_with_one_utc_prefix() {
+        let home = std::env::temp_dir().join(format!("acom-log-test-{}", harness::new_uuid()));
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("output.txt");
+        append_entry(
+            &path,
+            "2026-10-15T12:34:56Z",
+            "message",
+            "first line\nsecond line ☃",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[2026-10-15T12:34:56Z] [message] first line\nsecond line ☃\n"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn stdout_keeps_raw_lines_once_and_types_entries_at_capture_time() {
+        let app = test_app(0);
+        std::fs::create_dir_all(app.home.join("logs")).unwrap();
+        let lines = [
+            r#"{"timestamp":"2000-01-01T00:00:00Z","type":"assistant","message":{"content":[{"type":"text","text":"Bash: explanation, not a tool"},{"type":"tool_use","name":"Bash","input":{"command":"pwd"}}]}}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"shell: also a message"}}"#,
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"pwd"}}"#,
+            r#"{"type":"error","message":"captured failure"}"#,
+            r#"{"type":"unknown","text":"raw only"}"#,
+        ];
+        let before = now();
+        for (index, line) in lines.iter().enumerate() {
+            stdout_line(
+                &app,
+                1,
+                if index == 0 { "claude" } else { "codex" },
+                "gpt-6-sol",
+                line,
+            );
+        }
+        let after = now();
+        assert_eq!(
+            std::fs::read_to_string(log_path(&app, 1, "jsonl")).unwrap(),
+            format!("{}\n", lines.join("\n"))
+        );
+        let output = std::fs::read_to_string(log_path(&app, 1, "txt")).unwrap();
+        let expected = [
+            "[message] Bash: explanation, not a tool",
+            "[tool] Bash: pwd",
+            "[message] shell: also a message",
+            "[tool] shell: pwd",
+            "[error] captured failure",
+        ];
+        assert_eq!(output.lines().count(), expected.len());
+        for (line, expected) in output.lines().zip(expected) {
+            let (at, text) = line.strip_prefix('[').unwrap().split_once("] ").unwrap();
+            assert_eq!(at.len(), 20);
+            assert!(at.ends_with('Z'));
+            let captured = DateTime::parse_from_rfc3339(at).unwrap().timestamp();
+            assert!(captured >= before && captured <= after);
+            assert_eq!(text, expected);
+        }
+        assert_eq!(
+            app.lock().procs[&1].failure.as_deref(),
+            Some("captured failure")
+        );
+        std::fs::remove_dir_all(&app.home).unwrap();
+    }
 
     #[test]
     fn resumed_side_file_keeps_events_appended_before_the_follower_starts() {
@@ -857,6 +945,7 @@ mod tests {
                 .env("PATH", home.join("bin"))
                 .output()
                 .unwrap();
+            let _ = std::fs::remove_dir_all(&home);
             assert!(
                 output.status.success(),
                 "{}{}",
@@ -877,7 +966,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&sessions).unwrap();
         let native = sessions.join("rollout-native-audit-session.jsonl");
-        std::fs::write(&native, "{}\n").unwrap();
+        std::fs::write(&native, "{}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"old text must not be replayed\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"old tool must not be replayed\"}}\n").unwrap();
         let wrote = home.join("native-wrote");
         let event = serde_json::json!({
             "type":"event_msg", "payload":{
@@ -886,11 +975,16 @@ mod tests {
                 "rate_limits":{"primary":{"used_percent":98,"window_minutes":300,"resets_at":now()+3600}}
             }
         });
+        let text = serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":"current stdout message"}});
+        let tool = serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":"current stdout tool"}});
+        let session =
+            serde_json::json!({"type":"thread.started","thread_id":"native-audit-session"});
+        let tokens = serde_json::json!({"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":2}});
         let quote =
             |p: &std::path::Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
         let client = bin.join("codex");
         std::fs::write(&client, format!(
-            "#!/bin/sh\nwhile IFS= read -r task; do :; done\nprintf '%s\\n' '{event}' >> {}\n: > {}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"native-audit-session\"}}' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":20,\"output_tokens\":2}}}}'\n",
+            "#!/bin/sh\nwhile IFS= read -r task; do :; done\nprintf '%s\\n' '{event}' '{text}' '{tool}' >> {}\n: > {}\nprintf '%s\\n' '{session}' '{text}' '{tool}' '{tokens}'\n",
             quote(&native), quote(&wrote)
         )).unwrap();
         std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -932,6 +1026,30 @@ mod tests {
             123
         );
         assert_eq!(st.used_pct("codex").unwrap(), Some(98.0));
+        let output = std::fs::read_to_string(log_path(&app, 1, "txt")).unwrap();
+        assert_eq!(output.matches("[turn-start] turn 1 started").count(), 1);
+        assert_eq!(
+            output.matches("[message] current stdout message").count(),
+            1
+        );
+        assert_eq!(
+            output.matches("[tool] shell: current stdout tool").count(),
+            1
+        );
+        assert_eq!(output.matches("[turn-end] turn 1 ended").count(), 1);
+        assert_eq!(output.lines().count(), 4);
+        assert!(!output.contains("old text"));
+        assert!(!output.contains("old tool"));
+        for line in output.lines() {
+            let at = line.strip_prefix('[').unwrap().split_once(']').unwrap().0;
+            assert_eq!(at.len(), 20);
+            assert!(at.ends_with('Z'));
+            chrono::DateTime::parse_from_rfc3339(at).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(log_path(&app, 1, "jsonl")).unwrap(),
+            format!("{session}\n{text}\n{tool}\n{tokens}\n")
+        );
     }
 
     fn test_app(pid: u32) -> Arc<App> {
@@ -1187,7 +1305,14 @@ mod tests {
     fn structured_failure_is_retained_without_ending_the_worker() {
         let app = test_app(0);
         for reason in ["stream disconnected", "duplicate failure"] {
-            apply(&app, 1, "codex", "gpt-6-sol", Event::Failed(reason.into()));
+            apply(
+                &app,
+                1,
+                "codex",
+                "gpt-6-sol",
+                Event::Failed(reason.into()),
+                &capture_time(),
+            );
         }
         let st = app.lock();
         let worker = st.procs.get(&1).unwrap();
@@ -1207,7 +1332,7 @@ mod tests {
         let app = test_app(0);
         let warning = r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}"#;
         for ev in harness::parse_line("codex", warning) {
-            apply(&app, 1, "codex", "gpt-6-sol", ev);
+            apply(&app, 1, "codex", "gpt-6-sol", ev, &capture_time());
         }
         assert!(app.lock().procs[&1].failure.is_none());
         for line in [
@@ -1215,7 +1340,7 @@ mod tests {
             r#"{"type":"turn.failed","error":{"message":"actual request rejected"}}"#,
         ] {
             for ev in harness::parse_line("codex", line) {
-                apply(&app, 1, "codex", "gpt-6-sol", ev);
+                apply(&app, 1, "codex", "gpt-6-sol", ev, &capture_time());
             }
         }
         assert_eq!(

@@ -29,8 +29,9 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   status <text>                           Set your status text
   group <name>                            Put yourself in a group
   done                                    Mark your task finished, then end your turn
-  wait [--timeout duration | --ack ID]     Wait for hook updates (default 60s, maximum 1h)
-  agents [--group <name>]                 List agents
+  wait [--timeout duration | --ack ID] [--agents all|IDs] [--states states] [--status-text] [--after EVENT_ID]
+                                          Wait for normal updates and optional peer changes
+  agents [--group <name>] [--event-cursor] List agents; optionally print an atomic event baseline
   agent <ID>                              One agent's details
   launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done|--replace] [--ack-crashes]
                                           Launch a helper agent; --done also marks you done,
@@ -131,6 +132,34 @@ mod cli_tests {
             json!({"delivery_id":null,"text":"notice","timed_out":true}),
         ] {
             assert!(wait_output(&v).is_err());
+        }
+    }
+
+    #[test]
+    fn wait_watch_flags_require_a_watch_and_cannot_mix_with_ack() {
+        assert!(
+            Cli::try_parse_from([
+                "acom",
+                "wait",
+                "--agents",
+                "all",
+                "--states",
+                "crashed,done",
+                "--status-text",
+                "--after",
+                "0"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["acom", "agents", "--event-cursor"]).is_ok());
+        for args in [
+            vec!["acom", "wait", "--states", "crashed"],
+            vec!["acom", "wait", "--status-text"],
+            vec!["acom", "wait", "--after", "0"],
+            vec!["acom", "wait", "--agents", "all", "--after", "-1"],
+            vec!["acom", "wait", "--ack", "1", "--agents", "all"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 
@@ -468,12 +497,22 @@ enum Cmd {
     Wait {
         #[arg(long, default_value = "60s")]
         timeout: String,
-        #[arg(long, conflicts_with = "timeout", value_parser = clap::value_parser!(i64).range(1..))]
+        #[arg(long, conflicts_with_all = ["timeout", "agents", "states", "status_text", "after"], value_parser = clap::value_parser!(i64).range(1..))]
         ack: Option<i64>,
+        #[arg(long)]
+        agents: Option<String>,
+        #[arg(long, requires = "agents")]
+        states: Option<String>,
+        #[arg(long, requires = "agents")]
+        status_text: bool,
+        #[arg(long, requires = "agents", value_parser = clap::value_parser!(i64).range(0..))]
+        after: Option<i64>,
     },
     Agents {
         #[arg(long)]
         group: Option<String>,
+        #[arg(long)]
+        event_cursor: bool,
         #[command(flatten)]
         page: PageArgs,
     },
@@ -1322,7 +1361,14 @@ fn main() {
             post(&format!("/agents/{}/done", me()), json!({}));
             println!("marked done; end your turn now");
         }
-        Cmd::Wait { timeout, ack } => {
+        Cmd::Wait {
+            timeout,
+            ack,
+            agents,
+            states,
+            status_text,
+            after,
+        } => {
             let id = me();
             let acknowledge = |delivery: i64| {
                 let recover = |error: &str| {
@@ -1351,7 +1397,23 @@ fn main() {
             if !(1..=3600).contains(&secs) {
                 die("wait timeout must be between 1s and 1h");
             }
-            let v = request_with_timeout("POST", &format!("/wait/{id}"), Some(json!({"timeout":secs})), Some(std::time::Duration::from_secs(secs+5)))
+            let mut body = json!({"timeout":secs});
+            if let Some(agents) = agents {
+                body["agents"] = if agents == "all" {
+                    json!("all")
+                } else {
+                    let ids:Vec<i64>=agents.split(',').map(|value|value.trim().parse::<i64>().ok().filter(|id|*id>0).unwrap_or_else(||die("watched agents must be all or comma-separated positive IDs"))).collect();
+                    json!(ids)
+                };
+                if let Some(states) = states {
+                    body["states"] = json!(states.split(',').map(str::trim).collect::<Vec<_>>());
+                }
+                body["status_text"] = json!(status_text);
+                if let Some(after) = after {
+                    body["after"] = json!(after);
+                }
+            }
+            let v = request_with_timeout("POST", &format!("/wait/{id}"), Some(body), Some(std::time::Duration::from_secs(secs+5)))
                 .unwrap_or_else(|(_, error)| die(&format!("{error}. No delivery was acknowledged. Retry `acom wait` to retrieve any pending delivery.")));
             let (output, delivery) = wait_output(&v).unwrap_or_else(|e| die(e));
             let mut stdout = std::io::stdout().lock();
@@ -1368,18 +1430,34 @@ fn main() {
                 acknowledge(n);
             }
         }
-        Cmd::Agents { group, page } => {
+        Cmd::Agents {
+            group,
+            event_cursor,
+            page,
+        } => {
             let mut path = format!("/agents?{}&{}", scope(), page.query());
             let mut command = "acom agents".to_string();
             if let Some(g) = group {
                 path += &format!("&group={}", encode(&g));
                 command += &format!(" --group {}", shell_word(&g));
             }
+            if event_cursor {
+                command += " --event-cursor";
+            }
             let result = get(&path);
             for a in page_items(&result) {
                 if !item_truncated(a, &format!("acom agent {}", a["id"])) {
                     print_agent_line(a);
                 }
+            }
+            if event_cursor {
+                let cursor = result["event_cursor"]
+                    .as_i64()
+                    .filter(|id| *id >= 0)
+                    .unwrap_or_else(|| {
+                        die("agent response has no event cursor; request a fresh snapshot")
+                    });
+                println!("Event cursor: {cursor}");
             }
             page_hint(&result, &page, &command);
         }

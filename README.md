@@ -13,7 +13,7 @@ acom serve
 
 Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it; acom keeps none of its own state in your projects (the agents, of course, work on their files).
 
-The web workspace has project navigation, searchable agents with **Active**, **Needs attention** and **Finished** filters, and an overview of active agents, unread messages and held locks. Search and filters cover loaded records; use **Load more** to include earlier records. Summary counts for attention and held locks explicitly identify a partial loaded window. Account usage stays separate from project work; global Pause/Resume controls are under **All projects** (a menu on smaller screens).
+The web workspace has project navigation, searchable agents with **Active**, **Needs attention** and **Finished** filters, and an overview of active agents, unread messages and held locks. Agent search covers the full project and task text, not just loaded previews. Filter counts reflect the search before the selected category; the header separates loaded matches, matching total and project total. Categories can overlap: a queued replacement can be both Finished and Needs attention. Project agent summaries are exact; held-lock counts identify a partial loaded window. Account usage stays separate from project work; global Pause/Resume controls show eligible counts across all projects and disable at zero or while unknown/in flight.
 
 Threads have title/ID search and a mobile conversation view with **All threads** to return to the list while keeping the draft. **Ctrl/Cmd + Enter** sends; Enter adds a line. Settings have section links and a persistent save-state indicator. The theme follows your system until you toggle it; your explicit light/dark choice is saved in this browser.
 
@@ -55,7 +55,11 @@ Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACO
 
 An agent can wait for notifications in its current turn with `acom wait --timeout 10m` (default 60 seconds, maximum one hour). Keep the timeout below the shell tool's timeout. Waiting remains foreground and working: it consumes an active slot and lock TTLs continue. Notifications give counts, not message contents, and do not mark messages handled. Successful delivery is acknowledged so the next hook does not repeat it. If acknowledgement fails after you received the complete text, use the printed `acom wait --ack <delivery ID>` instruction; otherwise repeat `acom wait` to retrieve the same delivery.
 
-Polling preserves unchanged text and keyboard focus on controls that still exist. If you select text in a changing region, that region waits until you clear the selection; unrelated panels keep updating. An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Slow reads finish before the next background poll; stalled reads time out after 15 seconds so polling can recover. Connection failures keep the last view and show a retry status. Writes are not automatically retried or canceled by this read timeout.
+`acom wait --agents 71,72 --states crashed,done,replaced --timeout 10m` adds peer lifecycle events without suppressing normal messages/notices. `--agents all` includes future agents in the same project, excluding the caller; explicit IDs stay fixed and report replacement links rather than following successors. `--status-text` additionally watches descriptive status independently of state filters. A new normalized filter starts at registration; later calls continue its durable event cursor, including changes between waits. For a race-free earlier baseline, use `acom agents --event-cursor`, then `wait ... --after <cursor>` once; explicitly repeating `--after` rescans. Event batches are bounded and identify their history records; unacknowledged deliveries replay unchanged before new filters apply. These are wait-call watches, not persistent subscriptions or idle wake triggers. Agent cards and Details show the active wait, watched targets and remaining timeout without changing the agent's lifecycle state.
+
+Polling preserves unchanged text and keyboard focus on controls that still exist. If you select text in a changing region, that region waits until you clear the selection; unrelated panels keep updating. An open **Details** dialog refreshes changed fields and recent activity every two seconds without replacing unchanged task text or configuration drafts. It also shows the native conversation-history path when the harness has created it, and acom's raw output-log path. New readable-log entries have UTC capture timestamps and message/tool/error/turn types; the browser displays local date/time with seconds. They record live harness output, not a synchronized copy of native history. Existing unrecorded timestamps are not reconstructed. Logs follow new lines when you're at the bottom and keep your place when you scroll back; selecting log text temporarily holds its updates. Slow reads finish before the next background poll; stalled reads time out after 15 seconds so polling can recover. Connection failures keep the last view and show a retry status. Writes are not automatically retried or canceled by this read timeout.
+
+Details also has an on-demand **Lifecycle changes** panel with timestamped state transitions and bounded older pages, separate from the harness output.
 
 When an agent runs `acom done` it's closed by default: no message wakes it. Messages stay in its inbox until you **Reopen** it, resuming the same conversation. Settings can make it `done` instead, so new messages delivered while it's a current member can wake it; live active-only threads remove done agents. Agents are told which rule applies. `acom launch --task "..." --done` finishes the caller according to that rule and launches another agent in one step, so it fits even when the active-agent limit is full; it does not make the caller terminally replaced. If a message should wake a done agent but there's no room under the limits, the wake waits in line and happens when there's room.
 
@@ -128,11 +132,13 @@ Agents run unattended, so nobody can answer a permission prompt. By default they
 
 Deterministic regression tests use fake clients and require Node with `node:sqlite`.
 
+When developing beside a running instance, use a separate `CARGO_TARGET_DIR` and point `ACOM_BINARY` at that build; do not replace binaries used by live agents. Test fixtures use isolated data directories.
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-access.cjs
+cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-access.cjs tests/wait-watch.cjs
 ```
 
 Browser tests for the UI (optional; they need no agents or subscriptions):

@@ -395,8 +395,8 @@ process.stdin.on('end', async () => {
       fs.writeFileSync(path.join(process.env.ACOM_HOME,'restart-late-'+id),String(child.pid)); child.unref(); process.exit(0);
     });
     if(task.includes('RESTART_ESCAPE_TEST') && previous.length===0) {
-      const child=require('node:child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{detached:true,stdio:'ignore'});
-      fs.writeFileSync(path.join(process.env.ACOM_HOME,'restart-escaped-'+id),String(child.pid)); child.unref();
+      const child=require('node:child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(require('node:path').join(process.env.ACOM_HOME,'restart-escaped-'+process.env.ACOM_ID),String(process.pid));setInterval(()=>{},1000)"],{detached:true,stdio:'ignore'});
+      child.unref();
     }
     const released=path.join(process.env.ACOM_HOME,'release-'+id);
     while(!fs.existsSync(released)) await new Promise(resolve=>setTimeout(resolve,25));
@@ -767,7 +767,14 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET',`/agents/${diagnostic.id}`)).problem,null);
     assert.equal(runs().filter(r=>r.id===diagnostic.id).length,1,'successful startup warnings do not trigger configured recovery');
     assert.deepEqual((await api('GET',`/history?project=${a.id}&agent=${diagnostic.id}&kind=agent.failed`)).events,[]);
-    assert.ok((await api('GET',`/agents/${diagnostic.id}/log`)).lines.some(line=>line.includes(startupDiagnostic.item.message)),'startup diagnostics remain visible in the output log');
+    const diagnosticLog=(await api('GET',`/agents/${diagnostic.id}/log`)).lines;
+    assert.equal(diagnosticLog.length,3,'one committed start, diagnostic message and observed end');
+    for(const line of diagnosticLog) assert.match(line,/^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] \[(?:message|tool|error|turn-start|turn-end)\] /,'readable log entries carry capture UTC and a type');
+    assert.match(diagnosticLog[0],/\[turn-start\] turn 1 started$/);
+    assert.ok(diagnosticLog[1].includes(`[message] notice: ${startupDiagnostic.item.message}`),'startup diagnostics remain visible without becoming failures');
+    assert.match(diagnosticLog[2],/\[turn-end\] turn 1 ended$/);
+    const rawDiagnostic=fs.readFileSync(path.join(home,'logs',`${diagnostic.id}.jsonl`),'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rawDiagnostic.filter(event=>event.item?.message===startupDiagnostic.item.message).length,1,'raw JSONL stays parseable and does not duplicate the diagnostic');
     const diagnosticFailure=await api('POST','/agents',{project:b.id,harness:'codex',task:'STARTUP_DIAGNOSTIC_FAILURE_TEST'});
     await finished(diagnosticFailure.id,'crashed');
     assert.equal((await api('GET',`/agents/${diagnosticFailure.id}`)).problem,'its process exited with an error','a warning alone is not invented as the cause of a nonzero exit');
@@ -1282,14 +1289,18 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
       await api('POST',`/agents/${manual.id}/pause`,{locks},400);
       assert.equal((await view(manual.id)).state,'working','obsolete pause options cannot stop the worker');
     }
-    await until(()=>fs.existsSync(path.join(home,`restart-escaped-${manual.id}`)),'manual pause escaped tool starts');
+    await until(()=>fs.existsSync(path.join(home,`restart-escaped-${manual.id}`)),'manual pause escaped tool installs its TERM handler');
     const manualEscaped=Number(fs.readFileSync(path.join(home,`restart-escaped-${manual.id}`),'utf8'));
+    const manualPauseAt=Date.now();
     await api('POST',`/agents/${manual.id}/pause`,{});
     await until(async()=>(await view(manual.id)).stopping && !alive(captures(manual.id)[0].pid),'stopping stays visible after the native leader exits');
     await until(()=>fs.existsSync(path.join(home,`restart-late-${manual.id}`)),'manual pause TERM handler creates its owned detached child');
     const manualLate=Number(fs.readFileSync(path.join(home,`restart-late-${manual.id}`),'utf8'));
-    await new Promise(resolve=>setTimeout(resolve,2200));
-    assert.ok(alive(manualEscaped) && alive(manualLate),'owned TERM-resistant tools remain alive during the protected stopping phase');
+    // Expire this lease without consuming the finite process-stop grace period.
+    dbAction(db=>db.prepare("UPDATE locks SET expires_at=unixepoch()-1 WHERE project=? AND name='manual-released'").run(project.id));
+    assert.ok(alive(manualEscaped),`the ready TERM-resistant tool remains alive during the protected stopping phase (${Date.now()-manualPauseAt}ms since Pause)`);
+    // A newly forked tool can safely die before installing its own TERM handler;
+    // both tools must still be gone before the reservation is released/resumed.
     const stoppingLock=(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='manual-released');
     assert.equal(stoppingLock.holder,manual.id,'expired TTL cannot reassign a reservation while old tools are stopping');
     assert.equal(stoppingLock.holder_stopping,true,'lock previews explain that an expired reservation is still being released safely');
@@ -2166,9 +2177,8 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     await page.locator(`[data-message="${message.id}"]`).waitFor();
     await until(async () => (await api('GET', `/threads/${thread}`)).unread === 0, 'open thread clears new reply');
     assert.equal(await page.locator('#message-form textarea').inputValue(), 'Preserve this draft');
-    page.once('dialog',dialog=>dialog.accept());
     await page.locator('#close-thread').click();
-    await page.waitForFunction(()=>document.querySelector('#thread-main').textContent==='Select a thread');
+    await page.waitForFunction(()=>document.querySelector('#thread-main .empty strong')?.textContent==='Select a thread' && !document.querySelector('#message-form'));
     assert.equal(await page.locator('.thread-row.active').count(),0,'closing clears the selected thread');
     const closedMessage=await api('POST','/messages',{agent,thread,text:'Keep unread while the thread is closed'});
     await page.waitForFunction(thread=>document.querySelector(`[data-thread="${thread}"]`)?.textContent.includes('1 unread'),thread);
@@ -2191,7 +2201,7 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
       return selection.toString();
     });
     await api('POST', `/agents/${agent}/status`, { text: 'Live status from the test harness' });
-    fs.appendFileSync(path.join(home, 'logs', `${agent}.txt`), '\nLive log line from the test harness\n');
+    fs.appendFileSync(path.join(home, 'logs', `${agent}.txt`), `[${new Date().toISOString().replace(/\.\d{3}Z$/,'Z')}] [message] Live log line from the test harness\n`);
     await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('Live log line from the test harness'));
     assert.match(await page.locator('#agent-details').textContent(), /Live status from the test harness/);
     assert.equal(await page.evaluate(()=>getSelection().toString()),selectedTask,'live status and activity updates preserve task selection');
@@ -2263,6 +2273,7 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     assert.equal(await page.locator('[data-thread]').count(),1);
     await page.locator('#thread-membership').click();
     await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Leave thread');
+    await page.locator('[data-page=overview]').click();
     await page.locator('[data-usage=codex]').click();
     await page.locator('[data-check-usage=codex]').click();
     await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Usage check scheduled');

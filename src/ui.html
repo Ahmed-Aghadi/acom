@@ -343,8 +343,8 @@
         <p class="sidebar-label">All projects</p>
         <details class="system-menu" id="system-menu" open><summary>All projects <span aria-hidden="true">⌄</span></summary>
         <div class="actions">
-          <button id="pause-all" title="All projects; stop processes, then release every held lock">Pause all</button>
-          <button id="resume-all" title="All projects">Resume all</button>
+          <button id="pause-all" title="All projects; stop processes, then release every held lock" disabled>Pause all <span id="pause-all-count">(checking · all projects)</span></button>
+          <button id="resume-all" title="All projects" disabled>Resume all <span id="resume-all-count">(checking · all projects)</span></button>
           <button id="resume-restart" title="All projects on this machine; only agents paused by a server restart" disabled>Resume restart-paused <span id="restart-paused-count">(checking · all projects)</span></button>
         </div>
         </details>
@@ -369,9 +369,9 @@
         <div class="stack">
           <section class="panel">
             <div class="panel-head"><h2>Agents</h2><span class="count" id="agent-count"></span><span class="panel-caption">Your project team</span></div>
-            <div class="agent-toolbar"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="agent-search" aria-label="Search agents" placeholder="Search by name, task, model or group…"></label><div class="filter-actions" aria-label="Filter agents"><button class="small active" data-agent-filter="all" aria-pressed="true">All</button><button class="small" data-agent-filter="active" aria-pressed="false">Active</button><button class="small" data-agent-filter="attention" aria-pressed="false">Needs attention</button><button class="small" data-agent-filter="finished" aria-pressed="false">Finished</button></div></div>
+            <div class="agent-toolbar"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="agent-search" aria-label="Search agents" placeholder="Search by name, task, model or group…"></label><div class="filter-actions" aria-label="Filter agents"><button class="small active" data-agent-filter="all" aria-pressed="true">All <span data-agent-count="all">—</span></button><button class="small" data-agent-filter="active" aria-pressed="false">Active <span data-agent-count="active">—</span></button><button class="small" data-agent-filter="attention" aria-pressed="false">Needs attention <span data-agent-count="attention">—</span></button><button class="small" data-agent-filter="finished" aria-pressed="false">Finished <span data-agent-count="finished">—</span></button></div></div>
             <div id="agents"></div>
-            <button class="small" data-more="agents" hidden>Load more agents</button>
+            <button class="small" data-more="agentBrowser" hidden>Load more agents</button>
           </section>
           <section class="panel">
             <div class="panel-head"><h2>Shared locks</h2><span class="count" id="lock-count"></span><span class="panel-caption">Coordinate access to shared work</span></div>
@@ -496,7 +496,7 @@
     </form>
   </dialog>
 
-  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><details id="agent-lifecycle"><summary>Lifecycle changes</summary><div id="agent-lifecycle-items" class="activity"></div><p class="inline-error" id="agent-lifecycle-error" role="status" hidden></p><button type="button" class="small" id="lifecycle-older" hidden>Load older changes</button></details><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
@@ -527,7 +527,8 @@
     const icons = {"overview": "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>", "chat": "<path d=\"M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z\"/>", "settings": "<path d=\"m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>", "search": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/>", "agents": "<rect x=\"4\" y=\"7\" width=\"16\" height=\"13\" rx=\"3\"/><path d=\"M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4\"/>", "warning": "<path d=\"m12 3 10 18H2zM12 9v4M12 17h.01\"/>", "lock": "<rect x=\"4\" y=\"10\" width=\"16\" height=\"11\" rx=\"2\"/><path d=\"M8 10V7a4 4 0 0 1 8 0v3M12 14v3\"/>", "moon": "<path d=\"M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z\"/>", "sun": "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5\"/>", "check": "<path d=\"m5 12 4 4L19 6\"/>"};
     const svgIcon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || ''}</svg>`;
     const emptyState = (icon, title, description = '') => `<div class="empty"><div class="empty-symbol">${svgIcon(icon)}</div><strong>${esc(title)}</strong>${description ? `<p>${esc(description)}</p>` : ''}</div>`;
-    state.agentFilter = 'all';
+    state.agentFilter = 'all'; state.agentSearch = ''; state.agentBrowser = [];
+    let agentSearchTimer = null;
     const themeMedia = matchMedia('(prefers-color-scheme: dark)');
     let explicitTheme = ['light','dark'].includes(stored('acom:theme'));
     function applyTheme(theme) {
@@ -548,7 +549,9 @@
     document.getElementById('system-menu').open = !compactNavigation.matches;
     compactNavigation.addEventListener('change', event => { document.getElementById('system-menu').open = !event.matches; });
     const reading = new Set();
-    let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null;
+    const waitingReceipts = new WeakMap(), waitingClocks = new Map();
+    let serverClock = null;
+    let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null, agentLifecycle = null, lifecycleLoading = null;
     const agentTransitions = new Set();
     let resumingRestart = false, pausingAll = false, resumingAll = false;
     const $ = (s, root = document) => root.querySelector(s);
@@ -595,6 +598,8 @@
       let response, text;
       try {
         response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...(reading ? {signal:AbortSignal.timeout(15000)} : {}), ...options });
+        const serverTime = Date.parse(response.headers.get('Date'));
+        if (Number.isFinite(serverTime)) serverClock = {seconds:serverTime/1000,received:performance.now()};
         text = await response.text();
       } catch (error) {
         if (reading) throw error;
@@ -609,6 +614,7 @@
       if (!body || typeof body !== 'object' || Array.isArray(body)) {
         throw new Error(reading ? 'Invalid server response: expected a JSON object.' : 'Invalid server response. The action may have completed. Inspect current state before retrying.');
       }
+      stampWaiting(body); body.items?.forEach(stampWaiting);
       if (body?.result_truncated) {
         const counts = Object.entries(body.counts || {}).map(([key, count]) => `${key.replaceAll('_',' ')}: ${fmt(count)}`).join(' · ');
         const notice = $('#result-notice'); notice.hidden = false;
@@ -634,7 +640,7 @@
             if (!current()) return null;
             if (part.format !== 'json' || typeof part.chunk !== 'string' || part.offset !== offset) throw new Error('Invalid detail page');
             text += part.chunk; version = part.version;
-            if (!part.has_more) return JSON.parse(text);
+            if (!part.has_more) return stampWaiting(JSON.parse(text));
             if (!(part.next_offset > offset)) throw new Error('Detail cursor did not advance');
             offset = part.next_offset;
           }
@@ -643,12 +649,14 @@
       }
     }
     function collectionPath(key, project = state.selectedProject) {
+      if (key === 'agentBrowser') return query('/agents', {project, category:state.agentFilter, search:state.agentSearch});
       return query(`/${key}`, {project:['agents','threads','locks','activity'].includes(key) ? project : null});
     }
     async function loadCollection(key, more = false) {
       const scope = collectionPath(key), page = state.pages[key] ||= {scope, items:[], loaded:0};
       if (page.scope !== scope) { state.pages[key] = {scope, items:[], loaded:0}; return loadCollection(key, more); }
-      if (!more && page.revision && state.revisions?.[key] === page.revision) return;
+      const sourceRevision = state.revisions?.[key === 'agentBrowser' ? 'agents' : key];
+      if (!more && page.revision && sourceRevision === (['agents','agentBrowser'].includes(key) ? page.sourceRevision : page.revision)) return;
       if (page.pending) { await page.pending; return more ? loadCollection(key, true) : undefined; }
       const current = () => state.pages[key] === page && collectionPath(key) === scope;
       page.pending = (async () => {
@@ -699,7 +707,7 @@
             }
             items = [...new Map(items.map(item => [item.id, item])).values()];
             const changed = page.revision !== next.revision;
-            Object.assign(page, next, {items, loaded:items.length});
+            Object.assign(page, next, {items, loaded:items.length, sourceRevision});
             if (key === 'activity') { page.next_after = Math.max(0, ...items.map(item => item.id)); page.next_before = items.at(-1)?.id; }
             if (key === 'configs') {
               const wanted = [state.editor?.config, state.project?.config];
@@ -709,6 +717,7 @@
               }
             }
             state[key] = items;
+            if (key === 'agents' || key === 'agentBrowser') items.forEach(rememberWaiting);
             return;
           } catch (error) { if (!current()) return; if (error.status !== 409 || attempt === 2) throw error; }
         }
@@ -761,10 +770,12 @@
           state.limits = overview.limits; state.url = overview.url;
           state.unreadTotal = overview.unread_total;
           state.restartPaused = overview.restart_paused;
+          state.pauseEligible = overview.pause_eligible; state.resumeEligible = overview.resume_eligible;
+          state.agentCounts = overview.agent_counts;
           state.overviewRevision = overview.revision;
           state.revisions = overview.revisions;
         }
-        await Promise.all(['projects','configs','agents','threads','locks','activity'].map(key => loadCollection(key)));
+        await Promise.all(['projects','configs','agents','threads','locks','activity',...(!agentSearchTimer ? ['agentBrowser'] : [])].map(key => loadCollection(key)));
         if (request !== state.overviewRequest) return;
         for (const id of new Set([state.editor?.config, state.project?.config].filter(id => id != null))) {
           if (!state.configs.find(c => c.id === id)?.settings) await configSettings(id);
@@ -801,25 +812,30 @@
     function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); updatePaging(); }
 
     function renderStats() {
-      const total = state.pages.agents?.total ?? state.agents.length;
       const project = state.projects.find(p => p.id === state.selectedProject) || state.project;
-      const active = project?.active ?? state.agents.filter(a => ['working','idle'].includes(a.state)).length;
-      const attention = state.agents.filter(a => ['paused','crashed'].includes(a.state) || a.stopping || a.wake_queued_at || a.replacement_start_pending || a.replacement_start).length;
+      const total = state.agentCounts?.all ?? project?.agents;
+      const active = state.agentCounts?.active ?? project?.active;
+      const attention = state.agentCounts?.attention;
       const held = state.locks.filter(l => l.holder || l.holder_stopping).length;
-      const partialAgents = state.pages.agents?.has_more, partialLocks = state.pages.locks?.has_more;
+      const partialLocks = state.pages.locks?.has_more;
       const metrics = [
-        ['agents','Active agents',active,`${fmt(total)} agents in this project`,''],
-        ['warning','Needs attention',attention,partialAgents ? 'In loaded agents · load more below' : attention ? 'Paused, failed or waiting agents' : 'No agents need intervention','attention'],
+        ['agents','Active agents',active,total == null ? 'Checking project totals' : `${fmt(total)} agents in this project`,''],
+        ['warning','Needs attention',attention,attention == null ? 'Checking project totals' : attention ? 'Paused, failed or waiting agents' : 'No agents need attention','attention'],
         ['chat','Unread messages',project?.unread ?? 0,'Conversations you have joined',''],
         ['lock','Locks held',held,partialLocks ? 'In loaded locks · load more below' : `${fmt(state.pages.locks?.total ?? state.locks.length)} shared locks`,''],
       ];
-      setHTML($('#workspace-stats'), metrics.map(([icon,label,value,note,kind]) => `<div class="stat ${kind}"><div class="stat-label">${svgIcon(icon)}${label}</div><div class="stat-value">${fmt(value)}${(label === 'Needs attention' && partialAgents || label === 'Locks held' && partialLocks) ? '+' : ''}</div><div class="stat-note">${note}</div></div>`).join(''));
+      setHTML($('#workspace-stats'), metrics.map(([icon,label,value,note,kind]) => `<div class="stat ${kind}"><div class="stat-label">${svgIcon(icon)}${label}</div><div class="stat-value">${value == null ? '—' : fmt(value)}${label === 'Locks held' && partialLocks ? '+' : ''}</div><div class="stat-note">${note}</div></div>`).join(''));
     }
     function renderRestartResume() {
       const count = state.restartPaused;
       const known = Number.isInteger(count) && count >= 0;
       setText($('#restart-paused-count'), `(${known ? fmt(count) : 'checking'} · all projects)`);
       $('#resume-restart').disabled = resumingRestart || !known || !count;
+      for (const [action, value, busy] of [['pause',state.pauseEligible,pausingAll],['resume',state.resumeEligible,resumingAll]]) {
+        const available = Number.isInteger(value) && value >= 0;
+        setText($(`#${action}-all-count`), `(${available ? fmt(value) : 'checking'} · all projects)`);
+        $(`#${action}-all`).disabled = busy || !available || !value;
+      }
     }
 
     function renderProject() {
@@ -917,22 +933,67 @@
 
     function renderAgents() {
       const root = $('#agents');
-      setText($('#agent-count'), `${state.pages.agents?.total ?? state.agents.length} total`);
-      const search = $('#agent-search').value.trim().toLowerCase();
+      const page = state.pages.agentBrowser, current = page?.scope === collectionPath('agentBrowser');
+      const agents = current ? state.agentBrowser : [], ready = current && !!page.revision;
+      setText($('#agent-count'), ready ? `Showing ${fmt(agents.length)} of ${fmt(page.total)} matches · ${fmt(page.project_total)} total` : 'Loading agents…');
       document.querySelectorAll('[data-agent-filter]').forEach(button => {
         const active = button.dataset.agentFilter === state.agentFilter;
         button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
+        setText($('[data-agent-count]',button), ready ? fmt(page.counts[button.dataset.agentFilter]) : '—');
       });
-      if (!state.agents.length) { setHTML(root, emptyState('agents', 'No agents yet', state.project ? 'Launch your first agent with a task. Its progress and status will appear here.' : 'Add a project folder, then launch an agent to start working.')); return; }
-      const filtered = state.agents.filter(a => {
-        const matches = [a.name, a.id, a.harness, a.model, a.group, a.status, a.task_preview ?? a.task].join(' ').toLowerCase().includes(search);
-        const active = ['working','idle'].includes(a.state), attention = ['paused','crashed'].includes(a.state) || a.stopping || a.wake_queued_at || a.replacement_start_pending || a.replacement_start;
-        return matches && (state.agentFilter === 'all' || state.agentFilter === 'active' && active || state.agentFilter === 'attention' && attention || state.agentFilter === 'finished' && ['done','closed','replaced'].includes(a.state));
-      });
-      if (!filtered.length) { setHTML(root, emptyState('search', 'No agents match', `Try a different search or state filter.${state.pages.agents?.has_more ? ' Load more agents to search earlier records.' : ''}`)); return; }
+      if (!ready) { setHTML(root, emptyState('agents', page?.error ? 'Agents unavailable' : 'Loading agents…', page?.error || '')); return; }
+      if (!page.project_total) { setHTML(root, emptyState('agents', 'No agents yet', state.project ? 'Launch your first agent with a task. Its progress and status will appear here.' : 'Add a project folder, then launch an agent to start working.')); return; }
+      if (!agents.length) { setHTML(root, emptyState('search', 'No agents match', 'Try a different search or state filter.')); return; }
       const groups = new Map();
-      filtered.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
+      agents.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
       setHTML(root, [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join(''));
+      updateWaitTimers();
+    }
+    async function refreshAgentBrowser() {
+      const scope = collectionPath('agentBrowser');
+      if (state.pages.agentBrowser?.scope !== scope) { state.pages.agentBrowser = {scope,items:[],loaded:0}; state.agentBrowser = []; }
+      renderAgents(); updatePaging();
+      try { await loadCollection('agentBrowser'); }
+      catch (error) { if (state.pages.agentBrowser?.scope === scope) state.pages.agentBrowser.error = error.message; }
+      if (scope === collectionPath('agentBrowser')) { renderAgents(); updatePaging(); }
+    }
+    function findAgent(id) { return state.agentBrowser.find(agent => agent.id === id) || state.agents.find(agent => agent.id === id); }
+    function stampWaiting(value) {
+      if (value?.waiting && typeof value.waiting === 'object') waitingReceipts.set(value.waiting, performance.now());
+      return value;
+    }
+    function rememberWaiting(agent) {
+      if (agent.waiting) {
+        const wait = agent.waiting, previous = waitingClocks.get(agent.id);
+        if (!Number.isFinite(wait.remaining_secs) && previous && Number.isFinite(previous.remaining) && previous.waiting.started_at === wait.started_at && previous.waiting.expires_at === wait.expires_at) return;
+        const received = waitingReceipts.get(wait) ?? performance.now();
+        const remaining = Number.isFinite(wait.remaining_secs) ? wait.remaining_secs : serverClock && Number.isFinite(wait.expires_at) ? Math.max(0,wait.expires_at-serverClock.seconds-(received-serverClock.received)/1000) : null;
+        waitingClocks.set(agent.id, {waiting:wait,received,remaining});
+      }
+      else if (!agent.is_waiting) waitingClocks.delete(agent.id);
+    }
+    function waitingDescription(agent) {
+      const wait = agent.waiting, watches = [];
+      if (wait.agents === 'all') watches.push('all project agents');
+      else if (wait.agents?.length) watches.push(`agents ${wait.agents.map(id => `#${id}`).join(', ')}`);
+      if (wait.states?.length) watches.push(`states: ${wait.states.join(', ')}`);
+      if (wait.status_text) watches.push('status changes');
+      return `Waiting for notifications · <span data-wait-agent="${agent.id}" data-wait-started="${esc(wait.started_at)}" title="${esc(`Timeout at ${when(wait.expires_at)}`)}">checking timeout</span>${watches.length ? ` · watching ${esc(watches.join(' · '))}` : ''}`;
+    }
+    function updateWaitTimers() {
+      document.querySelectorAll('[data-wait-agent]').forEach(node => {
+        const clock = waitingClocks.get(Number(node.dataset.waitAgent));
+        if (!clock || String(clock.waiting.started_at) !== node.dataset.waitStarted) return;
+        const remaining = clock.remaining;
+        const seconds = Number.isFinite(remaining) ? Math.max(0, Math.ceil(remaining - (performance.now()-clock.received)/1000)) : null;
+        setText(node, seconds == null ? 'timeout unavailable' : seconds ? `${fmt(seconds)}s left` : 'timeout due');
+      });
+    }
+    function formatAgentLog(text) {
+      return text.replace(/^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\] \[(message|tool|error|turn-start|turn-end)\] /gm, (prefix, timestamp, kind) => {
+        const time = new Date(timestamp);
+        return Number.isNaN(time.getTime()) ? prefix : `[${time.toLocaleString()}] [${kind}] `;
+      });
     }
 
     function replacementSummary(a) {
@@ -951,8 +1012,9 @@
     function agentRow(a) {
       const replacement = replacementSummary(a), starting = a.replacement_start || a.replacement_start_pending;
       const stopping = a.stopping ? '<span class="pill waiting">Stopping</span><div class="meta">Stopping processes before releasing locks.</div>' : '';
+      const waiting = a.waiting ? `<div class="meta agent-wait">${waitingDescription(a)}</div>` : a.is_waiting ? '<div class="meta agent-wait">Waiting for notifications · See Details for the watch and timeout.</div>' : '';
       const disabled = a.stopping || agentTransitions.has(a.id) ? ' disabled' : '';
-      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}<div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
+      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}${waiting}<div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
       const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
       const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
@@ -961,13 +1023,13 @@
         : ['paused', 'crashed'].includes(a.state) ? `<button class="small" data-action="resume" data-id="${a.id}"${disabled}>${starting ? 'Resume replacement' : a.state === 'crashed' || unavailable ? 'Retry same model' : 'Resume'}</button>${!starting && (a.state === 'crashed' || unavailable) ? `<button class="small" data-action="another-model" data-id="${a.id}"${disabled}>Launch another model…</button>` : ''}`
         : a.state === 'closed' ? `<button class="small" data-action="reopen" data-id="${a.id}"${disabled}>${starting ? 'Reopen replacement' : 'Reopen'}</button>` : '';
       const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}"${disabled}>${starting ? 'Close replacement' : 'Close'}</button>` : '';
-      const waiting = !starting && a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
+      const queued = !starting && a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = !starting && a.wake_reason ? `<div class="meta wait-reason">${esc(a.wake_reason)}</div>` : '';
       const problem = a.has_problem || problemText ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
       const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta wait-reason">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
-        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${waiting}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta agent-task" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${queued}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
+        <div><div class="meta agent-task" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${waiting}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -1203,8 +1265,8 @@
         const current = () => request === agentRequest && id === selectedAgent && $('#agent-dialog').open;
         const [a, log] = await Promise.all([record(`/agents/${id}`, undefined, current), loadAgentLog(id, request)]);
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
-        const summary = state.agents.find(item => item.id === id);
-        if (summary?.truncated && a.project === state.selectedProject) {
+        rememberWaiting(a);
+        for (const summary of [state.agents.find(item => item.id === id), state.agentBrowser.find(item => item.id === id)]) if (summary?.truncated && a.project === state.selectedProject) {
           Object.assign(summary, a, {replacement_pending:!!a.replacement_request, replacement_start_pending:!!a.replacement_start,
             task_preview:a.task?.slice(0,400), problem_preview:a.problem?.slice(0,400), has_problem:!!a.problem,
             model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(a.problem || '')});
@@ -1212,7 +1274,8 @@
         }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        if (a.waiting) fields.push({key:'waiting',label:'waiting',content:waitingDescription(a)});
         if (a.stopping) fields.push({key:'stopping',label:'stop cleanup',content:'Stopping processes. Locks are released only after cleanup finishes.'});
         fields.push({key:'running_configuration',label:'current turn',content:a.running_configuration ? `${esc(a.harness)} / ${esc(a.running_configuration.model)} / effort ${esc(a.running_configuration.effort)}` : '— (no running turn)'});
         fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
@@ -1226,6 +1289,7 @@
         if (a.replacement_start) fields.push({key:'replacement_start',label:'replacement waiting',content:replacementSummary(a)});
         if (a.continuation) fields.push({key:'continuation',label:'pending continuation',content:`${esc(a.continuation.text)}<br>${a.continuation.blocked ? `Waiting: ${esc(a.continuation.blocked)}` : 'One turn after the current turn succeeds'}`});
         updateAgentDetails(fields);
+        updateWaitTimers();
         if (a.state === 'replaced') $('#agent-config').replaceChildren();
         else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         const configRoot = $('#agent-config'), blocked = !!a.replacement_request;
@@ -1248,7 +1312,7 @@
         }
         if (blocked) configRoot.querySelectorAll('input,select,textarea,button').forEach(control => control.disabled = true);
         if ($('#save-agent-config')) $('#save-agent-config').disabled = blocked || configRoot.dataset.saving === 'true';
-        const el = $('#agent-log'), text = log?.text || 'No activity yet';
+        const el = $('#agent-log'), text = formatAgentLog(log?.text || '') || 'No activity yet';
         const selectingLog = hasSelectedText(el);
         if (el.textContent !== text && !selectingLog) {
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
@@ -1257,12 +1321,36 @@
           el.scrollTop = atBottom ? el.scrollHeight : top;
         }
         setText($('#agent-detail-status'), `Live · updated ${new Date().toLocaleTimeString()}`);
+        if ($('#agent-lifecycle').open) await loadAgentLifecycle(id, request);
       } catch (error) {
         if (request === agentRequest && $('#agent-dialog').open) setText($('#agent-detail-status'), `Updates unavailable: ${error.message}. Retrying automatically.`);
       } finally { if (agentLoading === request) agentLoading = null; }
     }
 
     let logLoading = null;
+    async function loadAgentLifecycle(id, request, older = false) {
+      const current = () => id === selectedAgent && request === agentRequest && $('#agent-dialog').open && $('#agent-lifecycle').open;
+      if (!current() || lifecycleLoading?.request === request) return;
+      const flight = {id,request}; lifecycleLoading = flight; $('#lifecycle-older').disabled = true;
+      try {
+        const previous = agentLifecycle?.id === id ? agentLifecycle : null;
+        const cursor = previous?.events.length ? older ? {before:previous.events.at(-1).id} : {after:previous.events[0].id} : {};
+        let page = await api(query('/history',{agent:id,kind:'agent.state',limit:30,max_bytes:pageBytes,...cursor}));
+        if (!current()) return;
+        let replace = !previous?.events.length;
+        // A burst beyond one page restarts at the latest window; never leave a hidden gap.
+        if (!older && cursor.after && page.has_more) {page=await api(query('/history',{agent:id,kind:'agent.state',limit:30,max_bytes:pageBytes}));replace=true;}
+        if (!current()) return;
+        let events = [...new Map([...(replace ? [] : previous.events),...page.events].map(event=>[event.id,event])).values()].sort((a,b)=>b.id-a.id);
+        const windowSize = Math.max(30,previous?.events.length || 0), trimmed = !older && events.length>windowSize;
+        if (trimmed) events=events.slice(0,windowSize);
+        agentLifecycle = {id,events,has_more:older || replace ? page.has_more : previous.has_more || trimmed};
+        setHTML($('#agent-lifecycle-items'),events.length ? events.map(event=>`<div class="event"><time>${when(event.at)}</time><div>#${event.id} · ${event.truncated ? `<button type="button" class="small" data-record="history" data-record-id="${event.id}">Load state change</button>` : `${esc(event.details?.from || '—')} → ${esc(event.details?.to || '—')}`}</div></div>`).join('') : '<p class="meta">No lifecycle changes recorded.</p>');
+        $('#lifecycle-older').hidden=!agentLifecycle.has_more; $('#agent-lifecycle-error').hidden=true;
+      } catch(error) {if(current()) {setText($('#agent-lifecycle-error'),`Lifecycle updates unavailable: ${error.message}. Retrying automatically.`);$('#agent-lifecycle-error').hidden=false;}}
+      finally {if(lifecycleLoading===flight)lifecycleLoading=null;if(current())$('#lifecycle-older').disabled=false;}
+    }
+    $('#agent-lifecycle').addEventListener('toggle',()=>{if($('#agent-lifecycle').open&&selectedAgent!=null)loadAgentLifecycle(selectedAgent,agentRequest);});
     async function loadAgentLog(id, request, older = false) {
       if (logLoading?.id === id && logLoading.request === request) {
         await logLoading.promise;
@@ -1620,12 +1708,12 @@
     });
 
     async function agentTransition(action, id) {
-      if (agentTransitions.has(id) || state.agents.find(agent => agent.id === id)?.stopping) return;
+      if (agentTransitions.has(id) || findAgent(id)?.stopping) return;
       agentTransitions.add(id); action.disabled = true; renderAgents();
       try {
         const result = await mutate(`/agents/${id}/${action.dataset.action}`);
         if (!result.result_truncated && result.warnings?.length) toast(result.warnings.join('\n'));
-      } finally { agentTransitions.delete(id); action.disabled = !!state.agents.find(agent => agent.id === id)?.stopping; renderAgents(); }
+      } finally { agentTransitions.delete(id); action.disabled = !!findAgent(id)?.stopping; renderAgents(); }
     }
 
     document.addEventListener('click', async event => {
@@ -1639,7 +1727,7 @@
         (selected || $('#thread-search')).focus({preventScroll:true}); return;
       }
       const agentFilter = event.target.closest('[data-agent-filter]');
-      if (agentFilter) { state.agentFilter = agentFilter.dataset.agentFilter; renderAgents(); return; }
+      if (agentFilter) { clearTimeout(agentSearchTimer); agentSearchTimer = null; state.agentFilter = agentFilter.dataset.agentFilter; await refreshAgentBrowser(); return; }
       const full = event.target.closest('[data-record]');
       if (full) {
         const dialog = $('#record-dialog'); openDialog(dialog); const session = dialog._session;
@@ -1678,6 +1766,7 @@
         return;
       }
       if (event.target.closest('#thread-older')) { await olderMessages(); return; }
+      if (event.target.closest('#lifecycle-older')) {await loadAgentLifecycle(selectedAgent,agentRequest,true);return;}
       if (event.target.closest('#log-older')) {
         const button = $('#log-older'), id = selectedAgent, request = agentRequest, el = $('#agent-log');
         button.disabled = true;
@@ -1685,7 +1774,7 @@
           const top = el.scrollTop, height = el.scrollHeight;
           const log = await loadAgentLog(id, request, true);
           if (request === agentRequest && $('#agent-dialog').open && log && !hasSelectedText(el)) {
-            el.textContent = log.text; el.scrollTop = top + el.scrollHeight - height;
+            el.textContent = formatAgentLog(log.text); el.scrollTop = top + el.scrollHeight - height;
           }
         } catch (error) { if (request === agentRequest) toast(error.message, true); }
         finally { button.disabled = false; }
@@ -1884,7 +1973,7 @@
       if (!action) return;
       try {
         const id = Number(action.dataset.id);
-        if (action.dataset.action !== 'details' && (state.agents.find(agent => agent.id === id)?.stopping || agentTransitions.has(id))) return;
+        if (action.dataset.action !== 'details' && (findAgent(id)?.stopping || agentTransitions.has(id))) return;
         if (action.dataset.action === 'another-model') {
           const agent=await record(`/agents/${id}`);
           $('#launch-project-select').innerHTML=projectOptions(agent.project);
@@ -1896,6 +1985,7 @@
         } else if (action.dataset.action === 'details') {
           selectedAgent = id; agentRequest++;
           agentLog = null;
+          agentLifecycle = null; $('#agent-lifecycle').open=false; $('#agent-lifecycle-items').replaceChildren(); $('#agent-lifecycle-error').hidden=true; $('#lifecycle-older').hidden=true;
           $('#agent-title').textContent = `Agent #${id}`;
           $('#agent-details').replaceChildren(); $('#agent-config').replaceChildren(); $('#agent-log').textContent = '';
           $('#agent-detail-status').textContent = 'Loading…';
@@ -1915,16 +2005,16 @@
     });
 
     $('#pause-all').addEventListener('click', async () => {
-      if (pausingAll || !confirm('Pause all agents in all projects, stop their processes, and release every held lock?')) return;
-      pausingAll = true; $('#pause-all').disabled = true;
+      if (pausingAll || !(state.pauseEligible > 0) || !confirm('Pause all eligible agents in all projects, stop their processes, and release every held lock?')) return;
+      pausingAll = true; renderRestartResume();
       try { await mutate('/pause-all'); } catch (e) { toast(e.message, true); }
-      finally { pausingAll = false; $('#pause-all').disabled = false; }
+      finally { pausingAll = false; renderRestartResume(); }
     });
     $('#resume-all').addEventListener('click', async () => {
-      if (resumingAll) return;
-      resumingAll = true; $('#resume-all').disabled = true;
+      if (resumingAll || !(state.resumeEligible > 0)) return;
+      resumingAll = true; renderRestartResume();
       try { await mutate('/resume-all'); } catch (e) { toast(e.message, true); }
-      finally { resumingAll = false; $('#resume-all').disabled = false; }
+      finally { resumingAll = false; renderRestartResume(); }
     });
     $('#resume-restart').addEventListener('click', async () => {
       if (resumingRestart || !(state.restartPaused > 0)) return;
@@ -1970,7 +2060,8 @@
       state.selectedProject = Number(event.target.value);
       state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
-      for (const key of ['agents', 'threads', 'locks', 'activity']) state[key] = [];
+      clearTimeout(agentSearchTimer); agentSearchTimer = null; state.agentCounts = null;
+      for (const key of ['agents', 'agentBrowser', 'threads', 'locks', 'activity']) state[key] = [];
       resetThread(); $('#settings-form').replaceChildren(); render(); await refresh();
     });
     $('#remove-project').addEventListener('click', async () => {
@@ -2192,7 +2283,12 @@
         if (current?.dataset.draftProject === project && current.dataset.draftThread === thread) $('button', current).disabled = false;
       }
     });
-    $('#agent-search').addEventListener('input', renderAgents);
+    $('#agent-search').addEventListener('input', () => {
+      state.agentSearch = $('#agent-search').value.trim();
+      clearTimeout(agentSearchTimer);
+      agentSearchTimer = setTimeout(() => { agentSearchTimer = null; refreshAgentBrowser(); }, 200);
+      renderAgents(); updatePaging();
+    });
     $('#thread-search').addEventListener('input', renderThreads);
     window.addEventListener('resize', () => {
       const messages = $('#messages');
@@ -2333,6 +2429,7 @@
     resetThread();
     refresh(true).catch(e => toast(e.message, true));
     setInterval(() => { if (!refreshPending && document.visibilityState === 'visible') refresh(false); }, 2000);
+    setInterval(updateWaitTimers, 1000);
   </script>
 </body>
 </html>

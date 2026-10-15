@@ -80,10 +80,25 @@ impl PageQuery {
         through: i64,
         revision: &str,
     ) -> R<Value> {
+        self.finish_with(candidates, total, through, revision, &json!({}))
+    }
+
+    pub fn finish_with(
+        &self,
+        candidates: Vec<Value>,
+        total: i64,
+        through: i64,
+        revision: &str,
+        extra: &Value,
+    ) -> R<Value> {
         let count = candidates.len();
         let envelope = |items: &[Value], more: bool| {
             let last = items.last().and_then(|v| v["id"].as_i64());
-            json!({"items":items,"has_more":more,"next_before":if self.ascending(){None}else{last},"next_after":if self.ascending(){last}else{None},"through":through,"revision":revision,"total":total})
+            let mut value = json!({"items":items,"has_more":more,"next_before":if self.ascending(){None}else{last},"next_after":if self.ascending(){last}else{None},"through":through,"revision":revision,"total":total});
+            if let Some(fields) = extra.as_object() {
+                value.as_object_mut().unwrap().extend(fields.clone());
+            }
+            value
         };
         let mut items = Vec::new();
         for mut item in candidates.into_iter().take(self.limit as usize) {
@@ -124,6 +139,8 @@ fn stub(item: &Value) -> Value {
         "stopping",
         "holder_stopping",
         "replacement_start_pending",
+        "wake_queued_at",
+        "is_waiting",
         "private",
         "joinable",
         "owner",

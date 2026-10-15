@@ -1,8 +1,8 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, ThreadReq, acom_home, actor, bad,
-    bounded_record, not_found,
+    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, ThreadReq, WaitAgents, WaitOptions,
+    acom_home, actor, bad, bounded_record, not_found,
 };
 use crate::harness::catalog;
 use serde_json::{Value, json};
@@ -307,6 +307,55 @@ fn identity(b: &Value, key: &str) -> R<i64> {
             .ok_or_else(|| bad(format!("{key} must be 0 (user) or a positive agent ID"))),
     }
 }
+
+fn wait_options(b: &Value) -> R<WaitOptions> {
+    let agents = match b.get("agents") {
+        None => None,
+        Some(Value::String(value)) if value == "all" => Some(WaitAgents::All(value.clone())),
+        Some(Value::Array(values)) => Some(WaitAgents::Selected(
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .filter(|id| *id > 0)
+                        .ok_or_else(|| bad("watched agent IDs must be positive integers"))
+                })
+                .collect::<R<Vec<_>>>()?,
+        )),
+        _ => return Err(bad("agents must be all or an array of agent IDs")),
+    };
+    let states = match b.get("states") {
+        None => None,
+        Some(Value::Array(values)) => Some(
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| bad("states must be an array of lifecycle states"))
+                })
+                .collect::<R<Vec<_>>>()?,
+        ),
+        _ => return Err(bad("states must be an array of lifecycle states")),
+    };
+    let after = b
+        .get("after")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| bad("after must be a nonnegative event ID"))
+        })
+        .transpose()?;
+    Ok(WaitOptions {
+        agents,
+        states,
+        status_text: boolean(b, "status_text", false)?,
+        after,
+    })
+}
 fn settings(b: &Value, key: &str) -> R<Settings> {
     serde_json::from_value(b[key].clone()).map_err(|e| bad(format!("bad settings: {e}")))
 }
@@ -402,9 +451,13 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // agents
-        ("GET", ["agents"]) => {
-            J(app.agents_page(q.int("project")?, q.get("group").as_deref(), page(q)?)?)
-        }
+        ("GET", ["agents"]) => J(app.filtered_agents_page(
+            q.int("project")?,
+            q.get("group").as_deref(),
+            q.get("category").as_deref().unwrap_or("all"),
+            q.get("search").as_deref().unwrap_or(""),
+            page(q)?,
+        )?),
         ("GET", ["agents", a]) => J(record(app.agent_view_for(id(a)?, q.int("agent")?)?, q)?),
         ("GET", ["agents", a, "project"]) => J(json!({"project":app.agent_project(id(a)?)?})),
         ("GET", ["agents", a, "log"]) => {
@@ -493,7 +546,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("POST", ["wait", a]) => {
             let timeout = u64::try_from(int(b, "timeout")?)
                 .map_err(|_| bad("wait timeout must be 1–3600 seconds"))?;
-            J(app.wait_updates(id(a)?, timeout)?)
+            J(app.wait_for(id(a)?, timeout, wait_options(b)?)?)
         }
         ("POST", ["wait", a, "ack"]) => {
             app.ack_updates(id(a)?, int(b, "delivery_id")?)?;
@@ -1027,6 +1080,35 @@ fn folders(path: Option<&str>, hidden: bool, q: &Query) -> R<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wait_watch_options_are_strictly_typed() {
+        let options = super::wait_options(
+            &serde_json::json!({"agents":[3,1],"states":["crashed"],"status_text":true,"after":0}),
+        )
+        .unwrap();
+        assert!(
+            matches!(options.agents,Some(crate::app::WaitAgents::Selected(ids)) if ids==vec![3,1])
+        );
+        assert_eq!(options.states, Some(vec!["crashed".into()]));
+        assert!(options.status_text);
+        assert_eq!(options.after, Some(0));
+        for body in [
+            serde_json::json!({"agents":null}),
+            serde_json::json!({"agents":"1,2"}),
+            serde_json::json!({"agents":["1"]}),
+            serde_json::json!({"agents":[1.0]}),
+            serde_json::json!({"agents":[0]}),
+            serde_json::json!({"states":"crashed"}),
+            serde_json::json!({"states":[1]}),
+            serde_json::json!({"status_text":null}),
+            serde_json::json!({"status_text":"false"}),
+            serde_json::json!({"after":-1}),
+            serde_json::json!({"after":1.0}),
+        ] {
+            assert!(super::wait_options(&body).is_err(), "{body}");
+        }
+    }
+
     #[test]
     fn malformed_agent_identity_cannot_default_to_the_user() {
         assert_eq!(super::identity(&serde_json::json!({}), "agent").unwrap(), 0);

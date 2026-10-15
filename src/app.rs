@@ -463,10 +463,63 @@ pub struct Proc {
     pub failure: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum WaitAgents {
+    All(String),
+    Selected(Vec<i64>),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WaitOptions {
+    pub agents: Option<WaitAgents>,
+    pub states: Option<Vec<String>>,
+    pub status_text: bool,
+    pub after: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AgentWatch {
+    agents: WaitAgents,
+    states: Vec<String>,
+    status_text: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Waiting {
+    started_at: i64,
+    expires_at: i64,
+    deadline: Instant,
+    watch: Option<AgentWatch>,
+}
+
+impl Waiting {
+    pub fn view(&self) -> Value {
+        let mut value = json!({
+            "started_at":self.started_at,
+            "expires_at":self.expires_at,
+            "remaining_secs":self.deadline.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64,
+        });
+        if let Some(watch) = &self.watch {
+            value["agents"] = json!(watch.agents);
+            value["states"] = json!(watch.states);
+            value["status_text"] = json!(watch.status_text);
+        }
+        value
+    }
+
+    fn detail_view(&self) -> Value {
+        let mut value = self.view();
+        // Chunked details must not change version merely because a second passes.
+        value.as_object_mut().unwrap().remove("remaining_secs");
+        value
+    }
+}
+
 pub struct St {
     pub db: Connection,
     pub shutting_down: bool,
-    pub waiting_updates: HashSet<i64>,
+    pub waiting_updates: HashMap<i64, Waiting>,
     pub stopping_agents: HashSet<i64>,
     /// Lock queues by (project, lock name).
     pub queues: HashMap<(i64, String), Vec<i64>>,
@@ -519,6 +572,8 @@ CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT
 CREATE INDEX IF NOT EXISTS notices_agent ON notices(agent_id,id);
 CREATE INDEX IF NOT EXISTS notices_delivery ON notices(agent_id,shown,id);
 CREATE TABLE IF NOT EXISTS update_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER NOT NULL UNIQUE, text TEXT);
+CREATE TABLE IF NOT EXISTS wait_watch_cursors (agent_id INTEGER NOT NULL, filter TEXT NOT NULL, event_id INTEGER NOT NULL,
+  PRIMARY KEY(agent_id,filter));
 CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
 CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
@@ -646,6 +701,13 @@ INSERT OR IGNORE INTO view_ids SELECT 'notices',coalesce(max(id),0) FROM notices
 // Revision counters participate in the same SQLite transaction as their rows,
 // including external writes. No-op updates do not invalidate a snapshot.
 fn initialize_views(db: &Connection) -> R<()> {
+    db.create_scalar_function(
+        "acom_lower",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+    )?;
     for table in [
         "projects",
         "configs",
@@ -1566,6 +1628,13 @@ impl SelectedPage {
             None => q.finish(self.items, self.total, self.through, &self.revision),
         }
     }
+
+    fn finish_with(self, q: &PageQuery, extra: &Value) -> R<Value> {
+        match self.unchanged {
+            Some(value) => Ok(value),
+            None => q.finish_with(self.items, self.total, self.through, &self.revision, extra),
+        }
+    }
 }
 
 impl App {
@@ -1607,7 +1676,7 @@ impl App {
         let mut st = St {
             db,
             shutting_down: false,
-            waiting_updates: HashSet::new(),
+            waiting_updates: HashMap::new(),
             stopping_agents: HashSet::new(),
             queues: HashMap::new(),
             procs: HashMap::new(),
@@ -2926,6 +2995,10 @@ impl App {
             "UPDATE update_deliveries SET agent_id=?2 WHERE agent_id=?1 AND text IS NOT NULL",
             params![id, new],
         )?;
+        st.db.execute(
+            "INSERT INTO wait_watch_cursors(agent_id,filter,event_id) SELECT ?2,filter,event_id FROM wait_watch_cursors WHERE agent_id=?1",
+            params![id,new],
+        )?;
         Ok(())
     }
 
@@ -3107,11 +3180,137 @@ impl App {
         })
     }
 
+    fn normalize_watch(st: &St, id: i64, options: &WaitOptions) -> R<Option<AgentWatch>> {
+        let Some(mut agents) = options.agents.clone() else {
+            if options.states.is_some() || options.status_text || options.after.is_some() {
+                return Err(bad("states, status_text and after require watched agents"));
+            }
+            return Ok(None);
+        };
+        let project = st.agent(id)?.project;
+        match &mut agents {
+            WaitAgents::All(value) if value == "all" => {}
+            WaitAgents::All(_) => return Err(bad("agents must be all or an array of agent IDs")),
+            WaitAgents::Selected(ids) => {
+                ids.sort_unstable();
+                ids.dedup();
+                if ids.is_empty() || ids.len() > 200 {
+                    return Err(bad("watch 1–200 agent IDs, or all"));
+                }
+                for agent in ids {
+                    if *agent <= 0 {
+                        return Err(bad("watched agent IDs must be positive"));
+                    }
+                    if *agent == id {
+                        return Err(bad(
+                            "watch peer agents, not yourself; your turn changing cancels the wait",
+                        ));
+                    }
+                    if st.agent(*agent)?.project != project {
+                        return Err(bad(format!("agent {agent} is in another project")));
+                    }
+                }
+            }
+        }
+        let mut states = options
+            .states
+            .clone()
+            .unwrap_or_else(|| STATES.iter().map(|s| s.to_string()).collect());
+        states.sort();
+        states.dedup();
+        if states.is_empty() || states.iter().any(|state| !STATES.contains(&state.as_str())) {
+            return Err(bad(format!(
+                "states must contain lifecycle states: {}",
+                STATES.join(", ")
+            )));
+        }
+        Ok(Some(AgentWatch {
+            agents,
+            states,
+            status_text: options.status_text,
+        }))
+    }
+
+    fn watch_updates(st: &St, id: i64, watch: &AgentWatch, after: Option<i64>) -> R<String> {
+        let ceiling: i64 = st
+            .db
+            .query_row("SELECT coalesce(max(id),0) FROM events", [], |r| r.get(0))?;
+        if after.is_some_and(|value| value < 0 || value > ceiling) {
+            return Err(bad(
+                "after must be an existing event cursor between 0 and the latest event ID",
+            ));
+        }
+        let filter = json!(watch).to_string();
+        let saved: Option<i64> = st
+            .db
+            .query_row(
+                "SELECT event_id FROM wait_watch_cursors WHERE agent_id=?1 AND filter=?2",
+                params![id, filter],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let cursor = after.or(saved).unwrap_or(ceiling);
+        let ids = match &watch.agents {
+            WaitAgents::All(_) => json!([]),
+            WaitAgents::Selected(ids) => json!(ids),
+        };
+        let candidates=Self::event_rows(st,
+            "SELECT id,at,kind,agent,details FROM events WHERE project=?1 AND id>?2 AND id<=?3
+             AND ((?4=1 AND agent<>?5) OR EXISTS(SELECT 1 FROM json_each(?6) WHERE value=events.agent))
+             AND ((kind='agent.state' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value=json_extract(events.details,'$.to')))
+               OR (kind='agent.created' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value=json_extract(events.details,'$.state')))
+               OR (kind='agent.failed' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value='crashed'))
+               OR (kind='agent.replaced' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value='replaced'))
+               OR (kind='agent.status' AND ?8)) ORDER BY id LIMIT 51",
+            params![st.agent(id)?.project,cursor,ceiling,matches!(watch.agents,WaitAgents::All(_)),id,ids.to_string(),json!(watch.states).to_string(),watch.status_text])?;
+        let mut lines = Vec::new();
+        let mut through = cursor;
+        for event in candidates.iter().take(50) {
+            let details = event["details"].to_string();
+            let details = if details.len() > 512 {
+                let end = details
+                    .char_indices()
+                    .map(|(offset, _)| offset)
+                    .take_while(|offset| *offset <= 512)
+                    .last()
+                    .unwrap_or(0);
+                format!(
+                    "{}… [details: acom history {}]",
+                    &details[..end],
+                    event["id"]
+                )
+            } else {
+                details
+            };
+            lines.push(format!(
+                "[acom] Event #{} at {}: agent {} {} {}",
+                event["id"],
+                event["at"],
+                event["agent"],
+                event["kind"].as_str().unwrap_or(""),
+                details
+            ));
+            if json!({"text":lines.join("\n")}).to_string().len() > 4000 {
+                lines.pop();
+                break;
+            }
+            through = event["id"].as_i64().unwrap();
+        }
+        if lines.len() == candidates.len() {
+            through = ceiling;
+        }
+        if lines.len() < candidates.len() {
+            lines.push("[acom] More watched events remain; call acom wait with the same filters to continue.".into());
+        }
+        st.db.execute("INSERT INTO wait_watch_cursors(agent_id,filter,event_id) VALUES(?1,?2,?3) ON CONFLICT(agent_id,filter) DO UPDATE SET event_id=excluded.event_id",params![id,filter,through])?;
+        Ok(lines.join("\n"))
+    }
+
     pub fn hook(&self, id: i64) -> R<String> {
         let mut st = self.lock();
         if st.shutting_down
             || st.agent(id)?.state != "working"
-            || st.waiting_updates.contains(&id)
+            || st.waiting_updates.contains_key(&id)
             || st.pending_delivery(id)?.is_some()
         {
             return Ok(String::new());
@@ -3121,7 +3320,12 @@ impl App {
 
     /// Foreground wait in the current turn. A persisted receipt survives a lost
     /// HTTP response; only ACK or a successfully committed startup consumes it.
-    pub fn wait_updates(&self, id: i64, timeout: u64) -> R<Value> {
+    #[cfg(test)]
+    fn wait_updates(&self, id: i64, timeout: u64) -> R<Value> {
+        self.wait_for(id, timeout, WaitOptions::default())
+    }
+
+    pub fn wait_for(&self, id: i64, timeout: u64, options: WaitOptions) -> R<Value> {
         if !(1..=3600).contains(&timeout) {
             return Err(bad("wait timeout must be 1–3600 seconds"));
         }
@@ -3137,10 +3341,22 @@ impl App {
                 "wait requires a working turn and a running server",
             ));
         }
-        if !st.waiting_updates.insert(id) {
+        let watch = Self::normalize_watch(&st, id, &options)?;
+        if st.waiting_updates.contains_key(&id) {
             return Err(conflict("another wait is already running for this agent"));
         }
         let deadline = Instant::now() + Duration::from_secs(timeout);
+        let started_at = now();
+        st.waiting_updates.insert(
+            id,
+            Waiting {
+                started_at,
+                expires_at: started_at + timeout as i64,
+                deadline,
+                watch: watch.clone(),
+            },
+        );
+        let mut after = options.after;
         let result = loop {
             let ready = (|| -> R<Option<Value>> {
                 if st.shutting_down {
@@ -3162,13 +3378,18 @@ impl App {
                     ));
                 }
                 st.atomic(|st| {
-                    let text = st.coordination_updates(id)?;
+                    let watched=watch.as_ref().map(|watch|Self::watch_updates(st,id,watch,after)).transpose()?.unwrap_or_default();
+                    let updates=st.take_fresh_updates(id,if watch.is_some(){8000}else{11000})?;
+                    let summary=st.coordination_summary(id,false)?;
+                    let text=[updates,summary,watched].into_iter().filter(|text|!text.is_empty()).collect::<Vec<_>>().join("\n");
                     if text.is_empty() { return Ok(None); }
+                    if json!({"text":text,"delivery_id":i64::MAX,"timed_out":false}).to_string().len()>16000 {return Err(bad("wait updates exceed the response budget"));}
                     st.db.execute("DELETE FROM update_deliveries WHERE agent_id=?1",[id])?;
                     st.db.execute("INSERT INTO update_deliveries(agent_id,text) VALUES(?1,?2)",params![id,text])?;
                     Ok(Some(json!({"text":text,"delivery_id":st.db.last_insert_rowid(),"timed_out":false})))
                 })
             })();
+            after = None;
             match ready {
                 Ok(Some(value)) => break Ok(value),
                 Err(error) => break Err(error),
@@ -4979,16 +5200,114 @@ impl App {
         .finish(&q)
     }
 
+    #[cfg(test)]
     pub fn agents_page(&self, project: Option<i64>, group: Option<&str>, q: PageQuery) -> R<Value> {
-        let st = self.lock();
-        let sql="SELECT id,project,name,grp \"group\",harness,model,effort,state,status_text status,substr(task,1,400) task_preview,
+        self.filtered_agents_page(project, group, "all", "", q)
+    }
+
+    fn agent_runtime_revision(st: &St) -> String {
+        let mut stopping: Vec<i64> = st
+            .stopping_agents
+            .iter()
+            .copied()
+            .chain(
+                st.procs
+                    .iter()
+                    .filter(|(_, p)| p.stopping)
+                    .map(|(id, _)| *id),
+            )
+            .collect();
+        stopping.sort_unstable();
+        stopping.dedup();
+        let mut waiting: Vec<_> = st
+            .waiting_updates
+            .iter()
+            .map(|(id, wait)| (*id, format!("{wait:?}")))
+            .collect();
+        waiting.sort_unstable();
+        fingerprint(format!("{stopping:?}:{waiting:?}"))
+    }
+
+    fn agent_scope(
+        st: &St,
+        project: Option<i64>,
+        group: Option<&str>,
+        category: &str,
+        search: &str,
+    ) -> String {
+        format!(
+            "agents:{project:?}:{group:?}:{category}:{search:?}:{}",
+            Self::agent_runtime_revision(st)
+        )
+    }
+
+    fn agent_source(st: &St) -> String {
+        let mut stopping: Vec<i64> = st
+            .stopping_agents
+            .iter()
+            .copied()
+            .chain(
+                st.procs
+                    .iter()
+                    .filter(|(_, p)| p.stopping)
+                    .map(|(id, _)| *id),
+            )
+            .collect();
+        stopping.sort_unstable();
+        stopping.dedup();
+        let stopping = if stopping.is_empty() {
+            "0".into()
+        } else {
+            format!(
+                "a.id IN ({})",
+                stopping
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        format!("SELECT a.*,{stopping} stopping,
+          a.state IN ('working','idle') is_active,
+          (a.state IN ('paused','crashed') OR {stopping} OR a.wake_queued_at IS NOT NULL OR EXISTS(SELECT 1 FROM agent_starts s WHERE s.agent_id=a.id)) needs_attention,
+          a.state IN ('done','closed','replaced') is_finished
+          FROM agents a WHERE (?1 IS NULL OR a.project=?1) AND (?2 IS NULL OR a.grp=?2)
+          AND (?3='' OR instr(acom_lower(a.name||' '||a.id||' '||a.harness||' '||a.model||' '||coalesce(a.grp,'')||' '||coalesce(a.status_text,'')||' '||a.task),?3)>0)")
+    }
+
+    fn agent_counts(st: &St, project: Option<i64>, group: Option<&str>, search: &str) -> R<Value> {
+        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished FROM ({})", Self::agent_source(st)), params![project, group, search])?.remove(0))
+    }
+
+    pub fn filtered_agents_page(
+        &self,
+        project: Option<i64>,
+        group: Option<&str>,
+        category: &str,
+        search: &str,
+        q: PageQuery,
+    ) -> R<Value> {
+        let predicate = match category {
+            "all" => "1",
+            "active" => "is_active",
+            "attention" => "needs_attention",
+            "finished" => "is_finished",
+            _ => return Err(bad("category must be all, active, attention or finished")),
+        };
+        if search.len() > 4096 {
+            return Err(bad("search must be at most 4096 bytes"));
+        }
+        let search = search.trim().to_lowercase();
+        let mut st = self.lock();
+        st.atomic(|st| {
+        let sql=format!("SELECT id,project,name,grp \"group\",harness,model,effort,state,status_text status,substr(task,1,400) task_preview,
           substr(problem,1,400) problem_preview,problem IS NOT NULL has_problem,
           (lower(problem) LIKE '%model%not supported%' OR lower(problem) LIKE '%model%not available%'
            OR lower(problem) LIKE '%model%not found%' OR lower(problem) LIKE '%not supported%account%') model_unavailable,launched_by,launched_at,
           pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,turns,ended_at,wake_queued_at,wake_why wake_reason
-          FROM agents WHERE (?1 IS NULL OR project=?1) AND (?2 IS NULL OR grp=?2)";
+          FROM ({}) WHERE {predicate}", Self::agent_source(st));
         let mut page = self.select_page(
-            &st,
+            st,
             &q,
             &[
                 "agents",
@@ -4997,16 +5316,23 @@ impl App {
                 "agent_starts",
                 "events",
             ],
-            &format!("agents:{project:?}:{group:?}"),
-            sql,
-            &[project.into(), group.map(str::to_string).into()],
+            &Self::agent_scope(st, project, group, category, &search),
+            &sql,
+            &[project.into(), group.map(str::to_string).into(), search.clone().into()],
             true,
         )?;
         for item in &mut page.items {
             item["locks"] = json!(st.held_by(item["id"].as_i64().unwrap())?);
-            Self::replacement_fields(&st, item)?;
+            Self::replacement_fields(st, item)?;
+            let waiting = st.waiting_updates.get(&item["id"].as_i64().unwrap());
+            item["is_waiting"] = json!(waiting.is_some());
+            item["waiting"] = waiting.map(Waiting::view).unwrap_or(Value::Null);
         }
-        page.finish(&q)
+        let counts = Self::agent_counts(st, project, group, &search)?;
+        let project_total: i64 = st.db.query_row("SELECT count(*) FROM agents WHERE ?1 IS NULL OR project=?1", [project], |r| r.get(0))?;
+        let event_cursor: i64 = st.db.query_row("SELECT coalesce(max(id),0) FROM events", [], |r| r.get(0))?;
+        page.finish_with(&q, &json!({"counts":counts,"project_total":project_total,"event_cursor":event_cursor}))
+        })
     }
 
     pub fn threads_page(
@@ -5373,7 +5699,7 @@ impl App {
         ] {
             let scope = match name {
                 "projects" | "configs" => name.to_string(),
-                "agents" => format!("agents:{pid:?}:None"),
+                "agents" => Self::agent_scope(&st, pid, None, "all", ""),
                 "threads" => format!("threads:{pid:?}:None:0"),
                 "locks" => format!("locks:{pid:?}:{}", fingerprint(format!("{:?}", st.queues))),
                 "activity" => format!("activity:{pid:?}"),
@@ -5406,8 +5732,9 @@ impl App {
                 "agent_starts",
             ],
             &format!(
-                "overview:{project:?}:{}",
-                fingerprint(format!("{:?}", st.queues))
+                "overview:{project:?}:{}:{}",
+                fingerprint(format!("{:?}", st.queues)),
+                Self::agent_runtime_revision(&st)
             ),
         )?;
         if since == Some(revision.as_str()) {
@@ -5420,10 +5747,21 @@ impl App {
             [],
             |r| r.get(0),
         )?;
+        let resume_eligible: i64 = st.db.query_row(
+            "SELECT count(*) FROM agents WHERE state='paused'",
+            [],
+            |r| r.get(0),
+        )?;
+        let pause_eligible: i64 = st.db.query_row(
+            "SELECT count(*) FROM agents WHERE state IN ('working','idle','done')",
+            [],
+            |r| r.get(0),
+        )?;
+        let agent_counts = Self::agent_counts(&st, pid, None, "")?;
         let (total, per) = st.active_counts(pid)?;
         let limits = json!({"limits":s.limits,"active":{"total":total,"per_harness":per},"usage":rows(&st.db,"SELECT provider,win,used_pct,resets_at,at FROM usage ORDER BY provider,win",[])?,"checks":rows(&st.db,"SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider",[])?,"text":st.limits_text(pid)?});
         Ok(
-            json!({"url":self.url,"project":current,"unread_total":unread_total,"restart_paused":restart_paused,"limits":limits,"revisions":revisions,"revision":revision}),
+            json!({"url":self.url,"project":current,"unread_total":unread_total,"restart_paused":restart_paused,"resume_eligible":resume_eligible,"pause_eligible":pause_eligible,"agent_counts":agent_counts,"limits":limits,"revisions":revisions,"revision":revision}),
         )
     }
 
@@ -5738,6 +6076,12 @@ impl App {
                 .get(&id)
                 .map(|p| json!({"model":p.model,"effort":p.effort}))
         );
+        a["waiting"] = st
+            .waiting_updates
+            .get(&id)
+            .filter(|_| a["state"] == "working")
+            .map(Waiting::detail_view)
+            .unwrap_or(Value::Null);
         a["retry"] = json!(
             rows(
                 &st.db,
@@ -6201,7 +6545,7 @@ mod tests {
         St {
             db,
             shutting_down: false,
-            waiting_updates: HashSet::new(),
+            waiting_updates: HashMap::new(),
             stopping_agents: HashSet::new(),
             queues: HashMap::new(),
             procs: HashMap::new(),
@@ -6796,10 +7140,472 @@ mod tests {
 
     fn wait_registered(app: &App, id: i64) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !app.lock().waiting_updates.contains(&id) {
+        while !app.lock().waiting_updates.contains_key(&id) {
             assert!(Instant::now() < deadline, "wait was not registered");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn watch_app() -> Arc<App> {
+        let app = self_change_app();
+        app.lock().db.execute("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(3,1,'peer','task','claude','model','medium','working',0,0)",[]).unwrap();
+        app
+    }
+
+    fn watch_options() -> WaitOptions {
+        WaitOptions {
+            agents: Some(WaitAgents::All("all".into())),
+            ..Default::default()
+        }
+    }
+
+    fn event_ceiling(app: &App) -> i64 {
+        app.lock()
+            .db
+            .query_row("SELECT coalesce(max(id),0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn delivered_events(batch: &Value) -> Vec<i64> {
+        batch["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("[acom] Event #")
+                    .and_then(|line| line.split_whitespace().next())
+                    .and_then(|id| id.parse().ok())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wait_watch_preserves_fast_transitions_new_agents_and_between_call_events() {
+        let app = watch_app();
+        let active = app.lock().active_counts(Some(1)).unwrap();
+        let waiting = app.clone();
+        let thread = std::thread::spawn(move || waiting.wait_for(1, 10, watch_options()));
+        wait_registered(&app, 1);
+        let view = app.agent_view(1).unwrap();
+        assert_eq!(view["state"], "working");
+        assert_eq!(view["waiting"]["agents"], "all");
+        assert!(view["waiting"].get("remaining_secs").is_none());
+        let list = app
+            .agents_page(Some(1), None, PageQuery::default())
+            .unwrap();
+        let listed = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["id"] == 1)
+            .unwrap();
+        assert!((1..=10).contains(&listed["waiting"]["remaining_secs"].as_u64().unwrap()));
+        assert_eq!(app.lock().active_counts(Some(1)).unwrap(), active);
+        {
+            let mut st = app.lock();
+            st.atomic(|st| {
+                st.set_state(3,"crashed")?;
+                st.event(1,Some(3),None,"agent.failed","acom",json!({"reason":"specific failure"}))?;
+                st.set_state(3,"working")?;
+                st.set_state(2,"crashed")?;
+                st.db.execute("UPDATE agents SET status_text='own status' WHERE id=1",[])?;
+                st.db.execute("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(4,1,'new peer','t','claude','m','medium','idle',0,0)",[])?;
+                st.set_state(4,"done")
+            }).unwrap();
+        }
+        let batch = thread.join().unwrap().unwrap();
+        let text = batch["text"].as_str().unwrap();
+        assert!(text.contains("\"to\":\"crashed\""));
+        assert!(text.contains("\"to\":\"working\""));
+        assert!(text.contains("specific failure"));
+        assert!(text.contains("agent 4 agent.created"));
+        assert!(!text.contains("agent 2 "));
+        assert!(!text.contains("own status"));
+        assert_eq!(delivered_events(&batch).len(), 5);
+        assert!(app.agent_view(1).unwrap()["waiting"].is_null());
+        app.ack_updates(1, batch["delivery_id"].as_i64().unwrap())
+            .unwrap();
+        {
+            let st = app.lock();
+            st.set_state(3, "idle").unwrap();
+            st.set_state(3, "done").unwrap();
+            st.coordination_summary(1, true).unwrap();
+        }
+        let next = app.wait_for(1, 1, watch_options()).unwrap();
+        assert_eq!(delivered_events(&next).len(), 2);
+        assert!(delivered_events(&next)[0] > delivered_events(&batch).last().copied().unwrap());
+    }
+
+    #[test]
+    fn wait_watch_baseline_filters_and_pending_receipts_are_independent() {
+        let app = watch_app();
+        let baseline = event_ceiling(&app);
+        {
+            let st = app.lock();
+            st.set_state(3, "crashed").unwrap();
+            st.set_state(3, "working").unwrap();
+            st.db
+                .execute(
+                    "UPDATE agents SET status_text='text after recovery' WHERE id=3",
+                    [],
+                )
+                .unwrap();
+        }
+        let options = WaitOptions {
+            agents: Some(WaitAgents::Selected(vec![3, 3])),
+            states: Some(vec!["crashed".into()]),
+            after: Some(baseline),
+            ..Default::default()
+        };
+        let first = app.wait_for(1, 1, options.clone()).unwrap();
+        assert_eq!(delivered_events(&first).len(), 1);
+        assert!(
+            first["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"to\":\"crashed\"")
+        );
+        assert!(
+            !first["text"]
+                .as_str()
+                .unwrap()
+                .contains("text after recovery")
+        );
+        let changed = WaitOptions {
+            agents: Some(WaitAgents::All("all".into())),
+            states: Some(vec!["done".into()]),
+            status_text: true,
+            after: Some(event_ceiling(&app)),
+        };
+        assert_eq!(
+            app.wait_for(1, 1, changed).unwrap(),
+            first,
+            "new filters/cursor must not overwrite a pending batch"
+        );
+        app.ack_updates(1, first["delivery_id"].as_i64().unwrap())
+            .unwrap();
+        let status = app
+            .wait_for(
+                1,
+                1,
+                WaitOptions {
+                    status_text: true,
+                    ..options.clone()
+                },
+            )
+            .unwrap();
+        assert!(
+            status["text"]
+                .as_str()
+                .unwrap()
+                .contains("text after recovery")
+        );
+        assert_eq!(delivered_events(&status).len(), 2);
+        app.ack_updates(1, status["delivery_id"].as_i64().unwrap())
+            .unwrap();
+        let no_replay = app
+            .wait_for(
+                1,
+                1,
+                WaitOptions {
+                    after: None,
+                    status_text: true,
+                    ..options
+                },
+            )
+            .unwrap();
+        assert_eq!(no_replay["timed_out"], true);
+    }
+
+    #[test]
+    fn wait_watch_first_use_starts_now_and_rejects_invalid_scopes() {
+        let app = watch_app();
+        app.lock().set_state(3, "crashed").unwrap();
+        let first = app.wait_for(1, 1, watch_options()).unwrap();
+        assert_eq!(
+            first["timed_out"], true,
+            "first use must not replay historical failures"
+        );
+        for options in [
+            WaitOptions {
+                agents: Some(WaitAgents::Selected(vec![2])),
+                ..Default::default()
+            },
+            WaitOptions {
+                agents: Some(WaitAgents::Selected(vec![])),
+                ..Default::default()
+            },
+            WaitOptions {
+                agents: Some(WaitAgents::Selected(vec![0])),
+                ..Default::default()
+            },
+            WaitOptions {
+                agents: Some(WaitAgents::Selected(vec![1])),
+                ..Default::default()
+            },
+            WaitOptions {
+                agents: Some(WaitAgents::All("active".into())),
+                ..Default::default()
+            },
+            WaitOptions {
+                states: Some(vec!["crashed".into()]),
+                ..Default::default()
+            },
+            WaitOptions {
+                status_text: true,
+                ..Default::default()
+            },
+            WaitOptions {
+                after: Some(0),
+                ..Default::default()
+            },
+            WaitOptions {
+                states: Some(vec!["busy".into()]),
+                ..watch_options()
+            },
+            WaitOptions {
+                after: Some(-1),
+                ..watch_options()
+            },
+            WaitOptions {
+                after: Some(event_ceiling(&app) + 1),
+                ..watch_options()
+            },
+        ] {
+            assert!(app.wait_for(1, 1, options).is_err());
+            assert!(app.lock().waiting_updates.is_empty());
+        }
+    }
+
+    #[test]
+    fn wait_watch_batches_are_bounded_ordered_and_do_not_drop_overflow() {
+        let app = watch_app();
+        let baseline = event_ceiling(&app);
+        {
+            let st = app.lock();
+            for index in 0..120 {
+                st.db
+                    .execute(
+                        "UPDATE agents SET status_text=?1 WHERE id=3",
+                        [format!("{index} {}", "☃\\\"\n😀".repeat(180))],
+                    )
+                    .unwrap();
+            }
+            for _ in 0..30 {
+                st.notice(1, &"☃\\\"\n😀".repeat(180)).unwrap();
+            }
+        }
+        let expected: Vec<i64> = rows(
+            &app.lock().db,
+            "SELECT id FROM events WHERE agent=3 AND kind='agent.status' AND id>?1 ORDER BY id",
+            [baseline],
+        )
+        .unwrap()
+        .iter()
+        .map(|event| event["id"].as_i64().unwrap())
+        .collect();
+        let mut seen = Vec::new();
+        for attempt in 0..80 {
+            let batch = app
+                .wait_for(
+                    1,
+                    1,
+                    WaitOptions {
+                        after: if attempt == 0 { Some(baseline) } else { None },
+                        status_text: true,
+                        ..watch_options()
+                    },
+                )
+                .unwrap();
+            assert!(batch.to_string().len() <= 16000);
+            let ids = delivered_events(&batch);
+            assert!(ids.len() <= 50);
+            assert!(!ids.is_empty(), "watch backlog unexpectedly disappeared");
+            seen.extend(ids);
+            assert_eq!(
+                app.wait_updates(1, 1).unwrap(),
+                batch,
+                "plain waits must replay original watched batches"
+            );
+            app.ack_updates(1, batch["delivery_id"].as_i64().unwrap())
+                .unwrap();
+            if seen.len() == expected.len() {
+                break;
+            }
+        }
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn wait_watch_details_remain_chunkable_across_countdown_ticks() {
+        let app = watch_app();
+        let task = "large ☃ task".repeat(1000);
+        app.lock()
+            .db
+            .execute("UPDATE agents SET task=?1 WHERE id=1", [&task])
+            .unwrap();
+        let waiter = app.clone();
+        let thread = std::thread::spawn(move || waiter.wait_for(1, 30, watch_options()));
+        wait_registered(&app, 1);
+        let stub = bounded_record(app.agent_view(1).unwrap(), None, 512, None).unwrap();
+        assert_eq!(stub["truncated"], true);
+        let version = stub["version"].as_str().unwrap();
+        let mut text = String::new();
+        let mut offset = 0;
+        loop {
+            let chunk =
+                bounded_record(app.agent_view(1).unwrap(), Some(offset), 512, Some(version))
+                    .unwrap();
+            text.push_str(chunk["chunk"].as_str().unwrap());
+            if offset == 0 {
+                std::thread::sleep(Duration::from_millis(1100));
+            }
+            if chunk["has_more"] == false {
+                break;
+            }
+            offset = chunk["next_offset"].as_i64().unwrap();
+        }
+        let complete: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(complete["task"], task);
+        assert!(complete["waiting"].is_object());
+        assert!(complete["waiting"].get("remaining_secs").is_none());
+        app.lock().notice(1, "finish waiting").unwrap();
+        app.cv.notify_all();
+        assert!(thread.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn wait_watch_cursor_and_receipt_commit_or_roll_back_together() {
+        let app = watch_app();
+        let baseline = event_ceiling(&app);
+        app.lock().set_state(3, "crashed").unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER reject_watch_receipt BEFORE INSERT ON update_deliveries BEGIN SELECT RAISE(ABORT,'watch receipt fixture'); END").unwrap();
+        let options = WaitOptions {
+            after: Some(baseline),
+            ..watch_options()
+        };
+        assert!(app.wait_for(1, 1, options.clone()).is_err());
+        assert!(app.lock().waiting_updates.is_empty());
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM wait_watch_cursors WHERE agent_id=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER reject_watch_receipt")
+            .unwrap();
+        assert_eq!(
+            delivered_events(&app.wait_for(1, 1, options).unwrap()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn wait_watch_selected_ids_report_replacements_without_following_them() {
+        let app = watch_app();
+        let baseline = event_ceiling(&app);
+        {
+            let st = app.lock();
+            st.db.execute("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(4,1,'replacement','t','claude','m','medium','working',0,0)",[]).unwrap();
+            st.set_state(3, "replaced").unwrap();
+            st.event(
+                1,
+                Some(3),
+                None,
+                "agent.replaced",
+                "acom",
+                json!({"replacement":4}),
+            )
+            .unwrap();
+        }
+        let options = WaitOptions {
+            agents: Some(WaitAgents::Selected(vec![3])),
+            after: Some(baseline),
+            ..Default::default()
+        };
+        let batch = app.wait_for(1, 1, options.clone()).unwrap();
+        assert_eq!(delivered_events(&batch).len(), 2);
+        assert!(
+            batch["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"replacement\":4")
+        );
+        assert!(!batch["text"].as_str().unwrap().contains("agent 4 "));
+        app.ack_updates(1, batch["delivery_id"].as_i64().unwrap())
+            .unwrap();
+        app.lock().set_state(4, "crashed").unwrap();
+        assert_eq!(
+            app.wait_for(
+                1,
+                1,
+                WaitOptions {
+                    after: None,
+                    ..options
+                }
+            )
+            .unwrap()["timed_out"],
+            true
+        );
+    }
+
+    #[test]
+    fn wait_watch_cursor_and_pending_batch_follow_replacement_and_restart() {
+        let app = watch_app();
+        let baseline = event_ceiling(&app);
+        app.lock().set_state(3, "crashed").unwrap();
+        let first = app
+            .wait_for(
+                1,
+                1,
+                WaitOptions {
+                    after: Some(baseline),
+                    ..watch_options()
+                },
+            )
+            .unwrap();
+        {
+            let mut st = app.lock();
+            st.atomic(|st| {
+                st.db.execute("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(4,1,'successor','t','claude','m','medium','working',0,0)",[])?;
+                App::inherit_memberships(st,1,4)
+            }).unwrap();
+        }
+        assert_eq!(app.wait_for(4, 1, watch_options()).unwrap(), first);
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM wait_watch_cursors WHERE agent_id=4",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working' WHERE id=4", [])
+            .unwrap();
+        assert_eq!(app.wait_for(4, 1, watch_options()).unwrap(), first);
+        app.ack_updates(4, first["delivery_id"].as_i64().unwrap())
+            .unwrap();
+        app.lock().set_state(3, "done").unwrap();
+        let next = app.wait_for(4, 1, watch_options()).unwrap();
+        assert!(next["text"].as_str().unwrap().contains("\"to\":\"done\""));
+        assert!(delivered_events(&next)[0] > delivered_events(&first)[0]);
     }
 
     #[test]
@@ -9727,6 +10533,7 @@ mod tests {
             app.lock().window_pct("claude", "seven_day_fable").unwrap(),
             Some(100.0)
         );
+        app.lock().db.execute("UPDATE usage_checks SET attempted_at=(SELECT at-1 FROM usage WHERE provider='claude' AND win='seven_day_fable') WHERE provider='claude'", []).unwrap();
         refresh(Some(0.0)); // begun before exhaustion: still not recovery
         assert_eq!(
             app.lock().window_pct("claude", "seven_day_fable").unwrap(),
@@ -10633,6 +11440,174 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn agent_facets_search_and_pages_share_complete_project_scope() {
+        let app = app_with_two_projects();
+        let mut seeded = vec![(1, "idle")];
+        {
+            let mut st = app.lock();
+            st.atomic(|st| {
+                for id in 3..=102 {
+                    let state = STATES[(id % 7) as usize];
+                    let task = if id == 37 {format!("{} ÄäDeepNeedle", "x".repeat(900))} else {"regular task".into()};
+                    st.db.execute("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?1,1,?2,?3,'codex','gpt-6-sol','medium',?4,0,0)", params![id,format!("Worker {id}"),task,state])?;
+                    seeded.push((id, state));
+                }
+                st.db.execute("INSERT INTO agent_starts(agent_id,predecessor) VALUES(3,1)", [])?;
+                st.db.execute("UPDATE agents SET wake_queued_at=1 WHERE id=8", [])?;
+                Ok(())
+            }).unwrap();
+            st.stopping_agents.insert(4);
+        }
+        let active = |state: &str| matches!(state, "working" | "idle");
+        let attention =
+            |id: i64, state: &str| matches!(state, "paused" | "crashed") || [3, 4, 8].contains(&id);
+        let finished = |state: &str| matches!(state, "done" | "closed" | "replaced");
+        let expected = json!({"all":101,"active":seeded.iter().filter(|(_,s)| active(s)).count(),"attention":seeded.iter().filter(|(id,s)| attention(*id,s)).count(),"finished":seeded.iter().filter(|(_,s)| finished(s)).count()});
+        let mut seen = Vec::new();
+        let mut q = PageQuery {
+            limit: 3,
+            max_bytes: 512,
+            ..PageQuery::default()
+        };
+        loop {
+            let page = app
+                .filtered_agents_page(Some(1), None, "attention", "", q.clone())
+                .unwrap();
+            assert!(page.to_string().len() <= 512);
+            assert_eq!(page["counts"], expected);
+            assert_eq!(page["project_total"], 101);
+            assert_eq!(page["total"], expected["attention"]);
+            assert!(page["event_cursor"].as_i64().is_some());
+            for item in page["items"].as_array().unwrap() {
+                seen.push(item["id"].as_i64().unwrap());
+            }
+            if page["has_more"] != true {
+                break;
+            }
+            q.before = page["next_before"].as_i64();
+            q.through = page["through"].as_i64();
+            q.revision = page["revision"].as_str().map(str::to_string);
+        }
+        let wanted: Vec<_> = seeded
+            .iter()
+            .rev()
+            .filter(|(id, s)| attention(*id, s))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(seen, wanted);
+        let found = app
+            .filtered_agents_page(
+                Some(1),
+                None,
+                "all",
+                "  ÄÄdeepNEEDLE ",
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(found["counts"]["all"], 1);
+        assert_eq!(found["items"][0]["id"], 37);
+        assert!(
+            !found["items"][0]["task_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Needle")
+        );
+        let overview = app.overview(Some(1), None).unwrap();
+        assert_eq!(overview["agent_counts"], expected);
+        assert_eq!(
+            overview["pause_eligible"],
+            1 + seeded
+                .iter()
+                .filter(|(_, s)| active(s) || *s == "done")
+                .count()
+        );
+        assert_eq!(
+            overview["resume_eligible"],
+            seeded.iter().filter(|(_, s)| *s == "paused").count()
+        );
+        assert!(
+            app.filtered_agents_page(Some(1), None, "unknown", "", PageQuery::default())
+                .is_err()
+        );
+        assert!(
+            app.filtered_agents_page(
+                Some(1),
+                None,
+                "all",
+                &"x".repeat(4097),
+                PageQuery::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_filter_cursors_and_runtime_counts_invalidate_without_row_writes() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='closed' WHERE id=1", [])
+            .unwrap();
+        let page = app
+            .filtered_agents_page(Some(1), None, "all", "", PageQuery::default())
+            .unwrap();
+        let revision = page["revision"].as_str().unwrap().to_string();
+        for (category, search) in [("active", ""), ("all", "other")] {
+            assert_eq!(
+                app.filtered_agents_page(
+                    Some(1),
+                    None,
+                    category,
+                    search,
+                    PageQuery {
+                        revision: Some(revision.clone()),
+                        before: Some(2),
+                        ..PageQuery::default()
+                    }
+                )
+                .unwrap_err()
+                .0,
+                409
+            );
+        }
+        let old_overview = app.overview(Some(1), None).unwrap();
+        app.lock().stopping_agents.insert(1);
+        let fresh = app
+            .filtered_agents_page(
+                Some(1),
+                None,
+                "all",
+                "",
+                PageQuery {
+                    since: Some(revision),
+                    ..PageQuery::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(fresh["unchanged"], true);
+        assert_eq!(fresh["counts"]["attention"], 1);
+        assert_eq!(fresh["items"][0]["stopping"], true);
+        let overview = app
+            .overview(Some(1), old_overview["revision"].as_str())
+            .unwrap();
+        assert_ne!(overview["unchanged"], true);
+        assert_eq!(overview["agent_counts"]["attention"], 1);
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET state='paused',pause_reason='user' WHERE id=2",
+                [],
+            )
+            .unwrap();
+        let overview = app.overview(Some(1), None).unwrap();
+        assert_eq!(
+            overview["resume_eligible"], 1,
+            "bulk counts include the other project"
+        );
+        assert_eq!(overview["agent_counts"]["all"], 1);
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub enum Event {
     },
     /// A short readable line for the agent's activity view.
     Text(String),
+    /// A tool action, separate from ordinary assistant text.
+    Tool(String),
     /// A structured harness failure. The supervisor decides recovery after exit.
     Failed(String),
     /// An unexpected model switch; stop the process before it can do more work.
@@ -269,7 +271,7 @@ fn claude_events(v: &Value) -> Vec<Event> {
                             .or(input["file_path"].as_str())
                             .or(input["pattern"].as_str());
                         let name = b["name"].as_str().unwrap_or("tool");
-                        out.push(Event::Text(match what {
+                        out.push(Event::Tool(match what {
                             Some(w) => format!("{name}: {}", short(w, 200)),
                             None => name.to_string(),
                         }));
@@ -572,25 +574,27 @@ fn codex_events(v: &Value) -> Vec<Event> {
         "turn.completed" => vec![tokens(&v["usage"], false)],
         "item.completed" => {
             let item = &v["item"];
-            let text = match item["type"].as_str().unwrap_or("") {
-                "agent_message" => item["text"].as_str().map(|s| short(s, 300)),
+            let event = match item["type"].as_str().unwrap_or("") {
+                "agent_message" => item["text"].as_str().map(|s| Event::Text(short(s, 300))),
                 "command_execution" => item["command"]
                     .as_str()
-                    .map(|s| format!("shell: {}", short(s, 200))),
-                "mcp_tool_call" => item["tool"].as_str().map(|s| format!("MCP: {s}")),
+                    .map(|s| Event::Tool(format!("shell: {}", short(s, 200)))),
+                "mcp_tool_call" => item["tool"]
+                    .as_str()
+                    .map(|s| Event::Tool(format!("MCP: {s}"))),
                 "web_search" => item["query"]
                     .as_str()
-                    .map(|s| format!("search: {}", short(s, 200))),
-                "file_change" => Some("changed files".to_string()),
+                    .map(|s| Event::Tool(format!("search: {}", short(s, 200)))),
+                "file_change" => Some(Event::Tool("changed files".to_string())),
                 // Codex also uses error items for nonfatal startup diagnostics,
                 // including the hook-trust warning. Only turn/core errors (above)
                 // or an unsuccessful process exit establish a failed turn.
                 "error" => item["message"]
                     .as_str()
-                    .map(|s| format!("notice: {}", short(s, 300))),
+                    .map(|s| Event::Text(format!("notice: {}", short(s, 300)))),
                 _ => None,
             };
-            text.map(|s| vec![Event::Text(s)]).unwrap_or_default()
+            event.into_iter().collect()
         }
         // Persisted rollout events. Current Codex writes context and rate-limit
         // data here, but does not include them in the --json stdout stream.
@@ -990,6 +994,52 @@ mod tests {
                 add: false
             }
         ));
+    }
+
+    #[test]
+    fn tool_actions_are_typed_from_the_event_not_the_message_prefix() {
+        let events = parse_line(
+            "claude",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Bash: this is an explanation"},{"type":"tool_use","name":"Bash","input":{"command":"pwd"}}]}}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Text(text),Event::Tool(tool)] if text == "Bash: this is an explanation" && tool == "Bash: pwd")
+        );
+        for (item, expected) in [
+            (
+                json!({"type":"command_execution","command":"pwd"}),
+                "shell: pwd",
+            ),
+            (
+                json!({"type":"mcp_tool_call","tool":"read_resource"}),
+                "MCP: read_resource",
+            ),
+            (
+                json!({"type":"web_search","query":"parser"}),
+                "search: parser",
+            ),
+            (json!({"type":"file_change"}), "changed files"),
+        ] {
+            let events = parse_line(
+                "codex",
+                &json!({"type":"item.completed","item":item}).to_string(),
+            );
+            assert!(matches!(events.as_slice(), [Event::Tool(text)] if text == expected));
+        }
+        let events = parse_line(
+            "codex",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"shell: this is an explanation"}}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Text(text)] if text == "shell: this is an explanation")
+        );
+        assert!(
+            parse_line(
+                "codex",
+                r#"{"type":"item.started","item":{"type":"command_execution","command":"pwd"}}"#
+            )
+            .is_empty()
+        );
     }
 
     #[test]
