@@ -1,8 +1,8 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, ThreadReq, WaitAgents, WaitOptions,
-    acom_home, actor, bad, bounded_record, not_found,
+    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, ThreadReq, UsageWatch, WaitAgents,
+    WaitOptions, acom_home, actor, bad, bounded_record, not_found,
 };
 use crate::harness::catalog;
 use serde_json::{Value, json};
@@ -354,7 +354,25 @@ fn wait_options(b: &Value) -> R<WaitOptions> {
         states,
         status_text: boolean(b, "status_text", false)?,
         after,
+        usage: b
+            .get("usage")
+            .map(|value| {
+                serde_json::from_value::<UsageWatch>(value.clone())
+                    .map_err(|error| bad(format!("bad usage watch: {error}")))
+            })
+            .transpose()?,
     })
+}
+
+fn subscription_timeout(b: &Value) -> R<Option<u64>> {
+    b.get("timeout")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=3600).contains(value))
+                .ok_or_else(|| bad("deferred wait timeout must be 1–3600 seconds"))
+        })
+        .transpose()
 }
 fn settings(b: &Value, key: &str) -> R<Settings> {
     serde_json::from_value(b[key].clone()).map_err(|e| bad(format!("bad settings: {e}")))
@@ -551,6 +569,23 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("POST", ["wait", a, "ack"]) => {
             app.ack_updates(id(a)?, int(b, "delivery_id")?)?;
             J(json!({"acknowledged":true}))
+        }
+        ("GET", ["subscriptions"]) => J(app.subscriptions_page(
+            q.int("agent")?.ok_or_else(|| bad("agent is required"))?,
+            q.int("viewer")?,
+            page(q)?,
+        )?),
+        ("GET", ["subscriptions", subscription]) => J(record(
+            app.subscription_view(id(subscription)?, q.int("viewer")?)?,
+            q,
+        )?),
+        ("POST", ["subscriptions"]) => J(app.subscribe(
+            identity(b, "agent")?,
+            subscription_timeout(b)?,
+            wait_options(b)?,
+        )?),
+        ("POST", ["subscriptions", subscription, "cancel"]) => {
+            J(app.cancel_subscription(id(subscription)?, identity(b, "agent")?)?)
         }
 
         // threads and messages
@@ -1092,6 +1127,7 @@ mod tests {
         assert_eq!(options.states, Some(vec!["crashed".into()]));
         assert!(options.status_text);
         assert_eq!(options.after, Some(0));
+        assert!(options.usage.is_none());
         for body in [
             serde_json::json!({"agents":null}),
             serde_json::json!({"agents":"1,2"}),
@@ -1106,6 +1142,49 @@ mod tests {
             serde_json::json!({"after":1.0}),
         ] {
             assert!(super::wait_options(&body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn usage_watch_shape_and_deferred_timeout_are_strict() {
+        let options = super::wait_options(&serde_json::json!({"usage":{
+            "provider":"claude","window":"five_hour","condition":"above","percent":80.5
+        }}))
+        .unwrap();
+        let usage = options.usage.unwrap();
+        assert_eq!(usage.provider, "claude");
+        assert_eq!(usage.window, "five_hour");
+        assert_eq!(usage.condition, "above");
+        assert_eq!(usage.percent, Some(80.5));
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!("claude"),
+            serde_json::json!({"provider":1,"window":"five_hour","condition":"reset"}),
+            serde_json::json!({"provider":"claude","window":"five_hour"}),
+            serde_json::json!({"provider":"claude","window":"five_hour","condition":"above","percent":"80"}),
+            serde_json::json!({"provider":"claude","window":"five_hour","condition":"reset","unknown":true}),
+        ] {
+            assert!(super::wait_options(&serde_json::json!({"usage":usage})).is_err());
+        }
+        assert_eq!(
+            super::subscription_timeout(&serde_json::json!({})).unwrap(),
+            None
+        );
+        for timeout in [1, 60, 3600] {
+            assert_eq!(
+                super::subscription_timeout(&serde_json::json!({"timeout":timeout})).unwrap(),
+                Some(timeout)
+            );
+        }
+        for timeout in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(3601),
+            serde_json::json!(1.0),
+            serde_json::json!("60"),
+        ] {
+            assert!(super::subscription_timeout(&serde_json::json!({"timeout":timeout})).is_err());
         }
     }
 

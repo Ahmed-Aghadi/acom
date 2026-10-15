@@ -53,7 +53,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 | State | Meaning | What wakes it |
 |---|---|---|
 | `working` | In a turn: thinking and running tools | — |
-| `idle` | Its turn ended. Costs nothing | Any new message in its threads |
+| `idle` | Its turn ended; no running model turn, but still counts as active | Member messages, subscribed events, a deferred-wait deadline or a queued continuation, subject to limits |
 | `paused` | Stopped by you, by a limit, or by a server restart. Messages wait | You resume it, or the limit clears (if auto-resume is on) |
 | `done` | It ran `acom done`: task finished | Any new message in its threads, when there's room (see Limits) |
 | `closed` | You closed it, or it marked done under the default setting | Only you explicitly reopening it; messages wait |
@@ -75,7 +75,13 @@ Both harnesses run a hook after every tool call. acom uses it to tell a working 
 
 A long sender list is cut in the middle: `from agent 1, agent 2, agent 3, … agent 12, user`. An idle agent gets the same lines as the prompt that wakes it.
 
-`acom wait` receives updates during the current working turn. Optional `--agents all|IDs` adds project-peer lifecycle events; `--states` filters destination states and `--status-text` independently includes descriptive status. The first use of each normalized filter starts now; subsequent calls continue its durable event cursor. `acom agents --event-cursor` supplies an atomic baseline for a first `--after` call. Bounded deliveries replay by ID until acknowledged; peer watches do not create persistent subscriptions or idle wake-ups. Waiting metadata describes targets and remaining time without changing lifecycle state.
+`acom wait` receives ordinary notifications and selected events during the current working turn. `acom subscribe` instead registers persistent events that reach working hooks or wake an idle agent. `acom wait --idle --timeout <duration>` returns immediately with a one-shot deferred-wait ID: an ordinary notification (message, notice or own coordination change), selected event or deadline resolves it once. An early-resolution notice names its cause and says the timeout was canceled. The agent reads the receipt and any immediate update, then ends its turn normally without `acom done` if still waiting. Registration does not change lifecycle state until the worker exits or suspend shell/background commands; idle still counts as active and lock TTLs continue. Subscription events/deadlines do not wake done, paused, crashed, closed or replaced agents.
+
+All modes share event filters: `--agents all|IDs` selects project peers (`all` includes future agents, excludes self), `--states` filters destination states, and `--status-text` independently adds descriptive status changes. `--usage <provider> --window <raw name>` selects one `--above <percent>`, `--below <percent>`, `--reset` or `--reset-due` condition. Thresholds are strict; a qualifying latest known reading reports immediately, then only new crossings. Missing/unknown readings are not zero. `--reset` requires fresh observed rollover/recovery; `--reset-due` is an estimated deadline, not confirmation. Detection follows provider output/account checks. Agent and usage filters combine with OR. Persistent subscriptions require a filter; deferred waits need none.
+
+New ordinary-wait filters start now; repeat calls continue each filter's durable cursor. `acom agents --event-cursor` supplies a baseline for `--after` (requires `--agents`); explicitly repeating it rescans. Bounded deliveries replay unchanged by ID until acknowledged, before changed filters apply. Registration, matching, turn completion and notification consumption are serialized: matches consumed during work cannot also start a second turn, and arrivals before turn exit remain pending. Registrations, pending updates and IDs survive restart and transfer in true replacements. Cancellation stops future matches and withdraws undelivered updates, not already-issued immutable receipts.
+
+Agents can inspect same-project waits/subscriptions; inaccessible private-message causes and IDs are redacted. The detector examines the latest 30 subscription wakes within 60 seconds for ordered causal cycles of 2–6 agents traversed three times, with bounded search and deduplicated warnings. Matches produce `coordination.suspected-loop` events, evidence IDs, notices and UI warnings. This is not general deadlock detection or proof of a mistaken loop; no automatic pause, unsubscribe, wake-rate cap or new policy setting is added. Agents should inspect peer dependencies and adjust their subscriptions when warned.
 
 What agents are told, and when:
 
@@ -156,7 +162,7 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | Command | What it does |
 |---|---|
 | `acom guide` | Print the guide |
-| `acom me` | Your ID, name, group, state, task, launch details, usage, held locks |
+| `acom me` | Your ID, name, group, state, task, launch details, usage, locks, wait/subscription counts and warnings |
 | `acom limits` | All limits with their soft and hard values, and current usage |
 | `acom status <text>` | Set your status text |
 | `acom group <name>` | Put yourself in a group |
@@ -172,7 +178,10 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | `acom thread transfer-owner <TID> <AGENT_ID>` | Transfer exclusive ownership without changing membership |
 | `acom history [ID] [--agent ID \| --all-agents] [--thread TID] [--lock name] [--kind kind] [--before ID \| --after ID] [--limit N] [--max-bytes N]` | Read bounded coordination events or one event |
 | `acom send --thread <TID> [text]` | Post in a thread; says who couldn't be woken yet |
-| `acom wait [--timeout <duration>] [--agents all\|IDs] [--states states] [--status-text] [--after event-ID]` | Wait for ordinary notifications and optional peer events; `--ack delivery-ID` retries an acknowledgement |
+| `acom wait [--idle] [--timeout <duration>] [event filters]` | Foreground wait, or register a one-shot deferred wait; `--ack delivery-ID` only retries acknowledgement |
+| `acom subscribe <event filters>` | Register a persistent event subscription |
+| `acom subscriptions [--agent ID]` / `acom subscription <ID>` | Bounded registration list or one record; same-project peer inspection is allowed |
+| `acom unsubscribe <ID>` | Cancel your own registration; the user can cancel any |
 | `acom inbox [--mark new\|in-progress\|handled]` | Your messages with that mark (default `new`) |
 | `acom read <msg ID>` | One message in full |
 | `acom mark <msg ID,...> new\|in-progress\|handled` | Mark messages |
@@ -212,7 +221,7 @@ The launch guide covers:
 - your ID is in `ACOM_ID`; you never pass it; you only see your own project
 - your turn only ends when your process exits, so don't leave background tasks or monitors running
 - threads, picking members by ID or selector, starting a new thread per topic, marks, and reading messages when you're ready
-- the `[acom]` lines that appear after tool calls, and that ending your turn makes you idle until a new message wakes you
+- the `[acom]` lines after tools, foreground waits, persistent event subscriptions and one-shot deferred waits; ending a turn normally makes an active agent idle for messages or registered triggers
 - locks: create, acquire with `--wait` and `--ttl`, renew by acquiring again, release; and that you may lose locks if you're paused
 - launching helpers through `acom launch` (there are no subagents), and handing over with `--done`
 - limits, what soft and hard mean, that they may be unset, and the wake line
@@ -235,7 +244,7 @@ Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshin
 
 Agent search covers the whole project's names, IDs, full tasks, status, provider, model and groups. All/Active/Needs attention/Finished facets count the search before category selection; the header separates loaded matches, matching total and project total. Categories can overlap. Server-side pages and counts share predicates and a read snapshot; cursors bind project/search/category. Thread search still covers loaded titles and IDs. Search and filter choices survive polling. Settings have section links and a persistent saved/unsaved/read-only/pending-selection indicator.
 
-Readable agent-output entries capture UTC date/time and a message/tool/error/turn type; Details displays local date/time with seconds. Raw stdout remains separate. These are live-output captures, not a mirror of native conversation history; missing historical timestamps are not fabricated. An on-demand Lifecycle changes panel pages recorded state transitions separately. Wait descriptors expose watched targets and a monotonic remaining timeout while the agent remains working.
+Readable agent-output entries capture UTC date/time and a message/tool/error/turn type; Details displays local date/time with seconds. Raw stdout remains separate. These are live-output captures, not a mirror of native conversation history; missing historical timestamps are not fabricated. On-demand panels page lifecycle changes, subscriptions/deferred waits and coordination warnings. Subscription rows show IDs, conditions, deadlines, completion causes and Cancel; collapsed details retain active/pending counts. Cards identify recorded loop warnings, not a claim that a loop is still running. Foreground wait descriptors expose watched targets and a monotonic remaining timeout while the agent remains working.
 
 On mobile, opening a conversation shows a single pane and scrolls it into view. All threads returns to the list without losing the selected conversation or draft, and hidden conversations never acknowledge unread arrivals. Ctrl/Cmd + Enter submits a validated message; Enter adds a new line. Pending sends are tracked per project/thread, so reopening a pane cannot submit the same in-flight draft twice. Activity, messages and logs have named keyboard-scrollable regions, and the workspace provides a skip link, focus indicators and reduced-motion styling.
 
@@ -281,7 +290,8 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 |---|---|
 | UI | `GET /` (the page), `GET /overview?project=&since=` (selected project, limits, subscription usage/checks, unread totals, project agent counts, global bulk-action counts, restart-paused count and collection revisions); settings, catalog and collections are fetched separately |
 | Projects | `GET /projects`, `GET /projects?path=` (the project a folder is in), `POST /projects` (`path`), `POST /projects/{id}/remove`, `GET /folders?path=&hidden=1` (defaults to Home), `POST /folders` (`parent`, single-folder `name`) |
-| Agents | `GET /agents?project=&category=&search=` (bounded items, search facets, project total, event cursor), `GET /agents/{id}` (adds project details, limits, lost locks and current wait), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (automatically releases locks after cleanup), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all`, `POST /resume-restart`, `POST /wait/{id}` (`timeout`, optional `agents`, `states`, `status_text`, `after`), `POST /wait/{id}/ack` (`delivery_id`) |
+| Agents | `GET /agents?project=&category=&search=` (bounded items, search facets, project total, event cursor), `GET /agents/{id}` (adds project details, limits, lost locks, current wait and bounded subscription/diagnostic summaries), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (automatically releases locks after cleanup), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all`, `POST /resume-restart`, `POST /wait/{id}` (`timeout`, optional `agents`, `states`, `status_text`, `after`, `usage`), `POST /wait/{id}/ack` (`delivery_id`) |
+| Event subscriptions | `POST /subscriptions` (`agent`, optional `timeout` for one-shot; same event filters as wait), `GET /subscriptions?agent=&viewer=` (bounded pages), `GET /subscriptions/{id}?viewer=` (bounded record), `POST /subscriptions/{id}/cancel` (`agent`, default user). `usage` is `{provider, window, condition, percent?}`; `condition` is `above`, `below`, `reset` or `reset-due`. Rows include ID, owner agent, mode, state, watch, created/deadline/completed times and completion cause. |
 | Threads & messages | `GET /threads?project=&viewer=`, `POST /threads` (`members` snapshot or `watch` live selectors; optional `private`, `joinable`; `include_user` defaults true for users, false for agents), `GET /threads/{tid}?agent=` (personalized context, recent thread events), `GET /threads/{tid}/metadata?agent=` (includes `owner`, `created_by`, access and members), `POST /threads/{tid}/members`, `POST /threads/{tid}/members/remove` (`members`: IDs/user), `POST /threads/{tid}/owner` (`owner`: positive same-project non-replaced agent ID; caller `agent`, default user), `POST /threads/{tid}/user` (`joined`: boolean), `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}?agent=`, `GET /inbox/{agent}?mark=`, `POST /marks` |
 | Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
 | Configs | `GET /configs` (virtual Default plus saved configs, each with settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: `1` for Default or a saved config's id, or `custom`: settings) |
@@ -290,8 +300,8 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 ## Build notes
 
 - Rust, one crate, one binary. Crates: `rusqlite` (bundled SQLite), `tiny_http` (blocking, one thread per request), `ureq` (HTTPS client), `chrono` (provider reset timestamps), `serde` / `serde_json`, `clap`, `libc`.
-- Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and all the rules), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/usage.rs` (account checks and scheduling), `src/ui.html`, `src/guide.md` and `src/models.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
-- One SQLite connection behind a mutex, plus a condvar that every change notifies. `lock acquire --wait` blocks on it. A once-a-second tick expires locks, acts on usage limits, and serves the wake line. Lock queues live in memory.
+- Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and rules), `src/app/subscriptions.rs` (event matching and durable deliveries), `src/app/diagnostics.rs` (advisory wake-loop detection), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/usage.rs` (account checks and scheduling), `src/ui.html`, `src/guide.md` and `src/models.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
+- One SQLite connection behind a mutex, plus a condvar that every change notifies. `lock acquire --wait` blocks on it. A once-a-second tick expires locks, acts on usage limits, processes subscriptions/diagnostics, and serves the wake line. Lock queues live in memory; event registrations and their deliveries persist in SQLite.
 - **Launching** validates and records identity inside a SQLite savepoint, committed before spawning. A refused launch leaves nothing behind; a failed spawn leaves a visible crashed record and restores a caller's handoff state. A DB failure immediately after spawning kills and reaps the child before feeding it a task.
 - **Running a turn.** acom starts the harness in the agent's project folder, in its own process group, with `ACOM_ID`, `ACOM_URL`, and `PATH` starting with acom's own folder:
   - Claude: `claude -p --output-format stream-json --verbose <extra flags> --model <m> --effort <e> --session-id <uuid>` (or `--resume <uuid>`) `--autocompact <hard context> --settings <PostToolUse hook running acom hook> --disallowedTools Agent,Workflow,SendMessage,ListAgents --allowedTools "Bash(acom *)"`. The prompt goes on stdin.
@@ -326,6 +336,12 @@ usage_checks (provider, checked_at, attempted_at, next_check, error, in_flight)
 activity (id, project, at, actor, what)                -- project NULL: about all projects
 events   (id, project, at, kind, actor, agent, thread, lock, details) -- coordination history
 summary_cursors (agent_id, event_id)                   -- lifecycle summary position
+subscriptions (id, agent, project, mode, state, watch, created_at, deadline, cursor, completed_at, completion)
+subscription_updates (id, subscription, agent, at, event_key, cause, delivered, delivery_id)
+subscription_starts (agent, at, error)                -- durable event-wake startup attempt/error
+usage_reset_notices (provider, win, resets_at)         -- estimated reset notification deduplication
+usage_observations (provider, win, used_pct, resets_at, at) -- last observation across omitted windows
+diagnostic_patterns (project, pattern, last_event, last_at) -- suspected-loop warning deduplication
 history_origin (id, message_id)                       -- messages before tracking have unknown context
 configs  (id, name, settings)                          -- saved configs only, IDs >= 2; settings is JSON
 ```

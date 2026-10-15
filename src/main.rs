@@ -29,8 +29,11 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   status <text>                           Set your status text
   group <name>                            Put yourself in a group
   done                                    Mark your task finished, then end your turn
-  wait [--timeout duration | --ack ID] [--agents all|IDs] [--states states] [--status-text] [--after EVENT_ID]
-                                          Wait for normal updates and optional peer changes
+  wait [--timeout duration | --ack ID] [--idle] [watch flags]
+                                          Wait now, or register a one-shot wake and end your turn
+  subscribe [watch flags]                 Persistently wake on matching events; end your turn normally
+  subscriptions [--agent ID]             List your or a peer's subscriptions and deferred waits
+  subscription <ID> / unsubscribe <ID>    Read one subscription / cancel your own (user may cancel any)
   agents [--group <name>] [--event-cursor] List agents; optionally print an atomic event baseline
   agent <ID>                              One agent's details
   launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done|--replace] [--ack-crashes]
@@ -82,12 +85,17 @@ User commands (they act on the project the current folder is in):
 
 Selectors: active, working, idle, paused, done, closed, crashed, replaced, group:<name>.
 Durations: 30s, 5m, 1h.
+Watch flags (wait and subscribe; agent and usage conditions combine with OR):
+  --agents all|IDs [--states states] [--status-text] [--after EVENT_ID]
+  --usage provider --window name (--above PERCENT | --below PERCENT | --reset | --reset-due)
+  Usage is polled; --reset is confirmed recovery, --reset-due is only the estimated deadline.
+  --idle returns a wait ID immediately; finish the turn without `acom done`. It does not stop tools.
 
-Lists (agents, threads, inbox, notices, locks, projects, activity, configs, thread read):
+Lists (agents, threads, inbox, notices, locks, projects, activity, configs, subscriptions, thread read):
   [--before ID | --after ID] [--through ID] [--revision R] [--since R]
   [--limit N] [--max-bytes N]            Defaults: 50 items, 16000 JSON bytes.
   Continue with the printed cursor, through and revision; changed snapshots fail visibly.
-Details (me, agent, read, notice ID, config, project read, lock read, receipt, limits, history ID):
+Details (me, agent, read, notice ID, config, project read, lock read, receipt, limits, history ID, subscription):
   [--offset BYTE] [--version V] [--max-bytes N]
   Oversized records print a stub. Offset mode returns JSON chunks; retain the version.
 Limits: 1–200 items (log lines), 512–65536 JSON bytes; no automatic all-page drain.
@@ -160,6 +168,157 @@ mod cli_tests {
             vec!["acom", "wait", "--ack", "1", "--agents", "all"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn subscriptions_share_typed_watch_flags_and_ack_is_exclusive() {
+        for command in ["wait", "subscribe"] {
+            for condition in [
+                vec!["--above", "80"],
+                vec!["--below", "30.5"],
+                vec!["--reset"],
+                vec!["--reset-due"],
+            ] {
+                let mut args = vec![
+                    "acom",
+                    command,
+                    "--usage",
+                    "claude",
+                    "--window",
+                    "five_hour",
+                ];
+                args.extend(condition);
+                assert!(Cli::try_parse_from(args).is_ok());
+            }
+            for suffix in [
+                vec!["--usage", "claude"],
+                vec!["--usage", "claude", "--window", "five_hour"],
+                vec!["--window", "five_hour"],
+                vec!["--above", "80"],
+                vec![
+                    "--usage",
+                    "claude",
+                    "--window",
+                    "five_hour",
+                    "--above",
+                    "80",
+                    "--reset",
+                ],
+                vec![
+                    "--usage",
+                    "claude",
+                    "--window",
+                    "five_hour",
+                    "--above",
+                    "NaN",
+                ],
+                vec![
+                    "--usage",
+                    "claude",
+                    "--window",
+                    "five_hour",
+                    "--below",
+                    "101",
+                ],
+            ] {
+                let mut args = vec!["acom", command];
+                args.extend(suffix);
+                assert!(Cli::try_parse_from(args).is_err());
+            }
+        }
+        assert!(Cli::try_parse_from(["acom", "wait", "--idle"]).is_ok());
+        assert!(Cli::try_parse_from(["acom", "wait", "--idle", "--timeout", "5m"]).is_ok());
+        assert!(Cli::try_parse_from(["acom", "wait", "--ack", "1", "--idle"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "acom",
+                "wait",
+                "--ack",
+                "1",
+                "--usage",
+                "claude",
+                "--window",
+                "five_hour",
+                "--reset"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["acom", "subscribe", "--timeout", "5m"]).is_err());
+        for command in ["subscription", "unsubscribe"] {
+            assert!(Cli::try_parse_from(["acom", command, "1"]).is_ok());
+            assert!(Cli::try_parse_from(["acom", command, "0"]).is_err());
+        }
+    }
+
+    #[test]
+    fn watch_body_preserves_combined_filters_and_usage_boundaries() {
+        let Cli {
+            cmd: Cmd::Subscribe { watch },
+        } = Cli::try_parse_from([
+            "acom",
+            "subscribe",
+            "--agents",
+            "2, 3",
+            "--states",
+            "crashed, done",
+            "--status-text",
+            "--after",
+            "7",
+            "--usage",
+            "codex",
+            "--window",
+            "primary",
+            "--above",
+            "80.5",
+        ])
+        .unwrap()
+        else {
+            panic!("expected subscribe")
+        };
+        assert_eq!(
+            watch.body().unwrap(),
+            json!({
+                "agents":[2,3],"states":["crashed","done"],"status_text":true,"after":7,
+                "usage":{"provider":"codex","window":"primary","condition":"above","percent":80.5}
+            })
+        );
+        for ids in ["", "1,", "0", "all,2", "1.5"] {
+            let Cli {
+                cmd: Cmd::Subscribe { watch },
+            } = Cli::try_parse_from(["acom", "subscribe", "--agents", ids]).unwrap()
+            else {
+                panic!("expected subscribe")
+            };
+            assert!(watch.body().is_err());
+        }
+        assert!(percentage("0").is_ok());
+        assert!(percentage("100").is_ok());
+        for value in ["-1", "101", "inf", "-inf", "NaN", "word"] {
+            assert!(percentage(value).is_err());
+        }
+    }
+
+    #[test]
+    fn subscription_registration_requires_a_real_id_and_deferred_deadline() {
+        assert!(
+            subscription_registration_output(&json!({"id":7,"deadline":null}), false)
+                .unwrap()
+                .contains("without `acom done`")
+        );
+        assert!(
+            subscription_registration_output(&json!({"id":7,"deadline":123}), true)
+                .unwrap()
+                .contains("Deferred wait #7")
+        );
+        for value in [
+            json!({}),
+            json!({"id":0,"deadline":123}),
+            json!({"id":7}),
+            json!({"id":7,"deadline":"123"}),
+            json!({"id":7,"deadline":null}),
+        ] {
+            assert!(subscription_registration_output(&value, true).is_err());
         }
     }
 
@@ -322,7 +481,15 @@ mod cli_tests {
     #[test]
     fn growing_read_commands_share_explicit_page_and_chunk_options() {
         for command in [
-            "agents", "threads", "inbox", "notices", "locks", "projects", "activity", "configs",
+            "agents",
+            "threads",
+            "inbox",
+            "notices",
+            "locks",
+            "projects",
+            "activity",
+            "configs",
+            "subscriptions",
         ] {
             assert!(
                 Cli::try_parse_from([
@@ -372,6 +539,7 @@ mod cli_tests {
             vec!["acom", "thread", "details", "1", "--offset", "0"],
             vec!["acom", "project", "read", "1", "--offset", "0"],
             vec!["acom", "lock", "read", "1", "--offset", "0"],
+            vec!["acom", "subscription", "1", "--offset", "0"],
             vec!["acom", "log", "1", "--after", "0", "--lines", "200"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
@@ -461,6 +629,106 @@ impl RecordArgs {
     }
 }
 
+#[derive(Args)]
+struct WatchArgs {
+    #[arg(long, help = "Watch project peers: all or comma-separated IDs")]
+    agents: Option<String>,
+    #[arg(
+        long,
+        requires = "agents",
+        help = "Match transitions into these comma-separated lifecycle states"
+    )]
+    states: Option<String>,
+    #[arg(
+        long,
+        requires = "agents",
+        help = "Also match peer status-text changes"
+    )]
+    status_text: bool,
+    #[arg(long, requires = "agents", value_parser = clap::value_parser!(i64).range(0..), help = "Start the peer watch after this coordination event ID")]
+    after: Option<i64>,
+    #[arg(long, requires_all = ["window", "usage_condition"], help = "Watch this provider's subscription usage")]
+    usage: Option<String>,
+    #[arg(long, requires = "usage", help = "Usage window name from acom limits")]
+    window: Option<String>,
+    #[arg(long, requires = "usage", group = "usage_condition", value_parser = percentage, help = "Match usage crossing strictly above this percentage")]
+    above: Option<f64>,
+    #[arg(long, requires = "usage", group = "usage_condition", value_parser = percentage, help = "Match usage crossing strictly below this percentage")]
+    below: Option<f64>,
+    #[arg(
+        long,
+        requires = "usage",
+        group = "usage_condition",
+        help = "Match confirmed usage-window reset or recovery"
+    )]
+    reset: bool,
+    #[arg(
+        long,
+        requires = "usage",
+        group = "usage_condition",
+        help = "Match the estimated reset deadline, not confirmed recovery"
+    )]
+    reset_due: bool,
+}
+
+impl WatchArgs {
+    fn body(self) -> Result<Value, &'static str> {
+        let mut body = json!({});
+        if let Some(agents) = self.agents {
+            body["agents"] =
+                if agents == "all" {
+                    json!("all")
+                } else {
+                    let ids =
+                        agents
+                            .split(',')
+                            .map(|value| {
+                                value.trim().parse::<i64>().ok().filter(|id| *id > 0).ok_or(
+                                    "watched agents must be all or comma-separated positive IDs",
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                    json!(ids)
+                };
+            if let Some(states) = self.states {
+                body["states"] = json!(states.split(',').map(str::trim).collect::<Vec<_>>());
+            }
+            body["status_text"] = json!(self.status_text);
+            if let Some(after) = self.after {
+                body["after"] = json!(after);
+            }
+        }
+        if let Some(provider) = self.usage {
+            let (condition, percent) = if let Some(value) = self.above {
+                ("above", Some(value))
+            } else if let Some(value) = self.below {
+                ("below", Some(value))
+            } else if self.reset {
+                ("reset", None)
+            } else if self.reset_due {
+                ("reset-due", None)
+            } else {
+                return Err("usage watch requires --above, --below, --reset, or --reset-due");
+            };
+            let window = self.window.ok_or("usage watch requires --window")?;
+            let mut usage = json!({"provider":provider,"window":window,"condition":condition});
+            if let Some(percent) = percent {
+                usage["percent"] = json!(percent);
+            }
+            body["usage"] = usage;
+        }
+        Ok(body)
+    }
+}
+
+fn percentage(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
+        .ok_or_else(|| "percentage must be a finite number between 0 and 100".into())
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     Guide,
@@ -497,16 +765,35 @@ enum Cmd {
     Wait {
         #[arg(long, default_value = "60s")]
         timeout: String,
-        #[arg(long, conflicts_with_all = ["timeout", "agents", "states", "status_text", "after"], value_parser = clap::value_parser!(i64).range(1..))]
+        #[arg(long, conflicts_with_all = ["timeout", "idle", "agents", "states", "status_text", "after", "usage", "window", "above", "below", "reset", "reset_due"], value_parser = clap::value_parser!(i64).range(1..))]
         ack: Option<i64>,
-        #[arg(long)]
-        agents: Option<String>,
-        #[arg(long, requires = "agents")]
-        states: Option<String>,
-        #[arg(long, requires = "agents")]
-        status_text: bool,
-        #[arg(long, requires = "agents", value_parser = clap::value_parser!(i64).range(0..))]
-        after: Option<i64>,
+        #[arg(
+            long,
+            help = "Register a one-shot wake immediately; then end your turn without acom done"
+        )]
+        idle: bool,
+        #[command(flatten)]
+        watch: WatchArgs,
+    },
+    Subscribe {
+        #[command(flatten)]
+        watch: WatchArgs,
+    },
+    Subscriptions {
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        agent: Option<i64>,
+        #[command(flatten)]
+        page: PageArgs,
+    },
+    Subscription {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        id: i64,
+        #[command(flatten)]
+        record: RecordArgs,
+    },
+    Unsubscribe {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        id: i64,
     },
     Agents {
         #[arg(long)]
@@ -990,6 +1277,37 @@ fn wait_output(v: &Value) -> Result<(String, Option<i64>), &'static str> {
     }
 }
 
+fn subscription_registration_output(v: &Value, deferred: bool) -> Result<String, &'static str> {
+    let id = v["id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or("invalid subscription response; inspect `acom subscriptions` before retrying")?;
+    let deadline = v
+        .get("deadline")
+        .filter(|value| value.is_null() || value.as_i64().is_some_and(|n| n > 0))
+        .ok_or("invalid subscription deadline; inspect `acom subscriptions` before retrying")?;
+    if deferred && deadline.is_null() {
+        return Err(
+            "deferred wait response has no deadline; inspect `acom subscriptions` before retrying",
+        );
+    }
+    let label = if deferred {
+        "Deferred wait"
+    } else {
+        "Subscription"
+    };
+    Ok(format!(
+        "{v}\n{label} #{id} registered. End this turn without `acom done` to become idle; matching updates will wake you. Current tools are unchanged.\n"
+    ))
+}
+
+fn print_subscription_registration(v: &Value, deferred: bool) {
+    print!(
+        "{}",
+        subscription_registration_output(v, deferred).unwrap_or_else(|error| die(error))
+    );
+}
+
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -1217,6 +1535,23 @@ fn print_agent(a: &Value) {
             locks.join(", ")
         }
     );
+    if a["waiting"].is_object() {
+        println!("Foreground wait: {}", a["waiting"]);
+    }
+    let active = a["subscriptions"]["active"].as_u64().unwrap_or(0);
+    let pending = a["subscriptions"]["pending"].as_u64().unwrap_or(0);
+    if active > 0 || pending > 0 {
+        println!(
+            "Subscriptions/deferred waits: {active} active; {pending} pending updates. Inspect: acom subscriptions --agent {}",
+            a["id"]
+        );
+    }
+    if a["diagnostics"]["suspected_loop"] == true {
+        println!(
+            "Suspected wake loop: inspect acom history --agent {} --kind coordination.suspected-loop",
+            a["id"]
+        );
+    }
     println!("Task:\n{}", a["task"].as_str().unwrap_or(""));
     for (label, key) in [
         ("Conversation history", "conversation_history"),
@@ -1344,6 +1679,21 @@ fn main() {
             let value = get(&format!("/limits?{}&{}", scope(), record.query()));
             if !record_output(&value, &record, "acom limits") {
                 println!("{}", value["text"].as_str().unwrap_or(""));
+                let windows: Vec<String> = value["usage"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|usage| {
+                        Some(format!(
+                            "--usage {} --window {}",
+                            shell_word(usage["provider"].as_str()?),
+                            shell_word(usage["win"].as_str()?)
+                        ))
+                    })
+                    .collect();
+                if !windows.is_empty() {
+                    println!("Available usage watches:\n  {}", windows.join("\n  "));
+                }
             }
         }
         Cmd::Status { text } => {
@@ -1364,10 +1714,8 @@ fn main() {
         Cmd::Wait {
             timeout,
             ack,
-            agents,
-            states,
-            status_text,
-            after,
+            idle,
+            watch,
         } => {
             let id = me();
             let acknowledge = |delivery: i64| {
@@ -1397,21 +1745,13 @@ fn main() {
             if !(1..=3600).contains(&secs) {
                 die("wait timeout must be between 1s and 1h");
             }
-            let mut body = json!({"timeout":secs});
-            if let Some(agents) = agents {
-                body["agents"] = if agents == "all" {
-                    json!("all")
-                } else {
-                    let ids:Vec<i64>=agents.split(',').map(|value|value.trim().parse::<i64>().ok().filter(|id|*id>0).unwrap_or_else(||die("watched agents must be all or comma-separated positive IDs"))).collect();
-                    json!(ids)
-                };
-                if let Some(states) = states {
-                    body["states"] = json!(states.split(',').map(str::trim).collect::<Vec<_>>());
-                }
-                body["status_text"] = json!(status_text);
-                if let Some(after) = after {
-                    body["after"] = json!(after);
-                }
+            let mut body = watch.body().unwrap_or_else(|error| die(error));
+            body["timeout"] = json!(secs);
+            if idle {
+                body["agent"] = json!(id);
+                let value = post("/subscriptions", body);
+                print_subscription_registration(&value, true);
+                return;
             }
             let v = request_with_timeout("POST", &format!("/wait/{id}"), Some(body), Some(std::time::Duration::from_secs(secs+5)))
                 .unwrap_or_else(|(_, error)| die(&format!("{error}. No delivery was acknowledged. Retry `acom wait` to retrieve any pending delivery.")));
@@ -1429,6 +1769,48 @@ fn main() {
             if let Some(n) = delivery {
                 acknowledge(n);
             }
+        }
+        Cmd::Subscribe { watch } => {
+            let mut body = watch.body().unwrap_or_else(|error| die(error));
+            body["agent"] = json!(me());
+            let value = post("/subscriptions", body);
+            print_subscription_registration(&value, false);
+        }
+        Cmd::Subscriptions { agent, page } => {
+            let id = agent
+                .or_else(my_id)
+                .unwrap_or_else(|| die("give --agent ID to inspect an agent's subscriptions"));
+            let value = get(&format!(
+                "/subscriptions?agent={id}{}&{}",
+                viewer_query("viewer"),
+                page.query()
+            ));
+            for item in page_items(&value) {
+                if !item_truncated(item, &format!("acom subscription {}", item["id"])) {
+                    println!("{item}");
+                }
+            }
+            if value["total"] == 0 {
+                println!("no subscriptions or deferred waits");
+            }
+            page_hint(&value, &page, &format!("acom subscriptions --agent {id}"));
+        }
+        Cmd::Subscription { id, record } => {
+            let value = get(&format!(
+                "/subscriptions/{id}?{}{}",
+                record.query(),
+                viewer_query("viewer")
+            ));
+            if !record_output(&value, &record, &format!("acom subscription {id}")) {
+                println!("{value}");
+            }
+        }
+        Cmd::Unsubscribe { id } => {
+            let value = post(
+                &format!("/subscriptions/{id}/cancel"),
+                json!({"agent":my_id().unwrap_or(0)}),
+            );
+            println!("{value}");
         }
         Cmd::Agents {
             group,

@@ -12,6 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::paging::fingerprint;
 pub use crate::paging::{PageQuery, bounded_record};
+mod diagnostics;
+mod subscriptions;
+pub use subscriptions::UsageWatch;
 
 pub const GUIDE: &str = include_str!("guide.md");
 pub const MODELS: &str = include_str!("models.md");
@@ -463,7 +466,7 @@ pub struct Proc {
     pub failure: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WaitAgents {
     All(String),
@@ -476,13 +479,15 @@ pub struct WaitOptions {
     pub states: Option<Vec<String>>,
     pub status_text: bool,
     pub after: Option<i64>,
+    pub usage: Option<UsageWatch>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AgentWatch {
-    agents: WaitAgents,
+    agents: Option<WaitAgents>,
     states: Vec<String>,
     status_text: bool,
+    usage: Option<UsageWatch>,
 }
 
 #[derive(Clone, Debug)]
@@ -504,6 +509,7 @@ impl Waiting {
             value["agents"] = json!(watch.agents);
             value["states"] = json!(watch.states);
             value["status_text"] = json!(watch.status_text);
+            value["usage"] = json!(watch.usage);
         }
         value
     }
@@ -701,6 +707,8 @@ INSERT OR IGNORE INTO view_ids SELECT 'notices',coalesce(max(id),0) FROM notices
 // Revision counters participate in the same SQLite transaction as their rows,
 // including external writes. No-op updates do not invalidate a snapshot.
 fn initialize_views(db: &Connection) -> R<()> {
+    db.execute_batch(subscriptions::SCHEMA)?;
+    db.execute_batch(diagnostics::SCHEMA)?;
     db.create_scalar_function(
         "acom_lower",
         1,
@@ -731,6 +739,8 @@ fn initialize_views(db: &Connection) -> R<()> {
         "agent_handoffs",
         "agent_starts",
         "agent_retries",
+        "subscriptions",
+        "subscription_updates",
     ] {
         db.execute("INSERT OR IGNORE INTO view_revisions VALUES(?1,0)", [table])?;
         let columns: Vec<String> = rows(db, &format!("PRAGMA table_info({table})"), [])?
@@ -913,6 +923,16 @@ impl St {
             params![project,now(),kind,actor,agent,thread,details.to_string()],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn observe_usage(
+        &self,
+        provider: &str,
+        win: &str,
+        used: f64,
+        reset: Option<i64>,
+    ) -> R<()> {
+        subscriptions::observe_usage(self, provider, win, used, reset)
     }
 
     /// A project's settings: its custom ones, or the saved config it uses.
@@ -1393,16 +1413,41 @@ impl St {
     /// Recover an unacknowledged wait receipt at startup, then drain fresh updates.
     /// Startup's surrounding transaction restores the receipt if spawning fails.
     pub fn take_updates(&mut self, agent: i64) -> R<String> {
+        self.take_updates_inner(agent, false)
+    }
+
+    pub fn take_turn_updates(&mut self, agent: i64) -> R<String> {
+        self.take_updates_inner(agent, true)
+    }
+
+    fn take_updates_inner(&mut self, agent: i64, starting: bool) -> R<String> {
+        subscriptions::process(self)?;
         let Some((id, previous)) = self.pending_delivery(agent)? else {
-            return self.take_fresh_updates(agent, 11000);
+            let (text, updates) = self.take_updates_batch(agent, 11000)?;
+            if starting {
+                subscriptions::record_wake(self, agent, &updates)?;
+            }
+            return Ok(text);
         };
+        let mut delivered: Vec<i64> = rows(
+            &self.db,
+            "SELECT id FROM subscription_updates WHERE agent=?1 AND delivery_id=?2",
+            params![agent, id],
+        )?
+        .iter()
+        .filter_map(|v| v["id"].as_i64())
+        .collect();
         self.db
             .execute("UPDATE update_deliveries SET text=NULL WHERE id=?1", [id])?;
         let previous = format!(
             "[acom] Recovered delivery #{id} (same batch; ignore if already received).\n{previous}"
         );
         let remaining = 14900usize.saturating_sub(json!({"text":previous}).to_string().len());
-        let fresh = self.take_fresh_updates(agent, remaining)?;
+        let (fresh, updates) = self.take_updates_batch(agent, remaining)?;
+        delivered.extend(updates);
+        if starting {
+            subscriptions::record_wake(self, agent, &delivered)?;
+        }
         Ok([previous, fresh]
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -1421,12 +1466,22 @@ impl St {
     }
 
     /// Never includes message content: only bounded notices, counts and senders.
-    fn take_fresh_updates(&mut self, agent: i64, max_bytes: usize) -> R<String> {
+    fn take_updates_batch(&mut self, agent: i64, max_bytes: usize) -> R<(String, Vec<i64>)> {
         if max_bytes < 512 {
-            return Ok(String::new());
+            return Ok((String::new(), Vec::new()));
         }
         // Reserve room for the remaining-notice and message-count lines below.
-        let notice_budget = max_bytes.saturating_sub(512).min(10000);
+        let has_subscription_updates: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM subscription_updates WHERE agent=?1 AND delivered=0)",
+            [agent],
+            |r| r.get(0),
+        )?;
+        let reserve = if has_subscription_updates {
+            (max_bytes / 2).min(4500)
+        } else {
+            0
+        };
+        let notice_budget = max_bytes.saturating_sub(512 + reserve).min(10000);
         let mut lines = Vec::new();
         let mut s = self
             .db
@@ -1489,7 +1544,13 @@ impl St {
             ));
             self.mark_notified(agent)?;
         }
-        Ok(lines.join("\n"))
+        let remaining =
+            max_bytes.saturating_sub(json!({"text":lines.join("\n")}).to_string().len() + 128);
+        let (updates, ids) = subscriptions::take(self, agent, remaining.min(4500))?;
+        if !updates.is_empty() {
+            lines.push(updates);
+        }
+        Ok((lines.join("\n"), ids))
     }
 
     /// Nonzero coordination counts only. Consumed with the turn-start transaction,
@@ -2005,6 +2066,7 @@ impl App {
         if st.shutting_down {
             return Ok(());
         }
+        st.atomic(|st| subscriptions::process(st))?;
         if st.procs.contains_key(&id) || st.stopping_agents.contains(&id) {
             return Ok(()); // still stopping; turn_ended wakes it if needed
         }
@@ -2035,7 +2097,7 @@ impl App {
         if a.state == "idle" && self.continue_queued(st, id)? {
             return Ok(());
         }
-        if st.pending(id)?.is_empty() {
+        if st.pending(id)?.is_empty() && (a.state != "idle" || !subscriptions::pending(st, id)?) {
             return Ok(());
         }
         if a.state == "idle" {
@@ -2049,6 +2111,31 @@ impl App {
                 .any(|c| c.over(c.lim.hard))
             {
                 return self.pause_locked(st, id, "limit", "acom");
+            }
+            if subscriptions::pending(st, id)? {
+                let previous:Option<String>=st.db.query_row("SELECT coalesce(error,'Subscription wake startup was interrupted before it committed') FROM subscription_starts WHERE agent=?1",[id],|r|r.get(0)).optional()?;
+                let result = if let Some(error) = previous {
+                    Err(conflict(error))
+                } else {
+                    st.db.execute(
+                        "INSERT INTO subscription_starts(agent,at) VALUES(?1,?2)",
+                        params![id, now()],
+                    )?;
+                    self.wake(st, id, "idle")
+                };
+                if let Err(error) = result {
+                    st.atomic(|st| {
+                        st.db.execute("UPDATE subscription_starts SET error=?2 WHERE agent=?1",params![id,error.1])?;
+                        st.remember_crash(id,&a)?;
+                        st.set_state(id,"crashed")?;
+                        st.db.execute("UPDATE agents SET problem=?2 WHERE id=?1",params![id,error.1])?;
+                        st.release_all(id,"subscription wake startup failed")?;
+                        st.event(a.project,Some(id),None,"agent.failed","acom",json!({"reason":error.1,"phase":"subscription-wake","harness":a.harness,"model":a.model,"effort":a.effort}))?;
+                        st.log_for(id,"acom",&format!("subscription wake for agent {id} failed: {}",error.1))
+                    })?;
+                    return Err(error);
+                }
+                return Ok(());
             }
             return self.wake(st, id, "idle");
         }
@@ -2999,6 +3086,16 @@ impl App {
             "INSERT INTO wait_watch_cursors(agent_id,filter,event_id) SELECT ?2,filter,event_id FROM wait_watch_cursors WHERE agent_id=?1",
             params![id,new],
         )?;
+        st.db.execute(
+            "UPDATE subscriptions SET agent=?2 WHERE agent=?1",
+            params![id, new],
+        )?;
+        st.db.execute(
+            "UPDATE subscription_updates SET agent=?2 WHERE agent=?1",
+            params![id, new],
+        )?;
+        st.db
+            .execute("DELETE FROM subscription_starts WHERE agent=?1", [id])?;
         Ok(())
     }
 
@@ -3181,12 +3278,21 @@ impl App {
     }
 
     fn normalize_watch(st: &St, id: i64, options: &WaitOptions) -> R<Option<AgentWatch>> {
-        let Some(mut agents) = options.agents.clone() else {
+        if let Some(usage) = &options.usage {
+            subscriptions::validate_usage(usage)?;
+        }
+        if options.agents.is_none() {
             if options.states.is_some() || options.status_text || options.after.is_some() {
                 return Err(bad("states, status_text and after require watched agents"));
             }
-            return Ok(None);
-        };
+            return Ok(options.usage.as_ref().map(|usage| AgentWatch {
+                agents: None,
+                states: Vec::new(),
+                status_text: false,
+                usage: Some(usage.clone()),
+            }));
+        }
+        let mut agents = options.agents.clone().unwrap();
         let project = st.agent(id)?.project;
         match &mut agents {
             WaitAgents::All(value) if value == "all" => {}
@@ -3202,9 +3308,7 @@ impl App {
                         return Err(bad("watched agent IDs must be positive"));
                     }
                     if *agent == id {
-                        return Err(bad(
-                            "watch peer agents, not yourself; your turn changing cancels the wait",
-                        ));
+                        return Err(bad("watch peer agents, not yourself"));
                     }
                     if st.agent(*agent)?.project != project {
                         return Err(bad(format!("agent {agent} is in another project")));
@@ -3225,9 +3329,10 @@ impl App {
             )));
         }
         Ok(Some(AgentWatch {
-            agents,
+            agents: Some(agents),
             states,
             status_text: options.status_text,
+            usage: options.usage.clone(),
         }))
     }
 
@@ -3250,20 +3355,20 @@ impl App {
             )
             .optional()?;
         let cursor = after.or(saved).unwrap_or(ceiling);
-        let ids = match &watch.agents {
-            WaitAgents::All(_) => json!([]),
-            WaitAgents::Selected(ids) => json!(ids),
-        };
-        let candidates=Self::event_rows(st,
-            "SELECT id,at,kind,agent,details FROM events WHERE project=?1 AND id>?2 AND id<=?3
-             AND ((?4=1 AND agent<>?5) OR EXISTS(SELECT 1 FROM json_each(?6) WHERE value=events.agent))
-             AND ((kind='agent.state' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value=json_extract(events.details,'$.to')))
-               OR (kind='agent.created' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value=json_extract(events.details,'$.state')))
-               OR (kind='agent.failed' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value='crashed'))
-               OR (kind='agent.replaced' AND EXISTS(SELECT 1 FROM json_each(?7) WHERE value='replaced'))
-               OR (kind='agent.status' AND ?8)) ORDER BY id LIMIT 51",
-            params![st.agent(id)?.project,cursor,ceiling,matches!(watch.agents,WaitAgents::All(_)),id,ids.to_string(),json!(watch.states).to_string(),watch.status_text])?;
+        let candidates = subscriptions::events(st, id, watch, cursor, ceiling, 51, None)?;
         let mut lines = Vec::new();
+        if saved.is_none()
+            && let Some(usage) = &watch.usage
+            && let Some(current) = subscriptions::initial_usage(st, usage)?
+        {
+            lines.push(format!(
+                "[acom] {}.",
+                current["summary"]
+                    .as_str()
+                    .unwrap_or("Usage condition matches")
+            ));
+        }
+        let initial_count = lines.len();
         let mut through = cursor;
         for event in candidates.iter().take(50) {
             let details = event["details"].to_string();
@@ -3282,11 +3387,15 @@ impl App {
             } else {
                 details
             };
+            let actor = event["agent"]
+                .as_i64()
+                .map(|id| format!("agent {id} "))
+                .unwrap_or_default();
             lines.push(format!(
-                "[acom] Event #{} at {}: agent {} {} {}",
+                "[acom] Event #{} at {}: {}{} {}",
                 event["id"],
                 event["at"],
-                event["agent"],
+                actor,
                 event["kind"].as_str().unwrap_or(""),
                 details
             ));
@@ -3296,10 +3405,10 @@ impl App {
             }
             through = event["id"].as_i64().unwrap();
         }
-        if lines.len() == candidates.len() {
+        if lines.len() - initial_count == candidates.len() {
             through = ceiling;
         }
-        if lines.len() < candidates.len() {
+        if lines.len() - initial_count < candidates.len() {
             lines.push("[acom] More watched events remain; call acom wait with the same filters to continue.".into());
         }
         st.db.execute("INSERT INTO wait_watch_cursors(agent_id,filter,event_id) VALUES(?1,?2,?3) ON CONFLICT(agent_id,filter) DO UPDATE SET event_id=excluded.event_id",params![id,filter,through])?;
@@ -3378,15 +3487,49 @@ impl App {
                     ));
                 }
                 st.atomic(|st| {
-                    let watched=watch.as_ref().map(|watch|Self::watch_updates(st,id,watch,after)).transpose()?.unwrap_or_default();
-                    let updates=st.take_fresh_updates(id,if watch.is_some(){8000}else{11000})?;
-                    let summary=st.coordination_summary(id,false)?;
-                    let text=[updates,summary,watched].into_iter().filter(|text|!text.is_empty()).collect::<Vec<_>>().join("\n");
-                    if text.is_empty() { return Ok(None); }
-                    if json!({"text":text,"delivery_id":i64::MAX,"timed_out":false}).to_string().len()>16000 {return Err(bad("wait updates exceed the response budget"));}
-                    st.db.execute("DELETE FROM update_deliveries WHERE agent_id=?1",[id])?;
-                    st.db.execute("INSERT INTO update_deliveries(agent_id,text) VALUES(?1,?2)",params![id,text])?;
-                    Ok(Some(json!({"text":text,"delivery_id":st.db.last_insert_rowid(),"timed_out":false})))
+                    subscriptions::process(st)?;
+                    let watched = watch
+                        .as_ref()
+                        .map(|watch| Self::watch_updates(st, id, watch, after))
+                        .transpose()?
+                        .unwrap_or_default();
+                    if !watched.is_empty() {
+                        subscriptions::foreground_updates(st, id, now())?;
+                    }
+                    let (updates, subscription_updates) =
+                        st.take_updates_batch(id, if watch.is_some() { 8000 } else { 11000 })?;
+                    let summary = st.coordination_summary(id, false)?;
+                    let text = [updates, summary, watched]
+                        .into_iter()
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() {
+                        return Ok(None);
+                    }
+                    if json!({"text":text,"delivery_id":i64::MAX,"timed_out":false})
+                        .to_string()
+                        .len()
+                        > 16000
+                    {
+                        return Err(bad("wait updates exceed the response budget"));
+                    }
+                    st.db
+                        .execute("DELETE FROM update_deliveries WHERE agent_id=?1", [id])?;
+                    st.db.execute(
+                        "INSERT INTO update_deliveries(agent_id,text) VALUES(?1,?2)",
+                        params![id, text],
+                    )?;
+                    let delivery = st.db.last_insert_rowid();
+                    for update in subscription_updates {
+                        st.db.execute(
+                            "UPDATE subscription_updates SET delivery_id=?2 WHERE id=?1",
+                            params![update, delivery],
+                        )?;
+                    }
+                    Ok(Some(
+                        json!({"text":text,"delivery_id":delivery,"timed_out":false}),
+                    ))
                 })
             })();
             after = None;
@@ -4266,11 +4409,9 @@ impl App {
         used_pct: f64,
         resets_at: Option<i64>,
     ) -> R<()> {
-        let st = self.lock();
-        st.db.execute(
-            "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,?2,?3,?4,?5)",
-            params![provider, win, used_pct, resets_at, now()],
-        )?;
+        let mut st = self.lock();
+        st.atomic(|st| subscriptions::observe_usage(st, provider, win, used_pct, resets_at))?;
+        self.cv.notify_all();
         Ok(())
     }
 
@@ -4338,11 +4479,9 @@ impl App {
         )?;
         if why == "limit" {
             // Only a fresh provider check can clear this marker; don't invent a reset time.
-            st.db.execute(
-                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES(?1,?2,100,
-                    (SELECT resets_at FROM usage WHERE provider=?1 AND win=?2),?3)",
-                params![a.harness, window.unwrap_or("limit"), now()],
-            )?;
+            let win = window.unwrap_or("limit");
+            let reset:Option<i64>=st.db.query_row("SELECT coalesce((SELECT resets_at FROM usage WHERE provider=?1 AND win=?2),(SELECT resets_at FROM usage_observations WHERE provider=?1 AND win=?2))",params![a.harness,win],|r|r.get(0))?;
+            st.atomic(|st| subscriptions::observe_usage(st, &a.harness, win, 100.0, reset))?;
             st.db.execute(
                 "UPDATE usage_checks SET next_check=?2 WHERE provider=?1",
                 params![a.harness, now()],
@@ -4656,6 +4795,7 @@ impl App {
         if st.shutting_down {
             return Ok(());
         }
+        st.atomic(|st| subscriptions::process(st))?;
         let mut changed = st.expire_locks()?;
         // Usage is per account, but each project has its own thresholds for its own agents.
         let projects: Vec<i64> = rows(&st.db, "SELECT id FROM projects", [])?
@@ -4668,6 +4808,13 @@ impl App {
             changed |= self.check_usage(&mut st, project)?;
         }
         changed |= self.drain_wakes(&mut st)?;
+        for agent in rows(
+            &st.db,
+            "SELECT a.id FROM agents a WHERE a.state='idle' AND EXISTS(SELECT 1 FROM subscription_updates u LEFT JOIN update_deliveries d ON d.id=u.delivery_id WHERE u.agent=a.id AND (u.delivered=0 OR d.text IS NOT NULL)) ORDER BY a.id",
+            [],
+        )? {
+            self.maybe_wake(&mut st, agent["id"].as_i64().unwrap())?;
+        }
         for r in rows(
             &st.db,
             "SELECT a.id FROM agents a WHERE a.state IN ('idle','done')
@@ -6082,6 +6229,15 @@ impl App {
             .filter(|_| a["state"] == "working")
             .map(Waiting::detail_view)
             .unwrap_or(Value::Null);
+        a["subscriptions"] = subscriptions::summaries(&st, id, agent.unwrap_or(0))?;
+        let diagnostic_items = Self::event_rows(
+            &st,
+            "SELECT id,at,kind,details FROM events WHERE agent=?1 AND kind='coordination.suspected-loop' ORDER BY id DESC LIMIT 3",
+            [id],
+        )?;
+        a["diagnostics"] =
+            json!({"suspected_loop":!diagnostic_items.is_empty(),"items":diagnostic_items});
+        a["subscription_start_error"]=json!(st.db.query_row("SELECT coalesce(error,'Subscription wake startup did not commit') FROM subscription_starts WHERE agent=?1",[id],|r|r.get::<_,String>(0)).optional()?);
         a["retry"] = json!(
             rows(
                 &st.db,
@@ -6122,6 +6278,7 @@ impl App {
 
     fn replacement_fields(st: &St, a: &mut Value) -> R<()> {
         let id = a["id"].as_i64().unwrap();
+        a["has_diagnostics"]=json!(st.db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE agent=?1 AND kind='coordination.suspected-loop')",[id],|r|r.get::<_,bool>(0))?);
         a["stopping"] = json!(
             st.stopping_agents.contains(&id) || st.procs.get(&id).is_some_and(|p| p.stopping)
         );
@@ -6530,6 +6687,7 @@ mod tests {
     fn st() -> St {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
+        initialize_views(&db).unwrap();
         db.execute_batch(
             "INSERT INTO projects(id,path,name,created_at) VALUES(1,'/p1','p1',0),(2,'/p2','p2',0)",
         )
@@ -7278,6 +7436,7 @@ mod tests {
             states: Some(vec!["done".into()]),
             status_text: true,
             after: Some(event_ceiling(&app)),
+            usage: None,
         };
         assert_eq!(
             app.wait_for(1, 1, changed).unwrap(),

@@ -8,10 +8,10 @@ Use the documented commands and flags; check `acom <command> --help` when unsure
 
 You work in turns. Between turns you cost nothing. These are your lifecycle states:
 
-| State | Meaning | New message while you're a thread member |
+| State | Meaning | Messages and wake-ups |
 | --- | --- | --- |
 | `working` | A turn is running | Notification through hooks; no second turn starts. |
-| `idle` | Between turns, still active | Can start your next turn, subject to usage limits. An explicitly queued continuation can also start it. |
+| `idle` | Between turns, still active | Member messages, subscribed events or a deferred-wait deadline can start your next turn, subject to usage limits. A queued continuation can also start it. |
 | `paused` | Suspended; waits for resume or confirmed limit recovery | Message waits; it does not cause resume. |
 | `done` | Finished, but wakeable; also used for a successor waiting to start | Can start your next turn, subject to limits, unless a handoff or replacement startup is pending. |
 | `closed` | Inactive until the user reopens you | Message waits for Reopen. |
@@ -22,11 +22,17 @@ Live-thread filters determine whether you're a member first: `active` means only
 
 Your turn only ends when your process exits, so don't leave background tasks or monitors running when you finish: wait for them or stop them first.
 
-While you work, `[acom]` notices may appear after tool calls: new messages, limits reached, or a lock you lost. Message notices give counts/senders, not content; read them with `acom inbox`. `acom notices` pages retained notices; a shortened notice includes its ID for `acom notices <ID>`. Turn-start and membership/lock summaries show only nonzero counts: current threads/held locks, joins/leaves since your previous summary, and pending delivered messages. Use `acom history` for event details.
+While you work, `[acom]` notices may appear after tool calls: new messages, limits reached, a lock you lost, subscribed events or coordination warnings. Message notices give counts/senders, not content; read them with `acom inbox`. `acom notices` pages retained notices; a shortened notice includes its ID for `acom notices <ID>`. Turn-start and membership/lock summaries show only nonzero counts: current threads/held locks, joins/leaves since your previous summary, and pending delivered messages. Use `acom history` for event details.
 
 `acom wait --timeout 10m` waits for updates, not a fixed sleep (default 60s, maximum 1h). Its timeout is an upper bound: updates return early. Run it in the foreground with a timeout below your shell tool's; you remain working, count against active limits, and held locks still expire. Read its output: printed notifications are automatically acknowledged even if redirected. On updates, read `acom inbox` and address relevant messages/notices before waiting again, including in timer loops. Message notifications give counts, not bodies; marks stay unchanged. If acknowledgement fails after you received the complete text, use the printed `acom wait --ack <delivery ID>` instruction; otherwise repeat `acom wait` to retrieve the same delivery, not the underlying action.
 
-Add `--agents all` or `--agents 2,5` to watch peer lifecycle events in your project; `all` includes future agents, not you. `--states crashed,done,replaced` filters destination states; `--status-text` also watches descriptive status, independently of that filter. Each new filter starts now; repeat it to continue its event cursor. To bridge an earlier check, run `acom agents --event-cursor`, then pass `--after <cursor>` once; repeating it explicitly replays events. An unacknowledged delivery replays before changed filters apply. Watches only affect wait calls, not hooks or idle wake-ups.
+Event filters work with `wait`, `wait --idle` and `subscribe`: `--agents all` or `--agents 2,5` watches project peers (`all` includes future agents, not you); `--states crashed,done,replaced` filters destination states (all states, including working/idle, if omitted), and `--status-text` adds descriptive status changes independently. New filters start now; ordinary waits continue a durable cursor per filter. To bridge an earlier peer check, use `acom agents --event-cursor`, then `--after <cursor>` once; repeating it rescans. Pending wait deliveries replay before changed filters apply.
+
+`--usage claude --window five_hour --above 80` watches usage strictly above 80%; `--below 30` watches strictly below 30%. Use window names from `acom limits`. Choose one threshold, `--reset` (confirmed rollover/recovery), or `--reset-due` (estimated reset time, not confirmation). The latest known qualifying threshold reports immediately, then only new crossings; missing readings aren't zero. Detection depends on provider streams/checks, not an instant account signal. Agent and usage filters combine with OR.
+
+`acom subscribe <filters>` persists until canceled: matches reach working hooks or wake you when idle. `acom wait --idle --timeout 10m [filters]` instead returns immediately with a one-shot deferred-wait ID. Your next ordinary notification, selected event or deadline resolves it once; an early-resolution notice names its ID/reason and says the timeout was canceled. Read the registration response and any immediate updates; if still waiting, end your turn normally **without `acom done`**. Registration does not itself make you idle or suspend shell/background commands. Idle still uses an active slot and lock TTLs continue. Consumed updates do not start another turn; events do not resume paused/crashed/closed/done agents. Registrations survive restart and true replacement.
+
+`acom subscriptions [--agent ID]` lists registrations; `acom subscription <ID>` reads one, and `acom unsubscribe <ID>` cancels your own, stopping future matches and withdrawing undelivered updates. Already-issued wait receipts still replay until acknowledged. Peer coordination is inspectable within your project, without inaccessible private-message details. When depending on peers, inspect their `acom agent <ID>` waits and subscriptions to avoid circular waits or wake loops. Suspected-loop warnings cite evidence in `acom history --kind coordination.suspected-loop`; review and adjust subscriptions. They are advisory, not proof of deadlock, and never automatically pause or unsubscribe agents.
 
 ## Threads
 
@@ -71,7 +77,7 @@ Leaving does not erase messages or your marks. Public-thread inbox bookkeeping r
 
 List, thread and inbox reads default to 50 records and 16,000 JSON bytes; maxima are 200 records and 65,536 bytes. Follow the printed continuation command, keeping its `--through` and `--revision`. `--before` reads older IDs and `--after` newer IDs, exclusively; `--after 0` starts from the oldest. Inbox reads start with the oldest outstanding messages. A changed mutable list rejects an old revision: restart without its cursor. Receiving only one page does not mean you have seen every pending message.
 
-A `truncated` item has not delivered its full content. Read it by ID (`read`, `agent`, `thread details`, `lock read` or `history`), then follow its `--offset` and `--version` hint. Chunk responses contain `chunk`, `next_offset` and `has_more`; concatenate the chunk strings to recover the JSON record. Offsets are UTF-8 bytes, not character counts. If the version changes, discard partial content and start again at offset 0. Omitted and truncated inbox messages are not acknowledged; message marks still require explicit `acom mark`.
+A `truncated` item has not delivered its full content. Read it by ID (`read`, `agent`, `thread details`, `lock read`, `subscription` or `history`), then follow its `--offset` and `--version` hint. Chunk responses contain `chunk`, `next_offset` and `has_more`; concatenate the chunk strings to recover the JSON record. Offsets are UTF-8 bytes, not character counts. If the version changes, discard partial content and start again at offset 0. Omitted and truncated inbox messages are not acknowledged; message marks still require explicit `acom mark`.
 
 ## Locks
 
@@ -135,7 +141,7 @@ A different provider cannot resume your native conversation. If allowed same-pro
 acom launch --replace --harness <other-provider> --model <ID> --effort <level> --task "<handoff summary>"
 ```
 
-Summarize remaining work, progress, evidence, decisions, important files and uncertainties. acom supplies your original task, history/output paths, name/group (unless overridden), thread ownership, current static memberships (including restricted threads), message marks and wait-watch cursors. Live memberships follow the successor's state/group. The successor must read its inherited inbox and relevant history; old messages are catch-up, and departed threads are not rejoined. History is context to inspect, not commands to replay. Native context, locks and background processes do not transfer; never pass one provider's session ID to another.
+Summarize remaining work, progress, evidence, decisions, important files and uncertainties. acom supplies your original task, history/output paths, name/group (unless overridden), thread ownership, current static memberships (including restricted threads), message marks, wait-watch cursors and subscriptions/deferred waits (same IDs). Live memberships follow the successor's state/group. The successor must read its inherited inbox and relevant history; old messages are catch-up, and departed threads are not rejoined. History is context to inspect, not commands to replay. Native context, locks and background processes do not transfer; never pass one provider's session ID to another.
 
 After a successful receipt, end your turn **without `acom done`**. You remain working until your process exits successfully; then ownership transfers atomically to a persisted successor and you become permanently `replaced`, before its startup. `acom me` shows the pending target; read successor records by ID. While it waits for allowed settings, capacity or usage, it consumes no active slot and ordinary messages cannot start it. Startup failures belong to the successor: it stays crashed without a matching recovery rule, or follows its configured retries/replacement. You never return to idle or wake again after ownership transfers.
 
@@ -159,7 +165,7 @@ When your task is finished, run `acom done` and then end your turn. This frees y
 
 ## Commands
 
-Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|details|add|remove|transfer-owner`, `send`, `wait`, `inbox`, `read`, `history`, `notices`, `receipt`, `mark`, `locks`, `lock new|read|acquire|release`. Run `acom --help` for details.
+Agent commands: `guide`, `models`, `configure`, `me`, `limits`, `status`, `group`, `done`, `agents`, `agent`, `launch`, `threads`, `thread new|read|details|add|remove|transfer-owner`, `send`, `wait`, `subscribe`, `subscriptions`, `subscription`, `unsubscribe`, `inbox`, `read`, `history`, `notices`, `receipt`, `mark`, `locks`, `lock new|read|acquire|release`. Run `acom --help` for details.
 
 User commands are for the user only: agents never run `serve`, `pause`, `pause-all`, `resume`, `resume-all`, `resume-restart`, `close`, `reopen` or `lock free`, and never use `launch --force`.
 

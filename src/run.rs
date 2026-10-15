@@ -495,7 +495,7 @@ pub(crate) fn prepare_turn(
     st.set_state(id, "working")?;
     st.db
         .execute("DELETE FROM agent_starts WHERE agent_id=?1", [id])?;
-    let updates = st.take_updates(id)?;
+    let updates = st.take_turn_updates(id)?;
     let summary = st.coordination_summary(id, true)?;
     let prompt = [prompt.to_string(), updates, summary]
         .into_iter()

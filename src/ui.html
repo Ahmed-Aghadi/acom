@@ -217,6 +217,9 @@
     .details dt, .details dd { padding: 8px 0; border-bottom: 1px solid var(--line); }
     .details dt { color: var(--muted); }
     .details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .coordination-warning { margin: 12px 0; padding: 12px; border: 1px solid var(--warn); border-radius: 8px; overflow-wrap: anywhere; }
+    #agent-subscriptions, #agent-diagnostics, #agent-lifecycle { margin-top: 16px; }
+    #agent-subscription-items .event > div { min-width: 0; overflow-wrap: anywhere; }
     .agent-log { max-height: 260px; margin: 9px 0 0; padding: 15px; overflow: auto; border: 1px solid #2c3a50; border-radius: 8px; background: #101b2d; color: #ccdaec; font: 11px/1.7 ui-monospace, monospace; white-space: pre-wrap; }
     #record-content { font: 12px/1.6 ui-monospace,monospace; }
     .settings-panel { overflow: visible; }
@@ -496,7 +499,7 @@
     </form>
   </dialog>
 
-  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div id="agent-config"></div><details id="agent-lifecycle"><summary>Lifecycle changes</summary><div id="agent-lifecycle-items" class="activity"></div><p class="inline-error" id="agent-lifecycle-error" role="status" hidden></p><button type="button" class="small" id="lifecycle-older" hidden>Load older changes</button></details><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div class="coordination-warning" id="agent-coordination-warning" hidden></div><details id="agent-subscriptions"><summary>Subscriptions &amp; deferred waits <span class="meta" id="agent-subscription-count"></span></summary><div id="agent-subscription-items" class="activity"></div><p class="inline-error" id="agent-subscriptions-error" role="status" hidden></p><button type="button" class="small" id="subscriptions-more" hidden>Load more subscriptions</button></details><details id="agent-diagnostics"><summary>Coordination warnings</summary><div id="agent-diagnostics-items" class="activity"></div><p class="inline-error" id="agent-diagnostics-error" role="status" hidden></p><button type="button" class="small" id="diagnostics-older" hidden>Load older warnings</button></details><div id="agent-config"></div><details id="agent-lifecycle"><summary>Lifecycle changes</summary><div id="agent-lifecycle-items" class="activity"></div><p class="inline-error" id="agent-lifecycle-error" role="status" hidden></p><button type="button" class="small" id="lifecycle-older" hidden>Load older changes</button></details><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
@@ -551,7 +554,8 @@
     const reading = new Set();
     const waitingReceipts = new WeakMap(), waitingClocks = new Map();
     let serverClock = null;
-    let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null, agentLifecycle = null, lifecycleLoading = null;
+    let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null, agentLifecycle = null, lifecycleLoading = null, agentDiagnostics = null, diagnosticsLoading = null, agentSubscriptions = null, subscriptionsLoading = null;
+    const cancelingSubscriptions = new Set();
     const agentTransitions = new Set();
     let resumingRestart = false, pausingAll = false, resumingAll = false;
     const $ = (s, root = document) => root.querySelector(s);
@@ -576,7 +580,7 @@
       deferredContent.delete(node);
       if (html) {
         const focused = node.contains(document.activeElement) ? document.activeElement : null;
-        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
+        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage','data-record','data-record-id','data-cancel-subscription'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
         const agent = focused?.closest('[data-agent]');
         if (selector && agent && node.contains(agent)) selector = `[data-agent="${CSS.escape(agent.dataset.agent)}"] ${selector}`;
         node.innerHTML = value; node._renderedHTML = value;
@@ -1012,9 +1016,10 @@
     function agentRow(a) {
       const replacement = replacementSummary(a), starting = a.replacement_start || a.replacement_start_pending;
       const stopping = a.stopping ? '<span class="pill waiting">Stopping</span><div class="meta">Stopping processes before releasing locks.</div>' : '';
+      const diagnostics = a.has_diagnostics ? '<span class="pill waiting" title="A suspected coordination loop was recorded; inspect Details. No automatic intervention.">Coordination warning recorded</span>' : '';
       const waiting = a.waiting ? `<div class="meta agent-wait">${waitingDescription(a)}</div>` : a.is_waiting ? '<div class="meta agent-wait">Waiting for notifications · See Details for the watch and timeout.</div>' : '';
       const disabled = a.stopping || agentTransitions.has(a.id) ? ' disabled' : '';
-      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}${waiting}<div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
+      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}${waiting}${diagnostics}<div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
       const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
       const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
@@ -1029,7 +1034,7 @@
       const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta wait-reason">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${queued}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta agent-task" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${waiting}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta agent-task" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -1274,8 +1279,12 @@
         }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting','has_diagnostics','subscriptions','diagnostics'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
         if (a.waiting) fields.push({key:'waiting',label:'waiting',content:waitingDescription(a)});
+        const subscriptions = a.subscriptions || {active:0,pending:0};
+        setText($('#agent-subscription-count'), `(${fmt(subscriptions.active)} active · ${fmt(subscriptions.pending)} pending events)`);
+        const warning = $('#agent-coordination-warning'); warning.hidden = !a.diagnostics?.suspected_loop;
+        if (!warning.hidden) setHTML(warning, `<strong>Suspected coordination loop reported</strong><div class="meta">Advisory only; no automatic intervention.</div>${(a.diagnostics.items || []).map(item=>`<div class="meta">#${esc(item.id)} · ${esc(when(item.at))} · ${esc(item.details?.summary || 'Inspect coordination history for the observed pattern.')}</div>`).join('')}`);
         if (a.stopping) fields.push({key:'stopping',label:'stop cleanup',content:'Stopping processes. Locks are released only after cleanup finishes.'});
         fields.push({key:'running_configuration',label:'current turn',content:a.running_configuration ? `${esc(a.harness)} / ${esc(a.running_configuration.model)} / effort ${esc(a.running_configuration.effort)}` : '— (no running turn)'});
         fields.push({key:'locks',label:'locks held',content:a.locks?.map(esc).join(', ') || '—'}, {key:'lost_locks',label:'locks lost',content:a.lost_locks?.map(x => `${esc(when(x.at))} · ${esc(x.text)}`).join('<br>') || '—'});
@@ -1321,7 +1330,7 @@
           el.scrollTop = atBottom ? el.scrollHeight : top;
         }
         setText($('#agent-detail-status'), `Live · updated ${new Date().toLocaleTimeString()}`);
-        if ($('#agent-lifecycle').open) await loadAgentLifecycle(id, request);
+        await Promise.all([$('#agent-lifecycle').open ? loadAgentLifecycle(id, request) : null, $('#agent-diagnostics').open ? loadAgentDiagnostics(id, request) : null, $('#agent-subscriptions').open ? loadAgentSubscriptions(id, request) : null]);
       } catch (error) {
         if (request === agentRequest && $('#agent-dialog').open) setText($('#agent-detail-status'), `Updates unavailable: ${error.message}. Retrying automatically.`);
       } finally { if (agentLoading === request) agentLoading = null; }
@@ -1329,28 +1338,85 @@
 
     let logLoading = null;
     async function loadAgentLifecycle(id, request, older = false) {
-      const current = () => id === selectedAgent && request === agentRequest && $('#agent-dialog').open && $('#agent-lifecycle').open;
-      if (!current() || lifecycleLoading?.request === request) return;
-      const flight = {id,request}; lifecycleLoading = flight; $('#lifecycle-older').disabled = true;
+      return loadAgentHistory(id, request, older, false);
+    }
+    async function loadAgentDiagnostics(id, request, older = false) {
+      return loadAgentHistory(id, request, older, true);
+    }
+    async function loadAgentHistory(id, request, older, diagnostics) {
+      const key = diagnostics ? 'diagnostics' : 'lifecycle', kind = diagnostics ? 'coordination.suspected-loop' : 'agent.state';
+      const current = () => id === selectedAgent && request === agentRequest && $('#agent-dialog').open && $(`#agent-${key}`).open;
+      if (!current() || (diagnostics ? diagnosticsLoading : lifecycleLoading)?.request === request) return;
+      const flight = {id,request}; if (diagnostics) diagnosticsLoading=flight; else lifecycleLoading=flight;
+      $(`#${key}-older`).disabled = true;
       try {
-        const previous = agentLifecycle?.id === id ? agentLifecycle : null;
+        const cached = diagnostics ? agentDiagnostics : agentLifecycle, previous = cached?.id === id ? cached : null;
         const cursor = previous?.events.length ? older ? {before:previous.events.at(-1).id} : {after:previous.events[0].id} : {};
-        let page = await api(query('/history',{agent:id,kind:'agent.state',limit:30,max_bytes:pageBytes,...cursor}));
+        let page = await api(query('/history',{agent:id,kind,limit:30,max_bytes:pageBytes,...cursor}));
         if (!current()) return;
         let replace = !previous?.events.length;
         // A burst beyond one page restarts at the latest window; never leave a hidden gap.
-        if (!older && cursor.after && page.has_more) {page=await api(query('/history',{agent:id,kind:'agent.state',limit:30,max_bytes:pageBytes}));replace=true;}
+        if (!older && cursor.after && page.has_more) {page=await api(query('/history',{agent:id,kind,limit:30,max_bytes:pageBytes}));replace=true;}
         if (!current()) return;
         let events = [...new Map([...(replace ? [] : previous.events),...page.events].map(event=>[event.id,event])).values()].sort((a,b)=>b.id-a.id);
         const windowSize = Math.max(30,previous?.events.length || 0), trimmed = !older && events.length>windowSize;
         if (trimmed) events=events.slice(0,windowSize);
-        agentLifecycle = {id,events,has_more:older || replace ? page.has_more : previous.has_more || trimmed};
-        setHTML($('#agent-lifecycle-items'),events.length ? events.map(event=>`<div class="event"><time>${when(event.at)}</time><div>#${event.id} · ${event.truncated ? `<button type="button" class="small" data-record="history" data-record-id="${event.id}">Load state change</button>` : `${esc(event.details?.from || '—')} → ${esc(event.details?.to || '—')}`}</div></div>`).join('') : '<p class="meta">No lifecycle changes recorded.</p>');
-        $('#lifecycle-older').hidden=!agentLifecycle.has_more; $('#agent-lifecycle-error').hidden=true;
-      } catch(error) {if(current()) {setText($('#agent-lifecycle-error'),`Lifecycle updates unavailable: ${error.message}. Retrying automatically.`);$('#agent-lifecycle-error').hidden=false;}}
-      finally {if(lifecycleLoading===flight)lifecycleLoading=null;if(current())$('#lifecycle-older').disabled=false;}
+        const next = {id,events,has_more:older || replace ? page.has_more : previous.has_more || trimmed};
+        if (diagnostics) agentDiagnostics=next; else agentLifecycle=next;
+        setHTML($(`#agent-${key}-items`),events.length ? events.map(event=>`<div class="event"><time>${when(event.at)}</time><div>#${event.id} · ${event.truncated ? `<button type="button" class="small" data-record="history" data-record-id="${event.id}">Load ${diagnostics ? 'warning' : 'state change'}</button>` : diagnostics ? `${esc(event.details?.summary || 'Suspected coordination loop')}<div class="meta">${[['agents',event.details?.agents],['subscriptions',event.details?.subscriptions],['events',event.details?.events]].filter(([,ids])=>ids?.length).map(([label,ids])=>`${label}: ${ids.map(id=>`#${esc(id)}`).join(', ')}`).join(' · ')}</div>` : `${esc(event.details?.from || '—')} → ${esc(event.details?.to || '—')}`}</div></div>`).join('') : `<p class="meta">No ${diagnostics ? 'coordination warnings' : 'lifecycle changes'} recorded.</p>`);
+        $(`#${key}-older`).hidden=!next.has_more; $(`#agent-${key}-error`).hidden=true;
+      } catch(error) {if(current()) {setText($(`#agent-${key}-error`),`${diagnostics ? 'Coordination' : 'Lifecycle'} updates unavailable: ${error.message}. Retrying automatically.`);$(`#agent-${key}-error`).hidden=false;}}
+      finally {if(diagnosticsLoading===flight)diagnosticsLoading=null;if(lifecycleLoading===flight)lifecycleLoading=null;if(current())$(`#${key}-older`).disabled=false;}
     }
     $('#agent-lifecycle').addEventListener('toggle',()=>{if($('#agent-lifecycle').open&&selectedAgent!=null)loadAgentLifecycle(selectedAgent,agentRequest);});
+    $('#agent-diagnostics').addEventListener('toggle',()=>{if($('#agent-diagnostics').open&&selectedAgent!=null)loadAgentDiagnostics(selectedAgent,agentRequest);});
+    function subscriptionCondition(item) {
+      const watch = item.watch || {}, parts = [];
+      if (watch.agents) parts.push(`${watch.agents === 'all' ? 'all project agents' : `agents ${watch.agents.map(id=>`#${id}`).join(', ')}`} · ${watch.states?.length ? `states: ${watch.states.join(', ')}` : 'state changes'}${watch.status_text ? ' · status text' : ''}`);
+      if (watch.usage) { const usage=watch.usage, condition=usage.condition==='reset-due' ? 'estimated reset due (unconfirmed)' : usage.condition==='reset' ? 'confirmed reset/recovery' : `${usage.condition} ${usage.percent}%`; parts.push(`${usage.provider} / ${usage.window}: ${condition}`); }
+      if (!parts.length) parts.push(item.mode === 'once' ? 'Own notifications' : 'Event subscription');
+      return parts.join(' · ');
+    }
+    function subscriptionCompletion(item) {
+      if (!item.completion) return '';
+      if (item.mode === 'once' && item.state === 'resolved') return item.completion.kind === 'timeout' ? 'Deadline reached.' : `Resolved early by ${item.completion.summary || item.completion.kind}; timeout canceled.`;
+      return item.completion.summary || item.completion.kind;
+    }
+    function renderAgentSubscriptions() {
+      if (!agentSubscriptions || agentSubscriptions.id !== selectedAgent) return;
+      setHTML($('#agent-subscription-items'), agentSubscriptions.items.length ? agentSubscriptions.items.map(item=>`<div class="event" data-subscription="${esc(item.id)}"><time>${esc(when(item.created_at))}</time><div><strong>${item.mode === 'once' ? 'Deferred wait' : 'Subscription'} #${esc(item.id)}</strong> · ${esc(item.state || 'details required')}<div>${item.truncated ? `<button type="button" class="small" data-record="subscriptions" data-record-id="${esc(item.id)}">Load full subscription</button>` : esc(subscriptionCondition(item))}</div>${item.deadline ? `<div class="meta">${item.state === 'active' ? 'Deadline' : 'Original deadline'}: ${esc(when(item.deadline))}</div>` : ''}${item.completion ? `<div>${esc(subscriptionCompletion(item))}${item.completed_at ? ` · ${esc(when(item.completed_at))}` : ''}</div>` : ''}${item.state === 'active' ? `<button type="button" class="small" data-cancel-subscription="${esc(item.id)}" aria-label="Cancel ${item.mode === 'once' ? 'deferred wait' : 'subscription'} #${esc(item.id)}"${cancelingSubscriptions.has(item.id) ? ' disabled' : ''}>${cancelingSubscriptions.has(item.id) ? 'Canceling…' : 'Cancel'}</button>` : ''}</div></div>`).join('') : '<p class="meta">No subscriptions or deferred waits.</p>');
+      $('#subscriptions-more').hidden=!agentSubscriptions.has_more;
+    }
+    async function loadAgentSubscriptions(id, request, more = false) {
+      const current = () => id === selectedAgent && request === agentRequest && $('#agent-dialog').open && $('#agent-subscriptions').open;
+      if (!current() || subscriptionsLoading?.request === request) return;
+      const flight = {id,request}; subscriptionsLoading=flight; $('#subscriptions-more').disabled=true;
+      try {
+        const previous = agentSubscriptions?.id === id ? agentSubscriptions : null;
+        for (let attempt=0;attempt<3;attempt++) {
+          try {
+            const direct=more && previous?.has_more && attempt===0;
+            let page=await api(query('/subscriptions',{agent:id,limit:30,max_bytes:pageBytes,...(direct ? {before:previous.next_before,through:previous.through,revision:previous.revision} : {since:!more ? previous?.revision : null})}));
+            if (!current()) return;
+            if (page.unchanged) {$('#agent-subscriptions-error').hidden=true;return;}
+            let items=direct ? [...previous.items,...page.items] : [...page.items];
+            const target=direct ? items.length : Math.max(previous?.items.length || 0,more ? (previous?.items.length || 0)+30 : 0);
+            while(page.has_more && items.length<target) {
+              const before=page.next_before;
+              if (before==null) throw new Error('Missing subscription cursor');
+              page=await api(query('/subscriptions',{agent:id,limit:30,max_bytes:pageBytes,before,through:page.through,revision:page.revision}));
+              if (!current()) return;
+              if(page.has_more && page.next_before===before)throw new Error('Subscription cursor did not advance');
+              items.push(...page.items);
+            }
+            agentSubscriptions={...page,id,items:[...new Map(items.map(item=>[item.id,item])).values()]};
+            renderAgentSubscriptions(); $('#agent-subscriptions-error').hidden=true; return;
+          } catch(error) {if(!current())return;if(error.status!==409 || attempt===2)throw error;}
+        }
+      } catch(error) {if(current()){setText($('#agent-subscriptions-error'),`Subscriptions unavailable: ${error.message}. Retrying automatically.`);$('#agent-subscriptions-error').hidden=false;}}
+      finally {if(subscriptionsLoading===flight)subscriptionsLoading=null;if(current())$('#subscriptions-more').disabled=false;}
+    }
+    $('#agent-subscriptions').addEventListener('toggle',()=>{if($('#agent-subscriptions').open&&selectedAgent!=null)loadAgentSubscriptions(selectedAgent,agentRequest);});
     async function loadAgentLog(id, request, older = false) {
       if (logLoading?.id === id && logLoading.request === request) {
         await logLoading.promise;
@@ -1767,6 +1833,24 @@
       }
       if (event.target.closest('#thread-older')) { await olderMessages(); return; }
       if (event.target.closest('#lifecycle-older')) {await loadAgentLifecycle(selectedAgent,agentRequest,true);return;}
+      if (event.target.closest('#diagnostics-older')) {await loadAgentDiagnostics(selectedAgent,agentRequest,true);return;}
+      if (event.target.closest('#subscriptions-more')) {await loadAgentSubscriptions(selectedAgent,agentRequest,true);return;}
+      const cancelSubscription=event.target.closest('[data-cancel-subscription]');
+      if(cancelSubscription) {
+        const id=Number(cancelSubscription.dataset.cancelSubscription), agent=selectedAgent, request=agentRequest;
+        if(cancelingSubscriptions.has(id) || agent==null || !$('#agent-dialog').open || agentSubscriptions?.id!==agent || agentSubscriptions.items.find(item=>item.id===id)?.state!=='active')return;
+        cancelingSubscriptions.add(id); renderAgentSubscriptions();
+        try {
+          const result=await api(`/subscriptions/${id}/cancel`,{method:'POST',body:JSON.stringify({agent:0})});
+          if(agentSubscriptions?.id===agent && result.id===id && ['resolved','canceled'].includes(result.state)) {
+            const item=agentSubscriptions.items.find(item=>item.id===id); if(item)Object.assign(item,result);
+            if(agent===selectedAgent && request===agentRequest)renderAgentSubscriptions();
+          }
+          if(agent===selectedAgent && request===agentRequest && $('#agent-dialog').open)await refreshAgentDetails();
+        } catch(error) {if(agent===selectedAgent && request===agentRequest)toast(error.message,true);}
+        finally {cancelingSubscriptions.delete(id);if(agent===selectedAgent && request===agentRequest)renderAgentSubscriptions();}
+        return;
+      }
       if (event.target.closest('#log-older')) {
         const button = $('#log-older'), id = selectedAgent, request = agentRequest, el = $('#agent-log');
         button.disabled = true;
@@ -1986,6 +2070,9 @@
           selectedAgent = id; agentRequest++;
           agentLog = null;
           agentLifecycle = null; $('#agent-lifecycle').open=false; $('#agent-lifecycle-items').replaceChildren(); $('#agent-lifecycle-error').hidden=true; $('#lifecycle-older').hidden=true;
+          agentDiagnostics=null; $('#agent-diagnostics').open=false; $('#agent-diagnostics-items').replaceChildren(); $('#agent-diagnostics-error').hidden=true; $('#diagnostics-older').hidden=true;
+          agentSubscriptions=null; $('#agent-subscriptions').open=false; $('#agent-subscription-items').replaceChildren(); $('#agent-subscriptions-error').hidden=true; $('#subscriptions-more').hidden=true;
+          $('#agent-subscription-count').textContent=''; $('#agent-coordination-warning').hidden=true;
           $('#agent-title').textContent = `Agent #${id}`;
           $('#agent-details').replaceChildren(); $('#agent-config').replaceChildren(); $('#agent-log').textContent = '';
           $('#agent-detail-status').textContent = 'Loading…';

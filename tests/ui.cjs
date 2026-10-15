@@ -34,7 +34,7 @@ const reloadPage = async page => {
 };
 
 async function fixture(run) {
-  const data = { settings: settings(), agents: [], threads: [], reads: {}, agentLogs: {}, detailRequests: [], getRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
+  const data = { settings: settings(), agents: [], threads: [], subscriptions: [], reads: {}, agentLogs: {}, detailRequests: [], getRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
   data.configs = [{ id: 1, name: 'Default', settings: settings() }, { id: 2, name: 'Mine', settings: data.settings }];
   data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
@@ -67,7 +67,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -134,6 +134,19 @@ async function fixture(run) {
       if(data.historyFailure)return send({status:503,error:'History offline'});
       const events=selected.slice(0,Number(params.get('limit')||30));
       return send({events,has_more:events.length<selected.length,next_before:params.has('after')?null:events.at(-1)?.id??null,next_after:params.has('after')?events.at(-1)?.id??null:null});
+    }
+    if(req.method==='GET' && pathname==='/subscriptions') {
+      if(data.subscriptionFailure)return send({status:503,error:data.subscriptionFailure});
+      const rows=data.subscriptions.filter(item=>item.agent===Number(params.get('agent')));
+      return send(paged(rows,params,hash(rows)));
+    }
+    if(req.method==='GET' && /^\/subscriptions\/\d+$/.test(pathname))return send(bounded(data.subscriptions.find(item=>item.id===Number(pathname.split('/')[2])),params));
+    if(req.method==='POST' && /^\/subscriptions\/\d+\/cancel$/.test(pathname)) {
+      if(data.cancelSubscriptionDelay)await new Promise(resolve=>setTimeout(resolve,data.cancelSubscriptionDelay));
+      if(data.cancelSubscriptionError)return send({status:503,error:data.cancelSubscriptionError});
+      const item=data.subscriptions.find(item=>item.id===Number(pathname.split('/')[2]));
+      Object.assign(item,{state:'canceled',completed_at:Math.floor(Date.now()/1000),completion:{kind:'notice',summary:'Canceled by user'}});
+      return send({id:item.id,state:item.state});
     }
     if(req.method==='GET' && /^\/(projects|configs|locks|activity)\/\d+$/.test(pathname)) {
       const [key,id]=pathname.slice(1).split('/'),project=Number(params.get('project')) || data.projects[0]?.id;
@@ -271,6 +284,7 @@ async function fixture(run) {
         value={text:raw.subarray(start,end).toString('utf8'),start,end,total_bytes:ceiling,next_before:start,next_after:end,has_more:params.has('after')?end<ceiling:start>0,eof:end===ceiling,version,revision:rev,start_partial:false,end_partial:false};
       } else {
         const agent={...data.agents.find(a=>a.id===id)};
+        agent.subscriptions ||= {active:data.subscriptions.filter(item=>item.agent===id&&item.state==='active').length,pending:data.subscriptionPending?.[id] || 0};
         if(agent.waiting) {agent.waiting={...agent.waiting};delete agent.waiting.remaining_secs;}
         value=bounded(agent,params);
       }
@@ -3545,6 +3559,132 @@ test('lifecycle history restarts a large burst without gaps, recovers from failu
   await page.locator('#agent-dialog .dialog-actions button').click(); pending.release(); await pending.remove(); await page.waitForTimeout(100);
   assert.equal(await page.locator('#agent-dialog').isVisible(),false);
   assert.equal(await page.locator('#agent-lifecycle-items .event').count(),30,'a late page cannot update a closed pane');
+}));
+
+test('event subscriptions are on-demand, bounded and show deferred-wait IDs, conditions and completion reasons', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  data.subscriptionPending={1:2};
+  data.subscriptions=[
+    {id:1,agent:1,mode:'persistent',state:'active',created_at:100,watch:{agents:[2,3],states:['crashed','done'],status_text:true}},
+    {id:2,agent:1,mode:'once',state:'active',created_at:101,deadline:200,watch:{}},
+    {id:3,agent:1,mode:'once',state:'resolved',created_at:102,deadline:201,completed_at:120,completion:{kind:'message',summary:'a private notification'},watch:{}},
+    {id:4,agent:1,mode:'persistent',state:'active',created_at:103,watch:{usage:{provider:'claude',window:'five_hour <test>',condition:'above',percent:80}}},
+  ];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
+  await page.waitForFunction(()=>document.querySelector('#agent-subscription-count').textContent.includes('3 active'));
+  assert.match(await page.locator('#agent-subscription-count').textContent(),/3 active · 2 pending events/);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/subscriptions')).length,0);
+  await page.locator('#agent-subscriptions summary').click(); await page.waitForFunction(()=>agentSubscriptions?.items.length===2&&!subscriptionsLoading);
+  assert.match(await page.locator('#agent-subscription-items').textContent(),/Subscription #4.*claude \/ five_hour <test>: above 80%.*Deferred wait #3.*Resolved early by a private notification; timeout canceled/s);
+  assert.equal(await page.locator('#agent-subscription-items test').count(),0);
+  await page.locator('#subscriptions-more').click(); await page.waitForFunction(()=>agentSubscriptions?.items.length===4&&!subscriptionsLoading);
+  assert.match(await page.locator('[data-subscription="1"]').textContent(),/agents #2, #3 · states: crashed, done · status text/);
+  assert.match(await page.locator('[data-subscription="2"]').textContent(),/Deferred wait #2.*Own notifications.*Deadline:/s);
+  assert.equal(await page.locator('[data-subscription="2"] time').textContent(),await page.evaluate(()=>new Date(101000).toLocaleString()));
+  assert.equal(await page.locator('[data-subscription="3"] [data-cancel-subscription]').count(),0);
+  assert.equal(await page.locator('#subscriptions-more').isHidden(),true);
+  data.subscriptions[3].watch.usage={provider:'claude',window:'five_hour',condition:'reset-due'}; await page.evaluate(()=>refresh());
+  assert.match(await page.locator('[data-subscription="4"]').textContent(),/estimated reset due \(unconfirmed\)/);
+  data.subscriptions[3].watch.usage.condition='reset'; await page.evaluate(()=>refresh());
+  assert.match(await page.locator('[data-subscription="4"]').textContent(),/confirmed reset\/recovery/);
+  assert.ok(data.getRequests.filter(url=>url.startsWith('/subscriptions?')).every(url=>{const q=new URL(url,'http://test').searchParams;return q.get('agent')==='1'&&q.get('limit')==='30'&&q.get('max_bytes')==='16000';}));
+  assert.equal(data.requests.length,0);
+}));
+
+test('canceling subscriptions prevents duplicate requests, updates counts and preserves lifecycle and failed actions', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  data.subscriptions=[{id:1,agent:1,mode:'once',state:'active',created_at:100,deadline:200,watch:{}}];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
+  await page.locator('#agent-subscriptions summary').click(); await page.locator('[data-cancel-subscription="1"]').waitFor();
+  await page.locator('[data-cancel-subscription="1"]').focus();
+  data.subscriptions[0].watch={agents:[2],states:['crashed']}; await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>document.activeElement.dataset.cancelSubscription),'1','polling preserves keyboard focus on a subscription action');
+  data.cancelSubscriptionDelay=300;
+  await page.locator('[data-cancel-subscription="1"]').click();
+  await page.locator('[data-cancel-subscription="1"]').dispatchEvent('click');
+  await page.waitForFunction(()=>document.querySelector('[data-subscription="1"]').textContent.includes('canceled'));
+  await page.waitForFunction(()=>document.querySelector('#agent-subscription-count').textContent.includes('0 active')&&!agentLoading);
+  assert.equal(data.requests.length,1); assert.deepEqual(data.requests[0],{url:'/subscriptions/1/cancel',method:'POST',body:{agent:0}});
+  assert.match(await page.locator('#agent-subscription-count').textContent(),/0 active/);
+  assert.equal(data.agents[0].state,'idle');
+  assert.equal(await page.locator('[data-cancel-subscription="1"]').count(),0);
+  data.subscriptions.push({id:2,agent:1,mode:'persistent',state:'active',created_at:101,watch:{agents:'all',states:['crashed']}});
+  await page.evaluate(()=>refresh());
+  data.cancelSubscriptionError='Cancel <failed>';
+  await page.locator('[data-cancel-subscription="2"]').click();
+  await page.waitForFunction(()=>!document.querySelector('[data-cancel-subscription="2"]').disabled);
+  assert.equal(await page.locator('#toast').textContent(),'Cancel <failed>');
+  assert.equal(data.subscriptions[1].state,'active'); assert.equal(data.agents[0].state,'idle');
+  assert.equal(data.requests.filter(request=>!request.url.startsWith('/subscriptions/')).length,0);
+}));
+
+test('subscription paging restarts changed snapshots without gaps and polling preserves selected conditions', async () => fixture(async (page,data) => {
+  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  const row=id=>({id,agent:1,mode:'persistent',state:'active',created_at:id,watch:{agents:[id+10],states:['done']}});
+  data.subscriptions=Array.from({length:5},(_,i)=>row(i+1));
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
+  await page.locator('#agent-subscriptions summary').click(); await page.waitForFunction(()=>agentSubscriptions?.items.length===2&&!subscriptionsLoading);
+  data.subscriptions.push(row(6),row(7)); data.subscriptions[3].state='resolved';
+  await page.locator('#subscriptions-more').click(); await page.waitForFunction(()=>agentSubscriptions?.items.length===7&&!subscriptionsLoading);
+  assert.deepEqual(await page.locator('[data-subscription]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.subscription))),[7,6,5,4,3,2,1]);
+  assert.equal(new Set(await page.evaluate(()=>agentSubscriptions.items.map(item=>item.id))).size,7);
+  const selected=await selectText(page,'[data-subscription="7"] > div');
+  data.subscriptions[6].state='canceled'; await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.waitForFunction(()=>document.querySelector('[data-subscription="7"]').textContent.includes('canceled'));
+  assert.equal(await page.locator('[data-subscription]').count(),7);
+  assert.equal(data.requests.length,0);
+}));
+
+test('subscription failures retain the last view, oversized watches load explicitly and closed panes ignore late pages', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  data.subscriptions=[{id:1,agent:1,mode:'persistent',state:'active',created_at:100,watch:{usage:{provider:'claude',window:'large '.repeat(5000),condition:'reset'}}}];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
+  await page.locator('#agent-subscriptions summary').click(); await page.waitForFunction(()=>agentSubscriptions?.items.length===1&&!subscriptionsLoading);
+  assert.equal(await page.locator('[data-subscription="1"] [data-record=subscriptions]').count(),1);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/subscriptions/1')).length,0,'an oversized watch is not eagerly hydrated');
+  await page.locator('[data-subscription="1"] [data-record=subscriptions]').click();
+  await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('large large'));
+  assert.equal(await page.locator('#record-title').textContent(),'subscriptions #1');
+  await page.locator('#record-dialog .dialog-actions button').click();
+  data.subscriptionFailure='Subscriptions offline'; await page.evaluate(()=>refresh());
+  assert.match(await page.locator('#agent-subscriptions-error').textContent(),/Subscriptions offline/);
+  assert.equal(await page.locator('[data-subscription]').count(),1);
+  data.subscriptionFailure=null; await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-subscriptions-error').isHidden(),true);
+  const pending=await holdRequest(page,url=>url.pathname==='/subscriptions','GET');
+  await page.evaluate(()=>{window.pendingSubscriptions=loadAgentSubscriptions(selectedAgent,agentRequest);}); await pending.started;
+  await page.locator('#agent-dialog .dialog-actions button').click(); data.subscriptions=[];
+  pending.release(); await pending.remove(); await page.evaluate(()=>window.pendingSubscriptions);
+  assert.equal(await page.locator('#agent-dialog').isVisible(),false);
+  assert.equal(await page.locator('[data-subscription]').count(),1,'late responses do not redraw a closed pane');
+  assert.equal(data.requests.length,0);
+}));
+
+test('coordination warnings remain advisory, escaped and visible in compact cards and on-demand bounded history', async () => fixture(async (page,data) => {
+  const warning=id=>({id,agent:1,at:100+id,kind:'coordination.suspected-loop',details:{summary:'Repeated A → B → A <wake> pattern',agents:[1,2],subscriptions:[3,4],events:[5,6]}});
+  data.agents=[{id:1,project:1,name:'Coordinator '.repeat(1500),state:'idle',has_diagnostics:true,diagnostics:{suspected_loop:true,items:[warning(35)]}}];
+  data.history=Array.from({length:35},(_,i)=>warning(i+1));
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Coordination warning/);
+  assert.equal(data.detailRequests.length,0);
+  await page.locator('[data-action=details]').click(); await page.locator('#agent-coordination-warning').waitFor();
+  assert.match(await page.locator('#agent-coordination-warning').textContent(),/Advisory only; no automatic intervention.*Repeated A → B → A <wake> pattern/s);
+  assert.equal(await page.locator('#agent-coordination-warning wake').count(),0);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/history?')).length,0);
+  await page.locator('#agent-diagnostics summary').click(); await page.waitForFunction(()=>agentDiagnostics?.events.length===30&&!diagnosticsLoading);
+  assert.match(await page.locator('#agent-diagnostics-items').textContent(),/#35.*agents: #1, #2.*subscriptions: #3, #4.*events: #5, #6/s);
+  const selected=await selectText(page,'#agent-diagnostics-items .event > div');
+  data.history.push(warning(36)); await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.waitForFunction(()=>document.querySelector('#agent-diagnostics-items').textContent.includes('#36 ·'));
+  await page.locator('#diagnostics-older').click(); await page.waitForFunction(()=>agentDiagnostics?.events.length===36&&!diagnosticsLoading);
+  assert.equal(await page.locator('#diagnostics-older').isHidden(),true);
+  assert.equal(await page.locator('#agent-diagnostics-items wake').count(),0);
+  assert.equal(data.agents[0].state,'idle'); assert.equal(data.requests.length,0);
+  assert.ok(data.getRequests.filter(url=>url.startsWith('/history?')).every(url=>{const q=new URL(url,'http://test').searchParams;return q.get('kind')==='coordination.suspected-loop'&&q.get('limit')==='30'&&q.get('max_bytes')==='16000';}));
 }));
 
 test('workspace thread search scopes participation filters without discarding an open conversation draft', async () => fixture(async (page,data) => {
