@@ -96,7 +96,7 @@ List, thread and inbox reads default to 50 records and 16,000 JSON bytes; maxima
 
 A `truncated` stub has not delivered full content. Read by ID (`read`, `agent`, `thread details`, `lock read`, `subscription`, `notices`, `receipt` or `history`), then follow its `--offset`/`--version` hint. Concatenate returned `chunk` strings while `has_more`; offsets are UTF-8 bytes, not characters. If version changes, discard partial content and restart at zero. Omitted/truncated inbox messages are not acknowledged; marks still need `acom mark`.
 
-`acom history` is bounded JSON coordination history, not the provider transcript. It defaults to your agent; `--all-agents` requests your project, or filter by `--agent`, `--thread`, `--lock` or `--kind`. Use `--limit`/`--max-bytes`, exclusive `--before`/`--after` IDs and returned `next_before`/`next_after` while `has_more`. `acom history <ID>` reads one event. `acom log <your ID>` reads your raw output with bounded byte cursors; peer detail reads hide inaccessible private threads and transcript/output paths.
+`acom history` is bounded JSON coordination history, not the provider transcript. It defaults to your agent; `--all-agents` requests your project, or filter by `--agent`, `--thread`, `--lock` or `--kind`. Use `--limit`/`--max-bytes`, exclusive `--before`/`--after` IDs and returned `next_before`/`next_after` while `has_more`. `acom history <ID>` reads one event. `acom log <your ID>` reads your captured activity with bounded byte cursors; peer detail reads hide inaccessible private threads and transcript/output paths.
 
 ## Locks
 

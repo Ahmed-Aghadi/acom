@@ -128,6 +128,20 @@ async function freePort() {
   return port;
 }
 
+test('CLI rejects port zero before creating server state', () => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'acom-invalid-port-'));
+  const home=path.join(root,'state');
+  const env={...process.env,ACOM_HOME:home,CODEX_HOME:path.join(root,'codex'),CLAUDE_CONFIG_DIR:path.join(root,'claude'),PATH:''};
+  delete env.CLAUDE_CODE_OAUTH_TOKEN; delete env.ACOM_ID; delete env.ACOM_URL;
+  try {
+    const result=spawnSync(binary,['serve','--port','0'],{env,encoding:'utf8',timeout:1000});
+    assert.equal(result.error,undefined,'invalid input must fail without starting a server');
+    assert.notEqual(result.status,0);
+    assert.match(result.stderr,/invalid value.*0/);
+    assert.equal(fs.existsSync(home),false);
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
+});
+
 test('CLI paths and agent details use caller context; negative API actors cannot write', async () => {
   const executableDir=path.dirname(fs.realpathSync(binary));
   for(const client of ['codex','claude']) assert.equal(fs.existsSync(path.join(executableDir,client)),false,`${client} must not shadow the empty fixture PATH`);
@@ -175,8 +189,27 @@ test('CLI paths and agent details use caller context; negative API actors cannot
     await api('GET','/agents/2?agent=1',null,400);
     await api('GET','/agents/2?agent=99999',null,404);
     assert.equal((await api('GET','/agents/2?agent=0')).id,2);
+    for (const duration of ['9223372036854775807s','18446744073709551615s']) {
+      const excessiveWait=cli(['lock','acquire','unused','--wait',duration],actor);
+      assert.notEqual(excessiveWait.status,0);
+      assert.match(excessiveWait.stderr,/lock wait is too long/);
+    }
+    for (const wait of [null,-1,0.5,'5',{}]) {
+      const error=await api('POST','/locks/acquire',{agent:1,name:'unused',wait},400);
+      assert.match(error.error,/lock wait must be a nonnegative whole number/);
+    }
+    assert.equal((await api('GET','/agents/1')).state,'closed','invalid waits leave the server and agent unchanged');
     const thread=await api('POST','/threads',{project:a.id,title:'Invalid actor must not join'});
     const before=await api('GET',`/threads/${thread.id}`);
+    for (const identity of ['', 'not-an-id', '0', '-7', '1.5', '9223372036854775808']) {
+      for (const args of [['agent','2'], ['send','--thread',String(thread.id),'must not be sent as user']]) {
+        const invalid=cli(args,{ACOM_ID:identity});
+        assert.notEqual(invalid.status,0,`invalid ACOM_ID ${JSON.stringify(identity)} must not become the user`);
+        assert.match(invalid.stderr,/ACOM_ID.*positive.*integer/);
+        assert.doesNotMatch(invalid.stdout,/foreign private task|sent #/);
+      }
+    }
+    assert.deepEqual(await api('GET',`/threads/${thread.id}`),before,'invalid CLI identities cannot post as the user');
     await api('POST','/messages',{agent:-7,thread:thread.id,text:'ghost author'},400);
     assert.deepEqual(await api('GET',`/threads/${thread.id}`),before,'invalid sender cannot create messages, membership events or unread counts');
     await api('POST','/threads',{agent:-7,project:a.id,title:'ghost creator'},400);

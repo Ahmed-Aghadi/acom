@@ -1367,20 +1367,22 @@ impl St {
     // ---------- locks ----------
 
     fn release_lock(&mut self, project: i64, name: &str, why: Option<&str>) -> R<()> {
-        let holder: Option<i64> = self.db.query_row(
-            "SELECT holder FROM locks WHERE project=?1 AND name=?2",
-            params![project, name],
-            |r| r.get(0),
-        )?;
-        self.db.execute(
-            "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL, frozen=0, frozen_left=NULL
-             WHERE project=?1 AND name=?2",
-            params![project, name],
-        )?;
-        if let (Some(h), Some(why)) = (holder, why) {
-            self.notice(h, &format!("You no longer hold lock `{name}`: {why}. Acquire it again if you still need it."))?;
-        }
-        Ok(())
+        self.atomic(|st| {
+            let holder: Option<i64> = st.db.query_row(
+                "SELECT holder FROM locks WHERE project=?1 AND name=?2",
+                params![project, name],
+                |r| r.get(0),
+            )?;
+            st.db.execute(
+                "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL, frozen=0, frozen_left=NULL
+                 WHERE project=?1 AND name=?2",
+                params![project, name],
+            )?;
+            if let (Some(h), Some(why)) = (holder, why) {
+                st.notice(h, &format!("You no longer hold lock `{name}`: {why}. Acquire it again if you still need it."))?;
+            }
+            Ok(())
+        })
     }
 
     fn held_by(&self, agent: i64) -> R<Vec<String>> {
@@ -1423,28 +1425,30 @@ impl St {
     }
 
     /// Shorten oversized or untimed leases without extending valid leases.
-    fn cap_lock_ttls(&self, project: i64, max: u32) -> R<bool> {
-        let deadline = now() + i64::from(max);
-        let affected = rows(
-            &self.db,
-            "SELECT name,holder FROM locks WHERE project=?1 AND holder IS NOT NULL AND
-             (expires_at IS NULL OR expires_at>?2)",
-            params![project, deadline],
-        )?;
-        for l in &affected {
-            let name = l["name"].as_str().unwrap();
-            self.db.execute(
-                "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
-                params![project, name, deadline],
+    fn cap_lock_ttls(&mut self, project: i64, max: u32) -> R<bool> {
+        self.atomic(|st| {
+            let deadline = now() + i64::from(max);
+            let affected = rows(
+                &st.db,
+                "SELECT name,holder FROM locks WHERE project=?1 AND holder IS NOT NULL AND
+                 (expires_at IS NULL OR expires_at>?2)",
+                params![project, deadline],
             )?;
-            self.notice(
-                l["holder"].as_i64().unwrap(),
-                &format!(
-                    "Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining."
-                ),
-            )?;
-        }
-        Ok(!affected.is_empty())
+            for l in &affected {
+                let name = l["name"].as_str().unwrap();
+                st.db.execute(
+                    "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
+                    params![project, name, deadline],
+                )?;
+                st.notice(
+                    l["holder"].as_i64().unwrap(),
+                    &format!(
+                        "Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining."
+                    ),
+                )?;
+            }
+            Ok(!affected.is_empty())
+        })
     }
 
     // ---------- messages ----------
@@ -4304,9 +4308,16 @@ impl App {
     /// Take a lock in the agent's project, waiting in a first-come-first-served queue
     /// for up to `wait` seconds.
     pub fn acquire(&self, agent: i64, name: &str, wait: u64, ttl: Option<u64>) -> R<String> {
-        let deadline = Instant::now() + Duration::from_secs(wait);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(wait))
+            .ok_or_else(|| bad("lock wait is too long"))?;
         let mut st = self.lock();
         let project = st.agent(agent)?.project;
+        let turn: (i64, Option<i64>) =
+            st.db
+                .query_row("SELECT turns,pid FROM agents WHERE id=?1", [agent], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
         let key = (project, name.to_string());
         let leave = |st: &mut St| {
             if let Some(q) = st.queues.get_mut(&key) {
@@ -4314,71 +4325,80 @@ impl App {
             }
         };
         loop {
-            if st.shutting_down || st.stopping_agents.contains(&agent) {
-                leave(&mut st);
-                self.cv.notify_all();
-                return Err(conflict(
-                    "the server or your worker is stopping, so you left the queue",
-                ));
-            }
-            // Recheck after each wait: the user may lower the ceiling while queued.
-            let max = st.settings_for(Some(project)).max_lock_ttl_secs;
-            let ttl = ttl.unwrap_or(u64::from(max));
-            if ttl == 0 || ttl > u64::from(max) {
-                leave(&mut st);
-                self.cv.notify_all();
-                return Err(bad(format!(
-                    "lock TTL must be 1–{max} seconds; use --ttl within the project's maximum"
-                )));
-            }
-            st.expire_locks()?;
-            if st.agent(agent)?.state != "working" {
-                leave(&mut st);
-                self.cv.notify_all();
-                return Err(conflict(
-                    "you're not working (paused or stopped), so you left the queue",
-                ));
-            }
-            let (holder, since) = Self::lock_row(&st, project, name)?;
-            let expires = Some(now() + ttl as i64);
-            let until = |e: Option<i64>| {
-                e.map(|e| format!(", expires {}", hhmm(e)))
-                    .unwrap_or_default()
-            };
-            if holder == Some(agent) {
-                st.db.execute(
-                    "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
-                    params![project, name, expires],
+            let ready = (|| -> R<Option<String>> {
+                if st.shutting_down || st.stopping_agents.contains(&agent) {
+                    return Err(conflict(
+                        "the server or your worker is stopping, so you left the queue",
+                    ));
+                }
+                let current: (String, i64, Option<i64>) = st.db.query_row(
+                    "SELECT state,turns,pid FROM agents WHERE id=?1",
+                    [agent],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
-                leave(&mut st);
-                return Ok(format!("renewed {name}{}", until(expires)));
-            }
-            let first = st.queues.get(&key).and_then(|q| q.first().copied());
-            if holder.is_none() && (first.is_none() || first == Some(agent)) {
-                st.db.execute(
-                    "UPDATE locks SET holder=?3, acquired_at=?4, expires_at=?5, frozen=0, frozen_left=NULL
-                     WHERE project=?1 AND name=?2",
-                    params![project, name, agent, now(), expires],
-                )?;
-                leave(&mut st);
-                self.cv.notify_all();
-                return Ok(format!("acquired {name}{}", until(expires)));
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                leave(&mut st);
-                self.cv.notify_all();
-                let by = match holder {
-                    Some(h) => {
-                        let n = st.agent(h).map(|a| a.name).unwrap_or_default();
-                        format!("held by agent {h} \"{n}\" since {}", hhmm(since))
-                    }
-                    None => format!(
-                        "free, but agent {} is ahead of you in the queue",
-                        first.unwrap_or(0)
-                    ),
+                if current.0 != "working" || (current.1, current.2) != turn {
+                    return Err(conflict(
+                        "your working turn changed or stopped, so you left the queue",
+                    ));
+                }
+                // Recheck after each wait: the user may lower the ceiling while queued.
+                let max = st.settings_for(Some(project)).max_lock_ttl_secs;
+                let ttl = ttl.unwrap_or(u64::from(max));
+                if ttl == 0 || ttl > u64::from(max) {
+                    return Err(bad(format!(
+                        "lock TTL must be 1–{max} seconds; use --ttl within the project's maximum"
+                    )));
+                }
+                st.expire_locks()?;
+                let (holder, since) = Self::lock_row(&st, project, name)?;
+                let expires = Some(now() + ttl as i64);
+                let until = |e: Option<i64>| {
+                    e.map(|e| format!(", expires {}", hhmm(e)))
+                        .unwrap_or_default()
                 };
-                return Err(conflict(format!("{name} is {by}")));
+                if holder == Some(agent) {
+                    st.db.execute(
+                        "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
+                        params![project, name, expires],
+                    )?;
+                    return Ok(Some(format!("renewed {name}{}", until(expires))));
+                }
+                let first = st.queues.get(&key).and_then(|q| q.first().copied());
+                if holder.is_none() && (first.is_none() || first == Some(agent)) {
+                    st.db.execute(
+                        "UPDATE locks SET holder=?3, acquired_at=?4, expires_at=?5, frozen=0, frozen_left=NULL
+                         WHERE project=?1 AND name=?2",
+                        params![project, name, agent, now(), expires],
+                    )?;
+                    return Ok(Some(format!("acquired {name}{}", until(expires))));
+                }
+                if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                    let by = match holder {
+                        Some(h) => {
+                            let n = st.agent(h).map(|a| a.name).unwrap_or_default();
+                            format!("held by agent {h} \"{n}\" since {}", hhmm(since))
+                        }
+                        None => format!(
+                            "free, but agent {} is ahead of you in the queue",
+                            first.unwrap_or(0)
+                        ),
+                    };
+                    return Err(conflict(format!("{name} is {by}")));
+                }
+                Ok(None)
+            })();
+            match ready {
+                Ok(None) => {}
+                Ok(Some(text)) => {
+                    leave(&mut st);
+                    self.cv.notify_all();
+                    return Ok(text);
+                }
+                Err(error) => {
+                    leave(&mut st);
+                    self.cv.notify_all();
+                    return Err(error);
+                }
             }
             let q = st.queues.entry(key.clone()).or_default();
             if !q.contains(&agent) {
@@ -4386,7 +4406,12 @@ impl App {
             }
             st = self
                 .cv
-                .wait_timeout(st, left.min(Duration::from_secs(1)))
+                .wait_timeout(
+                    st,
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(1)),
+                )
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
@@ -4421,12 +4446,14 @@ impl App {
                 "the old worker is still stopping; its locks release after cleanup",
             ));
         }
-        st.release_lock(project, name, Some("the user freed it"))?;
-        st.log(
-            Some(project),
-            by,
-            &format!("freed lock {name} (held by agent {holder})"),
-        )?;
+        st.atomic(|st| {
+            st.release_lock(project, name, Some("the user freed it"))?;
+            st.log(
+                Some(project),
+                by,
+                &format!("freed lock {name} (held by agent {holder})"),
+            )
+        })?;
         self.cv.notify_all();
         Ok(())
     }
@@ -4905,8 +4932,8 @@ impl App {
             .map(|r| r["id"].as_i64().unwrap())
             .collect();
         for project in projects {
-            changed |=
-                st.cap_lock_ttls(project, st.settings_for(Some(project)).max_lock_ttl_secs)?;
+            let max_ttl = st.settings_for(Some(project)).max_lock_ttl_secs;
+            changed |= st.cap_lock_ttls(project, max_ttl)?;
             changed |= self.check_usage(&mut st, project)?;
         }
         changed |= self.drain_wakes(&mut st)?;
@@ -5022,7 +5049,7 @@ impl App {
     // ---------- configs ----------
 
     /// Tell a project's agents its limits or rules changed, if they did.
-    fn rules_changed(st: &St, project: i64, old: &Settings) -> R<()> {
+    fn rules_changed(st: &mut St, project: i64, old: &Settings) -> R<()> {
         let new = st.settings_for(Some(project));
         if old == &new {
             return Ok(());
@@ -5069,7 +5096,7 @@ impl App {
     /// Save settings as a new named config.
     pub fn add_config(&self, name: &str, settings: Settings, by: &str) -> R<i64> {
         settings.check()?;
-        let st = self.lock();
+        let mut st = self.lock();
         let name = name.trim();
         if name.is_empty() {
             return Err(bad("give the config a name"));
@@ -5077,16 +5104,18 @@ impl App {
         if name == "Default" {
             return Err(conflict("Default is reserved for the built-in config"));
         }
-        let added = st.db.execute(
-            "INSERT OR IGNORE INTO configs(name,settings) VALUES(?1,?2)",
-            params![name, serde_json::to_string(&settings).unwrap()],
-        )?;
-        if added == 0 {
-            return Err(conflict(format!("there's already a config called {name}")));
-        }
-        let id = st.db.last_insert_rowid();
-        st.log(None, by, &format!("saved config {name}"))?;
-        Ok(id)
+        st.atomic(|st| {
+            let added = st.db.execute(
+                "INSERT OR IGNORE INTO configs(name,settings) VALUES(?1,?2)",
+                params![name, serde_json::to_string(&settings).unwrap()],
+            )?;
+            if added == 0 {
+                return Err(conflict(format!("there's already a config called {name}")));
+            }
+            let id = st.db.last_insert_rowid();
+            st.log(None, by, &format!("saved config {name}"))?;
+            Ok(id)
+        })
     }
 
     /// Change a saved config (and every project using it).
@@ -5097,7 +5126,7 @@ impl App {
             ));
         }
         settings.check()?;
-        let st = self.lock();
+        let mut st = self.lock();
         let old_name: String = st
             .db
             .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
@@ -5119,22 +5148,31 @@ impl App {
         if name == "Default" {
             return Err(conflict("Default is reserved for the built-in config"));
         }
-        st.db
-            .execute(
-                "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
-                params![id, name, serde_json::to_string(&settings).unwrap()],
-            )
-            .map_err(|_| conflict(format!("there's already a config called {name}")))?;
-        st.log(None, by, &format!("changed config {name}"))?;
-        for (p, old) in users.iter().zip(&before) {
-            Self::rules_changed(&st, *p, old)?;
-        }
-        Ok(())
+        st.atomic(|st| {
+            st.db
+                .execute(
+                    "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
+                    params![id, name, serde_json::to_string(&settings).unwrap()],
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::SqliteFailure(code, _)
+                        if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+                    {
+                        conflict(format!("there's already a config called {name}"))
+                    }
+                    error => error.into(),
+                })?;
+            st.log(None, by, &format!("changed config {name}"))?;
+            for (p, old) in users.iter().zip(&before) {
+                Self::rules_changed(st, *p, old)?;
+            }
+            Ok(())
+        })
     }
 
     /// Remove a saved config no project uses. Default always stays.
     pub fn remove_config(&self, id: i64, by: &str) -> R<()> {
-        let st = self.lock();
+        let mut st = self.lock();
         if id == 1 {
             return Err(conflict("the Default config can't be removed"));
         }
@@ -5153,9 +5191,11 @@ impl App {
                 "{name} is used by {used} project(s); switch them first"
             )));
         }
-        st.db.execute("DELETE FROM configs WHERE id=?1", [id])?;
-        st.log(None, by, &format!("removed config {name}"))?;
-        Ok(())
+        st.atomic(|st| {
+            st.db.execute("DELETE FROM configs WHERE id=?1", [id])?;
+            st.log(None, by, &format!("removed config {name}"))?;
+            Ok(())
+        })
     }
 
     /// Make a project use Default, a saved config, or its own custom settings.
@@ -5166,44 +5206,46 @@ impl App {
         custom: Option<Settings>,
         by: &str,
     ) -> R<()> {
-        let st = self.lock();
+        let mut st = self.lock();
         st.project(project)?;
         let old = st.settings_for(Some(project));
-        match (config, custom) {
-            (Some(id), None) => {
-                let name: String = if id == 1 {
-                    "Default".into()
-                } else {
-                    st.db
-                        .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
-                        .optional()?
-                        .ok_or_else(|| not_found(format!("no config {id}")))?
-                };
-                st.db.execute(
-                    "UPDATE projects SET config=?2, custom=NULL WHERE id=?1",
-                    params![project, id],
-                )?;
-                st.log(
-                    Some(project),
-                    by,
-                    &format!("project now uses config {name}"),
-                )?;
+        st.atomic(|st| {
+            match (config, custom) {
+                (Some(id), None) => {
+                    let name: String = if id == 1 {
+                        "Default".into()
+                    } else {
+                        st.db
+                            .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+                            .optional()?
+                            .ok_or_else(|| not_found(format!("no config {id}")))?
+                    };
+                    st.db.execute(
+                        "UPDATE projects SET config=?2, custom=NULL WHERE id=?1",
+                        params![project, id],
+                    )?;
+                    st.log(
+                        Some(project),
+                        by,
+                        &format!("project now uses config {name}"),
+                    )?;
+                }
+                (None, Some(settings)) => {
+                    settings.check()?;
+                    st.db.execute(
+                        "UPDATE projects SET config=NULL, custom=?2 WHERE id=?1",
+                        params![project, serde_json::to_string(&settings).unwrap()],
+                    )?;
+                    st.log(Some(project), by, "changed the project's own settings")?;
+                }
+                _ => {
+                    return Err(bad(
+                        "give either config (Default or a saved config's id) or custom (settings)",
+                    ));
+                }
             }
-            (None, Some(settings)) => {
-                settings.check()?;
-                st.db.execute(
-                    "UPDATE projects SET config=NULL, custom=?2 WHERE id=?1",
-                    params![project, serde_json::to_string(&settings).unwrap()],
-                )?;
-                st.log(Some(project), by, "changed the project's own settings")?;
-            }
-            _ => {
-                return Err(bad(
-                    "give either config (Default or a saved config's id) or custom (settings)",
-                ));
-            }
-        }
-        Self::rules_changed(&st, project, &old)
+            Self::rules_changed(st, project, &old)
+        })
     }
 
     // ---------- projects ----------
@@ -6943,6 +6985,146 @@ mod tests {
     }
 
     #[test]
+    fn config_edits_and_all_affected_lease_notices_commit_together() {
+        for shared in [false, true] {
+            let app = app_with_two_projects();
+            let config = if shared {
+                let id = app
+                    .add_config("shared", Settings::default(), "user")
+                    .unwrap();
+                for project in [1, 2] {
+                    app.set_project_config(project, Some(id), None, "user")
+                        .unwrap();
+                }
+                Some(id)
+            } else {
+                None
+            };
+            let original = now() + 800;
+            {
+                let st = app.lock();
+                hold(&st, "one", 1, Some(original));
+                if shared {
+                    st.db.execute("INSERT INTO locks(project,name,about,created_at,holder,expires_at) VALUES(2,'two','shared lease',0,2,?1)", [original]).unwrap();
+                }
+                st.db.execute_batch(&format!("CREATE TRIGGER fail_shortening_notice BEFORE INSERT ON notices WHEN NEW.agent_id={} AND NEW.text LIKE 'Lock % was shortened%' BEGIN SELECT RAISE(ABORT,'shortening notice failed'); END;", if shared {2} else {1})).unwrap();
+            }
+            let project_before = app.project_view(1).unwrap();
+            let config_before = config.map(|id| app.config_view(id).unwrap());
+            let snapshot = || {
+                let st = app.lock();
+                rows(
+                    &st.db,
+                    "SELECT name,value FROM view_revisions ORDER BY name",
+                    [],
+                )
+                .unwrap()
+            };
+            let before = snapshot();
+            let settings = Settings {
+                max_lock_ttl_secs: 1,
+                ..Settings::default()
+            };
+            let save = || match config {
+                Some(id) => app.put_config(id, Some("updated"), settings.clone(), "user"),
+                None => app.set_project_config(1, None, Some(settings.clone()), "user"),
+            };
+            assert!(save().unwrap_err().1.contains("shortening notice failed"));
+            assert_eq!(app.project_view(1).unwrap(), project_before);
+            assert_eq!(config.map(|id| app.config_view(id).unwrap()), config_before);
+            assert_eq!(
+                snapshot(),
+                before,
+                "lease, notices and activity revisions roll back too"
+            );
+            assert_eq!(lock(&app.lock(), "one").1, Some(original));
+            if shared {
+                assert_eq!(lock(&app.lock(), "two").1, Some(original));
+            }
+            app.lock()
+                .db
+                .execute_batch("DROP TRIGGER fail_shortening_notice")
+                .unwrap();
+            save().unwrap();
+            assert_eq!(app.settings(Some(1)).max_lock_ttl_secs, 1);
+            assert!(lock(&app.lock(), "one").1.unwrap() <= now() + 1);
+            if shared {
+                assert_eq!(app.settings(Some(2)).max_lock_ttl_secs, 1);
+                assert!(lock(&app.lock(), "two").1.unwrap() <= now() + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn config_create_and_remove_roll_back_when_activity_cannot_be_saved() {
+        let app = app_with_two_projects();
+        let id = app
+            .add_config("saved", Settings::default(), "user")
+            .unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER fail_config_activity BEFORE INSERT ON activity BEGIN SELECT RAISE(ABORT,'config log failed'); END;").unwrap();
+        assert!(
+            app.add_config("not saved", Settings::default(), "user")
+                .unwrap_err()
+                .1
+                .contains("config log failed")
+        );
+        assert!(
+            app.remove_config(id, "user")
+                .unwrap_err()
+                .1
+                .contains("config log failed")
+        );
+        assert_eq!(app.config_view(id).unwrap()["name"], "saved");
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM configs WHERE name='not saved'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_config_activity")
+            .unwrap();
+        app.add_config("not saved", Settings::default(), "user")
+            .unwrap();
+        app.remove_config(id, "user").unwrap();
+    }
+
+    #[test]
+    fn config_write_errors_are_not_reported_as_duplicate_names() {
+        let app = app_with_two_projects();
+        let id = app
+            .add_config("original", Settings::default(), "user")
+            .unwrap();
+        app.add_config("taken", Settings::default(), "user")
+            .unwrap();
+        let duplicate = app
+            .put_config(id, Some("taken"), Settings::default(), "user")
+            .unwrap_err();
+        assert_eq!(duplicate.0, 409);
+        assert!(duplicate.1.contains("already a config"));
+        app.lock().db.execute_batch("CREATE TRIGGER fail_config_write BEFORE UPDATE ON configs BEGIN SELECT RAISE(ABORT,'injected config write failure'); END;").unwrap();
+        let error = app
+            .put_config(id, None, Settings::default(), "user")
+            .unwrap_err();
+        assert_eq!(error.0, 500);
+        assert!(error.1.contains("injected config write failure"));
+        assert_eq!(app.config_view(id).unwrap()["name"], "original");
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_config_write")
+            .unwrap();
+        app.put_config(id, Some("updated"), Settings::default(), "user")
+            .unwrap();
+        assert_eq!(app.config_view(id).unwrap()["name"], "updated");
+    }
+
+    #[test]
     fn queued_acquisition_rechecks_the_ttl_ceiling_and_leaves_the_queue_on_rejection() {
         let app = app_with_two_projects();
         app.lock()
@@ -6977,6 +7159,107 @@ mod tests {
     }
 
     #[test]
+    fn queued_lock_request_cannot_cross_into_another_working_turn() {
+        for changed in ["turns=turns+1", "pid=77"] {
+            let app = app_with_two_projects();
+            app.lock()
+                .db
+                .execute("UPDATE agents SET state='working',project=1", [])
+                .unwrap();
+            app.new_lock(1, "schema", "turn-bound request").unwrap();
+            app.acquire(1, "schema", 0, None).unwrap();
+            let waiting = app.clone();
+            let waiter = std::thread::spawn(move || waiting.acquire(2, "schema", 5, None));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !app
+                .lock()
+                .queues
+                .get(&(1, "schema".into()))
+                .is_some_and(|queue| queue.contains(&2))
+            {
+                assert!(Instant::now() < deadline, "request did not queue");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            {
+                let mut st = app.lock();
+                // A continuation can end and restart under one mutex hold.
+                st.set_state(2, "idle").unwrap();
+                st.db
+                    .execute(
+                        &format!("UPDATE agents SET state='working',{changed} WHERE id=2"),
+                        [],
+                    )
+                    .unwrap();
+                st.release_lock(1, "schema", None).unwrap();
+            }
+            app.cv.notify_all();
+            let error = waiter.join().unwrap().unwrap_err();
+            assert_eq!(error.0, 409);
+            assert!(error.1.contains("working turn changed or stopped"));
+            assert!(app.lock().queues[&(1, "schema".into())].is_empty());
+            assert_eq!(lock(&app.lock(), "schema").0, None);
+            assert!(
+                app.acquire(2, "schema", 0, None)
+                    .unwrap()
+                    .starts_with("acquired")
+            );
+        }
+    }
+
+    #[test]
+    fn excessive_lock_wait_returns_an_error_instead_of_panicking() {
+        let app = app_with_two_projects();
+        for wait in [i64::MAX as u64, u64::MAX] {
+            let error = app.acquire(1, "schema", wait, None).unwrap_err();
+            assert_eq!(error.0, 400);
+            assert!(error.1.contains("wait is too long"));
+        }
+    }
+
+    #[test]
+    fn failed_queued_acquisition_removes_its_orphaned_queue_entry() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='working',project=1", [])
+            .unwrap();
+        app.new_lock(1, "schema", "queue failure").unwrap();
+        app.acquire(1, "schema", 0, None).unwrap();
+        let waiting = app.clone();
+        let waiter = std::thread::spawn(move || waiting.acquire(2, "schema", 5, None));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .lock()
+            .queues
+            .get(&(1, "schema".into()))
+            .is_some_and(|queue| queue.contains(&2))
+        {
+            assert!(Instant::now() < deadline, "request did not queue");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.lock().db.execute_batch("CREATE TRIGGER fail_queued_acquire BEFORE UPDATE OF holder ON locks WHEN NEW.holder=2 BEGIN SELECT RAISE(ABORT,'queued write failed'); END;").unwrap();
+        app.release(1, "schema").unwrap();
+        assert!(
+            waiter
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .1
+                .contains("queued write failed")
+        );
+        assert!(app.lock().queues[&(1, "schema".into())].is_empty());
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_queued_acquire")
+            .unwrap();
+        assert!(
+            app.acquire(1, "schema", 0, None)
+                .unwrap()
+                .starts_with("acquired")
+        );
+    }
+
+    #[test]
     fn manual_and_all_pauses_release_locks_without_restoring_ttl() {
         for all in [false, true] {
             let app = app_with_two_projects();
@@ -7005,6 +7288,111 @@ mod tests {
             text.contains("You no longer hold lock `late`: its TTL ran out"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn lock_expiry_and_forced_release_keep_the_lease_until_notice_can_commit() {
+        let mut st = st();
+        hold(&st, "expiring", 1, Some(now() - 1));
+        st.db.execute_batch("CREATE TRIGGER fail_lock_notice BEFORE INSERT ON notices BEGIN SELECT RAISE(ABORT,'loss notice failed'); END;").unwrap();
+        assert!(
+            st.expire_locks()
+                .unwrap_err()
+                .1
+                .contains("loss notice failed")
+        );
+        assert_eq!(lock(&st, "expiring").0, Some(1));
+        assert_eq!(
+            st.db
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='lock.expired'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        st.db
+            .execute_batch("DROP TRIGGER fail_lock_notice")
+            .unwrap();
+        assert!(st.expire_locks().unwrap());
+        assert_eq!(lock(&st, "expiring").0, None);
+        assert!(!st.expire_locks().unwrap());
+        assert_eq!(
+            st.db
+                .query_row("SELECT count(*) FROM notices WHERE agent_id=1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+
+        let app = app_with_two_projects();
+        hold(&app.lock(), "forced", 1, Some(now() + 60));
+        app.lock().db.execute_batch("CREATE TRIGGER fail_lock_notice BEFORE INSERT ON notices BEGIN SELECT RAISE(ABORT,'loss notice failed'); END;").unwrap();
+        assert!(
+            app.free(1, "forced", "user")
+                .unwrap_err()
+                .1
+                .contains("loss notice failed")
+        );
+        assert_eq!(lock(&app.lock(), "forced").0, Some(1));
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_lock_notice")
+            .unwrap();
+        app.free(1, "forced", "user").unwrap();
+        assert_eq!(lock(&app.lock(), "forced").0, None);
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM notices WHERE agent_id=1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn forced_lock_release_rolls_back_when_activity_cannot_commit() {
+        let app = app_with_two_projects();
+        hold(&app.lock(), "forced-activity", 1, Some(now() + 600));
+        let snapshot = |st: &St| {
+            (
+                lock(st, "forced-activity"),
+                rows(&st.db, "SELECT * FROM notices ORDER BY id", []).unwrap(),
+                rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
+                rows(&st.db, "SELECT * FROM activity ORDER BY id", []).unwrap(),
+            )
+        };
+        let before = snapshot(&app.lock());
+        app.lock().db.execute_batch("CREATE TRIGGER fail_free_activity BEFORE INSERT ON activity BEGIN SELECT RAISE(ABORT,'lock activity write failed'); END;").unwrap();
+        let error = app.free(1, "forced-activity", "user").unwrap_err();
+        assert_eq!(error.0, 500);
+        assert!(error.1.contains("lock activity write failed"));
+        assert_eq!(snapshot(&app.lock()), before);
+        app.lock()
+            .db
+            .execute_batch("DROP TRIGGER fail_free_activity")
+            .unwrap();
+        app.free(1, "forced-activity", "user").unwrap();
+        let after = snapshot(&app.lock());
+        assert_eq!(after.0, (None, None, 0, None));
+        assert_eq!(after.1.len(), before.1.len() + 1);
+        assert_eq!(
+            after.1.last().unwrap()["text"],
+            "You no longer hold lock `forced-activity`: the user freed it. Acquire it again if you still need it."
+        );
+        assert_eq!(after.2.len(), before.2.len() + 1);
+        assert_eq!(after.2.last().unwrap()["kind"], "lock.released");
+        assert_eq!(after.3.len(), before.3.len() + 1);
+        assert_eq!(
+            after.3.last().unwrap()["what"],
+            "freed lock forced-activity (held by agent 1)"
+        );
+        assert_eq!(app.free(1, "forced-activity", "user").unwrap_err().0, 409);
+        assert_eq!(snapshot(&app.lock()), after);
     }
 
     #[test]
@@ -9473,6 +9861,182 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].value, 85.0);
         assert!(checks[0].over(checks[0].lim.soft));
+    }
+
+    #[test]
+    fn codex_missing_high_windows_do_not_clear_hard_limits_through_checks_or_restart() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        custom(&app, 1, |s| {
+            s.limits.usage.insert(
+                "codex".into(),
+                Limit {
+                    soft: Some(80.0),
+                    hard: Some(90.0),
+                },
+            );
+        });
+        crate::usage::finish(&app,"codex",120,crate::usage::parse("codex",&json!({"rateLimitsByLimitId":{
+            "codex":{"primary":{"usedPercent":95,"resetsAt":now()-60},"secondary":{"usedPercent":10}}
+        }}))).unwrap();
+        app.tick().unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        assert_eq!(state(&app, 1).0, "paused");
+        app.lock()
+            .db
+            .execute(
+                "UPDATE usage SET at=?1 WHERE provider='codex' AND win='codex primary'",
+                [now() - 600],
+            )
+            .unwrap();
+        let observed = app
+            .lock()
+            .db
+            .query_row(
+                "SELECT at FROM usage WHERE provider='codex' AND win='codex primary'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        crate::usage::finish(
+            &app,
+            "codex",
+            120,
+            crate::usage::parse(
+                "codex",
+                &json!({"rateLimitsByLimitId":{
+                    "codex":{"secondary":{"usedPercent":10}}
+                }}),
+            ),
+        )
+        .unwrap();
+        crate::usage::finish(&app, "codex", 120, Err("usage unavailable".into())).unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "paused",
+            "missing readings/errors/elapsed resets do not prove recovery"
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT at FROM usage WHERE provider='codex' AND win='codex primary'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            observed
+        );
+        let home = app.home.clone();
+        drop(app);
+        let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        crate::usage::finish(
+            &app,
+            "codex",
+            120,
+            crate::usage::parse(
+                "codex",
+                &json!({"rateLimitsByLimitId":{
+                    "codex":{"primary":{"usedPercent":89},"secondary":{"usedPercent":10}}
+                }}),
+            ),
+        )
+        .unwrap();
+        app.tick().unwrap();
+        assert_eq!(
+            state(&app, 1).0,
+            "idle",
+            "a real below-hard reading clears the limit"
+        );
+    }
+
+    #[test]
+    fn codex_derived_account_limits_need_explicit_clear_for_hard_recovery() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let observe = |value: Value| {
+            crate::usage::finish(&app, "codex", 120, crate::usage::parse("codex", &value)).unwrap();
+            app.tick().unwrap();
+        };
+        observe(json!({"rateLimits":{"primary":{"usedPercent":10},
+            "spendControlReached":true,"rateLimitReachedType":"weekly"},"ordinaryUsageAllowed":false}));
+        drop(app.wait_stopped(app.lock(), &[1]));
+        assert_eq!(state(&app, 1).0, "paused");
+        observe(json!({"rateLimits":{"primary":{"usedPercent":10}},"ordinaryUsageAllowed":true}));
+        assert_eq!(
+            state(&app, 1).0,
+            "paused",
+            "global availability doesn't clear a missing bucket condition"
+        );
+        observe(json!({"rateLimits":{"primary":{"usedPercent":10},
+            "spendControlReached":false,"rateLimitReachedType":null},"ordinaryUsageAllowed":true}));
+        assert_eq!(state(&app, 1).0, "idle");
+    }
+
+    #[test]
+    fn codex_synthetic_quota_marker_requires_a_post_interruption_status_check() {
+        let app = app_with_two_projects();
+        custom(&app, 1, |s| s.limits.usage.clear());
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',model='gpt-6-sol' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        app.record_usage("codex", "codex primary", 10.0, None)
+            .unwrap();
+        app.limit_hit(1, "actual provider interruption").unwrap();
+        drop(app.wait_stopped(app.lock(), &[1]));
+        app.lock().db.execute("INSERT INTO usage_checks(provider,attempted_at) VALUES('codex',(SELECT at-1 FROM usage WHERE provider='codex' AND win='limit'))",[]).unwrap();
+        let check = || {
+            crate::usage::finish(
+                &app,
+                "codex",
+                120,
+                crate::usage::parse(
+                    "codex",
+                    &json!({"rateLimits":{"primary":{"usedPercent":5}}}),
+                ),
+            )
+            .unwrap()
+        };
+        check();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "paused");
+        app.lock()
+            .db
+            .execute(
+                "UPDATE usage SET at=?1 WHERE provider='codex' AND win='limit'",
+                [now() - 2],
+            )
+            .unwrap();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE usage_checks SET attempted_at=?1 WHERE provider='codex'",
+                [now()],
+            )
+            .unwrap();
+        check();
+        app.tick().unwrap();
+        assert_eq!(state(&app, 1).0, "idle");
+        assert!(app.lock().window_pct("codex", "limit").unwrap().is_none());
     }
 
     #[test]

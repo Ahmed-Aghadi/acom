@@ -380,13 +380,13 @@ pub fn finish(
                 windows.retain(|w| w.name != "seven_day_fable");
             }
             let tx = st.db.unchecked_transaction()?;
-            // An omitted optional Fable bucket is unknown, not proof of reset.
-            // Retain its last confirmed reading until a new one replaces it.
+            // Missing Codex buckets and optional Fable usage are unknown, not resets.
+            // Keep their reading timestamps; only fresh observations replace them.
             for w in &windows {
                 st.observe_usage(provider, &w.name, w.used, w.reset)?;
             }
             let names: Vec<_> = windows.iter().map(|w| w.name.as_str()).collect();
-            tx.execute("DELETE FROM usage WHERE provider=?1 AND NOT (provider='claude' AND win='seven_day_fable') AND NOT EXISTS(SELECT 1 FROM json_each(?2) WHERE value=usage.win)",params![provider,serde_json::json!(names).to_string()])?;
+            tx.execute("DELETE FROM usage WHERE provider=?1 AND (provider<>'codex' OR win='limit') AND NOT (provider='claude' AND win='seven_day_fable') AND NOT EXISTS(SELECT 1 FROM json_each(?2) WHERE value=usage.win)",params![provider,serde_json::json!(names).to_string()])?;
             let next = next_check(now(), interval, windows.iter().filter_map(|w| w.reset));
             tx.execute("INSERT INTO usage_checks(provider,checked_at,attempted_at,next_check,error) VALUES(?1,?2,?2,?3,NULL)
                 ON CONFLICT(provider) DO UPDATE SET checked_at=?2,next_check=?3,error=NULL,in_flight=0", params![provider,now(),next])?;

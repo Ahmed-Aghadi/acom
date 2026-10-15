@@ -460,7 +460,7 @@
             <label><input type="checkbox" name="watch_state" value="done"> Done</label><label><input type="checkbox" name="watch_state" value="paused"> Paused</label><label><input type="checkbox" name="watch_state" value="crashed"> Crashed</label><label><input type="checkbox" name="watch_state" value="closed"> Closed</label><label><input type="checkbox" name="watch_state" value="replaced"> Replaced</label>
           </div>
           <label style="margin-top:12px">Groups (optional, comma-separated) <input name="watch_groups" placeholder="review, writing"></label>
-          <p class="meta launch-project">Membership follows agent state and group changes. Selected states match any; groups further narrow the match. Groups alone use active agents (working or idle). Done agents are not woken. Your own membership is controlled separately.</p>
+          <p class="meta launch-project">Membership follows agent state and group changes. Selected states match any; groups further narrow the match. Groups alone use active agents (working or idle). Active-only threads exclude done agents; select Done to let messages wake finished members. Your own membership is controlled separately.</p>
         </div>
       </div>
       <div class="dialog-actions"><button type="button" data-close="thread-dialog">Cancel</button><button class="primary" value="default">Create</button></div>
@@ -982,6 +982,7 @@
       else if (wait.agents?.length) watches.push(`agents ${wait.agents.map(id => `#${id}`).join(', ')}`);
       if (wait.states?.length) watches.push(`states: ${wait.states.join(', ')}`);
       if (wait.status_text) watches.push('status changes');
+      if (wait.usage) watches.push(subscriptionCondition({watch:{usage:wait.usage}}));
       return `Waiting for notifications · <span data-wait-agent="${agent.id}" data-wait-started="${esc(wait.started_at)}" title="${esc(`Timeout at ${when(wait.expires_at)}`)}">checking timeout</span>${watches.length ? ` · watching ${esc(watches.join(' · '))}` : ''}`;
     }
     function updateWaitTimers() {
@@ -1523,7 +1524,7 @@
         <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
         <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
         <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents require explicit Reopen; messages wait in their inbox. Turn this off to let finished agents wake for new messages.</span></label>
-        <label class="inline-check"><input type="checkbox" name="allow_agent_model_change" ${s.allow_agent_model_change ? 'checked' : ''}> Allow agents to change their model within the same provider</label>
+        <label class="inline-check"><input type="checkbox" name="allow_agent_model_change" ${s.allow_agent_model_change ? 'checked' : ''}> Allow agents to change their model, including cross-provider replacement</label>
         <label class="inline-check"><input type="checkbox" name="allow_agent_effort_change" ${s.allow_agent_effort_change ? 'checked' : ''}> Allow agents to change their effort level</label>
         <p class="meta launch-project">Both permissions are off by default. Changes use allowed models and efforts, and apply to the next turn. Provider-native sessions cannot move between providers; a new agent can read the previous agent's history instead. <a href="/models" target="_blank" rel="noopener">Model and provider reference</a></p>
         <h3>Crash recovery</h3><p class="meta launch-project">No retries are configured by default. The same-model count excludes the original turn; zero goes straight to the replacement. Successful responses, including refusals, do not trigger recovery. Manual/usage pauses are separate. Supported effort is preserved; ultra maps to max when supported. Fixed-effort Haiku 4.5 uses a medium placeholder and omits the effort flag. Allowed-effort restrictions still apply. Enable the replacement provider and allow its model in Harnesses above. Cross-provider replacements receive the original conversation history path.</p>

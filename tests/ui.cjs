@@ -1650,6 +1650,7 @@ test('agent self-change permissions are independent opt-ins and retry rules are 
   await page.locator('[data-page=settings]').click();
   const form = page.locator('#settings-form');
   assert.equal(await form.locator('[name=allow_agent_model_change]').isChecked(), false);
+  assert.match(await form.locator('label:has([name=allow_agent_model_change])').textContent(),/including cross-provider replacement/);
   assert.equal(await form.locator('[name=allow_agent_effort_change]').isChecked(), false);
   assert.equal(await form.locator('[data-retry-rule]').count(), 0);
   await form.locator('[name=allow_agent_effort_change]').check();
@@ -3437,10 +3438,11 @@ test('server-classified oversized agents stay in filtered results and expose wai
 }));
 
 test('notification waits retain working state and use a monotonic selection-safe countdown', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Watching',state:'working',waiting:{started_at:100,expires_at:200,remaining_secs:5,agents:[2],states:['idle','crashed'],status_text:true}},{id:2,project:1,name:'Watched',state:'closed'}];
+  data.agents=[{id:1,project:1,name:'Watching',state:'working',waiting:{started_at:100,expires_at:200,remaining_secs:5,agents:[2],states:['idle','crashed'],status_text:true,usage:{provider:'claude',window:'five_hour',condition:'below',percent:80}}},{id:2,project:1,name:'Watched',state:'closed'}];
   await manualPolling(page); await reloadPage(page);
   const wait=page.locator('#agents [data-agent="1"] .agent-wait');
   assert.match(await wait.textContent(),/5s left.*agents #2.*states: idle, crashed.*status changes/);
+  assert.match(await wait.textContent(),/claude \/ five_hour: below 80%/);
   assert.equal(await page.locator('#agents [data-agent="1"] .agent-name .pill').textContent(),'working');
   await page.evaluate(()=>{window.waitRow=document.querySelector('#agents [data-agent="1"]');const original=Date.now;Date.now=()=>original()+86400000;});
   await page.waitForTimeout(1100);
@@ -3454,6 +3456,7 @@ test('notification waits retain working state and use a monotonic selection-safe
   assert.equal(await page.evaluate(()=>window.waitRow===document.querySelector('#agents [data-agent="1"]')),true,'countdown updates do not rebuild the agent row');
   await page.locator('#agents [data-agent="1"] [data-action=details]').click();
   await page.waitForFunction(()=>document.querySelector('#agent-details dd [data-wait-agent="1"]'));
+  assert.match(await page.locator('#agent-details').textContent(),/claude \/ five_hour: below 80%/);
   assert.equal(data.agents[0].state,'working');
   data.agents[0].waiting=null; await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#agents [data-agent="1"] .agent-wait').count(),0);

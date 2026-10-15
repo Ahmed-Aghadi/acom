@@ -6,7 +6,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 
 ## Pieces
 
-**Server.** One per machine, for all your projects. `acom serve` runs it on `127.0.0.1:7400` (`--port` to change it); a second `acom serve` refuses to start. All state is kept in `~/.acom/acom.db` (SQLite; `ACOM_HOME` moves the folder), so a restart loses nothing; the server also writes its port to `~/.acom/port`, which is how `acom` commands find it. acom keeps none of its own state in projects. The server is also what launches and supervises agents.
+**Server.** One per data directory, handling all its projects. `acom serve` listens on `127.0.0.1:7400` (`--port` accepts 1–65535); another server using the same data directory refuses to start. The default directory is `~/.acom` (`ACOM_HOME` overrides it): durable coordination state is in `acom.db`, captured output in `logs/`, the discovery port in `port`, and the server lock in `serve.lock`. Native conversations remain in the harness's own storage. Foreground waits and lock queues are in memory; browser drafts are stored in that browser. acom launches/supervises agents but keeps none of its own state in projects. Isolated development instances need separate data directories and ports.
 
 **Project.** A folder. Every agent, thread and lock belongs to one project: agents run in its folder and only see that project's agents, threads and locks (agent IDs are unique across projects; lock names only within a project). Projects are added in the UI, with `acom project add`, or by running `acom launch` inside a folder that isn't one yet. A project without agents can be removed. Each project has its own settings (see Settings): its own limits, models, permissions and rules. There's no cap across projects. Subscription usage is per account, so every project sees the same usage %, but acts on it with its own thresholds.
 
@@ -14,7 +14,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 
 **Agent.** One harness session that acom launched. Nobody registers by hand: every agent comes from a launch, so acom can track and limit all of them. Each agent has:
 
-- an ID (a number), which acom passes to it in the `ACOM_ID` environment variable, so agents never type it
+- an ID (a number), passed as `ACOM_ID` so commands infer caller identity
 - a name, the task it was given, its harness, model and effort
 - an optional group: a label that keeps related agents together in the UI. Set at launch, or by the agent with `acom group <name>`
 - a state (below) and an optional status text the agent sets itself, e.g. "reviewing the lexer"
@@ -23,13 +23,13 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 
 **Thread.** A conversation in one project: a title, owner, member agents from that project (and optionally the user, ID `0`), and messages. Public, open threads are the default: any project agent can read or post, and posting joins a static thread. `--no-join` keeps public reads but requires membership to post; `--private` requires membership to read or post. The user can always read and manage every thread. Restricted threads use fixed membership, not live filters. User-created threads include the user by default; agents can opt in with `--include-user`. User membership remains manually managed.
 
-- There's no built-in thread for everyone. When starting a thread you pick members by ID, or by selector (selectors only match agents in the thread's project): `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `replaced`, `group:<name>`, or `user`. For example, `--members active` messages every active agent, and `--members active,done` adds the finished ones too.
+- There's no built-in thread for everyone. When starting a thread you pick members by ID, or by selector (selectors only match agents in the thread's project): `active` (working or idle), `working`, `idle`, `paused`, `done`, `closed`, `crashed`, `replaced`, `group:<name>`, or `user`. For example, `--members active` adds the currently active agents; creating a thread does not send a message.
 - `--members` resolves selectors once. Any project agent can add members to open static threads; only the user or current owner can add to restricted/live threads. Any member can leave itself; only the user can remove others.
 - The creator initially owns the thread. Leaving retains management rights, not private read/post access; owners can rejoin with `thread add <TID> <own ID>`. The user or current owner can transfer exclusive ownership to a non-replaced project agent with `thread transfer-owner`. Membership stays unchanged. Metadata exposes current `owner` and immutable `created_by`.
 - Alternatively, `--watch` accepts state/group selectors, not IDs or `user`, and cannot be combined with `--members`. Any selected state matches, AND any selected group; group-only watches default to `active`. Agent creation, state changes and group changes update membership atomically, recording joins/leaves and their reasons. A nonmatching owner is not pinned. Live `active` threads exclude done agents, so messages in them do not wake done agents; include `done` explicitly to do that. A done-only recipient leaves when waking into working, retaining the delivered message in its inbox without relabelling it as catch-up. Removal persists as an exclusion; the user or current owner can restore agents only when they match the filters.
 - To message one agent or a group, start a thread with them and post in it. Any number of threads can have the same members, so a new topic gets a new thread.
-- Joining/rejoining exposes earlier messages as catch-up without normal unread notifications or wake-ups. Personalized reads identify messages sent outside membership separately from their marks; reading does not change live membership. Thread reads include recent membership and ownership events.
-- Membership changes alone are passive: they do not resolve foreground/deferred waits or wake idle agents. They remain in history and hook/next-turn summaries, including live-filter changes caused by going idle. New messages from other members already notify working agents and wake idle ones without a subscription. Public reads without membership do not subscribe to messages.
+- Messages sent outside membership appear as catch-up without normal unread notifications or wake-ups. Rejoining preserves earlier membership periods and marks; reading does not change live membership. Thread reads include recent membership and ownership events.
+- Membership changes alone are passive: they do not resolve foreground/deferred waits or wake idle agents. They remain in history and hook/next-turn summaries, including live-filter changes caused by going idle. New messages from others in member threads already notify working agents and wake idle ones without a subscription. Public reads without membership do not subscribe to messages.
 
 **Message.** Plain text, from an agent or from `user`. Each agent puts its own mark on each message in its threads:
 
@@ -37,13 +37,13 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 - `in-progress`: read, and being acted on now
 - `handled`: dealt with; nothing more needed
 
-`acom inbox` shows `new` messages; `--mark in-progress` or `--mark handled` shows the others. Leaving retains marks and public-thread inbox access; private messages require current membership. Previously stored messages without membership tracking have explicit unknown context rather than an inferred delivery claim. Separately, acom tracks which messages it has told each agent about, so nothing is announced twice.
+`acom inbox` shows `new` messages; `--mark in-progress` or `--mark handled` shows the others. Reading or notification delivery never marks work handled: `acom mark` is explicit. Leaving retains marks and public-thread inbox access; private messages require current membership. Messages without recorded membership context are labelled unknown rather than guessed. Notification cursors are separate from marks; an unacknowledged wait receipt can intentionally replay its same batch.
 
 **Coordination history.** Durable structured events have monotonic IDs, timestamps, kind, actor, relevant agent/thread/lock and details. `agent.created` records a retained agent identity; `agent.turn-started` records a successfully started process, not a successful turn. `acom history` returns bounded JSON; agents default to their own events, `--all-agents` requests their project. Filters combine by agent/thread/lock/kind. Exclusive `before` or `after` event-ID cursors are positive and mutually exclusive. Defaults: 50 events / 16000 bytes; accepted limits: 1–200 events / 512–65536 bytes. One event is available with `acom history <ID>`. This is separate from provider conversation history. Lifecycle summaries at turn start and after membership/lock changes show only nonzero counts and point to history instead of repeating the log.
 
 **Lock.** A named cooperative reservation that agents create when needed, with an agreed description of what it protects. Any number of locks, one holder each; acom tracks ownership but does not prevent file writes. Agents should reuse agreed names, order multiple acquisitions consistently and avoid retaining a lock while waiting for work that needs it.
 
-- `acquire` takes the lock if it's free. If someone else holds it, it fails at once, or with `--wait` it queues (first come, first served) until it gets it or the wait runs out.
+- `acquire` takes the lock if it's free. If someone else holds it, it fails at once, or with `--wait` it queues (first come, first served) until acquisition/timeout. Invalid or unrepresentable wait durations are rejected. The request belongs to that working turn; a stop or new turn cancels it rather than acquiring a lease for a stale command.
 - Every acquisition or renewal has a positive TTL, at most the project's `max_lock_ttl_secs` (default 900s). Omitted or null TTL uses that maximum; zero, negative, fractional or larger values are rejected. Acquiring a lock you already hold succeeds and restarts its TTL. Lowering the maximum shortens existing oversized or untimed leases to at most that much time remaining and notifies their holders. Increasing it never extends existing leases. This is a per-lease ceiling, not a total holding-time limit across renewals. Legacy held locks are bounded on the next tick.
 - `release` frees a lock you hold, and fails if you don't hold it (e.g. its TTL ran out and someone else has it now).
 - You can free any lock from the UI or with `acom lock free`.
@@ -56,12 +56,12 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 | `working` | In a turn: thinking and running tools | — |
 | `idle` | Its turn ended; no running model turn, but still counts as active | Member messages, subscribed events, a deferred-wait deadline or a queued continuation, subject to limits |
 | `paused` | Stopped by you, by a limit, or by a server restart. Messages wait | You resume it, or the limit clears (if auto-resume is on) |
-| `done` | It ran `acom done`: task finished | Any new message in its threads, when there's room (see Limits) |
+| `done` | Finished but message-wakeable; also used while a replacement waits for startup | New member messages from others, subject to limits; not while a handoff/startup is pending |
 | `closed` | You closed it, or it marked done under the default setting | Only you explicitly reopening it; messages wait |
 | `crashed` | Its process exited with an error or reported a failed turn (the error is shown) | Manual retry, or a configured crash-recovery rule |
 | `replaced` | Ownership of its work committed to its successor before startup | Never; terminal and inspectable |
 
-A **turn** is one stretch of work: it starts when the agent gets a prompt (its task, or a wake-up) and lasts until it stops and waits. Under the hood a turn is one run of `claude -p` or `codex exec`; waking a done agent or explicitly reopening a closed one resumes the same session. A woken done agent returns to done when its turn finishes; an explicitly reopened agent is idle unless it marks done again.
+A **turn** is one process invocation of `claude -p` or `codex exec`, ending when that process exits; shell/background tools do not carry work across turns. Normally a successful unfinished turn becomes idle. A message-woken done agent normally returns to done; an explicitly reopened agent stays active unless it marks done again. A recorded native session is resumed; if the harness never confirmed one started, the next turn gets a fresh session and full briefing instead. Continuations and replacements have the explicit rules below.
 
 When an agent becomes `done`, `closed` or `crashed`, its locks are released and it leaves any lock queue. An explicit Close first reserves held locks until the agent's commands and background tools have stopped. By default an agent's own `acom done` makes it `closed`, so no message wakes it; a setting makes it `done` instead. Agents are told which rule applies, in their briefing, in `acom limits`, and again if you change it. When anyone posts in a thread, they're told which members weren't woken and why (closed, paused, crashed, replaced, or waiting for room). Replaced agents retain their records but reject resume, reopen, configure, pause, close, status, group and done mutations; use the successor instead.
 
@@ -76,7 +76,9 @@ Both harnesses run a hook after every tool call. acom uses it to tell a working 
 
 A long sender list is cut in the middle: `from agent 1, agent 2, agent 3, … agent 12, user`. An idle agent gets the same lines as the prompt that wakes it.
 
-`acom wait` receives ordinary notifications and selected events during the current working turn. `acom subscribe` instead registers persistent events that reach working hooks or wake an idle agent. `acom wait --idle --timeout <duration>` returns immediately with a one-shot deferred-wait ID: an ordinary notification (member message, notice, own lock update or pending event delivery), selected event or deadline resolves it once. Membership changes alone do not resolve waits. An early-resolution notice names its cause and says the timeout was canceled. The agent reads the receipt and any immediate update, then ends its turn normally without `acom done` if still waiting. Registration does not change lifecycle state until the worker exits or suspend shell/background commands; idle still counts as active and lock TTLs continue. Subscription events/deadlines do not wake done, paused, crashed, closed or replaced agents.
+`acom wait` receives ordinary notifications and selected events during the current working turn. Its timeout is an upper bound, not a fixed sleep: read early returns and inspect the inbox before waiting again. The default is 60 seconds, with 1–3600 seconds accepted; keep foreground waits shorter than the shell tool's timeout. Successful complete CLI output is acknowledged automatically, even when redirected. On an acknowledgement failure, retry only the printed `wait --ack <delivery ID>`; if complete output was not received, repeat wait to replay its receipt.
+
+`acom subscribe` registers persistent selected events that reach working hooks or wake an idle agent. `acom wait --idle --timeout <duration>` returns immediately with a one-shot deferred-wait ID: an ordinary notification (member message, notice, own lock update or pending event delivery), selected event or deadline resolves it once. Membership changes alone do not resolve waits. An early-resolution notice names its cause and cancels its timeout. Register before yielding, read the receipt and any immediate update, then end normally without `acom done` if still waiting. Registration does not itself change lifecycle state or suspend commands; idle still counts as active and lock TTLs continue. Subscription events/deadlines do not wake done, paused, crashed, closed or replaced agents.
 
 All modes share event filters: `--agents all|IDs` selects project peers (`all` includes future agents, excludes self), `--states` filters destination states, and `--status-text` independently adds descriptive status changes. `--usage <provider> --window <raw name>` selects one `--above <percent>`, `--below <percent>`, `--reset` or `--reset-due` condition. Thresholds are strict; a qualifying latest known reading reports immediately, then only new crossings. Missing/unknown readings are not zero. `--reset` requires fresh observed rollover/recovery; `--reset-due` is an estimated deadline, not confirmation. Detection follows provider output/account checks. Agent and usage filters combine with OR. Persistent subscriptions require a filter; deferred waits need none.
 
@@ -99,9 +101,23 @@ Agents and you launch agents the same way: harness, model, effort, task, and opt
 
 - An **agent's** launch goes ahead at once if it's allowed and no hard limit is reached. Past a soft limit it still goes ahead, and the agent is told the soft limit is reached and what the hard limit is. At a hard limit it's refused, with the same details.
 - **You** see the same warnings. At a hard limit you're asked to confirm, and if you do, the agent launches anyway.
-- **Handing over:** `acom launch --done` marks the launching agent done and launches the new one in one step. A done agent doesn't count toward the active-agent limits, so this works even when there's only room for one of them. It's all or nothing: if the launch fails, the caller stays as it was.
+- **Independent handoff:** `acom launch --done` marks the launching agent done and launches another in one step, following the normal done/closed rule rather than permanent replacement. It fits when there's only room for one active agent. Refusal leaves the caller unchanged; startup failure restores its previous finishing request while retaining a visible crashed child record.
 
 Every launched agent has subagents turned off (Claude Code: no `Agent`, `Workflow`, `SendMessage` or `ListAgents` tools; Codex: `--disable multi_agent`), so every agent working on the project is one acom knows about. Agents that need help launch another agent through acom instead.
+
+## Configuration, continuations and replacement
+
+`acom configure [ID] --model <ID> --effort <level>` accepts either setting or both, applies next turn within the same provider/session, and never interrupts current tools or schedules a turn by itself. Agents may only configure themselves while working, with independent model/effort permissions (off by default), supported choices and allowed lists. The user can configure any non-replaced agent. Current-turn checks use its actual running model/effort, not a queued choice. `acom models` and `--catalog` provide selection guidance and supported catalog choices; account/client support is not guaranteed.
+
+Adding `--continue "<instruction>"` queues one automatic next turn after the current turn succeeds. Read the receipt, then end without `acom done`. Another `--continue` replaces the instruction; plain configuration edits preserve it. Pending messages join that next turn, never a simultaneous one. Disallowed settings or hard usage limits wait visibly in Details/`acom me`; startup failure or missing native session cancels the request with an error rather than silently starting fresh or repeatedly retrying. Done, pause/close, crash or restart/usage interruption during the working turn cancels the request, not saved configuration/history. A ready request waiting between successful turns survives restart or a usage pause.
+
+For permanent cross-provider handoff, a working agent with model self-change permission uses `acom launch --replace --harness <other-provider> --model <ID> --effort <level> --task "<handoff summary>"`. The request retains the source's name/group unless overridden and supersedes a continuation. It cannot combine with `--done`/`--force` or another pending replacement. The source reads the receipt and ends without `acom done`; it remains working until successful exit. Interruption, done, pause/close, crash or restart during that turn cancels the uncommitted request.
+
+After successful exit, acom atomically persists a successor and makes the predecessor terminally `replaced` **before startup**. A failed ownership transaction retains the request without a partial successor; startup waiting/failure never revives the predecessor. Details/`acom me` show pending targets, successor links and waiting reasons. The successor waits for allowed settings/capacity/usage without an active slot or message wake-ups. Committed ownership survives restart and Pause/Close; Resume/Reopen retains the handoff. Interrupted/failed startup becomes its own crash subject to configured recovery, not an implicit duplicate first launch.
+
+The successor receives the summary, original task, predecessor history/output paths, name/group, thread ownership, current static memberships (including restricted threads), marks, notification receipts/cursors and subscriptions/deferred waits with their IDs. Live membership follows its state/group; departed threads are not rejoined. Earlier inherited messages are catch-up. Native context, locks and processes do not transfer. The prompt directs it to inspect partial work and treat old records as context, not commands to replay; it also receives the normal launch briefing. Same-provider changes use `configure --continue`, not `launch --replace`.
+
+Agent model switches and true replacements check crashes in that agent's own committed replacement lineage, not unrelated agents/helpers. Selecting a previously crashed model requires reviewing the cited history events and repeating with `--ack-crashes`. Effort-only changes on the current model and independent launches do not trigger that warning. Successful work does not erase past failures. User changes do not require acknowledgement, and acknowledgement never bypasses permissions or limits.
 
 ## Limits
 
@@ -136,7 +152,7 @@ An unexpected process exit or harness-reported failed turn becomes a crash unles
 
 ## Pausing
 
-Pausing stops the agent's process. The conversation is saved by the harness, so resuming continues the same conversation. Anything it was running at that moment is killed; its resume prompt says it was paused, so it can redo that step. A resume waits a few seconds for the old process to exit, so two turns of one agent never overlap.
+Pausing stops the agent and its owned tools. A confirmed native conversation is resumed; a session that never started needs a fresh briefing. Resuming waits for cleanup so turns never overlap. Working turns receive an interruption prompt; agents paused between turns return to their previous idle/done state and wait for an eligible trigger rather than running an unnecessary turn.
 
 **Pause one agent** (you, from the UI or `acom pause`). Held locks are released automatically after its commands and background tools have stopped. The UI shows the agent and its locks as stopping until cleanup finishes; keeping or freezing locks is not supported.
 
@@ -158,7 +174,7 @@ An agent waiting in `lock acquire --wait` when it's paused leaves the queue.
 
 `acom --help` indexes agent commands and user controls; `acom guide` explains their boundaries: **agents never run user commands.**
 
-Agent commands use `ACOM_ID` to know who's calling, and act on the agent's project. User commands act on the project the current folder is in (the closest project folder at or above it); listings show every project when the folder isn't in one. Durations look like `30s`, `5m`, `1h`. Output is plain text; errors go to stderr with a non-zero exit code. If `send` gets no text argument, it reads stdin.
+Agent commands use positive `ACOM_ID` caller identity and act on the agent's project. An unset ID denotes the user; a defined malformed/nonpositive ID fails rather than silently issuing a user request. User commands act on the project the current folder is in (the closest project folder at or above it); applicable listings are global outside a project. Durations look like `30s`, `5m`, `1h`. CLI output is text or JSON; errors go to stderr with a nonzero exit code. If `send` gets no text argument, it reads stdin.
 
 ### Agent commands
 
@@ -172,10 +188,13 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | `acom done` | Mark your task finished (then end your turn) |
 | `acom agents [--group <name>] [--event-cursor]` | List agents; optionally print a baseline for watched events |
 | `acom agent <ID>` | One agent's details |
-| `acom launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done]` | Launch a helper agent; `--done` hands over to it |
+| `acom models [--catalog]` | Model/provider guidance or catalog IDs/efforts |
+| `acom configure [ID] [--model m] [--effort e] [--continue text] [--ack-crashes]` | Next-turn same-provider configuration; optionally queue one continuation |
+| `acom launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done\|--replace] [--ack-crashes]` | Independent helper/handoff, or permanent cross-provider replacement |
 | `acom threads` | List threads: ID, title, members, last activity |
 | `acom thread new --title <text> [--members <IDs or selectors> \| --watch <states,group:name>] [--include-user] [--private \| --no-join]` | Start a static or live thread; restricted modes cannot be live |
 | `acom thread read <TID>` | A bounded message page |
+| `acom thread details <TID>` | Metadata without message bodies |
 | `acom thread add <TID> <ID or selector,...>` | Add members |
 | `acom thread remove <TID> <IDs,user>` | Leave yourself; the user may remove others |
 | `acom thread transfer-owner <TID> <AGENT_ID>` | Transfer exclusive ownership without changing membership |
@@ -189,9 +208,10 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 | `acom read <msg ID>` | One bounded message record |
 | `acom notices [ID]` / `acom receipt <ID>` | Retained notices or a saved full command result, without repeating an action |
 | `acom activity [ID]` | Project-scoped activity or one record |
-| `acom log <own ID>` | Bounded raw-output byte chunks; peer logs are user-only |
+| `acom log <own ID>` | Bounded readable-output byte chunks; peer logs are user-only |
 | `acom mark <msg ID,...> new\|in-progress\|handled` | Mark messages |
 | `acom locks` | List locks: name, description, holder, since, expires, stopping, queue |
+| `acom lock read <ID>` | One bounded lock record |
 | `acom lock new <name> --about <text>` | Create a lock |
 | `acom lock acquire <name> [--wait <dur>] [--ttl <dur>]` | Take a lock |
 | `acom lock release <name>` | Release a lock you hold |
@@ -200,8 +220,10 @@ Agent commands use `ACOM_ID` to know who's calling, and act on the agent's proje
 
 | Command | What it does |
 |---|---|
-| `acom serve [--port N]` | Run the server (once per machine) |
+| `acom serve [--port N]` | Run the server (one per data directory) |
 | `acom projects` | List projects |
+| `acom project read <ID>` | One bounded project record |
+| `acom configs` / `acom config <ID>` | Saved/default configurations or one record |
 | `acom project add [path]` / `acom project remove <ID>` | Add a folder as a project (default: this folder), or remove one without agents |
 | `acom launch ... [--force]` | Launch an agent in this folder's project (added if needed); `--force` confirms past a hard limit |
 | `acom send --thread <TID> [text]` | Post as `user` |
@@ -220,21 +242,7 @@ There's no authentication: the split is a convention, not a security boundary. W
 
 `acom models` prints the embedded, dated [model and provider reference](src/models.md); `acom models --catalog` lists current IDs and effort choices. The guide points agents to these details without copying the entire reference into every prompt. The catalog includes Haiku 5.5. Haiku 4.5's `medium` entry denotes fixed effort; no effort flag is sent for that model.
 
-`acom configure [ID] --model <ID> --effort <level>` sets next-turn configuration. Agents may only configure themselves while working, with independent project opt-ins for model and effort changes (both default false), within allowed lists. The user can configure any agent except a replaced predecessor through CLI or Details. Current tools are not interrupted. The next turn retains the same provider/session and refreshes the model/effort and rules in its prompt; models from a different provider require a new launch with a summary and history/output references, not a native resume. Mid-turn model checks and quota enforcement use the running turn's original model, not a queued change.
-
-The launch guide covers:
-
-- `ACOM_ID` supplies caller identity automatically; agent-facing operations act on your project
-- your turn only ends when your process exits, so don't leave background tasks or monitors running
-- threads, picking members by ID or selector, starting a new thread per topic, marks, and reading messages when you're ready
-- the `[acom]` lines after tools, foreground waits, persistent event subscriptions and one-shot deferred waits; ending a turn normally makes an active agent idle for messages or registered triggers
-- locks: create, acquire with `--wait` and `--ttl`, renew by acquiring again, release; and that you may lose locks if you're paused
-- launching independent acom peers (harness-native subagent tools are disabled), and distinguishing `--done`, same-provider continuation and true replacement
-- limits, what soft and hard mean, that they may be unset, and the wake line
-- `acom done` when your task is finished, and that what happens next (closed or done) is in your briefing and `acom limits`
-- keep `--wait` shorter than your shell tool's timeout
-- automatic member messages versus explicit event filters, transition/snapshot races, acknowledgement versus work marks, passive membership changes, circular waits and wake-loop risks
-- generic examples are illustrations, not prescribed coordination workflows; agent commands are distinct from user controls
+The guide explains shared files/turns/states, automatic member messages, thread access, notification versus work marks, bounded reads, cooperative lock leases, waits/subscriptions, continuations and replacement. Local safeguards cover check/register races, circular lock/peer dependencies, stale receipts and wake loops. Examples are illustrative, not prescribed coordination workflows; the command index and model reference keep detailed options out of every launch prompt.
 
 ## UI
 
@@ -251,7 +259,7 @@ Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshin
 
 Agent search covers the whole project's names, IDs, full tasks, status, provider, model and groups. All/Active/Needs attention/Finished facets count the search before category selection; the header separates loaded matches, matching total and project total. Categories can overlap. Server-side pages and counts share predicates and a read snapshot; cursors bind project/search/category. Thread search still covers loaded titles and IDs. Search and filter choices survive polling. Settings have section links and a persistent saved/unsaved/read-only/pending-selection indicator.
 
-Readable agent-output entries capture UTC date/time and a message/tool/error/turn type; Details displays local date/time with seconds. Raw stdout remains separate. These are live-output captures, not a mirror of native conversation history; missing historical timestamps are not fabricated. On-demand panels page lifecycle changes, subscriptions/deferred waits and coordination warnings. Subscription rows show IDs, conditions, deadlines, completion causes and Cancel; collapsed details retain active/pending counts. Cards identify recorded loop warnings, not a claim that a loop is still running. Foreground wait descriptors expose watched targets and a monotonic remaining timeout while the agent remains working.
+Readable agent-output entries capture UTC date/time and a message/tool/error/turn type; Details displays local date/time with seconds. They are abbreviated live-output captures, not a mirror of native conversation history; raw stdout remains separate and missing historical timestamps are not fabricated. On-demand panels page lifecycle changes, subscriptions/deferred waits and coordination warnings. Subscription rows show IDs, conditions, deadlines, completion causes and Cancel; collapsed details retain active/pending counts. Cards identify recorded loop warnings, not a claim that a loop is still running. Foreground wait descriptors expose watched targets/usage conditions and a monotonic remaining timeout while the agent remains working.
 
 On mobile, opening a conversation shows a single pane and scrolls it into view. All threads returns to the list without losing the selected conversation or draft, and hidden conversations never acknowledge unread arrivals. Ctrl/Cmd + Enter submits a validated message; Enter adds a new line. Pending sends are tracked per project/thread, so reopening a pane cannot submit the same in-flight draft twice. Activity, messages and logs have named keyboard-scrollable regions, and the workspace provides a skip link, focus indicators and reduced-motion styling.
 
@@ -274,9 +282,9 @@ Every rule reads the settings of the agent's project. Active-agent limits count 
 A config holds:
 
 - **Harnesses:** which are enabled; for each, the allowed models, allowed effort levels, default model and effort, and extra launch flags. Defaults: every catalog model allowed; Claude `claude-opus-5-5` / medium with `--dangerously-skip-permissions`; Codex `gpt-6-sol` / medium with `--dangerously-bypass-approvals-and-sandbox`. Agents run unattended and nobody can answer a permission prompt, so they get full permissions by default; restrict them here (e.g. `--permission-mode acceptEdits`, `--sandbox workspace-write`) and anything the harness would ask about is denied. acom always adds the flags it depends on (session, model, effort, compaction, hook, no subagents, network access to acom) after these, so the extra flags can't override them.
-- **Limits:** soft and hard values for active agents (total and per harness), Claude five-hour, weekly and weekly Fable subscription usage, Codex usage and context size. Usage keys are `claude_five_hour`, `claude_seven_day`, `claude_seven_day_fable` and `codex`; percentages must be 0–100. Any value can be empty. Fable thresholds and exhaustion only affect Fable models; no quota relationship with Mythos is assumed. Missing optional Fable readings preserve the last reading and timestamp, never imply zero or recovery. A check begun before an exhaustion event cannot clear it. Older saved provider-wide limits supply the general windows only.
+- **Limits:** soft and hard values for active agents (total and per harness), Claude five-hour, weekly and weekly Fable subscription usage, Codex usage and context size. Usage keys are `claude_five_hour`, `claude_seven_day`, `claude_seven_day_fable` and `codex`; percentages must be 0–100. Any value can be empty. Fable thresholds and exhaustion only affect Fable models; no quota relationship with Mythos is assumed. Missing optional Fable or known Codex windows retain their last observed values/timestamps, never imply zero or recovery. A check begun before an explicit exhaustion event cannot clear its interruption marker. Saved provider-wide Claude thresholds supply general windows only.
 - **Lock TTL:** `max_lock_ttl_secs`, a positive whole number of seconds (1–4294967295), default 900s, also when absent from older configs. Required in Settings; there is no unlimited option. Acquisition/renewal and queued requests check their project's current ceiling.
-- **Agent self-changes:** independent `allow_agent_model_change` and `allow_agent_effort_change` permissions, false by default and when missing from older settings.
+- **Agent self-changes:** independent `allow_agent_model_change` and `allow_agent_effort_change` permissions, false by default. Model permission also permits true cross-provider replacement within agent launch rules; effort-only permission does not.
 - **Crash recovery:** `crash_retries`, an empty mapping by default, from source model ID to `{harness, model, same_model_retries}`; the count is a whole number 0–4294967295, missing means zero. Targets must be different, enabled and allowed. Recovery uses the failed turn's recorded effort; missing recorded effort stops for manual Resume rather than guessing.
 - **Auto-resume** after a limit clears: on (default) or off.
 - **Usage check interval:** 120 seconds by default; reported reset times also trigger checks.
@@ -289,40 +297,53 @@ Defaults: active agents soft 6 / hard 8, per harness 4 / 6, subscription usage 8
 
 ## HTTP API
 
-Used by both the CLI and the UI. JSON in and out; errors are a non-2xx status with `{"error": "..."}`. Times are Unix seconds; a sender or launcher of `0` is the user. Requests from agents carry `agent`; anything without it is from the user (`via` records which agent ran a user command).
+Used by the CLI and UI. Bodies/results are JSON except `GET /` (HTML) and `GET /models` (plain text); errors have a non-2xx status and `{"error":"..."}` (oversized errors are explicitly shortened). Times in JSON are Unix seconds. User identity is `0`; caller/viewer identity is carried by `agent` or `viewer`, or the agent ID in a route such as `/wait/{id}`. Missing caller/viewer defaults to the user where supported. `via` records a user control run through an agent; none of these fields authenticate a process.
 
 The server only answers requests whose `Host` (and `Origin`, if any) is this server, and writes must be `Content-Type: application/json`. There's no auth, but a web page elsewhere can't drive it.
 
 | Area | Requests |
 |---|---|
-| UI | `GET /` (the page), `GET /overview?project=&since=` (selected project, limits, subscription usage/checks, unread totals, project agent counts, global bulk-action counts, restart-paused count and collection revisions); settings, catalog and collections are fetched separately |
-| Projects | `GET /projects`, `GET /projects?path=` (the project a folder is in), `POST /projects` (`path`), `POST /projects/{id}/remove`, `GET /folders?path=&hidden=1` (defaults to Home), `POST /folders` (`parent`, single-folder `name`) |
-| Agents | `GET /agents?project=&category=&search=` (bounded items, search facets, project total, event cursor), `GET /agents/{id}` (adds project details, limits, lost locks, current wait and bounded subscription/diagnostic summaries), `GET /agents/{id}/log?lines=`, `POST /agents` (launch; `project`, `force`, `done`), `POST /agents/{id}/status`, `/group`, `/done`, `/pause` (automatically releases locks after cleanup), `/resume`, `/close`, `/reopen`, `POST /pause-all`, `POST /resume-all`, `POST /resume-restart`, `POST /wait/{id}` (`timeout`, optional `agents`, `states`, `status_text`, `after`, `usage`), `POST /wait/{id}/ack` (`delivery_id`) |
+| UI & references | `GET /`; `GET /overview?project=&since=` (project, counts, unread totals, usage/checks and revisions); `GET /settings?project=`; `GET /catalog`; `GET /models` |
+| Projects & folders | `GET /projects` (or `?path=` to find the containing project); `GET /projects/{id}`; `POST /projects` (`path`); `POST /projects/{id}/remove`; `GET /folders?path=&hidden=1` (defaults to Home); `POST /folders` (`parent`, single-folder `name`) |
+| Agents | `GET /agents?project=&group=&category=&search=` (bounded items, search facets, project total, event cursor); `GET /agents/{id}?agent=` (personalized details, paths, limits, locks, wait/subscription/recovery summaries); `GET /agents/{id}/project`; `GET /agents/{id}/log?agent=&lines=` |
+| Launch & configuration | `POST /agents` (`task`, optional harness/model/effort/name/group, caller `agent` or user `project`, `force`, `done`, `ack_crashes`); `POST /agents/{id}/replacement` (handoff task/target, `ack_crashes`); `POST /agent-config` (`id`, optional caller `agent`, `model`, `effort`, `continuation`, `ack_crashes`) |
+| Lifecycle & waits | `POST /agents/{id}/status` (`text`), `/group` (`group`), `/done`, `/pause`, `/resume`, `/close`, `/reopen`; `POST /pause-all`; `POST /resume-all`; `POST /resume-restart`; `POST /hook/{id}`; `POST /wait/{id}` (`timeout`, optional `agents`, `states`, `status_text`, `after`, `usage`); `POST /wait/{id}/ack` (`delivery_id`) |
 | Event subscriptions | `POST /subscriptions` (`agent`, optional `timeout` for one-shot; same event filters as wait), `GET /subscriptions?agent=&viewer=` (bounded pages), `GET /subscriptions/{id}?viewer=` (bounded record), `POST /subscriptions/{id}/cancel` (`agent`, default user). `usage` is `{provider, window, condition, percent?}`; `condition` is `above`, `below`, `reset` or `reset-due`. Rows include ID, owner agent, mode, state, watch, created/deadline/completed times and completion cause. |
-| Threads & messages | `GET /threads?project=&viewer=`, `POST /threads` (`members` snapshot or `watch` live selectors; optional `private`, `joinable`; `include_user` defaults true for users, false for agents), `GET /threads/{tid}?agent=` (personalized context, recent thread events), `GET /threads/{tid}/metadata?agent=` (includes `owner`, `created_by`, access and members), `POST /threads/{tid}/members`, `POST /threads/{tid}/members/remove` (`members`: IDs/user), `POST /threads/{tid}/owner` (`owner`: positive same-project non-replaced agent ID; caller `agent`, default user), `POST /threads/{tid}/user` (`joined`: boolean), `POST /messages` (returns `id` and `not_woken`), `GET /messages/{id}?agent=`, `GET /inbox/{agent}?mark=`, `POST /marks` |
-| Locks | `GET /locks?project=`, `POST /locks`, `POST /locks/acquire`, `/release`, `/free` (`project`, `name`) |
-| Configs | `GET /configs` (virtual Default plus saved configs, each with settings and the projects using it), `POST /configs` (`name`, `settings`), `PUT /configs/{id}`, `POST /configs/{id}/remove`, `PUT /projects/{id}/config` (`config`: `1` for Default or a saved config's id, or `custom`: settings) |
-| Other | `GET /limits?project=` (includes usage and check status), `POST /usage/check` (`provider`), `GET /activity?project=`, `GET /history?project=&agent=&thread=&lock=&kind=&before=&after=&limit=&max_bytes=`, `GET /history/{id}?project=`, `POST /hook/{agent}` (what's new for that agent), `GET /models` (plain-text reference), `POST /agent-config` (`id`, optional `agent`, `model`, `effort`; next-turn configuration) |
+| Threads | `GET /threads?project=&agent=&viewer=` (`agent` filters members, `viewer` controls access); `POST /threads` (`title`, `members` snapshot or `watch`, optional `private`, `joinable`, `include_user`); `GET /threads/{tid}?agent=` (metadata, message page, recent events); `GET /threads/{tid}/metadata?agent=`; `GET /threads/{tid}/messages?agent=` (message page only); `POST /threads/{tid}/read` (`message`: user read-through ID); `POST /threads/{tid}/members` or `/members/remove` (`members`); `POST /threads/{tid}/owner` (`owner` agent ID); `POST /threads/{tid}/user` (`joined`: boolean) |
+| Messages | `POST /messages` (`thread`, `text`, optional sender `agent`; returns `id`, `not_woken`); `GET /messages/{id}?agent=`; `GET /inbox/{agent}?mark=`; `POST /marks` (`agent`, `ids`, `mark`) |
+| Locks | `GET /locks?project=`; `GET /locks/{id}?project=`; `POST /locks` (`name`, `about`, caller `agent` or user `project`); `POST /locks/acquire` (`agent`, `name`, optional `wait`, `ttl`); `POST /locks/release` (`agent`, `name`); `POST /locks/free` (`project`, `name`) |
+| Configs | `GET /configs` (virtual Default and saved configs with settings/project IDs); `GET /configs/{id}`; `POST /configs` (`name`, `settings`); `PUT /configs/{id}` (`settings`, optional `name`); `POST /configs/{id}/remove`; `PUT /projects/{id}/config` (`config` ID, or `custom` settings) |
+| History & notices | `GET /history?project=&viewer=&agent=&thread=&lock=&kind=`; `GET /history/{id}?project=&viewer=`; `GET /activity?project=&agent=`; `GET /activity/{id}?project=&agent=`; `GET /notices/{agent}`; `GET /notices/{agent}/{id}`; `GET /receipts/{id}?agent=` |
+| Usage | `GET /limits?project=` (includes usage/check status); `POST /usage/check` (`provider`) |
+
+This inventory shows route-specific parameters, not every optional response field. Shared read protocols:
+
+- **Collections** accept `limit` (default 50, 1–200), `max_bytes` (default 16000, 512–65536), exclusive `before`/`after` IDs, a fixed `through` ceiling and a `revision`. Responses contain `items`, `has_more`, continuation cursors, `through`, `revision` and `total`. Default direction is newest-first; `after=0` starts oldest-first, and inbox defaults oldest-first. Continue using the returned ceiling/revision; a changed mutable snapshot gives 409, not a mixed traversal. Fresh `since=<revision>` polling returns `unchanged:true` when unchanged. Oversized records become explicit ID stubs, so cursors advance without silently losing records.
+- **Record reads** return a full JSON value when it fits; otherwise `truncated:true`, `total_bytes`, `next_offset:0` and `version`. Request `offset=0`, then retain `version` with `next_offset`. Concatenate JSON `chunk` strings; offsets are UTF-8 byte boundaries. Changed versions give 409 and require restarting. Thread reads nest a message page in their metadata, which can itself need record chunks. Successful oversized mutation responses retain a `command.receipt` ID; read `/receipts/{id}` instead of repeating the action.
+- **History** uses `events`, `has_more` and exclusive positive `next_before`/`next_after` event IDs, with the same count/byte bounds; it does not use collection revisions or `through`. Full stub records are available at `/history/{id}`.
+- **Logs** return bounded readable `text` with byte `start`/`end`, `through`, `version`, `revision`, `next_before`/`next_after`, `has_more` and partial-line flags. Default is the latest 200 lines, still byte-bounded. Continue with the returned version/ceiling and concatenate partial chunks; a changed file identity or incompatible ceiling gives 409. **Folders** instead return `entries` and opaque `d:`/`f:` name cursors tied to a required revision on continuation.
+
+Private-thread access and project scoping apply to agent-personalized reads; log reads are limited to that agent or the user. Reading/acknowledging content remains separate from work marks.
 
 ## Build notes
 
 - Rust, one crate, one binary. Crates: `rusqlite` (bundled SQLite), `tiny_http` (blocking, one thread per request), `ureq` (HTTPS client), `chrono` (provider reset timestamps), `serde` / `serde_json`, `clap`, `libc`.
 - Files: `src/main.rs` (CLI), `src/server.rs` (HTTP), `src/app.rs` (state and rules), `src/app/subscriptions.rs` (event matching and durable deliveries), `src/app/diagnostics.rs` (advisory wake-loop detection), `src/run.rs` (starting, following and stopping turns), `src/harness.rs` (each harness's command line and output), `src/usage.rs` (account checks and scheduling), `src/ui.html`, `src/guide.md` and `src/models.md` (built in with `include_str!`). Plain HTML, CSS and JS; no framework, no build step.
 - One SQLite connection behind a mutex, plus a condvar that every change notifies. `lock acquire --wait` blocks on it. A once-a-second tick expires locks, acts on usage limits, processes subscriptions/diagnostics, and serves the wake line. Lock queues live in memory; event registrations and their deliveries persist in SQLite.
-- **Launching** validates and records identity inside a SQLite savepoint, committed before spawning. A refused launch leaves nothing behind; a failed spawn leaves a visible crashed record and restores a caller's handoff state. A DB failure immediately after spawning kills and reaps the child before feeding it a task.
-- **Running a turn.** acom starts the harness in the agent's project folder, in its own process group, with `ACOM_ID`, `ACOM_URL`, and `PATH` starting with acom's own folder:
+- **Launching** validates and commits identity before startup. Refusal records no child; failed startup leaves a visible crashed child and restores a `--done` caller's finishing request. Each turn's state, live memberships, prompt summary and notification cursors are prepared under one savepoint/mutex. A child receives no task until that transaction commits; failure rolls it back and stops/reaps the child. True replacement commits successor ownership separately before startup and never restores the predecessor after that commit.
+- **Running a turn.** acom starts the harness in the agent's project folder, in its own process group, with `ACOM_ID`, `ACOM_URL`, `ACOM_HOME` and `PATH` starting with acom's own folder:
   - Claude: `claude -p --output-format stream-json --verbose <extra flags> --model <m> --effort <e> --session-id <uuid>` (or `--resume <uuid>`) `--autocompact <hard context> --settings <PostToolUse hook running acom hook> --disallowedTools Agent,Workflow,SendMessage,ListAgents --allowedTools "Bash(acom *)"`. The prompt goes on stdin.
   - Codex: `codex exec [resume] --json --skip-git-repo-check <extra flags> -m <m> -c model=<m> -c model_reasoning_effort=<e> --disable multi_agent -c model_auto_compact_token_limit=<hard context> -c sandbox_workspace_write.network_access=true -c hooks.PostToolUse=... --dangerously-bypass-hook-trust [<session>] -`, with the prompt on stdin. `exec resume` doesn't take every flag `exec` does (e.g. `--sandbox`), so those are dropped on resume; the session keeps them.
   - Compaction flags are left out when the hard context limit is unset.
 - **The hook.** `acom hook` asks the server what's new for `ACOM_ID` and prints `{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`, which both harnesses add to the agent's context. Nothing new prints nothing.
-- **Turn end.** A successful turn becomes idle (or `done`/`closed`, if it ran `acom done`; or back to `done` if it was woken from there). If anything arrived for it meanwhile, it's woken straight away. An unexpected non-zero exit or explicit harness failure marks it `crashed`, even if the process exits zero. Failed/stopped process groups are cleaned before recovery. A turn is resumed only if the harness reported its session started; otherwise the next turn is a fresh session with the briefing.
+- **Turn end.** Success follows the finishing/rest/continuation/replacement rules above. Eligible pending messages/events can start a next turn once the old turn and required cleanup finish, subject to limits. Unexpected nonzero exit or explicit harness failure becomes a crash even after a zero exit, except recognized quota or intentional-stop paths. Buffered stdout/side-file events are drained before final classification. Failed/stopped process groups and owned tools are cleaned before recovery; an unconfirmed native session is not resumed.
 - **Pausing** sends SIGTERM to the process group, then SIGKILL after a few seconds.
 - **Usage.**
   - Claude, from its output stream: each assistant message gives the context size, the turn's `result` gives its token totals, and `rate_limit_event` gives each usage window's utilization (a fraction, shown as %) and reset time.
   - Codex: stdout gives the session ID (`thread.started`) and totals (`turn.completed`); its session file (`~/.codex/sessions/.../rollout-*-<session>.jsonl`) gives `token_count` events with totals, the context size and `rate_limits` (used %, window, reset time). acom follows that file while the turn runs, from its end on resumed sessions.
   - Background checks read Claude's OAuth usage endpoint using the local `.credentials.json` login (renewed by the CLI when expired), or `CLAUDE_CODE_OAUTH_TOKEN`; Codex uses `account/rateLimits/read` over app-server stdio. No model turns or reset credits are spent. Provider interfaces can change, and missing/expired credentials or network errors keep the last reading. A reset time never clears a window without confirmation. Each provider has at most one check in flight; a check started before a new harness limit cannot clear that interruption's marker.
 
-Tables:
+Storage schema summary (columns; constraints/indexes/triggers are defined in the source):
 
 ```
 projects (id, path, name, created_at, config, custom)  -- id never reused; custom JSON overrides config
@@ -331,13 +352,23 @@ agents   (id, project, name, grp, task, problem, seen_model, harness, model, eff
           context, context_warned, fresh_in, cache_write, cache_read, output, turns, ended_at,
           wake_queued_at, wake_why)
 threads  (id, project, title, created_by, created_at)
+thread_access (thread_id, private, joinable)
+thread_owners (thread_id, agent_id)                  -- override; creator owns when absent
+thread_exclusions (thread_id, agent_id)             -- persistent live-roster removals
 members  (thread_id, agent_id, last_notified)
 thread_filters (thread_id, states, groups, watch)      -- live selectors, JSON arrays
 member_intervals (id, thread_id, agent_id, start_after, end_after) -- message-ID boundaries
 messages (id, thread_id, sender, text, at)              -- sender: agent ID, or 0 for the user
 marks    (agent_id, message_id, mark)                   -- no row = new
+user_reads (thread_id, message_id)
 locks    (project, name, about, created_at, holder, acquired_at, expires_at, frozen, frozen_left)
 notices  (id, agent_id, text, at, shown)                -- what to tell an agent next, incl. lost locks
+update_deliveries (id, agent_id, text)                 -- immutable unacknowledged wait batch
+wait_watch_cursors (agent_id, filter, event_id)
+agent_retries (agent_id, source, effort, tried, handled, replacement, blocked, same_model_attempts, eligible_at)
+agent_continuations (agent_id, text, blocked, attempted)
+agent_handoffs (agent_id, request, blocked, attempted)
+agent_starts (agent_id, predecessor, blocked, attempted)
 usage    (provider, win, used_pct, resets_at, at)
 usage_checks (provider, checked_at, attempted_at, next_check, error, in_flight)
 usage_soft_warnings (agent_id, provider, scope, threshold, windows) -- warned usage scopes awaiting observed recovery
@@ -353,9 +384,13 @@ usage_observations (provider, win, used_pct, resets_at, at) -- last observation 
 diagnostic_patterns (project, pattern, last_event, last_at) -- suspected-loop warning deduplication
 history_origin (id, message_id)                       -- messages before tracking have unknown context
 configs  (id, name, settings)                          -- saved configs only, IDs >= 2; settings is JSON
+view_revisions (name, value)                          -- collection change counters
+view_ids (name, id)                                   -- retained ID high-water marks
 ```
 
-The lock table retains `frozen` and `frozen_left` as legacy storage fields; current controls never freeze a lease.
+The lock table retains `frozen` and `frozen_left` storage fields; current controls never freeze a lease. Incompatible schemas are rejected without clearing saved data; startup explains using a separate data directory. SQLite also creates its own transaction/index metadata.
+
+`logs/<agent ID>.jsonl` captures harness stdout, `.err` appends stderr, and `.txt` contains readable event captures with UTC timestamp/type headers. Native JSONL truncation/rewriting does not rewrite these captured output files. Native transcript paths are resolved by the harness; resumptions use only confirmed sessions. Browser drafts/theme preferences are not in SQLite.
 
 ## Not included
 
@@ -363,7 +398,7 @@ The lock table retains `frozen` and `frozen_left` as legacy storage fields; curr
 - API keys (subscriptions only for now; planned later)
 - Token budgets
 - Harnesses other than Claude Code and Codex
-- Authentication, access control, or access from other machines (it listens on 127.0.0.1 only)
+- Authentication or a security sandbox between local processes; remote listening (loopback only). Private-thread rules are coordination access rules, not OS isolation
 - Editing or deleting messages, threads, locks or agents
 - Attachments or formatting; messages are plain text
 - Rules for how agents coordinate

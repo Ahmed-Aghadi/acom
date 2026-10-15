@@ -56,7 +56,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   receipt <ID>                            Full saved command result; never repeats the action
   activity [ID]                           Project activity / one full activity record
   log <ID> [--before BYTE | --after BYTE] [--through BYTE] [--version V] [--since R]
-           [--lines N] [--max-bytes N]    Bounded raw log chunks (JSON); agents only their own
+           [--lines N] [--max-bytes N]    Bounded captured-activity chunks (JSON); agents only their own
   read <msg ID>                           One bounded message record
   mark <msg ID,...> new|in-progress|handled
   locks                                   List locks
@@ -946,7 +946,7 @@ enum Cmd {
         cmd: LockCmd,
     },
     Serve {
-        #[arg(long, default_value_t = 7400)]
+        #[arg(long, default_value_t = 7400, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
     },
     Pause {
@@ -1068,7 +1068,6 @@ fn die(msg: &str) -> ! {
     exit(1)
 }
 
-/// The server's address: ACOM_URL, or .acom/port in this folder or a parent.
 /// The server's address: ACOM_URL, or the port the running server wrote to ~/.acom/port.
 fn base_url() -> String {
     if let Ok(u) = std::env::var("ACOM_URL") {
@@ -1081,7 +1080,13 @@ fn base_url() -> String {
 }
 
 fn my_id() -> Option<i64> {
-    std::env::var("ACOM_ID").ok().and_then(|s| s.parse().ok())
+    std::env::var_os("ACOM_ID").map(|value| {
+        value
+            .to_str()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .unwrap_or_else(|| die("ACOM_ID must be a positive integer when set"))
+    })
 }
 
 fn me() -> i64 {

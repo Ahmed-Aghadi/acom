@@ -737,7 +737,15 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                         bad("lock TTL must be a positive whole number of seconds")
                     })?),
                 };
-            let wait = opt_int(b, "wait").unwrap_or(0).max(0) as u64;
+            let wait = b
+                .get("wait")
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        bad("lock wait must be a nonnegative whole number of seconds")
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
             J(json!({ "result": app.acquire(int(b, "agent")?, &text(b, "name")?, wait, ttl)? }))
         }
         ("POST", ["locks", "release"]) => {
