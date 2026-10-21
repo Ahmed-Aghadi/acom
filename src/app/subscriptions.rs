@@ -33,7 +33,35 @@ INSERT OR IGNORE INTO usage_observations(provider,win,used_pct,resets_at,at)
  SELECT provider,win,used_pct,resets_at,at FROM usage;
 ";
 
-pub(super) fn validate_usage(watch: &UsageWatch) -> R<()> {
+fn standard_windows(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &["five_hour", "seven_day", "seven_day_fable"],
+        "codex" => &[
+            "codex primary",
+            "codex secondary",
+            "codex account limit",
+            "account limit",
+        ],
+        _ => &[],
+    }
+}
+
+pub(super) fn known_windows(st: &St, provider: &str) -> R<Vec<String>> {
+    let mut names: BTreeSet<String> = standard_windows(provider)
+        .iter()
+        .map(|name| (*name).into())
+        .collect();
+    for row in rows(
+        &st.db,
+        "SELECT win FROM usage WHERE provider=?1 UNION SELECT win FROM usage_observations WHERE provider=?1",
+        [provider],
+    )? {
+        names.insert(row["win"].as_str().unwrap().into());
+    }
+    Ok(names.into_iter().collect())
+}
+
+pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
     if !crate::harness::KNOWN.contains(&watch.provider.as_str()) {
         return Err(bad("usage provider must be claude or codex"));
     }
@@ -44,15 +72,63 @@ pub(super) fn validate_usage(watch: &UsageWatch) -> R<()> {
         "above" | "below"
             if watch
                 .percent
-                .is_some_and(|n| n.is_finite() && (0.0..=100.0).contains(&n)) =>
-        {
-            Ok(())
+                .is_some_and(|n| n.is_finite() && (0.0..=100.0).contains(&n)) => {}
+        "reset" | "reset-due" if watch.percent.is_none() => {}
+        _ => {
+            return Err(bad(
+                "usage condition is above/below with percent 0–100, or reset/reset-due without percent",
+            ));
         }
-        "reset" | "reset-due" if watch.percent.is_none() => Ok(()),
-        _ => Err(bad(
-            "usage condition is above/below with percent 0–100, or reset/reset-due without percent",
-        )),
     }
+    let mut watch = watch.clone();
+    if watch.provider == "claude" {
+        watch.window = match watch.window.as_str() {
+            "five-hour" => "five_hour",
+            "weekly" => "seven_day",
+            "weekly Fable" => "seven_day_fable",
+            window => window,
+        }
+        .into();
+    }
+    let builtins = standard_windows(&watch.provider);
+    let known = builtins.contains(&watch.window.as_str())
+        || st.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage WHERE provider=?1 AND win=?2 UNION ALL SELECT 1 FROM usage_observations WHERE provider=?1 AND win=?2)",
+            params![watch.provider, watch.window],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if !known {
+        let mut choices: BTreeSet<String> = builtins.iter().map(|s| (*s).into()).collect();
+        for row in rows(
+            &st.db,
+            "SELECT win FROM usage WHERE provider=?1 UNION SELECT win FROM usage_observations WHERE provider=?1 ORDER BY win LIMIT 13",
+            [&watch.provider],
+        )? {
+            choices.insert(row["win"].as_str().unwrap().into());
+        }
+        let more = choices.len() > 12;
+        let choices = choices
+            .into_iter()
+            .take(12)
+            .map(|name| {
+                let short: String = name.chars().take(64).collect();
+                json!(if short.len() < name.len() {
+                    format!("{short}…")
+                } else {
+                    short
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(bad(format!(
+            "unknown usage window {:?} for {}; recognized IDs: {choices}{}. Use acom limits for current window IDs",
+            watch.window,
+            watch.provider,
+            if more { ", …" } else { "" }
+        )));
+    }
+    Ok(watch)
 }
 
 fn ceiling(st: &St) -> R<i64> {
@@ -602,6 +678,252 @@ mod usage_tests {
             condition: condition.into(),
             percent,
         }
+    }
+
+    fn usage_options(provider: &str, window: &str) -> WaitOptions {
+        WaitOptions {
+            usage: Some(UsageWatch {
+                provider: provider.into(),
+                window: window.into(),
+                condition: "above".into(),
+                percent: Some(80.0),
+            }),
+            ..WaitOptions::default()
+        }
+    }
+
+    #[test]
+    fn claude_display_aliases_match_registered_and_foreground_usage_events() {
+        for (alias, canonical) in [
+            ("five-hour", "five_hour"),
+            ("weekly", "seven_day"),
+            ("weekly Fable", "seven_day_fable"),
+        ] {
+            for timeout in [None, Some(60)] {
+                let app = app();
+                app.record_usage("claude", canonical, 70.0, None).unwrap();
+                let sub = app
+                    .subscribe(1, timeout, usage_options("claude", alias))
+                    .unwrap();
+                assert_eq!(sub["watch"]["usage"]["window"], canonical);
+                app.record_usage("claude", canonical, 90.0, None).unwrap();
+                let text = app.hook(1).unwrap();
+                assert!(text.contains(&format!("#{}", sub["id"])));
+                assert!(text.contains(canonical));
+                assert!(app.hook(1).unwrap().is_empty());
+                assert_eq!(
+                    app.subscription_view(sub["id"].as_i64().unwrap(), None)
+                        .unwrap()["state"],
+                    if timeout.is_some() {
+                        "resolved"
+                    } else {
+                        "active"
+                    }
+                );
+            }
+
+            let app = app();
+            app.record_usage("claude", canonical, 70.0, None).unwrap();
+            let options = usage_options("claude", alias);
+            let normalized = App::normalize_watch(&app.lock(), 1, &options)
+                .unwrap()
+                .unwrap();
+            assert_eq!(normalized.usage.as_ref().unwrap().window, canonical);
+            assert_eq!(
+                json!(normalized),
+                json!(
+                    App::normalize_watch(&app.lock(), 1, &usage_options("claude", canonical))
+                        .unwrap()
+                        .unwrap()
+                )
+            );
+            let foreground = app.clone();
+            let worker = std::thread::spawn(move || foreground.wait_for(1, 5, options));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !app.lock().waiting_updates.contains_key(&1) {
+                assert!(
+                    Instant::now() < deadline,
+                    "foreground wait did not register"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.record_usage("claude", canonical, 90.0, None).unwrap();
+            let batch = worker.join().unwrap().unwrap();
+            assert_eq!(batch["timed_out"], false);
+            assert!(batch["text"].as_str().unwrap().contains(canonical));
+            app.ack_updates(1, batch["delivery_id"].as_i64().unwrap())
+                .unwrap();
+            let st = app.lock();
+            let filters = rows(&st.db, "SELECT filter FROM wait_watch_cursors", []).unwrap();
+            assert_eq!(filters.len(), 1);
+            let filter: Value =
+                serde_json::from_str(filters[0]["filter"].as_str().unwrap()).unwrap();
+            assert_eq!(filter["usage"]["window"], canonical);
+        }
+    }
+
+    #[test]
+    fn known_absent_windows_and_exact_provider_scoped_observations_remain_valid() {
+        let app = app();
+        for (provider, window) in [
+            ("claude", "five_hour"),
+            ("claude", "seven_day"),
+            ("claude", "seven_day_fable"),
+            ("codex", "codex primary"),
+            ("codex", "codex secondary"),
+            ("codex", "codex account limit"),
+            ("codex", "account limit"),
+        ] {
+            let sub = app
+                .subscribe(1, None, usage_options(provider, window))
+                .unwrap();
+            assert_eq!(sub["watch"]["usage"]["window"], window);
+            assert_eq!(sub["state"], "active");
+        }
+        for window in ["custom_Bucket primary", "unusual-window", "limit"] {
+            app.record_usage("codex", window, 70.0, None).unwrap();
+            app.lock().db.execute("DELETE FROM usage", []).unwrap();
+            let sub = app
+                .subscribe(1, None, usage_options("codex", window))
+                .unwrap();
+            assert_eq!(sub["watch"]["usage"]["window"], window);
+            assert!(
+                app.subscribe(1, None, usage_options("claude", window))
+                    .is_err()
+            );
+        }
+        app.record_usage("codex", "only-current primary", 70.0, None)
+            .unwrap();
+        app.lock()
+            .db
+            .execute("DELETE FROM usage_observations", [])
+            .unwrap();
+        assert!(
+            app.subscribe(1, None, usage_options("codex", "only-current primary"))
+                .is_ok()
+        );
+        for window in [
+            "custom_bucket primary",
+            "custom-Bucket primary",
+            "five-hour",
+            "weekly",
+            " codex primary",
+            "primary",
+            "limit",
+        ] {
+            assert!(
+                app.subscribe(1, None, usage_options("codex", window))
+                    .is_err(),
+                "unexpected window: {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_window_choices_are_bounded_even_with_many_long_observed_ids() {
+        let app = app();
+        for index in 0..30 {
+            let name = format!("dynamic-{index:02}-{}", "x".repeat(200));
+            app.record_usage("codex", &name, 70.0, None).unwrap();
+        }
+        let error = app
+            .subscribe(1, None, usage_options("codex", "unknown"))
+            .unwrap_err();
+        assert_eq!(error.0, 400);
+        assert!(error.1.contains("acom limits"));
+        assert!(error.1.contains('…'));
+        assert!(error.1.len() < 2000);
+    }
+
+    #[test]
+    fn unknown_usage_windows_reject_before_registrations_cursors_or_delivery_changes() {
+        let app = app();
+        app.lock().notice(1, "pending notification").unwrap();
+        let batch = app.wait_for(1, 1, WaitOptions::default()).unwrap();
+        let snapshot = || {
+            let st = app.lock();
+            (
+                rows(&st.db, "SELECT * FROM subscriptions", []).unwrap(),
+                rows(&st.db, "SELECT * FROM events", []).unwrap(),
+                rows(&st.db, "SELECT * FROM wait_watch_cursors", []).unwrap(),
+                st.pending_delivery(1).unwrap(),
+            )
+        };
+        let before = snapshot();
+        for window in ["five_horu", "", " five_hour", "FIVE_HOUR", "five-hour "] {
+            for timeout in [None, Some(60)] {
+                let error = app
+                    .subscribe(1, timeout, usage_options("claude", window))
+                    .unwrap_err();
+                assert_eq!(error.0, 400);
+                assert!(error.1.contains("window"));
+                assert_eq!(snapshot(), before);
+            }
+            let error = app
+                .wait_for(1, 1, usage_options("claude", window))
+                .unwrap_err();
+            assert_eq!(error.0, 400);
+            assert_eq!(snapshot(), before);
+            assert!(app.lock().waiting_updates.is_empty());
+        }
+        assert_eq!(app.wait_for(1, 1, WaitOptions::default()).unwrap(), batch);
+    }
+
+    #[test]
+    fn limits_show_canonical_window_ids_beside_display_labels() {
+        let app = app();
+        let text = app.lock().limits_text(Some(1)).unwrap();
+        for label in [
+            "five-hour [five_hour]",
+            "weekly [seven_day]",
+            "weekly Fable [seven_day_fable]",
+        ] {
+            assert!(text.contains(label), "missing {label}");
+        }
+    }
+
+    #[test]
+    fn limits_discover_missing_and_observed_windows_without_mixing_providers() {
+        let app = app();
+        app.record_usage("codex", "custom-bucket primary", 95.0, None)
+            .unwrap();
+        app.lock().db.execute("DELETE FROM usage", []).unwrap();
+        let limits = app.limits(Some(1)).unwrap();
+        let windows = &limits["usage_windows"];
+        assert!(
+            windows["claude"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("five_hour"))
+        );
+        assert!(
+            windows["claude"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("seven_day_fable"))
+        );
+        assert!(
+            windows["codex"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("codex primary"))
+        );
+        assert!(
+            windows["codex"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("custom-bucket primary"))
+        );
+        assert!(
+            !windows["claude"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("custom-bucket primary"))
+        );
+        assert!(limits["usage"].as_array().unwrap().is_empty());
+        let bounded = bounded_record(limits, None, 512, None).unwrap();
+        assert!(bounded["truncated"].as_bool().unwrap_or(false));
+        assert!(bounded["next_offset"].as_u64().is_some());
     }
 
     #[test]

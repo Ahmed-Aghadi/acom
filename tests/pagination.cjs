@@ -219,6 +219,100 @@ test('CLI pause has no lock-preservation options or payload',async t=>{
   });
 });
 
+test('CLI agent lifecycle filters validate before requests and retain paging scope', async t => {
+  for (const flags of [
+    ['--state', 'unknown'], ['--state', ''], ['--state', 'Paused'],
+    ['--pause-reason', 'unknown'], ['--pause-reason', ''], ['--pause-reason', 'user'],
+    ['--state', 'idle', '--pause-reason', 'limit'],
+  ]) await t.test(`rejects ${JSON.stringify(flags)}`, async () => {
+    await mock((_, res) => res.end('{}'), async fixture => {
+      const result = await cli(['agents', ...flags], fixture);
+      assert.notEqual(result.status, 0);
+      assert.deepEqual(fixture.requests, [], 'invalid lifecycle filters must fail before project discovery');
+    });
+  });
+  for (const flags of [
+    ['--state', 'paused', '--pause-reason', 'limit'],
+    ['--pause-reason', 'manual'],
+  ]) await t.test(`retains ${flags.join(' ')}`, async () => {
+    await mock((req, res) => {
+      req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/agents/7/project' ? { project: 9 } : {
+        items: [{ id: 12, truncated: true }], has_more: true, next_before: 12,
+        next_after: null, total: 3, through: 20, revision: 'filtered-view', event_cursor: 21,
+      }));
+    }, async fixture => {
+      fixture.env.ACOM_ID = '7';
+      const result = await cli(['agents', ...flags, '--group', 'two words', '--event-cursor', '--limit', '1', '--max-bytes', '512'], fixture);
+      assert.equal(result.status, 0, result.stderr);
+      const request = fixture.requests.find(request => request.url.startsWith('/agents?'));
+      assert.ok(request, JSON.stringify(fixture.requests));
+      const query = new URL(request.url, 'http://fixture').searchParams;
+      assert.equal(query.get('project'), '9');
+      assert.equal(query.get('group'), 'two words');
+      assert.equal(query.get('pause_reason'), flags.at(-1));
+      if (flags.includes('--state')) assert.equal(query.get('state'), 'paused');
+      assert.equal(query.get('limit'), '1'); assert.equal(query.get('max_bytes'), '512');
+      const hint = result.stdout.split('\n').find(line => line.startsWith('More available: '));
+      assert.ok(hint, result.stdout);
+      for (const [index, flag] of flags.entries()) if (index % 2 === 0) {
+        assert.ok(hint.includes(`${flag} '${flags[index + 1]}'`) || hint.includes(`${flag} ${flags[index + 1]}`), hint);
+      }
+      assert.match(hint, /--group 'two words'/);
+      assert.match(hint, /--event-cursor/); assert.match(hint, /--before 12/);
+      assert.match(hint, /--through 20/); assert.match(hint, /--revision 'filtered-view'/);
+      assert.match(result.stdout, /Event cursor: 21/);
+      assert.ok(fixture.requests.every(request => request.method === 'GET'));
+    });
+  });
+});
+
+test('CLI agent queries validate before discovery and preserve every paging filter', async t => {
+  for (const flags of [
+    ['--search', 'unknown:value'], ['--search', 'provider:other'],
+    ['--search', 'state:paused,unknown'], ['--search', 'pause_reason:user'],
+    ['--search', 'group:'], ['--search', 'group:"unterminated'],
+    ['--search', 'model:model-id model:other'],
+    ['--search', 'group:team', '--group', 'team'],
+    ['--search', 'provider:codex', '--provider', 'codex'],
+    ['--search', 'state:crashed', '--pause-reason', 'limit'],
+    ['--provider', 'other'], ['--model', ''], ['--effort', ''],
+  ]) await t.test(`rejects ${JSON.stringify(flags)}`, async () => {
+    await mock((_, res) => res.end('{}'), async fixture => {
+      const result = await cli(['agents', ...flags], fixture);
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.deepEqual(fixture.requests, [], 'invalid queries must fail before project discovery');
+    });
+  });
+  await t.test('continuation hints retain structured fields, query and event baseline', async () => {
+    const search = 'state:paused,crashed "provider:literal" reentrancy';
+    await mock((req, res) => {
+      req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/agents/7/project' ? { project: 9 } : {
+        items: [{ id: 12, truncated: true }], has_more: true, next_before: 12,
+        next_after: null, total: 3, through: 20, revision: 'query-view', event_cursor: 21,
+      }));
+    }, async fixture => {
+      fixture.env.ACOM_ID = '7';
+      const flags = ['--group', 'Security review', '--provider', 'codex', '--model', 'model,id', '--effort', 'custom-effort', '--search', search];
+      const result = await cli(['agents', ...flags, '--event-cursor', '--limit', '1', '--max-bytes', '512'], fixture);
+      assert.equal(result.status, 0, result.stderr);
+      const request = fixture.requests.find(request => request.url.startsWith('/agents?'));
+      assert.ok(request, JSON.stringify(fixture.requests));
+      const query = new URL(request.url, 'http://fixture').searchParams;
+      for (let index = 0; index < flags.length; index += 2) assert.equal(query.get(flags[index].slice(2)), flags[index + 1]);
+      assert.equal(query.get('project'), '9');
+      const hint = result.stdout.split('\n').find(line => line.startsWith('More available: '));
+      assert.ok(hint, result.stdout);
+      for (let index = 0; index < flags.length; index += 2) assert.ok(hint.includes(`${flags[index]} '${flags[index + 1]}'`) || hint.includes(`${flags[index]} ${flags[index + 1]}`), hint);
+      assert.match(hint, /--event-cursor/); assert.match(hint, /--before 12/);
+      assert.match(hint, /--through 20/); assert.match(hint, /--revision 'query-view'/);
+      assert.match(result.stdout, /Event cursor: 21/);
+      assert.ok(fixture.requests.every(request => request.method === 'GET'));
+    });
+  });
+});
+
 test('CLI locks distinguishes stopping reservations from ordinary timed leases',async()=>{
   for(const holder_stopping of [true,false]) await mock((req,res)=>{
     req.resume(); res.writeHead(200,{'Content-Type':'application/json'});
@@ -779,12 +873,389 @@ test('agent filters search the whole project and return exact bounded facets', a
       assert.equal(overview.restart_paused, 3);
       assert.equal(overview.resume_eligible, 5);
       assert.equal(overview.pause_eligible, 7);
+      assert.deepEqual(overview.project_actions, { pause_eligible: 4, resume_eligible: 2, restart_paused: 1 });
+      assert.deepEqual((await api('GET', `/overview?project=${other.id}`)).project_actions, { pause_eligible: 3, resume_eligible: 3, restart_paused: 2 });
       const page = await api('GET', params('/agents', { project: project.id, group: 'facet', search: 'cohort', max_bytes: 512 }), undefined, 200, 512);
       assert.deepEqual(page.counts, counts(records.slice(1, 8)));
       assert.equal(page.project_total, 130);
       const all = await api('GET', '/agents?max_bytes=512', undefined, 200, 512);
       assert.equal(all.project_total, 136);
     });
+  });
+});
+
+test('structured agent filters preserve exact facets, paging and lifecycle scope', async t => {
+  await isolated(async ({ api, db, project, root }) => {
+    const special = new Map([
+      [1, ['paused', 'limit']], [2, ['paused', 'user']], [3, ['paused', 'all']],
+      [4, ['paused', 'restart']], [5, ['paused', 'limit']], [6, ['idle', 'limit']],
+      [7, ['done', 'limit']], [8, ['working', null]], [9, ['crashed', null]],
+      [10, ['replaced', null]], [12, ['paused', null]],
+      [127, ['paused', 'limit']], [130, ['paused', 'limit']],
+    ]);
+    const records = Array.from({ length: 130 }, (_, index) => {
+      const id = index + 1, [state, pause_reason] = special.get(id) || ['closed', null];
+      return { id, state, pause_reason, group: id <= 12 ? 'facet' : 'team', task: id === 1 ? `${'x'.repeat(900)} ÄäLifecycleNeedle 東京🙂` : `cohort task ${id}` };
+    });
+    const matchesCategory = (record, category) => category === 'all'
+      || category === 'active' && ['working', 'idle'].includes(record.state)
+      || category === 'attention' && ['paused', 'crashed'].includes(record.state)
+      || category === 'finished' && ['done', 'closed', 'replaced'].includes(record.state);
+    const counts = rows => Object.fromEntries(['all', 'active', 'attention', 'finished'].map(category => [category, rows.filter(record => matchesCategory(record, category)).length]));
+    const matches = (record, filter) => (!filter.state || record.state === filter.state)
+      && (!filter.pause_reason || record.state === 'paused' && (filter.pause_reason === 'manual' ? ['user', 'all'].includes(record.pause_reason) : record.pause_reason === filter.pause_reason))
+      && (!filter.group || record.group === filter.group)
+      && (!filter.search || record.task.toLowerCase().includes(filter.search.trim().toLowerCase()));
+    db(connection => {
+      connection.exec('BEGIN');
+      const update = connection.prepare('UPDATE agents SET state=?,pause_reason=?,grp=?,task=? WHERE id=?');
+      for (const record of records) update.run(record.state, record.pause_reason, record.group, record.task, record.id);
+      connection.exec('COMMIT');
+    });
+    await t.test('every lifecycle state and pause reason finds older matches across bounded pages', async () => {
+      const filters = [
+        ...['working', 'idle', 'paused', 'done', 'closed', 'crashed', 'replaced'].map(state => ({ state })),
+        ...['manual', 'limit', 'restart'].map(pause_reason => ({ pause_reason })),
+      ];
+      for (const filter of filters) {
+        const selected = records.filter(record => matches(record, filter));
+        const result = await collect(api, params('/agents', { project: project.id, ...filter }), { limit: 2, max_bytes: 512 });
+        assert.deepEqual(result.items.map(item => item.id), selected.map(record => record.id).reverse(), JSON.stringify(filter));
+        assert.deepEqual(result.page.counts, counts(selected));
+        assert.equal(result.page.total, selected.length);
+        assert.equal(result.page.project_total, 130);
+      }
+    });
+    await t.test('state and reason combine with full-text search, group and categories before pagination', async () => {
+      for (const filter of [
+        { state: 'paused', pause_reason: 'limit' },
+        { pause_reason: 'limit', group: 'facet', search: 'cohort' },
+        { pause_reason: 'manual', group: 'facet', search: 'cohort' },
+        { state: 'paused', search: '  ääLifecycleNeedle 東京🙂  ' },
+        { pause_reason: 'restart', group: 'team' },
+      ]) for (const category of ['all', 'active', 'attention', 'finished']) {
+        const selected = records.filter(record => matches(record, filter));
+        const result = await collect(api, params('/agents', { project: project.id, ...filter, category }), { limit: 1, max_bytes: 512 });
+        assert.deepEqual(result.items.map(item => item.id), selected.filter(record => matchesCategory(record, category)).map(record => record.id).reverse());
+        assert.deepEqual(result.page.counts, counts(selected), JSON.stringify({ ...filter, category }));
+        assert.equal(result.page.total, counts(selected)[category]);
+        assert.equal(result.page.project_total, 130);
+      }
+    });
+    await t.test('implicit paused state has the same cursor identity; changed filters reject stale cursors', async () => {
+      const filter = { project: project.id, pause_reason: 'limit', limit: 1, max_bytes: 512 };
+      const first = await api('GET', params('/agents', filter), undefined, 200, 512);
+      const explicit = await api('GET', params('/agents', { ...filter, state: 'paused' }), undefined, 200, 512);
+      assert.equal(explicit.revision, first.revision);
+      assert.deepEqual(explicit.items.map(item => item.id), first.items.map(item => item.id));
+      const cursor = { ...filter, before: first.next_before, through: first.through, revision: first.revision };
+      const next = await api('GET', params('/agents', { ...cursor, state: 'paused' }), undefined, 200, 512);
+      assert.deepEqual(next.items.map(item => item.id), [127]);
+      for (const changed of [{ pause_reason: 'manual' }, { pause_reason: undefined, state: 'paused' }, { search: 'cohort' }, { group: 'team' }, { category: 'attention' }]) {
+        await api('GET', params('/agents', { ...cursor, ...changed }), undefined, 409);
+      }
+      const unfiltered = await api('GET', params('/agents', { project: project.id, limit: 1, max_bytes: 512 }));
+      await api('GET', params('/agents', { project: project.id, state: 'paused', before: unfiltered.next_before, through: unfiltered.through, revision: unfiltered.revision }), undefined, 409);
+      const unchanged = await api('GET', params('/agents', { ...filter, state: 'paused', since: first.revision }));
+      assert.equal(unchanged.unchanged, true);
+    });
+    await t.test('pause transitions invalidate filtered cursors and fresh polls update matches', async () => {
+      const filter = { project: project.id, pause_reason: 'limit', limit: 1, max_bytes: 512 };
+      const first = await api('GET', params('/agents', filter), undefined, 200, 512);
+      db(connection => connection.prepare("UPDATE agents SET state='idle',pause_reason=NULL WHERE id=130").run());
+      try {
+        await api('GET', params('/agents', { ...filter, before: first.next_before, through: first.through, revision: first.revision }), undefined, 409);
+        const fresh = await api('GET', params('/agents', { ...filter, since: first.revision }), undefined, 200, 512);
+        assert.notEqual(fresh.unchanged, true);
+        assert.equal(fresh.total, 3); assert.equal(fresh.counts.attention, 3);
+        assert.deepEqual(fresh.items.map(item => item.id), [127]);
+      } finally {
+        db(connection => connection.prepare("UPDATE agents SET state='paused',pause_reason='limit' WHERE id=130").run());
+      }
+    });
+    await t.test('unknown, empty and incompatible filters reject without changing business state', async () => {
+      const snapshot = () => db(connection => Object.fromEntries(['agents', 'locks', 'events', 'notices', 'subscriptions'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+      const before = snapshot();
+      for (const filter of [
+        { state: '' }, { state: 'all' }, { state: 'Paused' }, { state: ' paused ' }, { state: 'unknown' },
+        { pause_reason: '' }, { pause_reason: 'all' }, { pause_reason: 'user' }, { pause_reason: 'unknown' },
+        ...['working', 'idle', 'done', 'closed', 'crashed', 'replaced'].map(state => ({ state, pause_reason: 'limit' })),
+        { states: 'paused' }, { 'pause-reason': 'limit' },
+      ]) {
+        const result = await api('GET', params('/agents', { project: project.id, ...filter }), undefined, 400);
+        assert.match(result.error, /state|reason|unknown/i);
+        assert.deepEqual(snapshot(), before, JSON.stringify(filter));
+      }
+    });
+    await t.test('structured matches never narrow project totals or project/global controls', async () => {
+      const otherDir = path.join(root, 'other-project'); fs.mkdirSync(otherDir);
+      const other = await api('POST', '/projects', { path: otherDir });
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,?,'other','cohort task','codex','gpt-6-sol','medium','paused','limit',0,0)").run(other.id));
+      const overview = await api('GET', `/overview?project=${project.id}`);
+      assert.deepEqual(overview.agent_counts, counts(records));
+      assert.deepEqual(overview.project_actions, { pause_eligible: 3, resume_eligible: 8, restart_paused: 1 });
+      assert.equal(overview.pause_eligible, 3); assert.equal(overview.resume_eligible, 9); assert.equal(overview.restart_paused, 1);
+      const scoped = await collect(api, params('/agents', { project: project.id, pause_reason: 'limit' }), { limit: 2, max_bytes: 512 });
+      assert.deepEqual(scoped.items.map(item => item.id), [130, 127, 5, 1]);
+      assert.equal(scoped.page.project_total, 130);
+      const global = await collect(api, '/agents?pause_reason=limit', { limit: 2, max_bytes: 512 });
+      assert.deepEqual(global.items.map(item => item.id), [131, 130, 127, 5, 1]);
+      assert.equal(global.page.project_total, 131);
+      assert.deepEqual((await api('GET', `/overview?project=${project.id}`)).project_actions, overview.project_actions);
+    });
+  });
+});
+
+test('agent query fields, literals and alternatives stay exact across bounded pages', async t => {
+  await isolated(async ({ api, db, project, root }) => {
+    const records = Array.from({ length: 130 }, (_, index) => ({
+      id: index + 1, group: 'team', provider: 'codex', model: 'gpt-6-sol', effort: 'medium',
+      state: 'closed', reason: null, name: `fixture ${index + 1}`, task: `task ${index + 1}`, status: '',
+    }));
+    const update = (id, fields) => Object.assign(records[id - 1], fields);
+    for (const id of [1, 2, 4, 5, 8, 9, 10, 11, 127, 130]) update(id, {
+      group: 'Security review', model: 'model-id', effort: 'high', task: 'reentrancy', state: 'paused', reason: 'limit',
+    });
+    update(1, { task: 'reentrancy alpha 東京🙂' });
+    update(2, { state: 'crashed', reason: null, task: 'reentrancy beta' });
+    update(3, { group: 'Other', model: 'model-id', effort: 'high', state: 'paused', reason: 'limit', task: 'Security review reentrancy' });
+    update(4, { provider: 'claude', model: 'claude-test', effort: 'medium', reason: 'user' });
+    update(5, { model: 'model-other', effort: 'max', state: 'closed', reason: null });
+    update(6, { group: 'Ops, red', model: 'model-id', effort: 'high', state: 'paused', reason: 'user', task: 'provider:codex quote "Q" slash\\ path reentrancy' });
+    update(7, { group: '', state: 'idle', task: 'ungrouped' });
+    update(8, { state: 'crashed', effort: 'low', reason: null });
+    update(9, { reason: 'restart', task: 'background' });
+    update(10, { model: 'custom,model', effort: 'fixed,effort', state: 'closed', reason: null });
+    update(11, { state: 'closed', reason: null, name: 'boundaryleft', task: 'boundaryright', status: 'statusneedle', effort: 'effortonlyneedle' });
+    const categories = rows => ({
+      all: rows.length,
+      active: rows.filter(row => ['working', 'idle'].includes(row.state)).length,
+      attention: rows.filter(row => ['paused', 'crashed'].includes(row.state)).length,
+      finished: rows.filter(row => ['done', 'closed', 'replaced'].includes(row.state)).length,
+    });
+    db(connection => {
+      connection.exec('BEGIN');
+      const statement = connection.prepare('UPDATE agents SET grp=?,harness=?,model=?,effort=?,state=?,pause_reason=?,name=?,task=?,status_text=? WHERE id=?');
+      for (const row of records) statement.run(row.group, row.provider, row.model, row.effort, row.state, row.reason, row.name, row.task, row.status, row.id);
+      connection.exec('COMMIT');
+    });
+    const route = filter => params('/agents', { project: project.id, ...filter });
+    const ids = async filter => (await collect(api, route(filter), { limit: 2, max_bytes: 512 })).items.map(row => row.id);
+    await t.test('exact group excludes matching task text, while bare terms AND across fields', async () => {
+      assert.deepEqual(await ids({ search: 'group:"Security review" reentrancy' }), [130, 127, 10, 8, 5, 4, 2, 1]);
+      assert.deepEqual(await ids({ search: 'Security review reentrancy' }), [130, 127, 10, 8, 5, 4, 3, 2, 1]);
+      assert.deepEqual(await ids({ search: 'boundaryleft boundaryright' }), [11]);
+      assert.deepEqual(await ids({ search: '"boundaryleft 11"' }), [], 'a phrase cannot cross metadata-field boundaries');
+      assert.deepEqual(await ids({ search: 'statusneedle' }), [11]);
+      assert.deepEqual(await ids({ search: 'effortonlyneedle' }), [], 'broad text does not search effort');
+      assert.deepEqual(await ids({ search: 'effort:effortonlyneedle' }), [11]);
+      assert.deepEqual(await ids({ search: '11 boundaryright' }), [11], 'IDs remain searchable');
+    });
+    await t.test('different fields AND, alternatives OR, and category facets precede category selection', async () => {
+      const search = 'group:"Security review" provider:codex model:model-id effort:high state:paused,crashed reentrancy';
+      const result = await collect(api, route({ search }), { limit: 1, max_bytes: 512 });
+      assert.deepEqual(result.items.map(row => row.id), [130, 127, 2, 1]);
+      assert.deepEqual(result.page.counts, { all: 4, active: 0, attention: 4, finished: 0 });
+      assert.equal(result.page.project_total, 130);
+      for (const category of ['all', 'active', 'attention', 'finished']) {
+        const page = await api('GET', route({ search, category, max_bytes: 512 }), undefined, 200, 512);
+        assert.deepEqual(page.counts, result.page.counts);
+        assert.equal(page.total, result.page.counts[category]);
+        assert.equal(page.project_total, 130);
+      }
+      assert.deepEqual(await ids({ search: 'group:"Security review","Ops, red" state:paused,crashed provider:codex reentrancy' }), [130, 127, 8, 6, 2, 1]);
+      assert.deepEqual(await ids({ group: 'Security review', provider: 'codex', model: 'model-id', effort: 'high', search: 'state:paused,crashed reentrancy' }), [130, 127, 2, 1]);
+      assert.deepEqual(await ids({ search: 'pause_reason:manual,limit state:crashed,paused' }), [130, 127, 6, 4, 3, 1]);
+    });
+    await t.test('quoted spaces, commas, colons, quotes and backslashes are literal', async () => {
+      assert.deepEqual(await ids({ search: 'group:"Ops, red"' }), [6]);
+      assert.deepEqual(await ids({ search: '"provider:codex"' }), [6]);
+      assert.deepEqual(await ids({ search: 'group:"Ops, red" "quote \\"Q\\"" "slash\\\\ path"' }), [6]);
+      assert.deepEqual(await ids({ search: 'group:""' }), [7]);
+      assert.deepEqual(await ids({ group: '' }), [7]);
+      assert.deepEqual(await ids({ model: 'custom,model', effort: 'fixed,effort' }), [10], 'direct scalar commas are not alternatives');
+      assert.deepEqual(await ids({ model: 'model-id,model-other' }), [], 'direct scalar values stay literal');
+      assert.deepEqual(await ids({ search: 'model:"custom,model" effort:"fixed,effort"' }), [10]);
+      assert.deepEqual(await ids({ search: 'group:missing model:unlisted effort:unlisted' }), [], 'open-ended exact values are valid even with no matches');
+      for (const search of ['group:"security review"', 'model:MODEL-ID', 'effort:High']) assert.deepEqual(await ids({ search }), [], 'field filters are exact, not broad case-insensitive search');
+    });
+    await t.test('equivalent canonical queries share cursors; changed meaning cannot reuse them', async () => {
+      const search = 'group:"Security review" state:paused,crashed provider:codex reentrancy';
+      const filter = { search, limit: 1, max_bytes: 512 };
+      const first = await api('GET', route(filter), undefined, 200, 512);
+      const cursor = { before: first.next_before, through: first.through, revision: first.revision, limit: 1, max_bytes: 512 };
+      const equivalent = '  REENTRANCY provider:"codex" state:crashed,paused group:"Security review"  ';
+      const next = await api('GET', route({ ...cursor, search: equivalent }), undefined, 200, 512);
+      assert.deepEqual(next.items.map(row => row.id), [127]);
+      const direct = await api('GET', route({ ...cursor, group: 'Security review', provider: 'codex', search: 'state:crashed,paused reentrancy' }), undefined, 200, 512);
+      assert.deepEqual(direct.items.map(row => row.id), [127]);
+      for (const changed of [
+        { search: 'group:"Security review" state:paused provider:codex reentrancy' },
+        { search, effort: 'high' }, { search, category: 'attention' },
+        { search: 'group:"Security review" state:paused,crashed provider:codex background' },
+      ]) await api('GET', route({ ...cursor, ...changed }), undefined, 409);
+      const reason = await api('GET', route({ search: 'pause_reason:limit', limit: 1, max_bytes: 512 }), undefined, 200, 512);
+      const paused = await api('GET', route({ search: 'state:paused,crashed pause_reason:limit', limit: 1, max_bytes: 512 }), undefined, 200, 512);
+      assert.equal(paused.revision, reason.revision, 'a pause reason normalizes a state alternative list containing paused');
+    });
+    await t.test('invalid fields, grammar and contradictory or duplicate filters do not mutate or consume state', async () => {
+      const snapshot = () => db(connection => Object.fromEntries(['agents', 'locks', 'events', 'notices', 'subscriptions', 'members', 'marks'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+      const before = snapshot();
+      for (const search of [
+        'unknown:value', 'provider:other', 'provider:Codex', 'state:unknown', 'state:paused,unknown', 'pause_reason:user',
+        'pause_reason:limit state:idle,crashed', 'group:', 'model:""', 'effort:""', 'state:""', 'provider:""',
+        'group:a,', 'group:,a', 'group:a,,b', 'group:"unterminated',
+        '"bad\\q"', 'bad\\q', 'model:a model:b', 'state:paused state:paused', '""',
+      ]) {
+        const error = await api('GET', route({ search }), undefined, 400);
+        assert.equal(typeof error.error, 'string'); assert.ok(error.error.length > 0, search);
+        assert.deepEqual(snapshot(), before, search);
+      }
+      for (const filter of [
+        { provider: 'other' }, { provider: '' }, { model: '' }, { effort: '' },
+        { search: 'group:team', group: 'team' }, { search: 'provider:codex', provider: 'codex' },
+        { search: 'model:model-id', model: 'model-id' }, { search: 'effort:high', effort: 'high' },
+        { search: 'state:paused', state: 'paused' }, { search: 'pause_reason:limit', pause_reason: 'limit' },
+      ]) {
+        await api('GET', route(filter), undefined, 400);
+        assert.deepEqual(snapshot(), before, JSON.stringify(filter));
+      }
+      assert.equal((await api('GET', route({ search: ' \t\n ', max_bytes: 512 }), undefined, 200, 512)).total, 130);
+    });
+    await t.test('bounded parser responses reconstruct without storing data or exposing agents', async () => {
+      const snapshot = () => db(connection => Object.fromEntries(['agents', 'events', 'notices'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+      const before = snapshot();
+      const search = 'group:"Security review" state:crashed,paused reentrancy';
+      const parsed = await api('GET', params('/agent-query', { search }));
+      assert.equal(typeof parsed.text, 'string'); assert.ok(parsed.text.length > 0);
+      assert.ok(parsed.clauses.every(clause => Array.isArray(clause.values) && typeof clause.text === 'string'));
+      assert.deepEqual(parsed.clauses.find(clause => clause.field === 'group').values, ['Security review']);
+      assert.deepEqual(parsed.clauses.find(clause => clause.field === 'state').values, ['crashed', 'paused']);
+      assert.deepEqual(parsed.clauses.find(clause => clause.field === null).values, ['reentrancy']);
+      assert.deepEqual(await ids({ search: parsed.text }), await ids({ search }));
+      assert.deepEqual((await api('GET', '/agent-query')).clauses, []);
+      await api('GET', '/agent-query?project=1', undefined, 400);
+      await api('GET', params('/agent-query', { search: 'unknown:value' }), undefined, 400);
+      for (const invalid of ['x'.repeat(4097), Array(65).fill('term').join(' '), `group:${Array.from({ length: 129 }, (_, index) => index).join(',')}`]) {
+        await api('GET', params('/agent-query', { search: invalid }), undefined, 400);
+      }
+      const longSearch = `group:"${'東京🙂'.repeat(200)}"`;
+      const detailRoute = params('/agent-query', { search: longSearch });
+      const completed = await complete(api, detailRoute, 512);
+      assert.deepEqual(completed.value.clauses.find(clause => clause.field === 'group').values, ['東京🙂'.repeat(200)]);
+      assert.equal(Object.hasOwn(completed.value, 'items'), false);
+      assert.equal(Object.hasOwn(completed.value, 'project'), false);
+      await api('GET', params('/agent-query', { search: 'group:changed', offset: 0, version: completed.stub.version, max_bytes: 512 }), undefined, 409);
+      await api('GET', params('/agent-query', { search, version: completed.stub.version }), undefined, 400);
+      assert.deepEqual(snapshot(), before);
+    });
+    await t.test('provider/model/group matches stay project scoped and never alter bulk counts', async () => {
+      const otherDir = path.join(root, 'query-other-project'); fs.mkdirSync(otherDir);
+      const other = await api('POST', '/projects', { path: otherDir });
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,?,'foreign','Security review','reentrancy','codex','model-id','high','paused','limit',0,0)").run(other.id));
+      const overview = await api('GET', `/overview?project=${project.id}`);
+      assert.deepEqual(overview.agent_counts, categories(records));
+      const search = 'group:"Security review" provider:codex model:model-id effort:high state:paused,crashed reentrancy';
+      assert.deepEqual(await ids({ search }), [130, 127, 2, 1]);
+      const global = await collect(api, params('/agents', { search }), { limit: 1, max_bytes: 512 });
+      assert.deepEqual(global.items.map(row => row.id), [131, 130, 127, 2, 1]);
+      assert.equal(global.page.project_total, 131);
+      const fresh = await api('GET', `/overview?project=${project.id}`);
+      assert.deepEqual(fresh.project_actions, overview.project_actions);
+      assert.equal(fresh.pause_eligible, overview.pause_eligible); assert.equal(fresh.resume_eligible, overview.resume_eligible);
+      assert.deepEqual(fresh.agent_counts, categories(records));
+    });
+  });
+});
+
+test('project bulk pause leaves other projects and their locks untouched', async () => {
+  await isolated(async ({ api, db, project, root }) => {
+    const otherDir = path.join(root, 'other-project');
+    fs.mkdirSync(otherDir);
+    const other = await api('POST', '/projects', { path: otherDir });
+    db(connection => {
+      connection.exec('BEGIN');
+      const insert = connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,'other','fixture','codex','gpt-6-sol','medium',?,0,0)");
+      for (const [index, state] of ['working', 'idle', 'done', 'paused', 'crashed', 'replaced'].entries()) {
+        connection.prepare('UPDATE agents SET state=? WHERE id=?').run(state, index + 1);
+        insert.run(131 + index, other.id, state);
+      }
+      connection.exec('COMMIT');
+    });
+    for (const [scope, agent] of [[project.id, 1], [other.id, 131]]) {
+      await api('POST', '/locks', { project: scope, name: 'held', about: 'Scoped bulk pause fixture' });
+      await api('POST', '/locks/acquire', { agent, name: 'held', wait: 0, ttl: 600 });
+    }
+    const foreign = () => db(connection => ({
+      agents: connection.prepare('SELECT * FROM agents WHERE project=? ORDER BY id').all(other.id),
+      locks: connection.prepare('SELECT * FROM locks WHERE project=? ORDER BY name').all(other.id),
+    }));
+    const before = foreign();
+    assert.deepEqual((await api('POST', '/pause-all', { project: project.id })).ids.toSorted((a, b) => a - b), [1, 2, 3]);
+    await until(() => db(connection => connection.prepare('SELECT holder FROM locks WHERE project=?').get(project.id).holder) === null, 'project pause releases its own lock');
+    assert.deepEqual(foreign(), before, 'another project retains every lifecycle field and held lease');
+    assert.deepEqual(db(connection => connection.prepare('SELECT id,state FROM agents WHERE id<=6 ORDER BY id').all()).map(row => ({ ...row })), [
+      { id: 1, state: 'paused' }, { id: 2, state: 'paused' }, { id: 3, state: 'paused' },
+      { id: 4, state: 'paused' }, { id: 5, state: 'crashed' }, { id: 6, state: 'replaced' },
+    ]);
+    assert.deepEqual((await api('POST', '/pause-all', {})).ids.toSorted((a, b) => a - b), [131, 132, 133], 'omitting project retains global scope');
+    await until(() => db(connection => connection.prepare('SELECT holder FROM locks WHERE project=?').get(other.id).holder) === null, 'global pause releases the remaining project lock');
+  });
+});
+
+test('project bulk resume respects scope and restart-only pause reasons', async () => {
+  await isolated(async ({ api, db, project, root }) => {
+    const otherDir = path.join(root, 'other-project');
+    fs.mkdirSync(otherDir);
+    const other = await api('POST', '/projects', { path: otherDir });
+    db(connection => {
+      connection.exec('BEGIN');
+      const insert = connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,pause_reason,pause_from,paused_at,launched_by,launched_at) VALUES(?,?,'other','fixture','codex','gpt-6-sol','medium','paused',?,?,1,0,0)");
+      for (const [index, reason] of ['restart', 'user', 'limit'].entries()) {
+        const from = index === 1 ? 'done' : 'idle';
+        connection.prepare("UPDATE agents SET state='paused',pause_reason=?,pause_from=?,paused_at=1 WHERE id=?").run(reason, from, index + 1);
+        insert.run(131 + index, other.id, reason, from);
+      }
+      connection.prepare("UPDATE agents SET state='crashed' WHERE id=4").run();
+      connection.exec('COMMIT');
+    });
+    const foreign = () => db(connection => connection.prepare('SELECT * FROM agents WHERE project=? ORDER BY id').all(other.id));
+    const before = foreign();
+    const resumed = await api('POST', '/resume-restart', { project: project.id });
+    assert.deepEqual(resumed, { ids: [1], errors: [], warnings: [] });
+    assert.deepEqual(foreign(), before);
+    assert.deepEqual(db(connection => connection.prepare('SELECT id,pause_reason FROM agents WHERE id IN (2,3) ORDER BY id').all()).map(row => ({ ...row })), [
+      { id: 2, pause_reason: 'user' }, { id: 3, pause_reason: 'limit' },
+    ]);
+    assert.deepEqual((await api('POST', '/resume-all', { project: project.id })).ids.toSorted((a, b) => a - b), [2, 3]);
+    assert.deepEqual(foreign(), before);
+    assert.deepEqual(db(connection => connection.prepare('SELECT id,state,pause_reason FROM agents WHERE id<=4 ORDER BY id').all()).map(row => ({ ...row })), [
+      { id: 1, state: 'idle', pause_reason: null }, { id: 2, state: 'done', pause_reason: null },
+      { id: 3, state: 'idle', pause_reason: null }, { id: 4, state: 'crashed', pause_reason: null },
+    ]);
+    assert.deepEqual((await api('POST', '/resume-restart', {})).ids, [131], 'global restart-only resume still spans projects');
+    assert.deepEqual((await api('POST', '/resume-all', {})).ids.toSorted((a, b) => a - b), [132, 133], 'global resume includes remaining manual and limit pauses');
+  });
+});
+
+test('project bulk actions reject invalid scopes without mutation', async () => {
+  await isolated(async ({ api, db, project }) => {
+    db(connection => connection.prepare("UPDATE agents SET state='working' WHERE id=1").run());
+    await api('POST', '/locks', { project: project.id, name: 'held', about: 'Invalid scope must not release this' });
+    await api('POST', '/locks/acquire', { agent: 1, name: 'held', wait: 0, ttl: 600 });
+    const snapshot = () => db(connection => Object.fromEntries(['agents', 'locks', 'events', 'notices'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+    const before = snapshot();
+    for (const route of ['/pause-all', '/resume-all', '/resume-restart']) {
+      for (const invalid of [null, 0, -1, 1.5, '1', true, [], {}]) {
+        const result = await api('POST', route, { project: invalid }, 400);
+        assert.match(result.error, /project/i);
+        assert.deepEqual(snapshot(), before, `${route} project=${JSON.stringify(invalid)} must not change state`);
+      }
+      await api('POST', route, { project: 999999 }, 404);
+      await api('POST', route, { project: project.id, projects: [] }, 400);
+      await api('POST', `${route}?project=${project.id}`, {}, 400);
+      assert.deepEqual(snapshot(), before, `${route} invalid scope must not broaden to all projects`);
+    }
   });
 });
 

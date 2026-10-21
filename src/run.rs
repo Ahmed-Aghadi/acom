@@ -150,10 +150,14 @@ struct ProcessIdentity {
     state: u8,
 }
 
+fn process_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 fn process_identity(pid: u32) -> R<Option<ProcessIdentity>> {
     let raw = match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if process_gone(&e) => return Ok(None),
         Err(e) => return Err(Fail(500, format!("can't verify worker PID {pid}: {e}"))),
     };
     let text = String::from_utf8_lossy(&raw);
@@ -1187,6 +1191,36 @@ mod tests {
             std::fs::read_to_string(app.home.join("late-detached-terms")).unwrap(),
             "t"
         );
+    }
+
+    #[test]
+    fn proc_stat_exit_race_is_missing_not_a_cleanup_failure() {
+        let mut worker = StopWorker(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let pid = worker.0.id();
+        assert!(process_identity(pid).unwrap().is_some());
+        let mut stat = File::open(format!("/proc/{pid}/stat")).unwrap();
+        worker.0.kill().unwrap();
+        worker.0.wait().unwrap();
+        // The process can exit after fs::read opens stat but before its read.
+        let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(process_gone(&error));
+        assert!(process_identity(pid).unwrap().is_none());
+        assert!(process_gone(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EINVAL] {
+            assert!(!process_gone(&std::io::Error::from_raw_os_error(code)));
+        }
     }
 
     #[test]

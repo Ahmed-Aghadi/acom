@@ -1,8 +1,9 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    App, Fail, HistoryQuery, LaunchReq, PageQuery, R, Settings, ThreadReq, UsageWatch, WaitAgents,
-    WaitOptions, acom_home, actor, bad, bounded_record, not_found,
+    AgentFilter, App, Fail, HistoryQuery, LaunchReq, PageQuery, ParsedAgentQuery, R, Settings,
+    ThreadReq, UsageWatch, WaitAgents, WaitOptions, acom_home, actor, bad, bounded_record,
+    not_found,
 };
 use crate::harness::catalog;
 use serde_json::{Value, json};
@@ -117,16 +118,18 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     let mut body = String::new();
-    let _ = req.as_reader().read_to_string(&mut body);
+    let read = req.as_reader().read_to_string(&mut body);
     let res = if !same_origin(app, &req, &method) {
         Err(Fail(
             403,
             "requests must come from this server's own page or the acom command".into(),
         ))
+    } else if let Err(error) = read {
+        Err(bad(format!("cannot read request body: {error}")))
     } else if body.trim().is_empty() {
-        Ok(Value::Null)
+        Ok(json!({}))
     } else {
-        serde_json::from_str(&body).map_err(|e| bad(format!("bad JSON: {e}")))
+        parse_body(&body)
     }
     .and_then(|b| {
         let segs: Vec<&str> = path
@@ -184,6 +187,71 @@ fn error_body(msg: &str) -> String {
     envelope(boundaries[low])
 }
 
+fn parse_body(body: &str) -> R<Value> {
+    let value = serde_json::from_str::<UniqueJson>(body)
+        .map(|value| value.0)
+        .map_err(|error| bad(format!("bad JSON: {error}")))?;
+    if !value.is_object() {
+        return Err(bad("request body must be a JSON object"));
+    }
+    Ok(value)
+}
+
+struct UniqueJson(Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate object fields")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(json!(value)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(value)) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, UniqueJson(value))) = map.next_entry::<String, UniqueJson>()? {
+                    if values.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!("duplicate field {key:?}")));
+                    }
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// No auth, but a web page elsewhere mustn't be able to drive the server: the Host and
 /// Origin must be this server, and writes must be JSON, which browsers won't send
 /// cross-origin without a preflight we never answer.
@@ -217,7 +285,7 @@ impl Query<'_> {
         self.0
             .split('&')
             .filter_map(|kv| kv.split_once('='))
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| decode(k) == key)
             .map(|(_, v)| decode(v))
     }
     fn int(&self, key: &str) -> R<Option<i64>> {
@@ -379,7 +447,285 @@ fn settings(b: &Value, key: &str) -> R<Settings> {
 }
 fn id(seg: &str) -> R<i64> {
     seg.parse()
-        .map_err(|_| bad(format!("{seg} isn't a number")))
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| bad(format!("{seg} must be a positive integer ID")))
+}
+
+/// Route contracts live beside routing so unsupported inputs cannot silently become defaults.
+fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
+    const PAGE: &str = "before after through revision since limit max_bytes";
+    const RECORD: &str = "offset version max_bytes";
+    const WATCH: &str = "agents states status_text after usage";
+    const LAUNCH: &str = "task harness model effort name group force done ack_crashes";
+    let (body, query, extra) = match (method, p) {
+        ("GET", []) => ("", "project", ""),
+        ("GET", ["models"] | ["catalog"] | ["agents", _, "project"]) => ("", "", ""),
+        ("GET", ["overview"]) => ("", "project since", RECORD),
+        ("GET", ["settings"] | ["limits"] | ["locks", _]) => ("", "project", RECORD),
+        ("GET", ["projects"]) if q.get("path").is_some() => ("", "path", RECORD),
+        ("GET", ["projects"] | ["configs"] | ["notices", _]) => ("", "", PAGE),
+        ("GET", ["projects", _] | ["configs", _] | ["notices", _, _]) => ("", "", RECORD),
+        ("GET", ["agents"]) => (
+            "",
+            "project group category search state pause_reason provider model effort",
+            PAGE,
+        ),
+        ("GET", ["agent-query"]) => ("", "search", RECORD),
+        ("GET", ["agents", _] | ["messages", _] | ["receipts", _]) => ("", "agent", RECORD),
+        ("GET", ["agents", _, "log"]) => (
+            "",
+            "agent lines before after through version since limit max_bytes",
+            "",
+        ),
+        ("GET", ["subscriptions"]) => ("", "agent viewer", PAGE),
+        ("GET", ["subscriptions", _]) => ("", "viewer", RECORD),
+        ("GET", ["threads"]) => ("", "project agent viewer", PAGE),
+        ("GET", ["threads", _]) => ("", "agent offset version", PAGE),
+        ("GET", ["threads", _, "metadata"]) => ("", "agent", RECORD),
+        ("GET", ["threads", _, "messages"]) => ("", "agent", PAGE),
+        ("GET", ["folders"]) => (
+            "",
+            "path hidden before after revision since limit max_bytes",
+            "",
+        ),
+        ("GET", ["inbox", _]) => ("", "mark", PAGE),
+        ("GET", ["locks"]) => ("", "project", PAGE),
+        ("GET", ["activity"]) => ("", "project agent", PAGE),
+        ("GET", ["activity", _]) => ("", "project agent", RECORD),
+        ("GET", ["history"]) => (
+            "",
+            "project viewer agent thread lock kind before after limit max_bytes",
+            "",
+        ),
+        ("GET", ["history", _]) => ("", "project viewer", RECORD),
+        ("POST", ["agent-config"]) => ("id agent model effort continuation ack_crashes", "", ""),
+        ("POST", ["projects"]) => ("path via", "", ""),
+        (
+            "POST",
+            ["projects", _, "remove"]
+            | ["configs", _, "remove"]
+            | ["agents", _, "pause" | "resume" | "close" | "reopen"],
+        ) => ("via", "", ""),
+        ("POST", ["pause-all"] | ["resume-all"] | ["resume-restart"]) => ("project via", "", ""),
+        ("POST", ["agents"]) => (LAUNCH, "", "agent via project"),
+        ("POST", ["agents", _, "replacement"]) => (LAUNCH, "", ""),
+        ("POST", ["agents", _, "status"]) => ("text", "", ""),
+        ("POST", ["agents", _, "group"]) => ("group", "", ""),
+        ("POST", ["agents", _, "done"] | ["hook", _]) => ("", "", ""),
+        ("POST", ["wait", _]) => (WATCH, "", "timeout"),
+        ("POST", ["wait", _, "ack"]) => ("delivery_id", "", ""),
+        ("POST", ["subscriptions"]) => (WATCH, "", "agent timeout"),
+        ("POST", ["subscriptions", _, "cancel"]) => ("agent", "", ""),
+        ("POST", ["threads"]) => (
+            "agent project title members include_user watch private joinable",
+            "",
+            "",
+        ),
+        ("POST", ["threads", _, "read"]) => ("agent message", "", ""),
+        ("POST", ["threads", _, "members"] | ["threads", _, "members", "remove"]) => {
+            ("agent members", "", "")
+        }
+        ("POST", ["threads", _, "owner"]) => ("agent owner", "", ""),
+        ("POST", ["threads", _, "user"]) => ("agent joined", "", ""),
+        ("POST", ["folders"]) => ("parent name", "", ""),
+        ("POST", ["usage", "check"]) => ("provider", "", ""),
+        ("POST", ["messages"]) => ("agent thread text", "", ""),
+        ("POST", ["marks"]) => ("agent ids mark", "", ""),
+        ("POST", ["locks"]) => ("agent project name about", "", ""),
+        ("POST", ["locks", "acquire"]) => ("agent name wait ttl", "", ""),
+        ("POST", ["locks", "release"]) => ("agent name", "", ""),
+        ("POST", ["locks", "free"]) => ("project name via", "", ""),
+        ("POST", ["configs"]) | ("PUT", ["configs", _]) => ("name settings via", "", ""),
+        ("PUT", ["projects", _, "config"]) => ("config custom via", "", ""),
+        _ => return Err(not_found(format!("no route {method} /{}", p.join("/")))),
+    };
+    let allowed = |key: &str, fields: &str| fields.split_ascii_whitespace().any(|f| f == key);
+    let body_extra = if method == "GET" { "" } else { extra };
+    match b.as_object() {
+        Some(fields) => {
+            for (key, value) in fields {
+                if !allowed(key, body) && !allowed(key, body_extra) {
+                    return Err(bad(format!("unknown request field {key:?}")));
+                }
+                validate_body_value(method, p, key, value)?;
+            }
+        }
+        None if method == "GET" && b.is_null() => {}
+        None => return Err(bad("request body must be a JSON object")),
+    }
+    let mut seen = std::collections::HashSet::new();
+    for part in q.0.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| bad("query parameters must use name=value"))?;
+        let key = strict_decode(key)?;
+        let value = strict_decode(value)?;
+        if !(allowed(&key, query) || method == "GET" && allowed(&key, extra)) {
+            return Err(bad(format!("unknown query parameter {key:?}")));
+        }
+        if !seen.insert(key.clone()) {
+            return Err(bad(format!("query parameter {key:?} must not be repeated")));
+        }
+        validate_query_value(p, &key, &value)?;
+    }
+    if method == "GET" && p == ["agents"] {
+        AgentFilter {
+            group: q.get("group").as_deref(),
+            category: q.get("category").as_deref().unwrap_or("all"),
+            search: q.get("search").as_deref().unwrap_or(""),
+            state: q.get("state").as_deref(),
+            pause_reason: q.get("pause_reason").as_deref(),
+            provider: q.get("provider").as_deref(),
+            model: q.get("model").as_deref(),
+            effort: q.get("effort").as_deref(),
+        }
+        .normalized()?;
+    }
+    if method == "GET" && p == ["agent-query"] {
+        ParsedAgentQuery::parse(q.get("search").as_deref().unwrap_or(""))?;
+    }
+    if method == "GET" && extra == PAGE {
+        page(q)?.validate()?;
+    }
+    if method == "GET"
+        && (extra == RECORD || allowed("offset", query))
+        && q.get("version").is_some()
+        && q.get("offset").is_none()
+    {
+        return Err(bad("version requires an explicit record offset"));
+    }
+    if method == "GET"
+        && matches!(p, ["agents", _, "log"])
+        && q.get("lines").is_some()
+        && q.get("limit").is_some()
+    {
+        return Err(bad("use lines or limit, not both"));
+    }
+    if method == "POST"
+        && matches!(
+            p,
+            ["threads", _, "members"] | ["threads", _, "members", "remove"]
+        )
+        && list(b, "members").is_empty()
+    {
+        return Err(bad("members must contain at least one selector"));
+    }
+    if method == "POST"
+        && matches!(p, ["agents"] | ["threads"] | ["locks"])
+        && b["agent"].as_i64().is_some_and(|agent| agent > 0)
+        && b.get("project").is_some()
+    {
+        return Err(bad("agents use their own project; omit project"));
+    }
+    Ok(())
+}
+
+fn validate_body_value(method: &str, p: &[&str], key: &str, value: &Value) -> R<()> {
+    let launch = method == "POST" && matches!(p, ["agents"] | ["agents", _, "replacement"]);
+    let nullable = (launch && matches!(key, "harness" | "model" | "effort" | "name" | "group"))
+        || (p == ["agent-config"] && matches!(key, "model" | "effort" | "continuation"))
+        || (method == "PUT"
+            && matches!(p, ["projects", _, "config"])
+            && matches!(key, "config" | "custom"))
+        || (key == "ttl" && p == ["locks", "acquire"]);
+    if nullable && value.is_null() {
+        return Ok(());
+    }
+    let valid = match key {
+        "agent" | "via" | "message" | "after" => value.as_i64().is_some_and(|n| n >= 0),
+        "id" | "project" | "thread" | "owner" | "delivery_id" | "config" => {
+            value.as_i64().is_some_and(|n| n > 0)
+        }
+        "timeout" | "wait" => value.as_u64().is_some(),
+        "ttl" => value.as_u64().is_some_and(|n| n > 0),
+        "force" | "done" | "ack_crashes" | "private" | "joinable" | "include_user" | "joined"
+        | "status_text" => value.is_boolean(),
+        "ids" => value.as_array().is_some_and(|ids| {
+            !ids.is_empty() && ids.iter().all(|id| id.as_i64().is_some_and(|n| n > 0))
+        }),
+        "members" | "watch" => {
+            let selector = |v: &Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
+            selector(value)
+                || value.as_array().is_some_and(|items| {
+                    items.iter().all(|item| {
+                        selector(item)
+                            || (key == "members" && item.as_i64().is_some_and(|id| id >= 0))
+                    })
+                })
+        }
+        "agents" | "states" | "usage" => return Ok(()), // Parsed by wait_options before application calls.
+        "settings" | "custom" => value.is_object(),
+        _ => value.as_str().is_some_and(|text| {
+            !(matches!(key, "harness" | "model" | "effort" | "continuation")
+                || (key == "name" && method == "PUT" && matches!(p, ["configs", _])))
+                || !text.trim().is_empty()
+        }),
+    };
+    if valid {
+        Ok(())
+    } else {
+        if key == "wait" {
+            return Err(bad(
+                "lock wait must be a nonnegative whole number of seconds",
+            ));
+        }
+        if key == "ttl" {
+            return Err(bad("lock TTL must be a positive whole number of seconds"));
+        }
+        Err(bad(format!(
+            "invalid {key}: wrong type, empty value or out of range"
+        )))
+    }
+}
+
+fn validate_query_value(p: &[&str], key: &str, value: &str) -> R<()> {
+    let number = || {
+        value
+            .parse::<i64>()
+            .map_err(|_| bad(format!("{key} must be an integer")))
+    };
+    let valid = match key {
+        "agent" | "viewer" | "offset" | "through" => number()? >= 0,
+        "project" | "thread" => number()? > 0,
+        "limit" | "lines" => (1..=200).contains(&number()?),
+        "max_bytes" => (512..=65536).contains(&number()?),
+        "before" | "after" if p != ["folders"] => number()? >= 0,
+        "hidden" => matches!(value, "0" | "1"),
+        "category" => matches!(value, "all" | "active" | "attention" | "finished"),
+        "mark" => crate::app::MARKS.contains(&value),
+        "group" | "search" | "state" | "pause_reason" | "provider" | "model" | "effort" => true,
+        _ => !value.is_empty(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(bad(format!("invalid query parameter {key}")))
+    }
+}
+
+fn strict_decode(value: &str) -> R<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .and_then(|hex| std::str::from_utf8(hex).ok())
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                    .ok_or_else(|| bad("invalid percent encoding in query parameter"))?;
+                out.push(hex);
+                i += 3;
+            }
+            byte => {
+                out.push(if byte == b'+' { b' ' } else { byte });
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| bad("query parameters must be valid UTF-8"))
 }
 
 /// Who a user command came from: "user", or "user (via agent 7)".
@@ -410,20 +756,15 @@ fn record(value: Value, q: &Query) -> R<Value> {
 
 fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Reply> {
     use Reply::Json as J;
+    validate_request(method, p, q, b)?;
     if app.lock().shutting_down {
         return Err(Fail(503, "the server is stopping".into()));
     }
-    // Malformed callers must not silently become the user.
-    identity(b, "agent")?;
-    if opt_int(b, "via").is_some_and(|id| id < 0) {
-        return Err(bad("via must be 0 (user) or a positive agent ID"));
-    }
-    for key in ["agent", "viewer"] {
-        if q.int(key)?.is_some_and(|id| id < 0) {
-            return Err(bad(format!(
-                "{key} must be 0 (user) or a positive agent ID"
-            )));
-        }
+    // On the HTML shell, project is a client selection hint, not a resource read.
+    if !p.is_empty()
+        && let Some(project) = q.int("project")?.or_else(|| opt_int(b, "project"))
+    {
+        app.lock().project(project)?;
     }
     let reply = match (method, p) {
         ("GET", []) => Reply::Html(UI),
@@ -469,11 +810,22 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // agents
+        ("GET", ["agent-query"]) => J(record(
+            ParsedAgentQuery::parse(q.get("search").as_deref().unwrap_or(""))?.view(),
+            q,
+        )?),
         ("GET", ["agents"]) => J(app.filtered_agents_page(
             q.int("project")?,
-            q.get("group").as_deref(),
-            q.get("category").as_deref().unwrap_or("all"),
-            q.get("search").as_deref().unwrap_or(""),
+            AgentFilter {
+                group: q.get("group").as_deref(),
+                category: q.get("category").as_deref().unwrap_or("all"),
+                search: q.get("search").as_deref().unwrap_or(""),
+                state: q.get("state").as_deref(),
+                pause_reason: q.get("pause_reason").as_deref(),
+                provider: q.get("provider").as_deref(),
+                model: q.get("model").as_deref(),
+                effort: q.get("effort").as_deref(),
+            },
             page(q)?,
         )?),
         ("GET", ["agents", a]) => J(record(app.agent_view_for(id(a)?, q.int("agent")?)?, q)?),
@@ -557,9 +909,13 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             app.reopen(id(a)?, &user(b))?;
             J(json!({}))
         }
-        ("POST", ["pause-all"]) => J(json!({ "ids": app.pause_all(&user(b))? })),
-        ("POST", ["resume-all"]) => J(json!({ "ids": app.resume_all(&user(b))? })),
-        ("POST", ["resume-restart"]) => J(app.resume_restart(&user(b))?),
+        ("POST", ["pause-all"]) => {
+            J(json!({ "ids": app.pause_all(opt_int(b, "project"), &user(b))? }))
+        }
+        ("POST", ["resume-all"]) => {
+            J(json!({ "ids": app.resume_all(opt_int(b, "project"), &user(b))? }))
+        }
+        ("POST", ["resume-restart"]) => J(app.resume_restart(opt_int(b, "project"), &user(b))?),
         ("POST", ["hook", a]) => J(json!({ "text": app.hook(id(a)?)? })),
         ("POST", ["wait", a]) => {
             let timeout = u64::try_from(int(b, "timeout")?)
@@ -722,7 +1078,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["locks", l]) => J(record(app.lock_view(id(l)?, q.int("project")?)?, q)?),
         ("POST", ["locks"]) => {
             // An agent's lock goes in its own project.
-            let project = match opt_int(b, "agent") {
+            let project = match opt_int(b, "agent").filter(|agent| *agent > 0) {
                 Some(a) => app.agent_project(a)?,
                 None => int(b, "project")?,
             };
@@ -1029,6 +1385,13 @@ fn folders(path: Option<&str>, hidden: bool, q: &Query) -> R<Value> {
     let (limit, budget) = response_bounds(q, 50)?;
     let before = q.get("before");
     let after = q.get("after");
+    if q.get("since").is_some()
+        && (before.is_some() || after.is_some() || q.get("revision").is_some())
+    {
+        return Err(bad(
+            "since is only for a fresh folder listing, without a revision cursor",
+        ));
+    }
     if before.is_some() && after.is_some() {
         return Err(bad("use one before or after folder cursor"));
     }
@@ -1123,6 +1486,369 @@ fn folders(path: Option<&str>, hidden: bool, q: &Query) -> R<Value> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
+    #[test]
+    fn route_contracts_reject_unknown_and_malformed_values() {
+        let bad = [
+            (
+                "POST",
+                vec!["subscriptions"],
+                "",
+                json!({"agent":1,"agents":"all","state":["idle"]}),
+            ),
+            (
+                "POST",
+                vec!["wait", "1"],
+                "",
+                json!({"timeout":1,"agents":"all","state":["idle"]}),
+            ),
+            (
+                "POST",
+                vec!["agents"],
+                "",
+                json!({"task":"test","project":1,"force":"false"}),
+            ),
+            (
+                "POST",
+                vec!["agents"],
+                "",
+                json!({"task":"test","project":1,"model":""}),
+            ),
+            (
+                "POST",
+                vec!["agents"],
+                "",
+                json!({"task":"test","project":"1"}),
+            ),
+            (
+                "POST",
+                vec!["agent-config"],
+                "",
+                json!({"id":1,"ack_crashes":null}),
+            ),
+            (
+                "POST",
+                vec!["threads"],
+                "",
+                json!({"project":1,"title":"test","members":[true]}),
+            ),
+            (
+                "POST",
+                vec!["threads"],
+                "",
+                json!({"project":1,"title":"test","watch":{}}),
+            ),
+            (
+                "POST",
+                vec!["threads", "1", "members"],
+                "",
+                json!({"members":null}),
+            ),
+            (
+                "POST",
+                vec!["threads", "1", "members"],
+                "",
+                json!({"members":[]}),
+            ),
+            (
+                "POST",
+                vec!["marks"],
+                "",
+                json!({"agent":1,"ids":[1,"2"],"mark":"read"}),
+            ),
+            (
+                "POST",
+                vec!["projects"],
+                "",
+                json!({"path":"/unused","via":"1"}),
+            ),
+            (
+                "POST",
+                vec!["projects"],
+                "ignored=1",
+                json!({"path":"/unused"}),
+            ),
+            ("POST", vec!["pause-all"], "", Value::Null),
+            ("POST", vec!["pause-all"], "", json!([])),
+            ("GET", vec!["agents"], "project=1&projects=2", Value::Null),
+            ("GET", vec!["agents"], "project=1&project=2", Value::Null),
+            ("GET", vec!["agents"], "project=1&%70roject=2", Value::Null),
+            ("GET", vec!["agents"], "project", Value::Null),
+            ("GET", vec!["agents"], "project=", Value::Null),
+            ("GET", vec!["agents"], "search=%FF", Value::Null),
+            ("GET", vec!["agents"], "search=%2", Value::Null),
+            ("GET", vec!["agents"], "before=1&after=0", Value::Null),
+            ("GET", vec!["agents"], "category=workng", Value::Null),
+            ("GET", vec!["agents"], "max_bytes=1", Value::Null),
+            ("GET", vec!["folders"], "hidden=true", Value::Null),
+            (
+                "GET",
+                vec!["threads", "1"],
+                "agent=1&version=v",
+                Value::Null,
+            ),
+            ("GET", vec!["agents", "1"], "version=v", Value::Null),
+            ("GET", vec!["catalog"], "", json!({"ignored":true})),
+        ];
+        for (method, path, query, body) in bad {
+            let error = super::validate_request(method, &path, &super::Query(query), &body)
+                .expect_err(&format!("{method} {path:?}?{query} {body}"));
+            assert_eq!(error.0, 400, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn bulk_routes_reject_invalid_scope_instead_of_becoming_global() {
+        for route in ["pause-all", "resume-all", "resume-restart"] {
+            for value in [
+                Value::Null,
+                json!(0),
+                json!(-1),
+                json!(1.5),
+                json!("1"),
+                json!(true),
+                json!([]),
+                json!({}),
+            ] {
+                let error = super::validate_request(
+                    "POST",
+                    &[route],
+                    &super::Query(""),
+                    &json!({"project":value}),
+                )
+                .unwrap_err();
+                assert_eq!(error.0, 400, "{route}: {value}");
+            }
+            assert!(
+                super::validate_request("POST", &[route], &super::Query("project=1"), &json!({}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn route_contracts_keep_explicit_client_nulls_and_query_filters() {
+        for (method, path, query, body) in [
+            ("GET", vec![], "project=1", Value::Null),
+            ("POST", vec!["pause-all"], "", json!({"project":1})),
+            ("POST", vec!["resume-all"], "", json!({"project":1})),
+            ("POST", vec!["resume-restart"], "", json!({"project":1})),
+            (
+                "POST",
+                vec!["threads"],
+                "",
+                json!({"project":1,"title":"test","private":true,"joinable":true}),
+            ),
+            (
+                "POST",
+                vec!["agents"],
+                "",
+                json!({"project":1,"task":"test","harness":null,"model":null,"effort":null,"name":"","group":""}),
+            ),
+            (
+                "POST",
+                vec!["threads"],
+                "",
+                json!({"project":1,"title":"test","members":[1,0,"2"]}),
+            ),
+            (
+                "POST",
+                vec!["agent-config"],
+                "",
+                json!({"id":1,"agent":1,"model":null,"effort":"high","continuation":null,"ack_crashes":false}),
+            ),
+            (
+                "POST",
+                vec!["locks", "acquire"],
+                "",
+                json!({"agent":1,"name":"test","ttl":null,"wait":0}),
+            ),
+            (
+                "PUT",
+                vec!["projects", "1", "config"],
+                "",
+                json!({"config":1,"custom":null}),
+            ),
+            (
+                "GET",
+                vec!["agents"],
+                "&%70roject=1&group=&search=&limit=50&max_bytes=16000",
+                Value::Null,
+            ),
+            (
+                "GET",
+                vec!["agents", "1", "log"],
+                "after=0&version=missing&since=missing&lines=100",
+                Value::Null,
+            ),
+            (
+                "GET",
+                vec!["threads", "1"],
+                "agent=1&after=0&offset=0&version=abc&max_bytes=512",
+                Value::Null,
+            ),
+            (
+                "GET",
+                vec!["folders"],
+                "path=%2F&hidden=0&after=d%3Atest&revision=abc",
+                Value::Null,
+            ),
+        ] {
+            super::validate_request(method, &path, &super::Query(query), &body)
+                .unwrap_or_else(|error| panic!("{method} {path:?}?{query} {body}: {error:?}"));
+        }
+        assert_eq!(super::Query("%70roject=2").get("project"), Some("2".into()));
+        assert_eq!(super::id("0").unwrap_err().0, 400);
+        assert_eq!(super::id("-1").unwrap_err().0, 400);
+    }
+
+    #[test]
+    fn rejected_route_inputs_leave_business_state_unchanged() {
+        let home = std::env::temp_dir().join(format!(
+            "acom-request-validation-{}",
+            crate::harness::new_uuid()
+        ));
+        let app = crate::app::App::open(home.clone(), "http://127.0.0.1:0".into()).unwrap();
+        app.lock().db.execute_batch("INSERT INTO projects(id,path,name,created_at) VALUES(1,'/validation','validation',0);
+            INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at)
+            VALUES(1,1,'watcher','test','codex','gpt-6-sol','medium','working',0,0);").unwrap();
+        let before = app.lock().db.total_changes();
+        for (path, body) in [
+            (
+                vec!["subscriptions"],
+                json!({"agent":1,"agents":"all","state":["idle"]}),
+            ),
+            (
+                vec!["wait", "1"],
+                json!({"timeout":1,"agents":"all","state":["idle"]}),
+            ),
+            (
+                vec!["threads"],
+                json!({"title":"must not create","project":1,"members":[true]}),
+            ),
+            (
+                vec!["agents"],
+                json!({"task":"must not launch","project":1,"force":"false"}),
+            ),
+            (
+                vec!["agent-config"],
+                json!({"id":1,"effort":"high","ack_crashes":"false"}),
+            ),
+        ] {
+            let error = super::route(&app, "POST", &path, &super::Query(""), &body)
+                .err()
+                .unwrap();
+            assert_eq!(error.0, 400, "{error:?}");
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
+        assert_eq!(
+            super::route(
+                &app,
+                "POST",
+                &["not-a-route"],
+                &super::Query("unknown=1"),
+                &json!({"typo":true})
+            )
+            .err()
+            .unwrap()
+            .0,
+            404
+        );
+        for path in ["overview", "settings", "limits", "agents"] {
+            assert_eq!(
+                super::route(
+                    &app,
+                    "GET",
+                    &[path],
+                    &super::Query("project=999"),
+                    &Value::Null
+                )
+                .err()
+                .unwrap()
+                .0,
+                404,
+                "{path} must not silently fall back to another project"
+            );
+        }
+        for query in [
+            "state=",
+            "state=Paused",
+            "state=active",
+            "state=idle,paused",
+            "pause_reason=",
+            "pause_reason=user",
+            "pause_reason=all",
+            "pause_reason=unknown",
+            "state=working&pause_reason=limit",
+            "state=closed&pause_reason=manual",
+        ] {
+            let error = super::route(&app, "GET", &["agents"], &super::Query(query), &Value::Null)
+                .err()
+                .unwrap();
+            assert_eq!(error.0, 400, "{query}: {error:?}");
+            assert!(
+                error.1.contains("must be") || error.1.contains("requires state paused"),
+                "{error:?}"
+            );
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
+        for query in [
+            "state=idle",
+            "state=paused&pause_reason=manual",
+            "pause_reason=limit",
+            "pause_reason=restart",
+        ] {
+            super::route(&app, "GET", &["agents"], &super::Query(query), &Value::Null)
+                .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
+        assert!(matches!(
+            super::route(&app, "GET", &[], &super::Query("project=999"), &Value::Null).unwrap(),
+            super::Reply::Html(_)
+        ));
+        assert_eq!(app.lock().db.total_changes(), before);
+        drop(app);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn nonobject_bodies_and_conflicting_folder_poll_cursors_are_rejected() {
+        for body in ["null", "[]", "true", "1", "\"text\""] {
+            assert_eq!(super::parse_body(body).unwrap_err().0, 400);
+        }
+        for query in [
+            "since=r&after=d:a&revision=r",
+            "since=r&revision=r",
+            "since=r&before=f:a&revision=r",
+        ] {
+            assert_eq!(
+                super::folders(None, false, &super::Query(query))
+                    .unwrap_err()
+                    .0,
+                400
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_json_fields_are_rejected_at_every_depth() {
+        for body in [
+            r#"{"agent":1,"agent":0}"#,
+            r#"{"agent":1,"\u0061gent":0}"#,
+            r#"{"settings":{"limits":{"max_active":1,"max_active":2}}}"#,
+            r#"{"items":[{"state":"idle","state":"working"}]}"#,
+        ] {
+            let error = super::parse_body(body).expect_err(body);
+            assert_eq!(error.0, 400);
+            assert!(error.1.contains("duplicate field"), "{error:?}");
+        }
+        assert_eq!(
+            super::parse_body(r#"{"items":[1,2.5,null,true,"text"],"task":"λ"}"#).unwrap(),
+            json!({"items":[1,2.5,null,true,"text"],"task":"λ"})
+        );
+    }
+
     #[test]
     fn wait_watch_options_are_strictly_typed() {
         let options = super::wait_options(

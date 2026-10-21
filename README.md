@@ -13,11 +13,15 @@ acom serve
 
 Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` using the same data directory refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it; acom keeps none of its own state in your projects (the agents, of course, work on their files).
 
-The web workspace has project navigation, searchable agents with **Active**, **Needs attention** and **Finished** filters, and an overview of active agents, unread messages and held locks. Agent search covers the full project and task text, not just loaded previews. Filter counts reflect the search before the selected category; the header separates loaded matches, matching total and project total. Categories can overlap: a queued replacement can be both Finished and Needs attention. Project agent summaries are exact; held-lock counts identify a partial loaded window. Account usage stays separate from project work; global Pause/Resume controls show eligible counts across all projects and disable at zero or while unknown/in flight.
+The web workspace has project navigation, searchable agents with **Active**, **Needs attention** and **Finished** filters, and an overview of active agents, unread messages and held locks. Agent search covers the full project and task text, not just loaded previews. **Filters** builds exact group, provider, model, effort, lifecycle-state and pause-reason conditions; removable chips and the search box edit the same query. Counts reflect that query before the selected category; the header separates loaded matches, matching total and project total. Categories can overlap: a queued replacement can be both Finished and Needs attention. Project agent summaries are exact; held-lock counts identify a partial loaded window. Account usage stays separate from project work.
+
+**Pause project**, **Resume project** and **Resume restart-paused** affect only the selected project. Global equivalents are under **All projects**. Counts show eligible agents, not search results: Pause includes working, idle and done agents; Resume includes all paused agents; restart-resume includes only restart-paused agents. Controls disable at zero, while checking counts or during a bulk action. Confirmations name the scope; switching projects does not retarget an action already started. CLI `pause-all`, `resume-all` and `resume-restart` remain global.
+
+Manual Pause, Resume/Retry, Close, Reopen and project/global lifecycle actions ask for confirmation by default, naming the agent or scope and the consequence. **Settings → Browser preferences → Confirm agent actions** changes this immediately across projects in this browser at the same server address, independently of saved project configurations. Existing explicit review dialogs count once; disabling this preference does not remove unrelated destructive-action or hard-limit warnings. CLI commands and automatic recovery remain noninteractive.
 
 Threads have title/ID search and a mobile conversation view with **All threads** to return to the list while keeping the draft. **Ctrl/Cmd + Enter** sends; Enter adds a line. Settings have section links and a persistent save-state indicator. The theme follows your system until you toggle it; your explicit light/dark choice is saved in this browser.
 
-Incompatible development databases are left untouched; startup explains how to use a separate data folder.
+Incompatible development databases and invalid stored settings are left untouched; startup explains the problem instead of silently replacing settings with Default.
 
 Before upgrading an older running instance, pause or stop its agents through the old server. If a worker without a data-home marker remains live, new startup refuses and identifies its PID; stop that worker before retrying.
 
@@ -55,6 +59,20 @@ Unsent conversation drafts save as you type, separately for each project/thread.
 
 Run `acom --help` for the user and agent commands. Agents get `ACOM_ID` and `ACOM_URL` automatically, and their first prompt includes the guide that `acom guide` prints.
 
+The UI search box and `acom agents --search` share this syntax:
+
+```text
+group:"Security review" state:paused,crashed reentrancy
+```
+
+This selects that exact group, either state, and a case-insensitive `reentrancy` match in a name, ID, full task, descriptive status, group, provider or model. Spaces combine conditions with AND; unquoted commas give alternatives within a field. A quoted phrase must match within one metadata field. Bare terms do not search effort, lifecycle state, pause reason, logs or project files.
+
+Exact fields are `group`, `provider`, `model`, `effort`, `state` and `pause_reason`. Their values are case-sensitive. Double quotes protect spaces, literal commas and colons: `group:"Review, security"`; quote a whole term such as `"group:parser"` to search it literally. Inside quotes, escape a quote or backslash as `\"` or `\\`. Use `group:""` for ungrouped agents. Repeat alternatives within one clause, not the field itself. Unknown fields, invalid syntax and invalid closed-set values produce an error, not an unfiltered result.
+
+Providers are `claude` or `codex`; states are working, idle, paused, done, closed, crashed or replaced. Pause reasons are manual, limit or restart; **Manual** includes individual and bulk user pauses. A reason narrows to paused and rejects a state condition that excludes paused. Group/model/effort names are open exact values, so an unknown name simply has no matches. The filter picker accepts literal values and adds alternatives without requiring query syntax.
+
+CLI scalar flags `--group`, `--provider`, `--model`, `--effort`, `--state` and `--pause-reason` select one exact value, including any literal comma. For example, `acom agents --pause-reason limit` lists limit-paused agents; use `acom agents --search 'state:paused,crashed'` for alternatives. Do not specify the same field in both a flag and the query. Queries allow up to 4,096 UTF-8 bytes, 64 clauses and 128 field values. Filters apply before pagination and are retained in continuation hints; they never narrow project/global lifecycle actions.
+
 Agents can wait during a turn or arrange a later wake-up:
 
 | Command | Behavior |
@@ -67,7 +85,7 @@ Wait timeouts default to 60 seconds and allow 1 second–1 hour. Keep foreground
 
 All three accept the same event filters. `--agents 71,72 --states crashed,done,replaced` watches peer lifecycle transitions, not current states or messages; `--agents all` includes future agents in the same project, excluding the caller. Explicit IDs stay fixed and report replacement links rather than following successors. `--status-text` additionally watches descriptive status independently of state filters. To avoid a check/register race, inspect `acom agents --event-cursor`, act if the condition already holds, otherwise register with that `--after <cursor>` to include intervening transitions. A new ordinary-wait filter otherwise starts now; later calls continue its durable event cursor. Explicitly repeating `--after` rescans; it requires `--agents`. Event batches are bounded and identify their history records; unacknowledged deliveries replay unchanged before new filters apply.
 
-Usage filters select a provider, raw window name from `acom limits`, and one condition: for example, `acom subscribe --usage claude --window five_hour --above 80`. `--above` / `--below` match strict percentage crossings, not equality; an already-qualifying last-known reading reports immediately, then only new crossings report. `--reset` requires a fresh observed rollover/recovery; `--reset-due` means the estimated reset time arrived, not that recovery is confirmed. Missing/unknown readings are not zero. Detection follows provider streams and configured account checks, not an instant account signal. Agent and usage filters combine with OR. Persistent subscriptions need a filter; deferred waits may use only ordinary notifications and a deadline.
+Usage filters select a provider, window ID from `acom limits`, and one condition: for example, `acom subscribe --usage claude --window five_hour --above 80`. Claude display labels (`five-hour`, `weekly`, `weekly Fable`) are also accepted; receipts show canonical IDs. Unknown names are rejected. Known windows include standard IDs and provider-specific previously observed names, even without a current reading; Codex IDs are matched exactly. Existing misspelled saved watches must be canceled and recreated. `--above` / `--below` match strict percentage crossings, not equality; an already-qualifying last-known reading reports immediately, then only new crossings report. `--reset` requires a fresh observed rollover/recovery; `--reset-due` means the estimated reset time arrived, not that recovery is confirmed. Missing/unknown readings are not zero. Detection follows provider streams and configured account checks, not an instant account signal. Agent and usage filters combine with OR. Persistent subscriptions need a filter; deferred waits may use only ordinary notifications and a deadline.
 
 After registration, read its receipt and any immediate update. If still waiting, end the turn normally **without `acom done`**. Registration does not itself change lifecycle state: the process must exit, and shell/background commands cannot be suspended across turns. Both working and idle agents count against active-agent limits; lock TTLs continue. An early deferred-wait notification identifies the wait and cause and explicitly cancels its timeout. Matches consumed while working do not cause an extra turn. Subscription events and deadlines wake only idle agents; they do not override pauses, crashes, done/closed/replaced states or recovery controls. Registrations, pending updates and IDs survive restart and true replacement.
 
@@ -146,6 +164,12 @@ Attempt counts and visited models survive restarts; successful turns and manual 
 
 Agents run unattended, so nobody can answer a permission prompt. By default they run with full permissions: Claude with `--dangerously-skip-permissions`, Codex with `--dangerously-bypass-approvals-and-sandbox`. They can do anything your user account can, so only run acom where that's acceptable. To restrict them, change the extra launch flags in Settings, e.g. `--permission-mode acceptEdits` for Claude or `--sandbox workspace-write` for Codex; anything the harness would then ask about is denied.
 
+## Development
+
+Read [AGENTS.md](AGENTS.md) for contributor rules and [SPEC.md](SPEC.md) for behavioral contracts, including [request validation and outcomes](SPEC.md#request-validation-and-outcomes). These apply to CLI, server and UI changes. SPEC marks known implementation gaps separately from required behavior.
+
+The server rejects unknown request fields/query parameters, duplicate keys and malformed supplied values before applying an action; CLI/UI checks are additional safeguards. Defaults apply only to documented omissions/nulls. Failures return an HTTP error and a nonzero CLI exit status. A successful registration or queued action is not a completed event or provider turn: inspect its receipt and subsequent status. If a write's result is uncertain, inspect state before retrying.
+
 ## Test
 
 Deterministic regression tests use fake clients and require Node with `node:sqlite`.
@@ -167,6 +191,8 @@ npx playwright install chromium
 node --test tests/ui.cjs
 ACOM_BROWSER_TEST=1 node --test tests/server.cjs
 ```
+
+For just the real-server browser setup/settings/filter flow, add `ACOM_BROWSER_TEST_ONLY=1` and `--test-name-pattern='single server'` to the last command.
 
 An opt-in real Codex check uses your installed login, spends subscription usage, and runs in a temporary project/data folder:
 

@@ -34,7 +34,9 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   subscribe [watch flags]                 Persistently wake on matching events; end your turn normally
   subscriptions [--agent ID]             List your or a peer's subscriptions and deferred waits
   subscription <ID> / unsubscribe <ID>    Read one subscription / cancel your own (user may cancel any)
-  agents [--group <name>] [--event-cursor] List agents; optionally print an atomic event baseline
+  agents [--search QUERY] [--group NAME] [--provider claude|codex] [--model ID] [--effort EFFORT]
+         [--state STATE] [--pause-reason manual|limit|restart] [--event-cursor]
+                                          Exact filters; query spaces AND, field commas OR, double quotes protect literals
   agent <ID>                              One agent's details
   launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done|--replace] [--ack-crashes]
                                           Launch a helper agent; --done also marks you done,
@@ -91,6 +93,7 @@ Watch flags (wait and subscribe; agent and usage conditions combine with OR):
   Peer watches report transitions, not current states. Member messages already notify/wake you;
   joining/leaving alone does not resolve waits or wake idle agents.
   Usage is polled; --reset is confirmed recovery, --reset-due is only the estimated deadline.
+  Use window IDs from limits; Claude display aliases are accepted and normalized in receipts.
   --idle returns a wait ID immediately; finish the turn without `acom done`. It does not stop tools.
 
 Lists (agents, threads, inbox, notices, locks, projects, activity, configs, subscriptions, thread read):
@@ -113,6 +116,70 @@ struct Cli {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn agents_accept_field_queries_and_exact_literal_flags() {
+        let cli = Cli::try_parse_from([
+            "acom",
+            "agents",
+            "--search",
+            "state:crashed,paused needle",
+            "--group",
+            "Security review",
+            "--provider",
+            "codex",
+            "--model",
+            "custom:model",
+            "--effort",
+            "high",
+            "--event-cursor",
+        ])
+        .unwrap();
+        let Cmd::Agents {
+            search,
+            group,
+            provider,
+            model,
+            effort,
+            state,
+            pause_reason,
+            event_cursor,
+            ..
+        } = cli.cmd
+        else {
+            panic!("wrong command")
+        };
+        assert!(event_cursor);
+        let query = app::AgentFilter {
+            search: search.as_deref().unwrap(),
+            group: group.as_deref(),
+            provider: provider.as_deref(),
+            model: model.as_deref(),
+            effort: effort.as_deref(),
+            state: state.as_deref(),
+            pause_reason: pause_reason.as_deref(),
+            ..app::AgentFilter::default()
+        }
+        .normalized()
+        .unwrap();
+        assert!(query.text().contains("group:\"Security review\""));
+        assert!(Cli::try_parse_from(["acom", "agents", "--provider", "other"]).is_err());
+        for (search, group) in [
+            ("group:crew", Some("crew")),
+            ("task:x", None),
+            ("state:active", None),
+        ] {
+            assert!(
+                app::AgentFilter {
+                    search,
+                    group,
+                    ..app::AgentFilter::default()
+                }
+                .normalized()
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn wait_flags_and_response_validation_do_not_ack_incomplete_delivery() {
@@ -547,6 +614,30 @@ mod cli_tests {
             assert!(Cli::try_parse_from(args).is_ok());
         }
     }
+    #[test]
+    fn id_lists_reject_empty_or_invalid_entries_before_any_action() {
+        assert_eq!(ids("1, 2").unwrap(), vec![1, 2]);
+        for input in ["", ",", "1,", ",1", "1,,2", "0", "1,0", "-1", "not-an-id"] {
+            assert!(ids(input).is_err(), "invalid ID list {input:?}");
+        }
+    }
+
+    #[test]
+    fn record_version_is_not_silently_ignored_without_an_offset() {
+        for command in [
+            "agent",
+            "read",
+            "config",
+            "history",
+            "activity",
+            "notices",
+            "subscription",
+        ] {
+            assert!(Cli::try_parse_from(["acom", command, "1", "--version", "v"]).is_err());
+        }
+        assert!(Cli::try_parse_from(["acom", "thread", "read", "1", "--version", "v"]).is_err());
+        assert!(Cli::try_parse_from(["acom", "log", "1", "--version", "v"]).is_ok());
+    }
 }
 
 #[derive(Args)]
@@ -612,7 +703,7 @@ impl PageArgs {
 struct RecordArgs {
     #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
     offset: Option<i64>,
-    #[arg(long)]
+    #[arg(long, requires = "offset")]
     version: Option<String>,
     #[arg(long, default_value_t = 16000, value_parser = clap::value_parser!(i64).range(512..=65536))]
     max_bytes: i64,
@@ -798,8 +889,23 @@ enum Cmd {
         id: i64,
     },
     Agents {
+        #[arg(
+            long,
+            help = "Field-aware query: spaces AND, field commas OR; double quotes protect spaces, commas and colons"
+        )]
+        search: Option<String>,
         #[arg(long)]
         group: Option<String>,
+        #[arg(long, value_parser = ["claude", "codex"])]
+        provider: Option<String>,
+        #[arg(long, help = "Exact model ID (including custom IDs)")]
+        model: Option<String>,
+        #[arg(long, help = "Exact effort value")]
+        effort: Option<String>,
+        #[arg(long, value_parser = app::STATES)]
+        state: Option<String>,
+        #[arg(long, value_parser = ["manual", "limit", "restart"], help = "Filter paused agents (manual includes individual and bulk pauses)")]
+        pause_reason: Option<String>,
         #[arg(long)]
         event_cursor: bool,
         #[command(flatten)]
@@ -879,7 +985,7 @@ enum Cmd {
         max_bytes: i64,
         #[arg(long, requires = "id", value_parser = clap::value_parser!(i64).range(0..))]
         offset: Option<i64>,
-        #[arg(long, requires = "id")]
+        #[arg(long, requires_all = ["id", "offset"])]
         version: Option<String>,
     },
     Mark {
@@ -897,7 +1003,7 @@ enum Cmd {
         page: PageArgs,
         #[arg(long, requires = "id", value_parser = clap::value_parser!(i64).range(0..))]
         offset: Option<i64>,
-        #[arg(long, requires = "id")]
+        #[arg(long, requires_all = ["id", "offset"])]
         version: Option<String>,
     },
     Configs {
@@ -921,7 +1027,7 @@ enum Cmd {
         page: PageArgs,
         #[arg(long, requires = "id", value_parser = clap::value_parser!(i64).range(0..))]
         offset: Option<i64>,
-        #[arg(long, requires = "id")]
+        #[arg(long, requires_all = ["id", "offset"])]
         version: Option<String>,
     },
     Log {
@@ -1013,7 +1119,7 @@ enum ThreadCmd {
         page: PageArgs,
         #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
         offset: Option<i64>,
-        #[arg(long)]
+        #[arg(long, requires = "offset")]
         version: Option<String>,
     },
     Details {
@@ -1326,13 +1432,13 @@ fn encode(s: &str) -> String {
         .collect()
 }
 
-fn ids(s: &str) -> Vec<i64> {
+fn ids(s: &str) -> Result<Vec<i64>, String> {
     s.split(',')
         .map(str::trim)
-        .filter(|x| !x.is_empty())
         .map(|x| {
-            x.parse()
-                .unwrap_or_else(|_| die(&format!("{x} isn't an ID")))
+            x.parse::<i64>().ok().filter(|id| *id > 0).ok_or_else(|| {
+                format!("{x:?} isn't a positive ID; use a comma-separated list of IDs")
+            })
         })
         .collect()
 }
@@ -1686,18 +1792,25 @@ fn main() {
             let value = get(&format!("/limits?{}&{}", scope(), record.query()));
             if !record_output(&value, &record, "acom limits") {
                 println!("{}", value["text"].as_str().unwrap_or(""));
-                let windows: Vec<String> = value["usage"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|usage| {
-                        Some(format!(
+                let choices = value["usage_windows"]
+                    .as_object()
+                    .unwrap_or_else(|| die("invalid limits response: missing usage window IDs"));
+                let mut windows = Vec::new();
+                for (provider, names) in choices {
+                    let names = names.as_array().unwrap_or_else(|| {
+                        die("invalid limits response: usage window IDs must be a list")
+                    });
+                    for name in names {
+                        let name = name.as_str().unwrap_or_else(|| {
+                            die("invalid limits response: usage window ID must be text")
+                        });
+                        windows.push(format!(
                             "--usage {} --window {}",
-                            shell_word(usage["provider"].as_str()?),
-                            shell_word(usage["win"].as_str()?)
-                        ))
-                    })
-                    .collect();
+                            shell_word(provider),
+                            shell_word(name)
+                        ));
+                    }
+                }
                 if !windows.is_empty() {
                     println!("Available usage watches:\n  {}", windows.join("\n  "));
                 }
@@ -1820,15 +1933,52 @@ fn main() {
             println!("{value}");
         }
         Cmd::Agents {
+            search,
             group,
+            provider,
+            model,
+            effort,
+            state,
+            pause_reason,
             event_cursor,
             page,
         } => {
+            app::AgentFilter {
+                group: group.as_deref(),
+                search: search.as_deref().unwrap_or(""),
+                provider: provider.as_deref(),
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                state: state.as_deref(),
+                pause_reason: pause_reason.as_deref(),
+                ..app::AgentFilter::default()
+            }
+            .normalized()
+            .unwrap_or_else(|error| die(&error.1));
             let mut path = format!("/agents?{}&{}", scope(), page.query());
             let mut command = "acom agents".to_string();
+            for (key, value) in [
+                ("search", search),
+                ("provider", provider),
+                ("model", model),
+                ("effort", effort),
+            ] {
+                if let Some(value) = value {
+                    path += &format!("&{key}={}", encode(&value));
+                    command += &format!(" --{key} {}", shell_word(&value));
+                }
+            }
             if let Some(g) = group {
                 path += &format!("&group={}", encode(&g));
                 command += &format!(" --group {}", shell_word(&g));
+            }
+            if let Some(state) = state {
+                path += &format!("&state={}", encode(&state));
+                command += &format!(" --state {}", shell_word(&state));
+            }
+            if let Some(reason) = pause_reason {
+                path += &format!("&pause_reason={}", encode(&reason));
+                command += &format!(" --pause-reason {}", shell_word(&reason));
             }
             if event_cursor {
                 command += " --event-cursor";
@@ -2262,7 +2412,7 @@ fn main() {
             }
         }
         Cmd::Mark { ids: list, mark } => {
-            let selected = ids(&list);
+            let selected = ids(&list).unwrap_or_else(|error| die(&error));
             post(
                 "/marks",
                 json!({ "agent": me(), "ids": selected, "mark": mark }),
@@ -2486,7 +2636,7 @@ fn main() {
             }
         }
         Cmd::Resume { ids: list } => {
-            for id in ids(&list) {
+            for id in ids(&list).unwrap_or_else(|error| die(&error)) {
                 let v = post(&format!("/agents/{id}/resume"), user_body(json!({})));
                 println!("resumed agent {id}");
                 for w in v["warnings"].as_array().into_iter().flatten() {

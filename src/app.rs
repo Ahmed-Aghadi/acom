@@ -12,8 +12,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::paging::fingerprint;
 pub use crate::paging::{PageQuery, bounded_record};
+mod agent_query;
 mod diagnostics;
 mod subscriptions;
+pub use agent_query::ParsedAgentQuery;
 pub use subscriptions::UsageWatch;
 
 pub const GUIDE: &str = include_str!("guide.md");
@@ -22,6 +24,42 @@ pub const STATES: [&str; 7] = [
     "working", "idle", "paused", "done", "closed", "crashed", "replaced",
 ];
 pub const MARKS: [&str; 3] = ["new", "in-progress", "handled"];
+const PAUSE_ELIGIBLE: &str = "state IN ('working','idle','done')";
+const RESUME_ELIGIBLE: &str = "state='paused'";
+const RESTART_PAUSED: &str = "state='paused' AND pause_reason='restart'";
+
+#[derive(Clone, Copy, Debug)]
+pub struct AgentFilter<'a> {
+    pub group: Option<&'a str>,
+    pub category: &'a str,
+    pub search: &'a str,
+    pub state: Option<&'a str>,
+    pub pause_reason: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
+impl Default for AgentFilter<'_> {
+    fn default() -> Self {
+        Self {
+            group: None,
+            category: "all",
+            search: "",
+            state: None,
+            pause_reason: None,
+            provider: None,
+            model: None,
+            effort: None,
+        }
+    }
+}
+
+impl AgentFilter<'_> {
+    pub fn normalized(self) -> R<ParsedAgentQuery> {
+        ParsedAgentQuery::from_filter(self)
+    }
+}
 
 /// Where acom keeps its data: `ACOM_HOME`, or `~/.acom`.
 pub fn acom_home() -> PathBuf {
@@ -60,6 +98,7 @@ pub fn not_found(m: impl Into<String>) -> Fail {
 // ---------- settings ----------
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Limit {
     pub soft: Option<f64>,
     pub hard: Option<f64>,
@@ -106,6 +145,7 @@ impl Check {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessCfg {
     pub enabled: bool,
     pub models: Vec<String>,
@@ -116,6 +156,7 @@ pub struct HarnessCfg {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub active: Limit,
     pub active_per_harness: BTreeMap<String, Limit>,
@@ -154,6 +195,7 @@ fn is_fable(model: &str) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub harnesses: BTreeMap<String, HarnessCfg>,
     pub limits: Limits,
@@ -174,6 +216,7 @@ pub struct Settings {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RetryRule {
     pub harness: String,
     pub model: String,
@@ -243,7 +286,7 @@ fn default_max_lock_ttl_secs() -> u32 {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Prompts {
     pub launch: String,
     pub wake: String,
@@ -357,19 +400,17 @@ impl Settings {
             if !crate::harness::KNOWN.contains(&name.as_str()) {
                 return Err(bad(format!("unknown harness {name}")));
             }
-            if h.model.trim().is_empty() || h.effort.trim().is_empty() {
-                return Err(bad(format!("{name}: choose a default model and effort")));
+            check_choice(name, &h.model, &h.effort)
+                .map_err(|Fail(code, message)| Fail(code, format!("{name}: {message}")))?;
+            for model in &h.models {
+                check_model(name, model)?;
             }
-            if let Some(m) = crate::harness::catalog(name)
-                .into_iter()
-                .find(|m| m.id == h.model)
-                && !m.efforts.contains(&h.effort.as_str())
+            if h.efforts
+                .iter()
+                .any(|effort| effort.is_empty() || effort.contains(char::is_whitespace))
             {
                 return Err(bad(format!(
-                    "{name}: {} doesn't support effort {} (it supports {})",
-                    h.model,
-                    h.effort,
-                    m.efforts.join(", ")
+                    "{name}: allowed efforts must be nonempty effort IDs"
                 )));
             }
             if !h.models.contains(&h.model) {
@@ -444,6 +485,13 @@ impl Settings {
         );
         all.extend(l.usage.iter().map(|(k, v)| (format!("{k} usage"), v)));
         for (name, lim) in all {
+            if [lim.soft, lim.hard]
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite())
+            {
+                return Err(bad(format!("{name}: limits must be finite numbers")));
+            }
             let negative = [lim.soft, lim.hard].iter().flatten().any(|v| *v < 0.0);
             let backwards = matches!((lim.soft, lim.hard), (Some(s), Some(h)) if s > h);
             if negative || backwards {
@@ -819,6 +867,27 @@ fn check_stored_schema(db: &Connection) -> R<()> {
         return Err(bad(
             "this database uses an earlier development schema. It has not been changed. Keep it as a backup and start with a separate ACOM_HOME folder.",
         ));
+    }
+    for (kind, query) in [
+        ("config", "SELECT id,settings FROM configs"),
+        (
+            "project",
+            "SELECT id,custom FROM projects WHERE custom IS NOT NULL",
+        ),
+    ] {
+        let mut statement = db.prepare(query)?;
+        let saved = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for item in saved {
+            let (id, text) = item?;
+            let settings: Settings = serde_json::from_str(&text).map_err(|error| {
+                bad(format!("invalid saved settings for {kind} {id}: {error}. Saved data has not been changed; restore valid settings or use a separate ACOM_HOME."))
+            })?;
+            settings.check().map_err(|Fail(_, message)| {
+                bad(format!("invalid saved settings for {kind} {id}: {message}. Saved data has not been changed; restore valid settings or use a separate ACOM_HOME."))
+            })?;
+        }
     }
     Ok(())
 }
@@ -1240,7 +1309,7 @@ impl St {
             let label = if window.is_empty() {
                 h.to_string()
             } else {
-                format!("{h} {}", window_label(window))
+                format!("{h} {} [{window}]", window_label(window))
             };
             out += &format!("\n  {label} {used} ({})", lim.text("%"));
         }
@@ -2620,57 +2689,109 @@ impl App {
         }
     }
 
-    pub fn pause_all(self: &Arc<Self>, by: &str) -> R<Vec<i64>> {
-        let mut st = self.lock();
-        let ids: Vec<i64> = rows(
+    fn check_action_project(st: &St, project: Option<i64>) -> R<()> {
+        if let Some(project) = project {
+            if project <= 0 {
+                return Err(bad("project must be a positive ID"));
+            }
+            st.project(project)?;
+        }
+        Ok(())
+    }
+
+    fn action_ids(st: &St, project: Option<i64>, eligible: &str) -> R<Vec<i64>> {
+        Self::check_action_project(st, project)?;
+        Ok(rows(
             &st.db,
-            "SELECT id FROM agents WHERE state IN ('working','idle','done')",
-            [],
+            &format!("SELECT id FROM agents WHERE ({eligible}) AND (?1 IS NULL OR project=?1) ORDER BY id"),
+            [project],
         )?
         .iter()
         .map(|r| r["id"].as_i64().unwrap())
-        .collect();
+        .collect())
+    }
+
+    fn action_counts(st: &St, project: Option<i64>) -> R<Value> {
+        let count = |eligible| -> R<i64> {
+            Ok(st.db.query_row(
+                &format!(
+                    "SELECT count(*) FROM agents WHERE ({eligible}) AND (?1 IS NULL OR project=?1)"
+                ),
+                [project],
+                |r| r.get(0),
+            )?)
+        };
+        Ok(
+            json!({"pause_eligible":count(PAUSE_ELIGIBLE)?,"resume_eligible":count(RESUME_ELIGIBLE)?,"restart_paused":count(RESTART_PAUSED)?}),
+        )
+    }
+
+    fn unchanged_pause(
+        st: &St,
+        id: i64,
+        project: Option<i64>,
+        eligible: &str,
+        through: i64,
+    ) -> R<bool> {
+        Ok(st.db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM agents a WHERE id=?1 AND (?2 IS NULL OR project=?2) AND ({eligible})
+                AND NOT EXISTS(SELECT 1 FROM events e WHERE e.project=a.project AND e.agent=a.id AND e.kind='agent.state' AND e.id>?3))"),
+            params![id, project, through],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn pause_all(self: &Arc<Self>, project: Option<i64>, by: &str) -> R<Vec<i64>> {
+        let mut st = self.lock();
+        let ids = Self::action_ids(&st, project, PAUSE_ELIGIBLE)?;
         for &id in &ids {
-            self.pause_locked(&mut st, id, "all", by)?;
+            self.pause_locked(
+                &mut st,
+                id,
+                if project.is_some() { "user" } else { "all" },
+                by,
+            )?;
         }
         Ok(ids)
     }
 
-    pub fn resume_all(self: &Arc<Self>, by: &str) -> R<Vec<i64>> {
+    pub fn resume_all(self: &Arc<Self>, project: Option<i64>, by: &str) -> R<Vec<i64>> {
         let st = self.lock();
-        let ids: Vec<i64> = rows(&st.db, "SELECT id FROM agents WHERE state='paused'", [])?
-            .iter()
-            .map(|r| r["id"].as_i64().unwrap())
-            .collect();
+        let ids = Self::action_ids(&st, project, RESUME_ELIGIBLE)?;
+        let through = st
+            .db
+            .query_row("SELECT coalesce(max(id),0) FROM events", [], |r| r.get(0))?;
         let mut st = self.wait_stopped(st, &ids);
-        let ids: Vec<i64> = ids
-            .into_iter()
-            .filter(|i| !st.procs.contains_key(i) && !st.stopping_agents.contains(i))
-            .collect();
-        for &id in &ids {
+        Self::check_action_project(&st, project)?;
+        let mut resumed = Vec::new();
+        for id in ids {
+            // Waiting releases the mutex; a new pause belongs to the newer action.
+            if !Self::unchanged_pause(&st, id, project, RESUME_ELIGIBLE, through)?
+                || st.procs.contains_key(&id)
+                || st.stopping_agents.contains(&id)
+            {
+                continue;
+            }
             self.resume_locked(&mut st, id, by)?;
+            resumed.push(id);
         }
-        Ok(ids)
+        Ok(resumed)
     }
 
     /// Unlike Resume all, leave manual and usage-limit pauses alone.
-    pub fn resume_restart(self: &Arc<Self>, by: &str) -> R<Value> {
+    pub fn resume_restart(self: &Arc<Self>, project: Option<i64>, by: &str) -> R<Value> {
         let st = self.lock();
-        let ids: Vec<i64> = rows(
-            &st.db,
-            "SELECT id FROM agents WHERE state='paused' AND pause_reason='restart' ORDER BY id",
-            [],
-        )?
-        .iter()
-        .map(|r| r["id"].as_i64().unwrap())
-        .collect();
+        let ids = Self::action_ids(&st, project, RESTART_PAUSED)?;
+        let through = st
+            .db
+            .query_row("SELECT coalesce(max(id),0) FROM events", [], |r| r.get(0))?;
         let mut st = self.wait_stopped(st, &ids);
+        Self::check_action_project(&st, project)?;
         let mut resumed = Vec::new();
         let mut errors = Vec::new();
         for id in ids {
             // Waiting releases the mutex: don't undo a concurrent user action.
-            let eligible: bool = st.db.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1 AND state='paused' AND pause_reason='restart')", [id], |r|r.get(0))?;
-            if !eligible {
+            if !Self::unchanged_pause(&st, id, project, RESTART_PAUSED, through)? {
                 continue;
             }
             match self.resume_locked(&mut st, id, by) {
@@ -2681,8 +2802,8 @@ impl App {
         let warnings: Vec<String> = rows(
             &st.db,
             "SELECT DISTINCT a.id FROM agents a JOIN locks l ON l.holder=a.id
-             WHERE a.state='paused' ORDER BY a.id",
-            [],
+             WHERE a.state='paused' AND (?1 IS NULL OR a.project=?1) ORDER BY a.id",
+            [project],
         )?
         .iter()
         .map(|r| format!("agent {} is still stopping and holds locks", r["id"]))
@@ -3367,18 +3488,20 @@ impl App {
     }
 
     fn normalize_watch(st: &St, id: i64, options: &WaitOptions) -> R<Option<AgentWatch>> {
-        if let Some(usage) = &options.usage {
-            subscriptions::validate_usage(usage)?;
-        }
+        let usage = options
+            .usage
+            .as_ref()
+            .map(|usage| subscriptions::normalize_usage(st, usage))
+            .transpose()?;
         if options.agents.is_none() {
             if options.states.is_some() || options.status_text || options.after.is_some() {
                 return Err(bad("states, status_text and after require watched agents"));
             }
-            return Ok(options.usage.as_ref().map(|usage| AgentWatch {
+            return Ok(usage.map(|usage| AgentWatch {
                 agents: None,
                 states: Vec::new(),
                 status_text: false,
-                usage: Some(usage.clone()),
+                usage: Some(usage),
             }));
         }
         let mut agents = options.agents.clone().unwrap();
@@ -3421,7 +3544,7 @@ impl App {
             agents: Some(agents),
             states,
             status_text: options.status_text,
-            usage: options.usage.clone(),
+            usage,
         }))
     }
 
@@ -3702,21 +3825,25 @@ impl App {
     /// Agents named by IDs or selectors, all within one project.
     fn resolve(st: &St, project: i64, sel: &[String]) -> R<Vec<i64>> {
         let mut ids = Vec::new();
-        for s in sel
-            .iter()
-            .flat_map(|s| s.split(','))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        for s in sel.iter().flat_map(|s| s.split(',')).map(str::trim) {
+            if s.is_empty() {
+                return Err(bad("member selectors must not contain empty entries"));
+            }
             let found: Vec<i64> = if s == "user" || s == "0" {
                 vec![0]
             } else if let Ok(id) = s.parse::<i64>() {
+                if id < 0 {
+                    return Err(bad("member IDs must be positive, or 0 for the user"));
+                }
                 if st.agent(id)?.project != project {
                     return Err(bad(format!("agent {id} is in another project")));
                 }
                 vec![id]
             } else {
                 let (cond, arg) = if let Some(g) = s.strip_prefix("group:") {
+                    if g.trim().is_empty() {
+                        return Err(bad("group selectors need a group name"));
+                    }
                     ("grp=?1", g.to_string())
                 } else if s == "active" {
                     ("state IN ('working','idle') AND ?1=?1", String::new())
@@ -5126,6 +5253,10 @@ impl App {
             ));
         }
         settings.check()?;
+        let name = name.map(str::trim);
+        if name == Some("") {
+            return Err(bad("give the config a name"));
+        }
         let mut st = self.lock();
         let old_name: String = st
             .db
@@ -5141,10 +5272,7 @@ impl App {
         .map(|r| r["id"].as_i64().unwrap())
         .collect();
         let before: Vec<Settings> = users.iter().map(|p| st.settings_for(Some(*p))).collect();
-        let name = name
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .unwrap_or(&old_name);
+        let name = name.unwrap_or(&old_name);
         if name == "Default" {
             return Err(conflict("Default is reserved for the built-in config"));
         }
@@ -5484,7 +5612,14 @@ impl App {
 
     #[cfg(test)]
     pub fn agents_page(&self, project: Option<i64>, group: Option<&str>, q: PageQuery) -> R<Value> {
-        self.filtered_agents_page(project, group, "all", "", q)
+        self.filtered_agents_page(
+            project,
+            AgentFilter {
+                group,
+                ..AgentFilter::default()
+            },
+            q,
+        )
     }
 
     fn agent_runtime_revision(st: &St) -> String {
@@ -5513,12 +5648,12 @@ impl App {
     fn agent_scope(
         st: &St,
         project: Option<i64>,
-        group: Option<&str>,
         category: &str,
-        search: &str,
+        query: &ParsedAgentQuery,
     ) -> String {
         format!(
-            "agents:{project:?}:{group:?}:{category}:{search:?}:{}",
+            "agents:{project:?}:{category}:{}:{}",
+            query.scope(),
             Self::agent_runtime_revision(st)
         )
     }
@@ -5553,33 +5688,36 @@ impl App {
           a.state IN ('working','idle') is_active,
           (a.state IN ('paused','crashed') OR {stopping} OR a.wake_queued_at IS NOT NULL OR EXISTS(SELECT 1 FROM agent_starts s WHERE s.agent_id=a.id)) needs_attention,
           a.state IN ('done','closed','replaced') is_finished
-          FROM agents a WHERE (?1 IS NULL OR a.project=?1) AND (?2 IS NULL OR a.grp=?2)
-          AND (?3='' OR instr(acom_lower(a.name||' '||a.id||' '||a.harness||' '||a.model||' '||coalesce(a.grp,'')||' '||coalesce(a.status_text,'')||' '||a.task),?3)>0)")
+          FROM agents a WHERE (?1 IS NULL OR a.project=?1)
+          AND (json_array_length(?2)=0 OR coalesce(a.grp,'') IN (SELECT value FROM json_each(?2)))
+          AND (json_array_length(?3)=0 OR a.harness IN (SELECT value FROM json_each(?3)))
+          AND (json_array_length(?4)=0 OR a.model IN (SELECT value FROM json_each(?4)))
+          AND (json_array_length(?5)=0 OR a.effort IN (SELECT value FROM json_each(?5)))
+          AND (json_array_length(?6)=0 OR a.state IN (SELECT value FROM json_each(?6)))
+          AND (json_array_length(?7)=0 OR CASE WHEN a.pause_reason IN ('user','all') THEN 'manual' ELSE a.pause_reason END IN (SELECT value FROM json_each(?7)))
+          AND NOT EXISTS (SELECT 1 FROM json_each(?8) term WHERE NOT EXISTS (
+            SELECT 1 FROM json_each(json_array(a.name,CAST(a.id AS TEXT),a.harness,a.model,a.grp,a.status_text,a.task)) field
+            WHERE instr(acom_lower(coalesce(field.value,'')),term.value)>0))")
     }
 
-    fn agent_counts(st: &St, project: Option<i64>, group: Option<&str>, search: &str) -> R<Value> {
-        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished FROM ({})", Self::agent_source(st)), params![project, group, search])?.remove(0))
+    fn agent_counts(st: &St, project: Option<i64>, query: &ParsedAgentQuery) -> R<Value> {
+        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished FROM ({})", Self::agent_source(st)), rusqlite::params_from_iter(query.params(project)))?.remove(0))
     }
 
     pub fn filtered_agents_page(
         &self,
         project: Option<i64>,
-        group: Option<&str>,
-        category: &str,
-        search: &str,
+        filters: AgentFilter<'_>,
         q: PageQuery,
     ) -> R<Value> {
-        let predicate = match category {
+        let query = filters.normalized()?;
+        let predicate = match filters.category {
             "all" => "1",
             "active" => "is_active",
             "attention" => "needs_attention",
             "finished" => "is_finished",
-            _ => return Err(bad("category must be all, active, attention or finished")),
+            _ => unreachable!(),
         };
-        if search.len() > 4096 {
-            return Err(bad("search must be at most 4096 bytes"));
-        }
-        let search = search.trim().to_lowercase();
         let mut st = self.lock();
         st.atomic(|st| {
         let sql=format!("SELECT id,project,name,grp \"group\",harness,model,effort,state,status_text status,substr(task,1,400) task_preview,
@@ -5598,9 +5736,9 @@ impl App {
                 "agent_starts",
                 "events",
             ],
-            &Self::agent_scope(st, project, group, category, &search),
+            &Self::agent_scope(st, project, filters.category, &query),
             &sql,
-            &[project.into(), group.map(str::to_string).into(), search.clone().into()],
+            &query.params(project),
             true,
         )?;
         for item in &mut page.items {
@@ -5610,7 +5748,7 @@ impl App {
             item["is_waiting"] = json!(waiting.is_some());
             item["waiting"] = waiting.map(Waiting::view).unwrap_or(Value::Null);
         }
-        let counts = Self::agent_counts(st, project, group, &search)?;
+        let counts = Self::agent_counts(st, project, &query)?;
         let project_total: i64 = st.db.query_row("SELECT count(*) FROM agents WHERE ?1 IS NULL OR project=?1", [project], |r| r.get(0))?;
         let event_cursor: i64 = st.db.query_row("SELECT coalesce(max(id),0) FROM events", [], |r| r.get(0))?;
         page.finish_with(&q, &json!({"counts":counts,"project_total":project_total,"event_cursor":event_cursor}))
@@ -5626,6 +5764,15 @@ impl App {
     ) -> R<Value> {
         let st = self.lock();
         let project = Self::viewer_project(&st, project, viewer)?;
+        if agent.is_some_and(|id| id < 0) {
+            return Err(bad("agent must be 0 (user) or a positive agent ID"));
+        }
+        if let Some(id) = agent.filter(|id| *id > 0) {
+            let member_project = st.agent(id)?.project;
+            if project.is_some_and(|project| project != member_project) {
+                return Err(bad("agent is in another project"));
+            }
+        }
         let sql=format!("SELECT t.id,t.project,t.title,t.created_by,t.created_at,
           (SELECT count(*) FROM messages m WHERE m.thread_id=t.id) messages,
           (SELECT max(at) FROM messages m WHERE m.thread_id=t.id) last_at
@@ -5981,7 +6128,7 @@ impl App {
         ] {
             let scope = match name {
                 "projects" | "configs" => name.to_string(),
-                "agents" => Self::agent_scope(&st, pid, None, "all", ""),
+                "agents" => Self::agent_scope(&st, pid, "all", &ParsedAgentQuery::default()),
                 "threads" => format!("threads:{pid:?}:None:0"),
                 "locks" => format!("locks:{pid:?}:{}", fingerprint(format!("{:?}", st.queues))),
                 "activity" => format!("activity:{pid:?}"),
@@ -6024,26 +6171,16 @@ impl App {
         }
         let unread_total:i64=st.db.query_row("SELECT count(*) FROM messages m JOIN members b ON b.thread_id=m.thread_id AND b.agent_id=0 LEFT JOIN user_reads r ON r.thread_id=m.thread_id WHERE m.sender<>0 AND m.id>coalesce(r.message_id,0) AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))",[],|r|r.get(0))?;
         let s = st.settings_for(pid);
-        let restart_paused: i64 = st.db.query_row(
-            "SELECT count(*) FROM agents WHERE state='paused' AND pause_reason='restart'",
-            [],
-            |r| r.get(0),
-        )?;
-        let resume_eligible: i64 = st.db.query_row(
-            "SELECT count(*) FROM agents WHERE state='paused'",
-            [],
-            |r| r.get(0),
-        )?;
-        let pause_eligible: i64 = st.db.query_row(
-            "SELECT count(*) FROM agents WHERE state IN ('working','idle','done')",
-            [],
-            |r| r.get(0),
-        )?;
-        let agent_counts = Self::agent_counts(&st, pid, None, "")?;
+        let global_actions = Self::action_counts(&st, None)?;
+        let project_actions = match pid {
+            Some(pid) => Self::action_counts(&st, Some(pid))?,
+            None => json!({"pause_eligible":0,"resume_eligible":0,"restart_paused":0}),
+        };
+        let agent_counts = Self::agent_counts(&st, pid, &ParsedAgentQuery::default())?;
         let (total, per) = st.active_counts(pid)?;
         let limits = json!({"limits":s.limits,"active":{"total":total,"per_harness":per},"usage":rows(&st.db,"SELECT provider,win,used_pct,resets_at,at FROM usage ORDER BY provider,win",[])?,"checks":rows(&st.db,"SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider",[])?,"text":st.limits_text(pid)?});
         Ok(
-            json!({"url":self.url,"project":current,"unread_total":unread_total,"restart_paused":restart_paused,"resume_eligible":resume_eligible,"pause_eligible":pause_eligible,"agent_counts":agent_counts,"limits":limits,"revisions":revisions,"revision":revision}),
+            json!({"url":self.url,"project":current,"unread_total":unread_total,"restart_paused":global_actions["restart_paused"],"resume_eligible":global_actions["resume_eligible"],"pause_eligible":global_actions["pause_eligible"],"project_actions":project_actions,"agent_counts":agent_counts,"limits":limits,"revisions":revisions,"revision":revision}),
         )
     }
 
@@ -6713,10 +6850,15 @@ impl App {
             "SELECT provider, win, used_pct, resets_at, at FROM usage ORDER BY provider, win",
             [],
         )?;
+        let usage_windows: BTreeMap<&str, Vec<String>> = crate::harness::KNOWN
+            .iter()
+            .map(|provider| Ok((*provider, subscriptions::known_windows(&st, provider)?)))
+            .collect::<R<_>>()?;
         Ok(json!({
             "limits": s.limits,
             "active": { "total": total, "per_harness": per },
             "usage": usage,
+            "usage_windows": usage_windows,
             "checks": rows(&st.db, "SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider", [])?,
             "text": st.limits_text(project)?,
         }))
@@ -6863,6 +7005,147 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn settings_reject_unknown_fields_at_each_input_level() {
+        let base = serde_json::to_value(Settings::default()).unwrap();
+        for pointer in [
+            "",
+            "/limits",
+            "/limits/active",
+            "/limits/active_per_harness/codex",
+            "/limits/usage/codex",
+            "/harnesses/codex",
+            "/prompts",
+        ] {
+            let mut value = base.clone();
+            value
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("misspelled_field".into(), json!(true));
+            assert!(
+                serde_json::from_value::<Settings>(value).is_err(),
+                "unknown field at {pointer} must not be silently ignored"
+            );
+        }
+        let mut value = base;
+        value["crash_retries"] = json!({"source":{
+            "harness":"codex", "model":"custom-target", "same_model_retry":1
+        }});
+        assert!(serde_json::from_value::<Settings>(value).is_err());
+    }
+
+    #[test]
+    fn settings_validate_model_lists_and_defaults_without_closing_custom_ids() {
+        for model in ["", "bad model", "claude-opus-5-5"] {
+            let mut settings = Settings::default();
+            settings
+                .harnesses
+                .get_mut("codex")
+                .unwrap()
+                .models
+                .push(model.into());
+            assert!(settings.check().is_err(), "invalid allowed model {model:?}");
+        }
+        for effort in ["", "bad effort"] {
+            let mut settings = Settings::default();
+            settings
+                .harnesses
+                .get_mut("codex")
+                .unwrap()
+                .efforts
+                .push(effort.into());
+            assert!(
+                settings.check().is_err(),
+                "invalid allowed effort {effort:?}"
+            );
+        }
+        let mut settings = Settings::default();
+        let cfg = settings.harnesses.get_mut("codex").unwrap();
+        cfg.model = "custom-model".into();
+        cfg.models.push(cfg.model.clone());
+        assert!(settings.check().is_ok());
+        let cfg = settings.harnesses.get_mut("codex").unwrap();
+        cfg.model = "claude-opus-5-5".into();
+        cfg.models.push(cfg.model.clone());
+        assert!(settings.check().is_err());
+    }
+
+    #[test]
+    fn settings_reject_nonfinite_limits() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut settings = Settings::default();
+            settings.limits.context.soft = Some(value);
+            assert!(settings.check().is_err());
+            let mut settings = Settings::default();
+            settings.limits.usage.get_mut("codex").unwrap().hard = Some(value);
+            assert!(settings.check().is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_saved_settings_fail_startup_without_replacing_or_rewriting_them() {
+        for custom in [false, true] {
+            let app = app_with_two_projects();
+            let mut invalid = serde_json::to_value(Settings::default()).unwrap();
+            invalid["auto_resum"] = json!(false);
+            let text = invalid.to_string();
+            let id = if custom {
+                app.lock()
+                    .db
+                    .execute("UPDATE projects SET custom=?1 WHERE id=1", [&text])
+                    .unwrap();
+                1
+            } else {
+                let id = app.add_config("Mine", Settings::default(), "user").unwrap();
+                app.lock()
+                    .db
+                    .execute(
+                        "UPDATE configs SET settings=?1 WHERE id=?2",
+                        params![text, id],
+                    )
+                    .unwrap();
+                id
+            };
+            let home = app.home.clone();
+            drop(app);
+            let error = App::open(home.clone(), "http://127.0.0.1:0".into())
+                .err()
+                .unwrap();
+            assert!(error.1.contains("invalid saved settings"));
+            let db = Connection::open(home.join("acom.db")).unwrap();
+            let query = if custom {
+                "SELECT custom FROM projects WHERE id=?1"
+            } else {
+                "SELECT settings FROM configs WHERE id=?1"
+            };
+            let retained: String = db.query_row(query, [id], |row| row.get(0)).unwrap();
+            assert_eq!(retained, text);
+        }
+    }
+
+    #[test]
+    fn blank_config_rename_rejects_the_entire_settings_update() {
+        let app = app_with_two_projects();
+        let original = Settings::default();
+        let id = app.add_config("Mine", original.clone(), "user").unwrap();
+        let mut changed = original.clone();
+        changed.auto_resume = !original.auto_resume;
+        for name in ["", "  "] {
+            assert_eq!(
+                app.put_config(id, Some(name), changed.clone(), "user")
+                    .unwrap_err()
+                    .0,
+                400
+            );
+            let saved = app.configs().unwrap();
+            let saved = saved.iter().find(|config| config["id"] == id).unwrap();
+            assert_eq!(saved["name"], "Mine");
+            assert_eq!(saved["settings"], json!(original));
+        }
     }
 
     #[test]
@@ -7265,7 +7548,7 @@ mod tests {
             let app = app_with_two_projects();
             hold(&app.lock(), "schema", 1, Some(now() + 100));
             if all {
-                app.pause_all("user").unwrap();
+                app.pause_all(None, "user").unwrap();
             } else {
                 app.pause(1, "user").unwrap();
             }
@@ -7537,6 +7820,187 @@ mod tests {
     }
 
     #[test]
+    fn overview_separates_project_actions_from_global_counts() {
+        let app = app_with_two_projects();
+        app.lock().db.execute_batch("UPDATE agents SET state='paused',pause_reason='restart',pause_from='idle' WHERE id=2;
+            INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at,pause_reason,pause_from)
+            VALUES(3,1,'done','t','claude','m','e','done',0,0,NULL,NULL),
+                  (4,1,'manual','t','claude','m','e','paused',0,0,'user','idle'),
+                  (5,2,'closed','t','claude','m','e','closed',0,0,NULL,NULL);").unwrap();
+        let first = app.overview(Some(1), None).unwrap();
+        assert_eq!(first["pause_eligible"], 2);
+        assert_eq!(first["resume_eligible"], 2);
+        assert_eq!(first["restart_paused"], 1);
+        assert_eq!(
+            first["project_actions"],
+            json!({"pause_eligible":2,"resume_eligible":1,"restart_paused":0})
+        );
+        assert_eq!(
+            app.overview(Some(2), None).unwrap()["project_actions"],
+            json!({"pause_eligible":0,"resume_eligible":1,"restart_paused":1})
+        );
+        assert_eq!(
+            app.overview(None, None).unwrap()["project_actions"],
+            first["project_actions"]
+        );
+        app.lock()
+            .db
+            .execute_batch("DELETE FROM agents; DELETE FROM projects;")
+            .unwrap();
+        assert_eq!(
+            app.overview(None, None).unwrap()["project_actions"],
+            json!({"pause_eligible":0,"resume_eligible":0,"restart_paused":0})
+        );
+    }
+
+    #[test]
+    fn project_bulk_controls_leave_other_projects_untouched() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            hold(&st, "own", 1, Some(now() + 120));
+            st.db
+                .execute(
+                    "INSERT INTO locks(project,name,about,created_at,holder,acquired_at,expires_at)
+                VALUES(2,'foreign','',0,2,0,?1)",
+                    [now() + 120],
+                )
+                .unwrap();
+        }
+        assert_eq!(app.pause_all(Some(1), "user").unwrap(), vec![1]);
+        drop(app.wait_stopped(app.lock(), &[1]));
+        {
+            let st = app.lock();
+            assert_eq!(st.agent(1).unwrap().state, "paused");
+            assert_eq!(st.agent(2).unwrap().state, "idle");
+            assert_eq!(lock(&st, "own").0, None);
+            assert_eq!(
+                st.db
+                    .query_row("SELECT holder FROM locks WHERE project=2", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                st.db
+                    .query_row("SELECT pause_reason FROM agents WHERE id=1", [], |r| r
+                        .get::<_, String>(
+                        0
+                    ))
+                    .unwrap(),
+                "user"
+            );
+        }
+        assert_eq!(app.resume_all(Some(2), "user").unwrap(), Vec::<i64>::new());
+        assert_eq!(app.resume_all(Some(1), "user").unwrap(), vec![1]);
+        assert_eq!(app.pause_all(None, "user").unwrap(), vec![1, 2]);
+        drop(app.wait_stopped(app.lock(), &[1, 2]));
+        assert_eq!(app.resume_all(None, "user").unwrap(), vec![1, 2]);
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn project_restart_resume_scopes_agents_and_cleanup_warnings() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db.execute_batch("UPDATE agents SET state='paused',pause_reason='restart',pause_from='idle';
+                INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at,pause_reason,pause_from)
+                VALUES(3,1,'manual','t','claude','m','e','paused',0,0,'user','idle'),
+                      (4,1,'limited','t','claude','m','e','paused',0,0,'limit','idle');
+                INSERT INTO locks(project,name,about,created_at,holder,acquired_at)
+                VALUES(2,'foreign','',0,2,0);").unwrap();
+        }
+        let result = app.resume_restart(Some(1), "user").unwrap();
+        assert_eq!(result, json!({"ids":[1],"errors":[],"warnings":[]}));
+        assert_eq!(app.lock().agent(1).unwrap().state, "idle");
+        for id in [2, 3, 4] {
+            assert_eq!(app.lock().agent(id).unwrap().state, "paused");
+        }
+        app.lock()
+            .db
+            .execute("UPDATE locks SET holder=NULL WHERE project=2", [])
+            .unwrap();
+        assert_eq!(
+            app.resume_restart(Some(2), "user").unwrap()["ids"],
+            json!([2])
+        );
+        assert_eq!(app.resume_all(Some(1), "user").unwrap(), vec![3, 4]);
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn bulk_controls_reject_invalid_project_before_any_changes() {
+        let app = app_with_two_projects();
+        let snapshot = || {
+            let st = app.lock();
+            json!([
+                rows(&st.db, "SELECT * FROM agents ORDER BY id", []).unwrap(),
+                rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
+                rows(&st.db, "SELECT * FROM activity ORDER BY id", []).unwrap(),
+            ])
+        };
+        let before = snapshot();
+        for project in [-1, 0, 999] {
+            let expected = if project > 0 { 404 } else { 400 };
+            assert_eq!(
+                app.pause_all(Some(project), "user").unwrap_err().0,
+                expected
+            );
+            assert_eq!(
+                app.resume_all(Some(project), "user").unwrap_err().0,
+                expected
+            );
+            assert_eq!(
+                app.resume_restart(Some(project), "user").unwrap_err().0,
+                expected
+            );
+            assert_eq!(snapshot(), before);
+        }
+        assert!(app.lock().stopping_agents.is_empty());
+        assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn bulk_resume_recheck_preserves_newer_lifecycle_actions() {
+        let app = app_with_two_projects();
+        let st = app.lock();
+        st.db.execute("UPDATE agents SET state='paused',pause_reason='restart',pause_from='idle',paused_at=1", []).unwrap();
+        let through: i64 = st
+            .db
+            .query_row("SELECT max(id) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert!(App::unchanged_pause(&st, 1, Some(1), RESUME_ELIGIBLE, through).unwrap());
+        assert!(!App::unchanged_pause(&st, 1, Some(2), RESUME_ELIGIBLE, through).unwrap());
+        st.db
+            .execute("UPDATE agents SET status_text='updated' WHERE id=1", [])
+            .unwrap();
+        st.db
+            .execute("UPDATE agents SET state='idle' WHERE id=2", [])
+            .unwrap();
+        assert!(App::unchanged_pause(&st, 1, Some(1), RESUME_ELIGIBLE, through).unwrap());
+        st.db
+            .execute("UPDATE agents SET pause_reason='user' WHERE id=1", [])
+            .unwrap();
+        assert!(!App::unchanged_pause(&st, 1, Some(1), RESTART_PAUSED, through).unwrap());
+        for state in ["closed", "crashed", "idle", "done", "paused"] {
+            st.db
+                .execute("UPDATE agents SET state=?1 WHERE id=1", [state])
+                .unwrap();
+            assert!(
+                !App::unchanged_pause(&st, 1, Some(1), RESUME_ELIGIBLE, through).unwrap(),
+                "{state}"
+            );
+        }
+        // A second pause can have the same timestamp/reason as the first one.
+        st.db
+            .execute("UPDATE agents SET pause_reason='restart' WHERE id=1", [])
+            .unwrap();
+        assert!(!App::unchanged_pause(&st, 1, None, RESTART_PAUSED, through).unwrap());
+        assert_eq!(st.agent(1).unwrap().state, "paused");
+    }
+
+    #[test]
     fn shutdown_preserves_pause_reasons_and_releases_paused_locks() {
         let app = app_with_two_projects();
         {
@@ -7585,7 +8049,7 @@ mod tests {
                   (5,1,'idle','t','claude','m','e','idle',0,0,NULL,NULL);").unwrap();
         let before = app.overview(Some(1), None).unwrap();
         assert_eq!(before["restart_paused"], 2);
-        let result = app.resume_restart("user").unwrap();
+        let result = app.resume_restart(None, "user").unwrap();
         assert_eq!(result["ids"], json!([1, 2]));
         assert_eq!(result["errors"], json!([]));
         assert_eq!(app.lock().agent(3).unwrap().state, "paused");
@@ -7594,7 +8058,7 @@ mod tests {
         let after = app.overview(Some(1), before["revision"].as_str()).unwrap();
         assert_eq!(after["restart_paused"], 0);
         assert_ne!(after["unchanged"], true);
-        assert_eq!(app.resume_restart("user").unwrap()["ids"], json!([]));
+        assert_eq!(app.resume_restart(None, "user").unwrap()["ids"], json!([]));
     }
 
     #[test]
@@ -9091,7 +9555,7 @@ mod tests {
         }
         app.turn_ended(1, 0, false, Some("late callback")).unwrap();
         app.tick().unwrap();
-        assert!(app.resume_all("user").unwrap().is_empty());
+        assert!(app.resume_all(None, "user").unwrap().is_empty());
         let view = app.agent_view(1).unwrap();
         assert_eq!(view["state"], "replaced");
         assert_eq!(view["problem"], "original failure");
@@ -10193,6 +10657,31 @@ mod tests {
     }
 
     #[test]
+    fn thread_membership_filters_validate_agent_identity_and_scope() {
+        let app = app_with_two_projects();
+        for (agent, code) in [(-1, 400), (999, 404), (2, 400)] {
+            assert_eq!(
+                app.threads_page(Some(1), Some(agent), None, PageQuery::default())
+                    .unwrap_err()
+                    .0,
+                code
+            );
+        }
+        assert!(
+            app.threads_page(Some(1), Some(0), None, PageQuery::default())
+                .is_ok()
+        );
+        assert!(
+            app.threads_page(Some(1), Some(1), None, PageQuery::default())
+                .is_ok()
+        );
+        assert!(
+            app.threads_page(None, Some(2), None, PageQuery::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn members_and_selectors_stay_within_the_project() {
         let st = st();
         let p1 = App::resolve(&st, 1, &["active".into()]).unwrap();
@@ -10200,6 +10689,11 @@ mod tests {
         assert_eq!(App::resolve(&st, 2, &["working".into()]).unwrap(), [4]);
         let err = App::resolve(&st, 1, &["2,4".into()]).unwrap_err();
         assert_eq!(err.1, "agent 4 is in another project");
+        for selector in ["", "1,", ",1", "1,,2", "group:", "group: ", "-1"] {
+            assert_eq!(App::resolve(&st, 1, &[selector.into()]).unwrap_err().0, 400);
+        }
+        assert_eq!(App::resolve(&st, 1, &["0,1".into()]).unwrap(), [0, 1]);
+        assert!(App::resolve(&st, 1, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -13022,7 +13516,14 @@ mod tests {
         };
         loop {
             let page = app
-                .filtered_agents_page(Some(1), None, "attention", "", q.clone())
+                .filtered_agents_page(
+                    Some(1),
+                    AgentFilter {
+                        category: "attention",
+                        ..AgentFilter::default()
+                    },
+                    q.clone(),
+                )
                 .unwrap();
             assert!(page.to_string().len() <= 512);
             assert_eq!(page["counts"], expected);
@@ -13049,9 +13550,10 @@ mod tests {
         let found = app
             .filtered_agents_page(
                 Some(1),
-                None,
-                "all",
-                "  ÄÄdeepNEEDLE ",
+                AgentFilter {
+                    search: "  ÄÄdeepNEEDLE ",
+                    ..AgentFilter::default()
+                },
                 PageQuery::default(),
             )
             .unwrap();
@@ -13077,19 +13579,484 @@ mod tests {
             seeded.iter().filter(|(_, s)| *s == "paused").count()
         );
         assert!(
-            app.filtered_agents_page(Some(1), None, "unknown", "", PageQuery::default())
-                .is_err()
-        );
-        assert!(
             app.filtered_agents_page(
                 Some(1),
-                None,
-                "all",
-                &"x".repeat(4097),
+                AgentFilter {
+                    category: "unknown",
+                    ..AgentFilter::default()
+                },
                 PageQuery::default()
             )
             .is_err()
         );
+        assert!(
+            app.filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    search: &"x".repeat(4097),
+                    ..AgentFilter::default()
+                },
+                PageQuery::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn field_queries_share_exact_filters_counts_and_semantic_cursors() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            for (id, project, group, harness, model, effort, state, reason, task) in [
+                (
+                    3,
+                    1,
+                    Some("Security review"),
+                    "codex",
+                    "custom:model",
+                    "high",
+                    "paused",
+                    Some("limit"),
+                    "reentrancy",
+                ),
+                (
+                    4,
+                    1,
+                    Some("Security review"),
+                    "codex",
+                    "custom:model",
+                    "high",
+                    "crashed",
+                    None,
+                    "REENTRANCY",
+                ),
+                (
+                    5,
+                    1,
+                    Some("Security review"),
+                    "claude",
+                    "custom:model",
+                    "high",
+                    "paused",
+                    Some("user"),
+                    "reentrancy",
+                ),
+                (
+                    6,
+                    1,
+                    Some("other"),
+                    "codex",
+                    "custom:model",
+                    "high",
+                    "paused",
+                    Some("limit"),
+                    "Security review reentrancy",
+                ),
+                (
+                    7,
+                    1,
+                    Some("Security review"),
+                    "codex",
+                    "other",
+                    "high",
+                    "paused",
+                    Some("limit"),
+                    "reentrancy",
+                ),
+                (
+                    8,
+                    1,
+                    Some("Security review"),
+                    "codex",
+                    "custom:model",
+                    "low",
+                    "paused",
+                    Some("limit"),
+                    "reentrancy",
+                ),
+                (
+                    9,
+                    2,
+                    Some("Security review"),
+                    "codex",
+                    "custom:model",
+                    "high",
+                    "paused",
+                    Some("limit"),
+                    "reentrancy",
+                ),
+                (
+                    10,
+                    1,
+                    None,
+                    "codex",
+                    "empty",
+                    "high",
+                    "idle",
+                    None,
+                    "ungrouped",
+                ),
+                (
+                    11,
+                    1,
+                    Some(""),
+                    "codex",
+                    "empty",
+                    "high",
+                    "idle",
+                    None,
+                    "ungrouped",
+                ),
+            ] {
+                st.db.execute("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(?1,?2,'Worker',?3,?4,?5,?6,?7,?8,?9,0,0)", params![id,project,group,task,harness,model,effort,state,reason]).unwrap();
+            }
+        }
+        let before = app.lock().db.total_changes();
+        let filter = AgentFilter {
+            search: "group:\"Security review\" provider:codex model:\"custom:model\" effort:high state:paused,crashed reentrancy",
+            ..AgentFilter::default()
+        };
+        let first = app
+            .filtered_agents_page(
+                Some(1),
+                filter,
+                PageQuery {
+                    limit: 1,
+                    max_bytes: 512,
+                    ..PageQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(first["total"], 2);
+        assert_eq!(
+            first["counts"],
+            json!({"all":2,"active":0,"attention":2,"finished":0})
+        );
+        assert_eq!(first["items"][0]["id"], 4);
+        let next_query = PageQuery {
+            before: first["next_before"].as_i64(),
+            through: first["through"].as_i64(),
+            revision: first["revision"].as_str().map(str::to_owned),
+            max_bytes: 512,
+            ..PageQuery::default()
+        };
+        let equivalent = AgentFilter {
+            group: Some("Security review"),
+            provider: Some("codex"),
+            model: Some("custom:model"),
+            effort: Some("high"),
+            search: "REENTRANCY state:crashed,paused,paused",
+            ..AgentFilter::default()
+        };
+        let second = app
+            .filtered_agents_page(Some(1), equivalent, next_query.clone())
+            .unwrap();
+        assert_eq!(second["items"][0]["id"], 3);
+        assert_eq!(second["has_more"], false);
+        assert_eq!(
+            app.filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    effort: Some("low"),
+                    ..equivalent
+                },
+                next_query
+            )
+            .unwrap_err()
+            .0,
+            409
+        );
+        let ungrouped = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    search: "group:\"\" model:empty",
+                    ..AgentFilter::default()
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(ungrouped["total"], 2);
+        let narrowed = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    search: "state:crashed,paused pause_reason:limit",
+                    ..AgentFilter::default()
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert!(
+            narrowed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["state"] == "paused" && item["pause_reason"] == "limit")
+        );
+        for search in [
+            "group:bad group:other",
+            "provider:bad",
+            "task:x",
+            "state:idle pause_reason:limit",
+            "group:",
+        ] {
+            assert_eq!(
+                app.filtered_agents_page(
+                    Some(1),
+                    AgentFilter {
+                        search,
+                        ..AgentFilter::default()
+                    },
+                    PageQuery::default()
+                )
+                .unwrap_err()
+                .0,
+                400
+            );
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
+        assert_eq!(
+            app.overview(Some(1), None).unwrap()["agent_counts"]["all"],
+            9
+        );
+        assert_eq!(app.lock().db.total_changes(), before);
+    }
+
+    #[test]
+    fn bare_query_terms_match_individual_metadata_fields_not_effort_or_boundaries() {
+        let app = app_with_two_projects();
+        app.lock().db.execute("UPDATE agents SET name='Boundary', task='different task', model='custom:model', grp='ÄÄ crew', effort='ultra' WHERE id=1", []).unwrap();
+        for (search, total) in [
+            ("boundary crew", 1),
+            ("ÄÄ DIFFERENT", 1),
+            ("ultra", 0),
+            ("effort:ultra", 1),
+            ("\"Boundary 1\"", 0),
+            ("\"custom:model\"", 1),
+            ("\"crew different\"", 0),
+            ("group:\"ÄÄ crew\"", 1),
+            ("group:\"ää crew\"", 0),
+        ] {
+            let result = app
+                .filtered_agents_page(
+                    Some(1),
+                    AgentFilter {
+                        search,
+                        ..AgentFilter::default()
+                    },
+                    PageQuery::default(),
+                )
+                .unwrap();
+            assert_eq!(result["total"], total, "{search}");
+        }
+    }
+
+    #[test]
+    fn structured_agent_filters_share_counts_pages_and_normalized_cursor_scope() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            for (id, project, state, reason, group, task) in [
+                (3, 1, "paused", Some("user"), "crew", "needle"),
+                (4, 1, "paused", Some("all"), "crew", "needle"),
+                (5, 1, "paused", Some("limit"), "crew", "needle"),
+                (6, 1, "paused", Some("restart"), "crew", "needle"),
+                (7, 1, "working", None, "crew", "needle"),
+                (8, 1, "paused", Some("user"), "other", "needle"),
+                (9, 1, "paused", Some("user"), "crew", "different task"),
+                (10, 2, "paused", Some("limit"), "crew", "needle"),
+            ] {
+                st.db.execute("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(?1,?2,'Worker',?3,?4,'codex','gpt-6-sol','medium',?5,?6,0,0)", params![id, project, group, task, state, reason]).unwrap();
+            }
+            for id in 11..=34 {
+                let reason = if id % 2 == 0 { "user" } else { "all" };
+                st.db.execute("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(?1,1,'Worker','crew','needle','codex','gpt-6-sol','medium','paused',?2,0,0)", params![id, reason]).unwrap();
+            }
+        }
+        let before = app.lock().db.total_changes();
+        let filter = AgentFilter {
+            group: Some("crew"),
+            search: " NEEDLE ",
+            pause_reason: Some("manual"),
+            ..AgentFilter::default()
+        };
+        let mut query = PageQuery {
+            limit: 3,
+            max_bytes: 512,
+            ..PageQuery::default()
+        };
+        let first = app
+            .filtered_agents_page(Some(1), filter, query.clone())
+            .unwrap();
+        let explicit = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    state: Some("paused"),
+                    ..filter
+                },
+                query.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            first, explicit,
+            "an implied paused state has the same cursor scope"
+        );
+        let expected_counts = json!({"all":26,"active":0,"attention":26,"finished":0});
+        let mut ids = Vec::new();
+        loop {
+            let page = app
+                .filtered_agents_page(Some(1), filter, query.clone())
+                .unwrap();
+            assert!(page.to_string().len() <= 512);
+            assert_eq!(page["total"], 26);
+            assert_eq!(page["counts"], expected_counts);
+            assert_eq!(page["project_total"], 32);
+            ids.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_i64().unwrap()),
+            );
+            if page["has_more"] != true {
+                break;
+            }
+            query.before = page["next_before"].as_i64();
+            query.through = page["through"].as_i64();
+            query.revision = page["revision"].as_str().map(str::to_owned);
+        }
+        let expected: Vec<_> = (11..=34).rev().chain([4, 3]).collect();
+        assert_eq!(
+            ids, expected,
+            "no missing or duplicated matching agents across pages"
+        );
+        let active = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    category: "active",
+                    ..filter
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(active["total"], 0);
+        assert_eq!(
+            active["counts"], expected_counts,
+            "category selection does not narrow facet counts"
+        );
+        let limits = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    pause_reason: Some("limit"),
+                    ..AgentFilter::default()
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(limits["total"], 1);
+        assert_eq!(limits["items"][0]["id"], 5);
+        let restart = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    pause_reason: Some("restart"),
+                    ..AgentFilter::default()
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(restart["items"][0]["id"], 6);
+        for changed in [
+            AgentFilter {
+                pause_reason: Some("limit"),
+                ..filter
+            },
+            AgentFilter {
+                pause_reason: None,
+                ..filter
+            },
+            AgentFilter {
+                state: Some("idle"),
+                pause_reason: None,
+                ..filter
+            },
+        ] {
+            assert_eq!(
+                app.filtered_agents_page(
+                    Some(1),
+                    changed,
+                    PageQuery {
+                        before: first["next_before"].as_i64(),
+                        through: first["through"].as_i64(),
+                        revision: first["revision"].as_str().map(str::to_owned),
+                        ..PageQuery::default()
+                    }
+                )
+                .unwrap_err()
+                .0,
+                409
+            );
+        }
+        let overview = app.overview(Some(1), None).unwrap();
+        assert_eq!(overview["agent_counts"]["all"], 32);
+        assert_eq!(overview["project_actions"]["resume_eligible"], 30);
+        assert_eq!(overview["resume_eligible"], 31);
+        assert_eq!(app.lock().db.total_changes(), before);
+    }
+
+    #[test]
+    fn invalid_structured_agent_filters_reject_without_changes() {
+        let app = app_with_two_projects();
+        let before = app.lock().db.total_changes();
+        for filter in [
+            AgentFilter {
+                state: Some(""),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                state: Some("Paused"),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                state: Some("active"),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                pause_reason: Some(""),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                pause_reason: Some("user"),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                pause_reason: Some("all"),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                pause_reason: Some(" limit "),
+                ..AgentFilter::default()
+            },
+            AgentFilter {
+                state: Some("idle"),
+                pause_reason: Some("limit"),
+                ..AgentFilter::default()
+            },
+        ] {
+            let error = app
+                .filtered_agents_page(Some(1), filter, PageQuery::default())
+                .unwrap_err();
+            assert_eq!(error.0, 400, "{filter:?}: {error:?}");
+            assert!(
+                error.1.contains("must be") || error.1.contains("requires state paused"),
+                "{error:?}"
+            );
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
     }
 
     #[test]
@@ -13100,16 +14067,18 @@ mod tests {
             .execute("UPDATE agents SET state='closed' WHERE id=1", [])
             .unwrap();
         let page = app
-            .filtered_agents_page(Some(1), None, "all", "", PageQuery::default())
+            .filtered_agents_page(Some(1), AgentFilter::default(), PageQuery::default())
             .unwrap();
         let revision = page["revision"].as_str().unwrap().to_string();
         for (category, search) in [("active", ""), ("all", "other")] {
             assert_eq!(
                 app.filtered_agents_page(
                     Some(1),
-                    None,
-                    category,
-                    search,
+                    AgentFilter {
+                        category,
+                        search,
+                        ..AgentFilter::default()
+                    },
                     PageQuery {
                         revision: Some(revision.clone()),
                         before: Some(2),
@@ -13126,9 +14095,7 @@ mod tests {
         let fresh = app
             .filtered_agents_page(
                 Some(1),
-                None,
-                "all",
-                "",
+                AgentFilter::default(),
                 PageQuery {
                     since: Some(revision),
                     ..PageQuery::default()

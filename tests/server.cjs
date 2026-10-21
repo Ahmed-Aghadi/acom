@@ -142,7 +142,7 @@ test('CLI rejects port zero before creating server state', () => {
   } finally {fs.rmSync(root,{recursive:true,force:true});}
 });
 
-test('CLI paths and agent details use caller context; negative API actors cannot write', async () => {
+test('CLI paths and agent details use caller context; negative API actors cannot write', async t => {
   const executableDir=path.dirname(fs.realpathSync(binary));
   for(const client of ['codex','claude']) assert.equal(fs.existsSync(path.join(executableDir,client)),false,`${client} must not shadow the empty fixture PATH`);
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'acom-caller-context-'));
@@ -150,7 +150,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
   const emptyBin=path.join(root,'empty-bin');
   for(const dir of [home,serverCwd,clientCwd,emptyBin,path.join(serverCwd,'child'),path.join(clientCwd,'child')]) fs.mkdirSync(dir,{recursive:true});
   const env={...process.env,ACOM_HOME:home,CODEX_HOME:path.join(root,'codex'),CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'),PATH:emptyBin};
-  delete env.ACOM_ID; delete env.ACOM_URL; delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  for(const key of ['ACOM_ID','ACOM_URL','CLAUDE_CODE_OAUTH_TOKEN','ANTHROPIC_API_KEY','OPENAI_API_KEY']) delete env[key];
   const url=`http://127.0.0.1:${await freePort()}`;
   const server=spawn(binary,['serve','--port',new URL(url).port],{cwd:serverCwd,env,stdio:['ignore','ignore','pipe']});
   let errors=''; server.stderr.on('data',chunk=>errors+=chunk);
@@ -220,6 +220,103 @@ test('CLI paths and agent details use caller context; negative API actors cannot
     assert.equal((await api('GET','/agents')).length,3);
     assert.equal((await api('GET','/threads')).length,1);
     assert.equal((await api('GET','/agents/1')).effort,'medium');
+    await t.test('server validates request boundaries before business-state changes',async()=>{
+      await api('POST',`/threads/${thread.id}/members`,{members:['1']});
+      assert.ok((await api('POST',`/threads/${thread.id}/members`,{members:[3]})).members.includes(3),'numeric member IDs remain valid selectors');
+      const message=await api('POST','/messages',{thread:thread.id,text:'Keep this message unhandled'});
+      const snapshot=()=>{
+        const connection=new DatabaseSync(path.join(home,'acom.db'));
+        try {
+          connection.exec('PRAGMA busy_timeout=5000');
+          return Object.fromEntries([
+            'projects','configs','agents','threads','thread_access','thread_owners','members',
+            'member_intervals','messages','marks','locks','notices','events','activity',
+            'summary_cursors','update_deliveries','wait_watch_cursors','subscriptions',
+          ].map(table=>[table,connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+        } finally {connection.close();}
+      };
+      const settings=(await api('GET','/configs/1')).settings;
+      const malformedSettings=[
+        value=>{value.typo=true;},
+        value=>{value.prompts.resuem='typo';},
+        value=>{value.harnesses.codex.typo=true;},
+        value=>{value.limits.active.typo=1;},
+        value=>{value.limits.typo={soft:null,hard:null};},
+        value=>{value.harnesses.codex.models.push('');},
+        value=>{value.harnesses.codex.efforts.push('bad effort');},
+      ].map(change=>{const value=structuredClone(settings);change(value);return value;});
+      const cases=[
+        ['POST','/threads',{project:a.id,title:'must not exist',member:['1']}],
+        ['POST','/threads',{project:a.id,title:'must not exist',members:[true]}],
+        ['POST','/threads',{project:a.id,title:'must not exist',members:{agent:1}}],
+        ['POST','/threads',{project:a.id,title:'must not exist',watch:'idle',members:['1']}],
+        ['POST',`/threads/${thread.id}/members`,{members:['3'],agent:'1'}],
+        ['POST','/messages',{agent:null,thread:thread.id,text:'must not send'}],
+        ['POST','/messages',{agent:0,thread:thread.id,text:'must not send',typo:true}],
+        ['POST','/messages',{agent:0,thread:thread.id,text:'must not send'},'typo=1'],
+        ['POST','/marks',{agent:1,ids:[message.id,'2'],mark:'handled'}],
+        ['POST','/locks',{project:a.id,name:'must not exist',about:'fixture',agent:null}],
+        ['POST','/agents',{project:a.id,harness:'codex',task:'must not start',force:'false'}],
+        ['POST','/agents',{project:a.id,harness:'codex',task:'must not start',done:null}],
+        ['POST','/agents',{project:a.id,harness:'codex',task:'must not start',model:''}],
+        ['POST','/agents',{project:a.id,harness:'codex',task:'must not start',model:'claude-sonnet-5-5'}],
+        ['POST','/agent-config',{id:1,agent:0,effort:'high',ack_crashes:'false'}],
+        ['POST','/projects',{path:serverCwd,via:'1'}],
+        ['POST','/folders',{parent:clientCwd,name:'must-not-create',typo:true}],
+        ['PUT',`/projects/${a.id}/config`,{config:'1'}],
+        ['PUT',`/projects/${a.id}/config`,{config:1,custom:settings}],
+        ['POST','/projects',[]],
+        ...malformedSettings.map(value=>['POST','/configs',{name:'must not save',settings:value}]),
+      ];
+      for(const [method,route,body,query] of cases) {
+        const before=snapshot();
+        const error=await api(method,route+(query?`?${query}`:''),body,400).catch(error=>{
+          error.message+=`\nRejected input: ${JSON.stringify(body)}`; throw error;
+        });
+        assert.equal(typeof error.error,'string'); assert.ok(error.error.length>0);
+        assert.deepEqual(snapshot(),before,`${method} ${route} ${JSON.stringify(body)} must be rejected before writes`);
+      }
+      for(const [route,body] of [
+        ['/messages',`{"agent":1,"agent":0,"thread":${thread.id},"text":"must not send"}`],
+        ['/configs',JSON.stringify({name:'must not save',settings}).replace('"prompts":{','"prompts":{"launch":"duplicate",')],
+      ]) {
+        const before=snapshot();
+        const response=await fetch(url+route,{method:'POST',headers:{'Content-Type':'application/json'},body});
+        assert.equal(response.status,400);
+        assert.match((await response.json()).error,/duplicate/i);
+        assert.deepEqual(snapshot(),before,'duplicate JSON keys must not overwrite caller identity or settings');
+      }
+      for(const route of [
+        '/agents?cateogry=active','/agents?project=0','/threads?agent=1&viewer=1&typo=1',
+        '/agents?project=1&project=2','/agents?%70roject=1&project=2','/folders?hidden=true',
+        '/folders?hidden=2','/folders?path=%FF','/projects?path',
+        `/threads/${thread.id}?agent=1&version=must-not-ignore`,
+      ]) {
+        const before=snapshot();
+        assert.equal(typeof (await api('GET',route,undefined,400)).error,'string');
+        assert.deepEqual(snapshot(),before,`invalid read ${route} must not mutate state`);
+      }
+      assert.deepEqual(await api('GET',`/agents?%70roject=${a.id}`),await api('GET',`/agents?project=${a.id}`),'encoded known query names must still apply their filter');
+      const deepLink=await fetch(`${url}/?project=${a.id}`);
+      assert.equal(deepLink.status,200);
+      assert.match(deepLink.headers.get('content-type'),/text\/html/);
+      assert.match(await deepLink.text(),/<title>acom<\/title>/);
+      assert.equal((await fetch(`${url}/?project=999999`)).status,200,'a stale bookmark must still load the UI shell');
+      for(const ids of ['',',','1,',',1','1,,2','0','1,0']) {
+        const before=snapshot();
+        const rejected=cli(['resume',ids]);
+        assert.notEqual(rejected.status,0,`invalid resume IDs ${JSON.stringify(ids)} must fail`);
+        assert.match(rejected.stderr,/ID|integer/i);
+        assert.deepEqual(snapshot(),before,'invalid ID lists must fail before resuming any agent');
+      }
+      assert.equal(fs.existsSync(path.join(clientCwd,'must-not-create')),false);
+      const custom=structuredClone(settings);
+      custom.harnesses.codex.models.push('custom-local-model');
+      custom.harnesses.codex.model='custom-local-model';
+      const saved=await api('POST','/configs',{name:'Custom model',settings:custom});
+      assert.equal((await api('GET',`/configs/${saved.id}`)).settings.harnesses.codex.model,'custom-local-model','open-ended model IDs stay supported');
+      assert.equal((await api('GET','/agents')).length,3,'rejected launches must not create agents');
+    });
   } finally {
     if(server.exitCode===null && server.signalCode===null) {
       const exited=new Promise(resolve=>server.once('exit',resolve));server.kill('SIGTERM');await exited;
@@ -549,7 +646,10 @@ process.stdin.on('end', async () => {
     const reference=await fetch(url+'/models');
     assert.match(reference.headers.get('content-type'),/text\/plain/);
     assert.match(await reference.text(),/Unresolved cross-generation/);
-    if (process.env.ACOM_BROWSER_TEST) await browserChecks(url, api, first, second, defaults, mine.id);
+    if (process.env.ACOM_BROWSER_TEST) {
+      await browserChecks(url, api, first, second, defaults, mine.id);
+      if (process.env.ACOM_BROWSER_TEST_ONLY) return;
+    }
     const a = await api('POST', '/projects', { path: first });
     const b = await api('POST', '/projects', { path: second });
     for(const project of [a.id,b.id]) await api('PUT',`/projects/${project}/config`,{config:mine.id});
@@ -560,8 +660,10 @@ process.stdin.on('end', async () => {
     const windowView = await api('GET',`/overview?project=${a.id}`);
     assert.deepEqual(windowView.settings.limits.usage.claude_five_hour,{soft:25,hard:75});
     assert.deepEqual(windowView.settings.limits.usage.claude_seven_day,{soft:60,hard:90});
-    assert.match(cli(first,['limits']),/claude five-hour unknown \(soft 25%, hard 75%\)/);
-    assert.match(cli(first,['limits']),/claude weekly unknown \(soft 60%, hard 90%\)/);
+    const windowLimits=cli(first,['limits']);
+    assert.match(windowLimits,/claude five-hour \[five_hour\] unknown \(soft 25%, hard 75%\)/);
+    assert.match(windowLimits,/claude weekly \[seven_day\] unknown \(soft 60%, hard 90%\)/);
+    assert.match(windowLimits,/claude weekly Fable \[seven_day_fable\] unknown/);
     const invalid = structuredClone(windowConfig); invalid.limits.usage.claude_seven_day.hard = 101;
     await api('PUT',`/configs/${mine.id}`,{settings:invalid},400);
     await api('PUT',`/configs/${mine.id}`,{settings:defaults});
@@ -699,8 +801,8 @@ process.stdin.on('end', async () => {
     const reopenedPrompt = runs().filter(r=>r.id===one.id)[1].prompt;
     assert.match(reopenedPrompt,/Literal \{updates\} wake/);
     assert.doesNotMatch(reopenedPrompt, /# acom guide|user changed the limits or rules/);
-    assert.match(reopenedPrompt, /claude five-hour unknown \(soft 25%, hard 75%\)/);
-    assert.match(reopenedPrompt, /claude weekly unknown \(soft 60%, hard 90%\)/);
+    assert.match(reopenedPrompt, /claude five-hour \[five_hour\] unknown \(soft 25%, hard 75%\)/);
+    assert.match(reopenedPrompt, /claude weekly \[seven_day\] unknown \(soft 60%, hard 90%\)/);
     assert.match(reopenedPrompt, /any new message in its threads wakes it again/);
     assert.ok(runs().filter(r => r.id === one.id)[1].args.includes('--dangerously-bypass-approvals-and-sandbox'));
     await finished(one.id, 'done');
@@ -721,7 +823,7 @@ process.stdin.on('end', async () => {
     assert.match(crashRetry.prompt, /Resumed at .* after an error/);
     assertResumeWarning(crashRetry.prompt,defaults.prompts.resume);
     assert.match(crashRetry.prompt, /Literal \{updates\} resume/);
-    assert.match(crashRetry.prompt, /claude weekly unknown \(soft 35%, hard 65%\)/);
+    assert.match(crashRetry.prompt, /claude weekly \[seven_day\] unknown \(soft 35%, hard 65%\)/);
     assert.doesNotMatch(crashRetry.prompt, /# acom guide|user changed the limits or rules/);
     await finished(crashed.id);
     assert.equal((await api('GET', `/agents/${crashed.id}`)).session, crashSession);
@@ -2240,6 +2342,32 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
   try {
     await page.goto(`${url}/?project=${project}`);
     await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
+    await page.locator('#agent-search').fill('provider:codex state:closed "First project"');
+    await page.waitForFunction(id => {
+      const cards = document.querySelectorAll('#agents [data-action=details]');
+      return cards.length === 1 && cards[0].dataset.id === String(id);
+    }, agent);
+    assert.equal(await page.locator('[data-edit-agent-filter=provider]').count(), 1);
+    assert.equal(await page.locator('[data-edit-agent-filter=state]').count(), 1);
+    await page.locator('#agent-search').fill('provider:made-up');
+    await page.waitForFunction(() => document.querySelector('#agent-search').getAttribute('aria-invalid') === 'true');
+    assert.match(await page.locator('#agent-query-error').textContent(), /provider/);
+    assert.equal(await page.locator('#agents [data-action=details]').count(), 0, 'invalid queries never show stale results as current');
+    await page.waitForTimeout(2200);
+    assert.equal(await page.locator('#live-text').textContent(), 'live', 'a query error is not a server outage');
+    await page.locator('#clear-agent-filters').click();
+    await page.locator(`[data-action=reopen][data-id="${agent}"]`).waitFor();
+    const beforeReopen = await api('GET', `/agents/${agent}`);
+    assert.equal(beforeReopen.state, 'closed');
+    const confirmations = [];
+    page.once('dialog', async dialog => {
+      confirmations.push(dialog.message());
+      await dialog.dismiss();
+    });
+    await page.locator(`[data-action=reopen][data-id="${agent}"]`).click();
+    assert.equal(confirmations.length, 1);
+    assert.match(confirmations[0], new RegExp(`Reopen .*#${agent}`));
+    assert.equal((await api('GET', `/agents/${agent}`)).state, beforeReopen.state, 'canceling a real-page confirmation keeps the agent closed');
     await api('POST', '/messages', { agent, thread, text: 'Live unread badge' });
     await page.waitForFunction(() => document.querySelector('#unread-total').textContent === '1 unread');
     await page.locator('[data-page=threads]').click(); await page.locator(`[data-thread="${thread}"]`).click();
@@ -2331,6 +2459,34 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     const firstId = projects.find(p => p.path === first).id;
     const secondId = projects.find(p => p.path === second).id;
     assert.equal(await page.locator('#project-path').textContent(), second);
+    await page.locator('[data-page=settings]').click();
+    await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    assert.equal(await page.locator('#confirm-agent-actions').isChecked(), true);
+    const configBeforePreference = await api('GET', '/configs');
+    await page.locator('#confirm-agent-actions').uncheck();
+    assert.equal(await page.locator('[form=settings-form]').isDisabled(), true, 'browser preferences do not dirty Default');
+    await page.reload();
+    await page.locator('[data-page=settings]').click();
+    await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    assert.equal(await page.locator('#confirm-agent-actions').isChecked(), false, 'preference survives reload against the real server');
+    await page.locator('#confirm-agent-actions').check();
+    assert.deepEqual(await api('GET', '/configs'), configBeforePreference, 'browser preferences never write project configurations');
+    await page.locator('[data-page=overview]').click();
+    await page.locator('#agent-filters summary').click();
+    const filteredResponse = page.waitForResponse(response => {
+      const query = new URL(response.url());
+      return query.pathname === '/agents' && query.searchParams.get('search') === 'pause_reason:"limit"';
+    });
+    await page.locator('#agent-filter-field').selectOption('pause_reason');
+    await page.locator('#agent-filter-value').fill('limit');
+    await page.locator('#apply-agent-filter').click();
+    const filtered = await (await filteredResponse).json();
+    assert.equal(filtered.total, 0);
+    assert.deepEqual(filtered.counts, { all: 0, active: 0, attention: 0, finished: 0 });
+    await page.locator('[data-edit-agent-filter=pause_reason]').waitFor();
+    assert.match(await page.locator('[data-edit-agent-filter=pause_reason]').textContent(), /limit/);
+    assert.match(await page.locator('#agent-filter-scope').textContent(), /ignore these filters/);
+    await page.locator('#clear-agent-filters').click();
     await page.locator('[data-page=threads]').click();
     await page.locator('[data-open=thread-dialog]').click();
     await page.locator('#thread-form [name=title]').fill('Browser notes');

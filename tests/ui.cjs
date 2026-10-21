@@ -33,6 +33,45 @@ const reloadPage = async page => {
   await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
 };
 
+// Test-server query fixture only; the page obtains clauses from the real server parser.
+function agentQueryFixture(source) {
+  const fields=['group','provider','model','effort','state','pause_reason'],clauses=[]; let i=0;
+  const quote=value=>'"'+value.replaceAll('\\','\\\\').replaceAll('"','\\"')+'"',fail=message=>{throw new Error(message);};
+  const value=()=>{
+    if(source[i]==='"') {
+      i++;let text='';
+      while(i<source.length) {
+        const char=source[i++];if(char==='"')return text;
+        if(char==='\\') {const next=source[i++];if(!['\\','"'].includes(next))fail('Invalid escape');text+=next;} else text+=char;
+      }
+      fail('Unclosed quote');
+    }
+    const start=i;while(i<source.length&&!/[\s,:"\\]/.test(source[i]))i++;
+    if(start===i)fail('Missing or malformed value');return source.slice(start,i);
+  };
+  try {
+    while(i<source.length) {
+      while(/\s/.test(source[i]||'')&&i<source.length)i++;if(i===source.length)break;
+      const quoted=source[i]==='"',first=value(); let field=null,values=[first];
+      if(!quoted&&source[i]===':') {
+        field=first;i++;if(!fields.includes(field))fail(`Unknown search field: ${field}`);
+        if(clauses.some(clause=>clause.field===field))fail(`Duplicate search field: ${field}`);
+        values=[value()];while(source[i]===','){i++;values.push(value());}
+        if(field!=='group'&&values.includes(''))fail(`Empty ${field} value`);
+        const valid={provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']}[field];
+        if(valid&&values.some(value=>!valid.includes(value)))fail(`Unknown ${field} value`);
+        values=[...new Set(values)].sort();
+      } else if(first==='')fail('Empty text term');
+      if(i<source.length&&!/\s/.test(source[i]))fail('Expected space between clauses');
+      clauses.push({field,values,text:field?`${field}:${values.map(quote).join(',')}`:quote(first)});
+    }
+    const reason=clauses.find(clause=>clause.field==='pause_reason'),state=clauses.find(clause=>clause.field==='state');
+    if(reason&&state&&!state.values.includes('paused'))fail('Pause reason conflicts with state');
+    clauses.sort((a,b)=>(a.field==null?fields.length:fields.indexOf(a.field))-(b.field==null?fields.length:fields.indexOf(b.field)));
+    return {text:clauses.map(clause=>clause.text).join(' '),clauses};
+  } catch(error) {return {status:400,error:error.message};}
+}
+
 async function fixture(run) {
   const data = { settings: settings(), agents: [], threads: [], subscriptions: [], reads: {}, agentLogs: {}, detailRequests: [], getRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
   data.configs = [{ id: 1, name: 'Default', settings: settings() }, { id: 2, name: 'Mine', settings: data.settings }];
@@ -108,11 +147,17 @@ async function fixture(run) {
       const revisions = Object.fromEntries(['projects','configs','agents','threads','locks','activity'].map(key => [key,revision(key,project?.id)]));
       revisions.settings=hash([data.projects,configs()]);
       const restartPaused=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart').length;
-      const rev=hash([revisions,data.usage,data.checks,restartPaused,globalEligible(),data.unknownGlobalCounts]);
+      const projectAgents=data.agents.filter(a=>a.project===project?.id);
+      const projectActions={pause_eligible:projectAgents.filter(a=>['working','idle','done'].includes(a.state)).length,resume_eligible:projectAgents.filter(a=>a.state==='paused').length,restart_paused:projectAgents.filter(a=>a.state==='paused'&&a.pause_reason==='restart').length};
+      const rev=hash([revisions,data.usage,data.checks,restartPaused,globalEligible(),projectActions,data.unknownGlobalCounts,data.unknownProjectCounts]);
       if(params.get('since')===rev) return send({unchanged:true,revision:rev});
-      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),restart_paused:restartPaused,...(data.unknownGlobalCounts?{}:globalEligible()),agent_counts:agentCounts(data.agents.filter(agent=>agent.project===project?.id)), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
+      return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),...(data.unknownGlobalCounts?{}:{restart_paused:restartPaused,...globalEligible()}),...(data.unknownProjectCounts?{}:{project_actions:projectActions}),agent_counts:agentCounts(projectAgents), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
     }
     if(req.method==='GET' && pathname==='/catalog') return send(bounded(catalog,params));
+    if(req.method==='GET' && pathname==='/agent-query') {
+      const result=agentQueryFixture(params.get('search')||'');
+      return send(result.error?result:bounded(result,params));
+    }
     if(req.method==='GET' && pathname==='/settings') {
       const id=Number(params.get('project')),project=data.projects.find(p=>p.id===id);
       if(data.delays?.[id])await new Promise(resolve=>setTimeout(resolve,data.delays[id]));
@@ -121,10 +166,11 @@ async function fixture(run) {
     if(req.method==='GET' && /^\/(projects|configs|agents|threads|locks|activity)$/.test(pathname)) {
       const key=pathname.slice(1),project=Number(params.get('project')) || data.projects[0]?.id;
       if(key==='agents') {
-        const category=params.get('category')||'all', search=(params.get('search')||'').trim().toLowerCase();
-        const matched=data.agents.filter(agent=>agent.project===project&&[agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].join(' ').toLowerCase().includes(search));
+        const category=params.get('category')||'all', search=params.get('search')||'',state=params.get('state'),reason=params.get('pause_reason'),parsed=agentQueryFixture(search);
+        if(parsed.error)return send(parsed);
+        const matched=data.agents.filter(agent=>agent.project===project&&(!state||agent.state===state)&&(!reason||(agent.state==='paused'&&(reason==='manual'?['user','all'].includes(agent.pause_reason):agent.pause_reason===reason)))&&parsed.clauses.every(clause=>clause.field==null?[agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].join(' ').toLowerCase().includes(clause.values[0].toLowerCase()):clause.field==='pause_reason'?agent.state==='paused'&&clause.values.includes(['user','all'].includes(agent.pause_reason)?'manual':agent.pause_reason):clause.values.includes(String(clause.field==='provider'?agent.harness:clause.field==='group'?agent.group||'':agent[clause.field]))));
         const ids=new Set(matched.filter(agent=>agentCategory(agent,category)).map(agent=>agent.id));
-        const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search]));
+        const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search,state,reason]));
         return send(result.error||result.unchanged ? result : {...result,counts:agentCounts(matched),project_total:data.agents.filter(agent=>agent.project===project).length});
       }
       return send(paged(collection(key,project),params,revision(key,project),key!=='activity'));
@@ -230,13 +276,13 @@ async function fixture(run) {
     }
     if (req.url === '/resume-all') {
       if(data.resumeAllError)return send({status:503,error:data.resumeAllError});
-      const ids=data.agents.filter(a=>a.state==='paused').map(a=>a.id);
+      const ids=data.agents.filter(a=>a.state==='paused'&&(body.project==null||a.project===body.project)).map(a=>a.id);
       for(const id of ids)Object.assign(data.agents.find(a=>a.id===id),{state:'working',pause_reason:null});
       return send({ids});
     }
     if (req.url === '/resume-restart') {
       if(data.resumeRestartError)return send({status:503,error:data.resumeRestartError});
-      const eligible=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart');
+      const eligible=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart'&&(body.project==null||a.project===body.project));
       const ids=eligible.filter(a=>!data.resumeRestartFailures?.[a.id]).map(a=>a.id);
       for(const id of ids)Object.assign(data.agents.find(a=>a.id===id),{state:'working',pause_reason:null});
       return send(data.resumeRestartResult || {ids,warnings:data.resumeRestartWarnings || [],errors:eligible.filter(a=>data.resumeRestartFailures?.[a.id]).map(a=>data.resumeRestartFailures[a.id])});
@@ -251,9 +297,9 @@ async function fixture(run) {
     }
     if(req.url==='/pause-all') {
       if(data.pauseAllError)return send({status:503,error:data.pauseAllError});
-      const ids=data.agents.filter(a=>['working','idle','done'].includes(a.state)).map(a=>a.id);
+      const ids=data.agents.filter(a=>['working','idle','done'].includes(a.state)&&(body.project==null||a.project===body.project)).map(a=>a.id);
       for(const id of ids) {
-        Object.assign(data.agents.find(a=>a.id===id),{state:'paused',pause_reason:'all',stopping:!!data.pauseStopping});
+        Object.assign(data.agents.find(a=>a.id===id),{state:'paused',pause_reason:body.project==null?'all':'user',stopping:!!data.pauseStopping});
         if(!data.pauseStopping)releaseLocks(id);
       }
       return send({ids});
@@ -354,6 +400,7 @@ async function fixture(run) {
   try {
     browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
     const page = await browser.newPage();
+    page.on('dialog', dialog => { if (page.listenerCount('dialog') === 1) dialog.accept(); });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}`);
@@ -366,6 +413,7 @@ async function fixture(run) {
   }
 }
 const openLaunch = page => page.locator('[data-open="launch-dialog"]').click();
+const openGlobalActions = async page => { if (!await page.locator('#system-menu').evaluate(menu=>menu.open)) await page.locator('#system-menu > summary').click(); };
 const saveSettings = async page => {
   await page.locator('[form="settings-form"]').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
@@ -3019,6 +3067,7 @@ test('Pause all confirms stop-and-release scope, can be cancelled and stays sing
   data.agents=[{id:1,project:1,name:'Working',state:'working'},{id:2,project:2,name:'Idle elsewhere',state:'idle'},{id:3,project:1,name:'Already paused',state:'paused',pause_reason:'user'}];
   data.locks=[{id:1,project:1,name:'first',holder:1},{id:2,project:2,name:'second',holder:2}];
   await manualPolling(page); await reloadPage(page);
+  await openGlobalActions(page);
   const confirmations=[];
   page.on('dialog',dialog=>{confirmations.push(dialog.message());return confirmations.length===1?dialog.dismiss():dialog.accept();});
   await page.locator('#pause-all').click();
@@ -3027,11 +3076,15 @@ test('Pause all confirms stop-and-release scope, can be cancelled and stays sing
   await page.locator('#pause-all').click(); await held.started;
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#pause-all').isDisabled(),true);
+  for(const id of ['pause-project','resume-project','resume-project-restart','resume-all','resume-restart']) {
+    assert.equal(await page.locator(`#${id}`).isDisabled(),true);
+    await page.locator(`#${id}`).dispatchEvent('click');
+  }
   await page.evaluate(()=>document.querySelector('#pause-all').click());
   held.release(); await held.remove();
-  await page.waitForFunction(()=>!pausingAll);
+  await page.waitForFunction(()=>!bulkAction);
   assert.equal(await page.locator('#pause-all').isDisabled(),true);
-  assert.deepEqual(confirmations,Array(2).fill('Pause all eligible agents in all projects, stop their processes, and release every held lock?'));
+  assert.deepEqual(confirmations,Array(2).fill('Pause 2 eligible agents across all projects? This stops their processes and releases their locks.'));
   assert.deepEqual(data.requests,[{url:'/pause-all',method:'POST',body:{}}]);
   assert.ok(data.locks.every(lock=>lock.holder===null));
   assert.deepEqual(data.agents.map(a=>a.pause_reason),['all','all','user']);
@@ -3235,6 +3288,7 @@ test('Resume restart-paused uses an exact all-project count and leaves manual an
     {id:6,project:1,name:'Already done',state:'done',pause_reason:'restart'},
   ];
   await manualPolling(page); await reloadPage(page);
+  await openGlobalActions(page);
   const button=page.locator('#resume-restart');
   assert.equal(await button.textContent(),'Resume restart-paused (2 · all projects)');
   assert.equal(await button.isEnabled(),true);
@@ -3278,6 +3332,7 @@ test('restart-paused resume stays disabled during polling and reports request er
   data.agents=[{id:1,project:1,name:'Restart pause',state:'paused',pause_reason:'restart'}];
   data.resumeRestartError='Cannot resume restart-paused agents';
   await manualPolling(page); await reloadPage(page);
+  await openGlobalActions(page);
   const pending=await holdRequest(page,'**/resume-restart');
   await page.locator('#resume-restart').click(); await pending.started;
   assert.equal(await page.locator('#resume-restart').isDisabled(),true);
@@ -3298,6 +3353,7 @@ test('restart-paused resume exposes partial failures and warnings while retainin
   data.resumeRestartWarnings=['Agent 1 is waiting for an active slot'];
   data.resumeRestartFailures={2:'Agent 2: requested model is disabled'};
   await manualPolling(page); await reloadPage(page);
+  await openGlobalActions(page);
   await page.locator('#resume-restart').click();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Agent 2: requested model is disabled'));
   assert.equal(await page.locator('#toast').textContent(),'Resumed 1 restart-paused agents across all projects.\nAgent 1 is waiting for an active slot\nAgent 2: requested model is disabled');
@@ -3315,6 +3371,7 @@ test('truncated restart-paused results report full failure counts even when the 
   data.resumeRestartResult={result_truncated:true,counts:{ids:2,errors:1,warnings:0},ids:[1],errors:[],warnings:[],receipt_event:11};
   data.receipts={11:{details:{response:{ids:[1,2],errors:[error],warnings:[]}}}};
   await manualPolling(page); await reloadPage(page);
+  await openGlobalActions(page);
   await page.locator('#resume-restart').click();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('2 resumed, 1 failed'));
   assert.equal(await page.locator('#toast').textContent(),'Restart-paused agents across all projects: 2 resumed, 1 failed. See the completed-action result below.');
@@ -3501,6 +3558,111 @@ test('typed log timestamps render locally while raw bytes, multiline chunks and 
   assert.equal((await page.locator('#agent-log').textContent()).split('Entry 0 ').length-1,1);
 }));
 
+test('current-project bulk counts ignore search and paging, reset on project switches, and disable unknown or zero totals', async () => fixture(async (page,data) => {
+  data.pageLimit=1;
+  data.agents=[{id:1,project:1,state:'working'},{id:2,project:1,state:'done'},{id:3,project:1,state:'paused',pause_reason:'restart'},{id:4,project:1,state:'paused',pause_reason:'user'},{id:5,project:2,state:'idle'},{id:6,project:2,state:'paused',pause_reason:'limit'}];
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(await page.locator('#system-menu').evaluate(menu=>menu.open),false,'global controls start collapsed');
+  assert.equal(await page.locator('#pause-all').isVisible(),false);
+  assert.equal(await page.locator('#pause-project').isVisible(),true);
+  const counts=async()=>Promise.all(['pause-project-count','resume-project-count','restart-project-count'].map(id=>page.locator(`#${id}`).textContent()));
+  assert.deepEqual(await counts(),['(2)','(2)','(1)']);
+  await page.locator('#agent-search').fill('no matching agents');
+  await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser?.pending);
+  assert.deepEqual(await counts(),['(2)','(2)','(1)'],'bulk eligibility is not the loaded or searched agent count');
+  const pending=await holdRequest(page,'**/overview?project=2*','GET');
+  await page.locator('#project-select').selectOption('2'); await pending.started;
+  for(const id of ['pause-project','resume-project','resume-project-restart'])assert.equal(await page.locator(`#${id}`).isDisabled(),true);
+  assert.deepEqual(await counts(),['(checking)','(checking)','(checking)']);
+  await page.locator('#pause-project').dispatchEvent('click');
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  assert.deepEqual(await counts(),['(1)','(1)','(0)']);
+  assert.equal(await page.locator('#resume-project-restart').isDisabled(),true);
+  assert.equal(await page.locator('#pause-project').getAttribute('title'),'Project “other” (#2) only');
+  data.unknownProjectCounts=true; await page.evaluate(()=>refresh());
+  assert.deepEqual(await counts(),['(checking)','(checking)','(checking)']);
+  for(const id of ['pause-project','resume-project','resume-project-restart']) {assert.equal(await page.locator(`#${id}`).isDisabled(),true);await page.locator(`#${id}`).dispatchEvent('click');}
+  data.unknownProjectCounts=false; data.agents.filter(a=>a.project===2).forEach(a=>a.state='closed'); await page.evaluate(()=>refresh());
+  assert.deepEqual(await counts(),['(0)','(0)','(0)']);
+  assert.equal(await page.locator('#pause-project').isDisabled(),true);
+  assert.equal(await page.locator('#resume-project').isDisabled(),true);
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.locator('#system-menu').evaluate(menu=>menu.open),false);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await openGlobalActions(page); await page.locator('#system-menu > summary').focus(); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#system-menu').evaluate(menu=>menu.open),true,'polling preserves menu state');
+  assert.equal(await page.locator('#system-menu > summary').evaluate(summary=>document.activeElement===summary),true,'polling preserves menu focus');
+  data.projects=[]; data.agents=[]; await page.evaluate(()=>refresh());
+  assert.deepEqual(await counts(),['(0)','(0)','(0)']);
+  for(const id of ['pause-project','resume-project','resume-project-restart'])assert.equal(await page.locator(`#${id}`).isDisabled(),true);
+  assert.equal(await page.locator('#pause-project').getAttribute('title'),'Select a project');
+  assert.equal(data.requests.length,0);
+}));
+
+test('current-project Pause, Resume and restart-only Resume confirm their project and never affect other projects', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'working'},{id:2,project:2,state:'idle'},{id:3,project:1,state:'done'},{id:4,project:1,state:'paused',pause_reason:'restart'},{id:5,project:1,state:'paused',pause_reason:'user'},{id:6,project:2,state:'paused',pause_reason:'restart'}];
+  data.locks=[{id:1,project:1,name:'mine',holder:1},{id:2,project:2,name:'elsewhere',holder:2}];
+  await manualPolling(page); await reloadPage(page);
+  const confirmations=[];
+  page.on('dialog',dialog=>{confirmations.push(dialog.message());return confirmations.length===1?dialog.dismiss():dialog.accept();});
+  await page.locator('#pause-project').click();
+  assert.equal(data.requests.length,0,'canceling a project confirmation is read-only');
+  await page.locator('#pause-project').click();
+  await page.waitForFunction(()=>!bulkAction&&state.projectActions.pause_eligible===0);
+  assert.deepEqual(data.agents.map(a=>a.state),['paused','idle','paused','paused','paused','paused']);
+  assert.deepEqual(data.agents.map(a=>a.pause_reason),['user',undefined,'user','restart','user','restart']);
+  assert.deepEqual(data.locks.map(l=>l.holder),[null,2]);
+  await page.locator('#resume-project-restart').click();
+  await page.waitForFunction(()=>!bulkAction&&state.projectActions.restart_paused===0);
+  assert.deepEqual(data.agents.map(a=>a.state),['paused','idle','paused','working','paused','paused']);
+  assert.equal(await page.locator('#toast').textContent(),'Resumed 1 restart-paused agents in project “example” (#1).');
+  await page.locator('#resume-project').click();
+  await page.waitForFunction(()=>!bulkAction&&state.projectActions.resume_eligible===0);
+  assert.deepEqual(data.agents.map(a=>a.state),['working','idle','working','working','working','paused']);
+  assert.deepEqual(data.requests,[{url:'/pause-all',method:'POST',body:{project:1}},{url:'/resume-restart',method:'POST',body:{project:1}},{url:'/resume-all',method:'POST',body:{project:1}}]);
+  assert.deepEqual(confirmations,[...Array(2).fill('Pause 2 eligible agents in project “example” (#1)? This stops their processes and releases their locks.'),'Resume 1 restart-paused agent in project “example” (#1)? This may start work and consume provider quota.','Resume 3 paused agents in project “example” (#1)? This may start work and consume provider quota.']);
+}));
+
+test('project bulk actions capture their scope across project switches and lock both scopes until completion', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page);
+  page.on('dialog',dialog=>dialog.accept());
+  for(const [button,endpoint,initial] of [['pause-project','pause-all','idle'],['resume-project','resume-all','paused'],['resume-project-restart','resume-restart','paused']]) {
+    data.agents=[{id:1,project:1,state:initial,pause_reason:'restart'},{id:2,project:2,state:initial,pause_reason:'restart'}];
+    await page.locator('#project-select').selectOption('1'); await page.waitForFunction(()=>state.selectedProject===1&&refreshPending===0); await page.evaluate(()=>refresh());
+    const pending=await holdRequest(page,`**/${endpoint}`);
+    await page.locator(`#${button}`).click(); await pending.started;
+    await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+    await openGlobalActions(page);
+    for(const id of ['pause-project','resume-project','resume-project-restart','pause-all','resume-all','resume-restart']) {
+      assert.equal(await page.locator(`#${id}`).isDisabled(),true);
+      await page.locator(`#${id}`).dispatchEvent('click');
+    }
+    pending.release(); await pending.remove();
+    await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
+    assert.equal(await page.locator('#project-select').inputValue(),'2');
+    assert.equal(data.agents[0].state,initial==='idle'?'paused':'working');
+    assert.equal(data.agents[1].state,initial);
+    assert.deepEqual(data.requests.at(-1),{url:`/${endpoint}`,method:'POST',body:{project:1}});
+    assert.match(await page.locator('#toast').textContent(),/in project “example” \(#1\)/);
+  }
+  assert.equal(data.requests.length,3,'cross-scope clicks never issue another mutation');
+}));
+
+test('failed project bulk requests unlock both scopes without retrying or changing agents', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'paused',pause_reason:'restart'},{id:2,project:2,state:'paused',pause_reason:'restart'}];
+  data.resumeRestartError='Scoped resume unavailable';
+  await manualPolling(page); await reloadPage(page); await openGlobalActions(page);
+  page.on('dialog',dialog=>dialog.accept());
+  await page.locator('#resume-project-restart').click();
+  await page.waitForFunction(()=>!bulkAction&&document.querySelector('#toast').textContent==='Scoped resume unavailable');
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#resume-project-restart').isEnabled(),true);
+  assert.equal(await page.locator('#resume-restart').isEnabled(),true);
+  assert.deepEqual(data.requests,[{url:'/resume-restart',method:'POST',body:{project:1}}]);
+  assert.ok(data.agents.every(a=>a.state==='paused'));
+}));
+
 test('all-project Pause and Resume counts remain exact across pages and project switches and disable zero or unknown totals', async () => fixture(async (page,data) => {
   data.pageLimit=1; data.agents=[{id:1,project:1,state:'working'},{id:2,project:2,state:'idle'},{id:3,project:2,state:'done'},{id:4,project:1,state:'paused',pause_reason:'limit'},{id:5,project:2,state:'paused',pause_reason:'restart'},{id:6,project:2,state:'crashed'},{id:7,project:1,state:'closed'},{id:8,project:1,state:'replaced'}];
   await manualPolling(page); await reloadPage(page);
@@ -3512,6 +3674,8 @@ test('all-project Pause and Resume counts remain exact across pages and project 
   assert.equal(await page.locator('#resume-all-count').textContent(),'(2 · all projects)');
   data.unknownGlobalCounts=true; await page.evaluate(()=>refresh());
   for(const action of ['pause','resume']) {assert.equal(await page.locator(`#${action}-all`).isDisabled(),true);assert.equal(await page.locator(`#${action}-all-count`).textContent(),'(checking · all projects)');}
+  assert.equal(await page.locator('#resume-restart').isDisabled(),true);
+  assert.equal(await page.locator('#restart-paused-count').textContent(),'(checking · all projects)');
   await page.locator('#pause-all').dispatchEvent('click'); await page.locator('#resume-all').dispatchEvent('click');
   data.unknownGlobalCounts=false; for(const agent of data.agents)agent.state='closed'; await page.evaluate(()=>refresh());
   for(const action of ['pause','resume']) {assert.equal(await page.locator(`#${action}-all`).isDisabled(),true);assert.equal(await page.locator(`#${action}-all-count`).textContent(),'(0 · all projects)');}
@@ -3858,6 +4022,7 @@ test('workspace a pending send stays single-flight after close and reopen and re
 test('workspace Resume all stays single-flight across polling and recovers from failure without retrying', async () => fixture(async (page,data) => {
   data.agents=[{id:1,project:1,name:'Paused worker',state:'paused',pause_reason:'user'}];
   await manualPolling(page); await reloadPage(page);
+  await openGlobalActions(page);
   const pending=await holdRequest(page,'**/resume-all');
   await page.locator('#resume-all').click(); await pending.started;
   assert.equal(await page.locator('#resume-all').isDisabled(),true);
@@ -3865,7 +4030,7 @@ test('workspace Resume all stays single-flight across polling and recovers from 
   assert.equal(await page.locator('#resume-all').isDisabled(),true);
   await page.locator('#resume-all').dispatchEvent('click');
   pending.release(); await pending.remove();
-  await page.waitForFunction(()=>!resumingAll);
+  await page.waitForFunction(()=>!bulkAction);
   assert.equal(await page.locator('#resume-all').isDisabled(),true);
   assert.equal(data.requests.filter(r=>r.url==='/resume-all').length,1);
   assert.equal(data.agents[0].state,'working');
@@ -3896,7 +4061,7 @@ test('workspace Close and Reopen lock all lifecycle actions while pending and re
     assert.equal(data.requests.filter(r=>r.url===`/agents/1/${action}`).length,1);
     assert.equal(data.agents[0].state,action==='close'?'closed':'idle');
   }
-  assert.equal(confirmations,1,'only Close asks for confirmation, once');
+  assert.equal(confirmations,2,'Close and Reopen each ask once');
   data.agentTransitionError='Close unavailable';
   await page.locator('[data-agent="1"] [data-action=close]').click();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Close unavailable');
@@ -3931,6 +4096,277 @@ test('workspace membership and usage scheduling remain single-flight through pan
   await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Usage check scheduled');
   assert.equal(await page.locator('[data-check-usage=codex]').isEnabled(),true);
   assert.equal(data.requests.filter(r=>r.url==='/usage/check').length,1);
+}));
+
+test('manual lifecycle actions each confirm once by default and cancellation never mutates', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page);
+  for (const [initial,action,verb,consequence,problem] of [['working','pause','Pause',/stops its processes and releases its locks/],['paused','resume','Resume',/start work and consume provider quota/],['crashed','resume','Retry',/same model.*consume provider quota/],['paused','resume','Retry',/same model.*consume provider quota/,'Model not available'],['idle','close','Close',/cannot wake until reopened/],['closed','reopen','Reopen',/start work and consume provider quota/]]) {
+    data.agents=[{id:1,project:1,name:'Careful worker',state:initial,pause_reason:'user',problem}]; await page.evaluate(()=>refresh());
+    const prompts=[];
+    page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.dismiss();});
+    const before=data.requests.length;
+    await page.locator(`[data-agent="1"] [data-action=${action}]`).click();
+    assert.equal(data.requests.length,before); assert.equal(data.agents[0].state,initial);
+    assert.match(prompts[0],new RegExp(`^${verb} agent “Careful worker” \\(#1\\)`)); assert.match(prompts[0],consequence);
+    page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.accept();});
+    await page.locator(`[data-agent="1"] [data-action=${action}]`).click();
+    await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0);
+    assert.equal(data.requests.length,before+1); assert.deepEqual(prompts,[prompts[0],prompts[0]],'one prompt per click');
+  }
+}));
+
+test('all six bulk lifecycle controls confirm captured unfiltered scope once and can be canceled', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page);
+  for (const button of ['pause-project','resume-project','resume-project-restart','pause-all','resume-all','resume-restart']) {
+    const pause=button.startsWith('pause'),scoped=button.includes('project');
+    data.agents=[{id:1,project:1,name:'Visible',state:pause?'working':'paused',pause_reason:'restart'},{id:2,project:1,name:'Hidden by search',state:pause?'idle':'paused',pause_reason:'restart'},{id:3,project:2,state:pause?'done':'paused',pause_reason:'restart'}];
+    await page.evaluate(()=>refresh()); await page.locator('#agent-search').fill('Visible');
+    await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser.pending);
+    await openGlobalActions(page);
+    const prompts=[],before=data.requests.length;
+    page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.dismiss();});
+    await page.locator(`#${button}`).click(); assert.equal(data.requests.length,before);
+    assert.match(prompts[0],new RegExp(`${scoped?2:3} .*agents ${scoped?'in project “example” \\(#1\\)':'across all projects'}`));
+    assert.match(prompts[0],pause?/stops their processes and releases their locks/:/consume provider quota/);
+    page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.accept();});
+    await page.locator(`#${button}`).click(); await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
+    assert.equal(data.requests.length,before+1); assert.deepEqual(prompts,[prompts[0],prompts[0]]);
+    assert.deepEqual(data.requests.at(-1).body,scoped?{project:1}:{});
+  }
+}));
+
+test('confirmation preference applies immediately across projects, persists independently of Default and leaves other warnings enabled', async () => fixture(async (page,data) => {
+  data.projects[0].config=1;
+  data.agents=[{id:1,project:1,name:'First',state:'working'},{id:2,project:2,name:'Second',state:'paused',pause_reason:'user'}];
+  data.locks=[{id:1,project:1,name:'separate lock',holder:1}];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
+  const checkbox=page.locator('#confirm-agent-actions');
+  assert.equal(await checkbox.isChecked(),true); assert.equal(await checkbox.isEnabled(),true);
+  assert.equal(await checkbox.evaluate(el=>el.closest('form')),null);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(),true);
+  const before=JSON.stringify(data.configs);
+  await checkbox.uncheck(); assert.match(await page.locator('#preferences-status').textContent(),/Saved in this browser/);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(),true); assert.equal(data.requests.length,0); assert.equal(JSON.stringify(data.configs),before);
+  await page.locator('[data-page=overview]').click();
+  let prompts=0;
+  page.on('dialog',dialog=>{prompts++;dialog.dismiss();});
+  await page.locator('[data-action=free-lock]').click(); assert.equal(prompts,1,'unrelated lock confirmation stays enabled');
+  await page.locator('[data-action=pause]').click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0); assert.equal(prompts,1);
+  await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  await page.locator('[data-action=resume]').click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0); assert.equal(prompts,1);
+  await reloadPage(page); assert.equal(await checkbox.isChecked(),false);
+  await page.locator('[data-page=settings]').click(); await checkbox.check();
+  await reloadPage(page); assert.equal(await checkbox.isChecked(),true); assert.equal(JSON.stringify(data.configs),before);
+}));
+
+test('disabling lifecycle confirmations bypasses each individual and bulk control, not launch limit warnings', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('[data-page=settings]').click(); await page.locator('#confirm-agent-actions').uncheck(); await page.locator('[data-page=overview]').click();
+  let prompts=0; page.on('dialog',dialog=>{prompts++;dialog.dismiss();});
+  for(const [initial,action] of [['working','pause'],['paused','resume'],['crashed','resume'],['idle','close'],['closed','reopen']]) {
+    data.agents=[{id:1,project:1,state:initial,pause_reason:'user'}]; await page.evaluate(()=>refresh());
+    const before=data.requests.length;
+    await page.locator(`[data-agent="1"] [data-action=${action}]`).click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0);
+    assert.equal(data.requests.length,before+1); assert.equal(prompts,0);
+  }
+  for(const button of ['pause-project','resume-project','resume-project-restart','pause-all','resume-all','resume-restart']) {
+    data.agents=[{id:1,project:1,state:button.startsWith('pause')?'idle':'paused',pause_reason:'restart'}]; await page.evaluate(()=>refresh()); await openGlobalActions(page);
+    const before=data.requests.length;
+    await page.locator(`#${button}`).click(); await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
+    assert.equal(data.requests.length,before+1); assert.equal(prompts,0);
+  }
+  data.hardLimit=true; await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Review before a forced launch'); await page.locator('#launch-form button.primary').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('hard limit reached'));
+  assert.equal(prompts,1,'hard-limit confirmation is not a lifecycle preference'); assert.equal(await page.locator('#launch-dialog').evaluate(dialog=>dialog.open),true);
+  assert.equal(data.requests.filter(request=>request.url==='/agents').length,1,'canceling the limit warning does not force launch');
+}));
+
+test('missing or invalid confirmation preferences default to enabled and unavailable storage is reported', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Worker',state:'working'}];
+  await manualPolling(page);
+  for(const value of [null,'','0','FALSE',' false ','invalid','true']) {
+    await page.evaluate(value=>value===null?localStorage.removeItem('acom:confirm-agent-actions'):localStorage.setItem('acom:confirm-agent-actions',value),value);
+    await reloadPage(page); assert.equal(await page.locator('#confirm-agent-actions').isChecked(),true);
+  }
+  await page.addInitScript(()=>{for(const method of ['getItem','setItem'])Storage.prototype[method]=()=>{throw new Error('storage blocked');};});
+  await reloadPage(page); await page.locator('[data-page=settings]').click(); await page.locator('#confirm-agent-actions').uncheck();
+  assert.match(await page.locator('#preferences-status').textContent(),/this tab only.*storage is unavailable.*reload/);
+  let prompts=0; page.on('dialog',dialog=>{prompts++;dialog.dismiss();});
+  await page.locator('[data-page=overview]').click(); await page.locator('[data-action=pause]').click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0);
+  assert.equal(prompts,0,'failed persistence does not undo the explicit tab preference');
+  await reloadPage(page); assert.equal(await page.locator('#confirm-agent-actions').isChecked(),true);
+}));
+
+async function pickAgentFilter(page,field,values) {
+  if(!await page.locator('#agent-filters').evaluate(el=>el.open))await page.locator('#agent-filters > summary').click();
+  await page.locator('#agent-filter-field').selectOption(field);
+  while(await page.locator('[data-remove-filter-value]').count())await page.locator('[data-remove-filter-value]').first().click();
+  for(const value of values) {
+    if(value==='')await page.locator('#agent-filter-ungrouped').click();
+    else {await page.locator('#agent-filter-value').fill(value);await page.locator('#add-filter-value').click();}
+  }
+  await page.locator('#apply-agent-filter').click();
+  await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser.pending&&!!currentAgentQuery()?.value);
+}
+
+test('exact query filters search all pages, preserve polling and expose editable removable chips', async () => fixture(async (page,data) => {
+  data.pageLimit=1;
+  data.agents=[{id:1,project:1,name:'Usage older',state:'paused',pause_reason:'limit',group:'Security review',harness:'codex',model:'model-one',effort:'high',task:'reentrancy'},{id:2,project:1,name:'Manual',state:'paused',pause_reason:'user'},{id:3,project:1,name:'Bulk manual',state:'paused',pause_reason:'all'},{id:4,project:1,name:'Restart',state:'paused',pause_reason:'restart'},{id:5,project:1,name:'Usage newer',state:'paused',pause_reason:'limit',group:'Security review',harness:'claude',model:'model-two',effort:'medium',task:'reentrancy'},...['working','idle','crashed','done','closed','replaced'].map((state,i)=>({id:6+i,project:1,name:state,state,task:'Security review reentrancy'})),{id:12,project:2,state:'paused',pause_reason:'limit'}];
+  await manualPolling(page); await reloadPage(page); await page.locator('#agent-filters > summary').click();
+  await page.locator('[data-agent-filter=active]').click(); await pickAgentFilter(page,'pause_reason',['limit']);
+  await page.waitForFunction(()=>state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('[data-agent-filter=all]').getAttribute('aria-pressed'),'true');
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 2 matches · 11 total');
+  assert.equal(await page.locator('[data-agent-count=attention]').textContent(),'2');
+  assert.equal(await page.locator('#resume-project-count').textContent(),'(5)','bulk scope stays independent of filters');
+  await page.locator('#page-overview [data-more=agentBrowser]').click(); await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(a=>a.id)),[5,1]);
+  const query=await page.locator('#agent-search').inputValue();await page.evaluate(()=>refresh());assert.equal(await page.locator('#agent-search').inputValue(),query); assert.equal(await page.locator('#agent-filters').evaluate(el=>el.open),true);
+  await page.locator('#agent-search').fill(`${query} older`); await page.waitForFunction(()=>!agentSearchTimer&&state.pages.agentBrowser.total===1&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agents [data-agent]').getAttribute('data-agent'),'1');
+  await page.locator('[data-remove-agent-clause="1"]').focus(); await page.locator('[data-remove-agent-clause="1"]').press('Enter'); await page.waitForFunction(()=>state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.evaluate(()=>!!document.activeElement.closest('#agent-filter-chips')),true,'removing a focused chip keeps keyboard focus in the remaining filters');
+  await pickAgentFilter(page,'pause_reason',['manual']); await page.waitForFunction(()=>state.agentBrowser[0]?.id===3&&!state.pages.agentBrowser.pending);
+  await page.locator('#page-overview [data-more=agentBrowser]').click(); await page.waitForFunction(()=>!state.pages.agentBrowser.pending); assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(a=>a.id)),[3,2]);
+  await pickAgentFilter(page,'pause_reason',['restart']); await page.waitForFunction(()=>state.agentBrowser[0]?.id===4&&!state.pages.agentBrowser.pending);
+  await page.locator('#clear-agent-filters').focus(); await page.locator('#clear-agent-filters').press('Enter'); await page.waitForFunction(()=>state.pages.agentBrowser.total===11&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agent-filters > summary').evaluate(el=>document.activeElement===el),true,'clearing every filter returns focus to the disclosure');
+  assert.equal(await page.locator('#agent-filter-chips button').count(),0); assert.equal(data.requests.length,0);
+  await page.locator('#agent-search').fill('group:"Security review" state:paused,crashed reentrancy'); await page.waitForFunction(()=>!agentSearchTimer&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
+  await pickAgentFilter(page,'provider',['codex']);assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 1 matches · 11 total');
+  await pickAgentFilter(page,'model',['model-one']);await pickAgentFilter(page,'effort',['high']);assert.equal(await page.locator('#agents [data-agent]').getAttribute('data-agent'),'1');
+  await page.locator('[data-edit-agent-filter=state]').click(); assert.deepEqual(await page.locator('#agent-filter-values button').allTextContents(),['crashed ×','paused ×']);
+  await page.locator('#agent-filter-value').fill('working'); await page.locator('#agent-filter-value').press('Escape');assert.equal(await page.locator('#agent-filter-value').inputValue(),'');
+  if(process.env.ACOM_UI_SCREENSHOT_DIR) {
+    await page.evaluate(()=>{document.activeElement?.blur();window.scrollTo(0,0);});
+    await page.setViewportSize({width:1440,height:1000}); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'agent-filters-desktop.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844}); assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'agent-filters-mobile.png'),fullPage:true});
+    await page.locator('[data-page=settings]').click(); await page.evaluate(()=>{document.activeElement?.blur();window.scrollTo(0,0);}); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'preferences-mobile.png')});
+  }
+}));
+
+test('changing query filters or project discards delayed list responses and clears obsolete cursors', async () => fixture(async (page,data) => {
+  data.pageLimit=1; data.agents=[{id:1,project:1,state:'paused',pause_reason:'limit'},{id:2,project:1,state:'paused',pause_reason:'limit'},{id:3,project:1,state:'paused',pause_reason:'restart'},{id:4,project:2,state:'paused',pause_reason:'restart'}];
+  await manualPolling(page); await reloadPage(page); await page.locator('#agent-filters > summary').click();
+  const pending=await holdRequest(page,'**/agents?*search=pause_reason%3Alimit*','GET');
+  await page.locator('#agent-search').fill('pause_reason:limit'); await pending.started;
+  await page.locator('#agent-search').fill('pause_reason:restart'); await page.waitForFunction(()=>state.agentBrowser[0]?.id===3&&!state.pages.agentBrowser.pending);
+  await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.agentBrowser[0]?.id===4&&refreshPending===0);
+  pending.release(); await pending.remove(); await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(a=>a.id)),[4]); assert.equal(await page.locator('#agent-search').inputValue(),'pause_reason:restart');
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 1 matches · 1 total');
+  assert.equal(await page.locator('#page-overview [data-more=agentBrowser]').isVisible(),false);
+}));
+
+test('invalid queries stay local, hide old results and pagination, and never silently broaden', async () => fixture(async (page,data) => {
+  data.pageLimit=1;data.agents=[{id:1,project:1,name:'First',state:'idle'},{id:2,project:1,name:'Second',state:'paused',pause_reason:'limit'}];
+  await manualPolling(page);await reloadPage(page);
+  assert.equal(await page.locator('#page-overview [data-more=agentBrowser]').isVisible(),true);
+  for(const source of ['unknown:foo','group:','group:"unterminated','state:paused,','provider:made-up','state:idle pause_reason:limit','group:a group:b']) {
+    const before=data.getRequests.filter(url=>url.startsWith('/agents?')).length;
+    await page.locator('#agent-search').fill(source);await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.error);
+    assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'true');
+    assert.equal(await page.locator('#agent-query-error').isVisible(),true);assert.match(await page.locator('#agents').textContent(),/Invalid search query/);
+    assert.equal(await page.locator('#agents [data-agent]').count(),0);assert.equal(await page.locator('#page-overview [data-more=agentBrowser]').isVisible(),false);
+    await page.evaluate(()=>refresh());assert.equal(await page.locator('#live-text').textContent(),'live');assert.equal(await page.locator('#connection-banner').isVisible(),false);
+    assert.equal(data.getRequests.filter(url=>url.startsWith('/agents?')&&new URL(url,'http://test').searchParams.get('search')===source).length,0);
+    assert.ok(data.getRequests.filter(url=>url.startsWith('/agents?')).length>=before,'ordinary unfiltered member pickers remain separate');
+  }
+  await page.locator('#clear-agent-filters').click();await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'false');assert.equal(await page.locator('#agent-query-error').isVisible(),false);
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 2 matches · 2 total');
+}));
+
+test('literal values, alternatives and free words share one server query without rewriting typed input', async () => fixture(async (page,data) => {
+  const group='Team, "Alpha" \\ review';
+  data.agents=[{id:1,project:1,name:'Exact member',state:'crashed',group,harness:'codex',model:'custom:model',effort:'ultra',task:'reentrancy checks'},
+    {id:2,project:1,name:'Task false positive',state:'crashed',group:'Different',harness:'codex',model:'custom:model',effort:'ultra',task:`${group} reentrancy checks`},
+    {id:3,project:1,name:'Literal query text',state:'idle',group:null,task:'group:example reentrancy'},
+    {id:4,project:1,name:'Another alternative',state:'paused',group:'Second team',harness:'claude',model:'other',effort:'high',task:'reentrancy'}];
+  await manualPolling(page);await reloadPage(page);
+  await pickAgentFilter(page,'group',[group,'Second team']);await pickAgentFilter(page,'state',['paused','crashed']);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[4,1]);
+  assert.match(await page.locator('[data-edit-agent-filter=group]').textContent(),/Second team OR/);
+  await pickAgentFilter(page,'model',['custom:model']);await pickAgentFilter(page,'effort',['ultra']);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+  let raw=`  group:${JSON.stringify(group)}   state:crashed,paused reentrancy  `;
+  await page.locator('#agent-search').fill(raw);await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agent-search').inputValue(),raw);assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el),true);
+  const calls=data.getRequests.filter(url=>url.startsWith('/agent-query?')&&new URL(url,'http://test').searchParams.get('search')===raw).length;
+  await page.evaluate(()=>refresh());assert.equal(await page.locator('#agent-search').inputValue(),raw);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/agent-query?')&&new URL(url,'http://test').searchParams.get('search')===raw).length,calls,'polling reuses server-validated clauses');
+  await page.locator('#agent-search').fill('"group:example"');await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===3&&!state.pages.agentBrowser.pending);
+  await page.locator('#agent-search').fill('ultra');await page.waitForFunction(()=>!agentSearchTimer&&state.pages.agentBrowser.total===0&&!state.pages.agentBrowser.pending);
+  await page.locator('#clear-agent-filters').click();await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
+  await pickAgentFilter(page,'group',['']);assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3]);
+  assert.match(await page.locator('[data-edit-agent-filter=group]').textContent(),/Ungrouped/);
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  assert.equal(await page.locator('#apply-agent-filter').isVisible(),true);
+  assert.equal(data.requests.length,0);
+}));
+
+test('delayed query parsing cannot replace newer text, chips or selected-project results', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'First',group:'old',state:'idle'},{id:2,project:1,name:'Second',group:'new',state:'idle'},{id:3,project:2,name:'Elsewhere',group:'new',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);
+  const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search')==='group:old','GET');
+  await page.locator('#agent-search').fill('group:old');await pending.started;
+  await page.locator('#agent-search').fill('group:new');await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===2&&!state.pages.agentBrowser.pending);
+  await page.locator('#project-select').selectOption('2');await page.waitForFunction(()=>state.agentBrowser[0]?.id===3&&refreshPending===0);
+  pending.release();await pending.remove();await page.waitForTimeout(50);
+  assert.equal(await page.locator('#agent-search').inputValue(),'group:new');assert.match(await page.locator('[data-edit-agent-filter=group]').textContent(),/new/);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3]);
+}));
+
+test('obsolete pause-reason parsing during a newer debounce cannot reset the selected category', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'New worker',state:'idle'},{id:2,project:1,name:'Paused',state:'paused',pause_reason:'limit'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=active]').click();
+  const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search')==='pause_reason:limit','GET');
+  await page.locator('#agent-search').fill('pause_reason:limit');await pending.started;
+  await page.locator('#agent-search').fill('New');pending.release();await pending.remove();
+  await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#agent-search').inputValue(),'New');
+}));
+
+test('returning to a discarded in-flight query starts a fresh parse instead of remaining stuck', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Group worker',group:'Team',state:'idle'}];await manualPolling(page);await reloadPage(page);
+  const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search')==='group:Team','GET');
+  await page.locator('#agent-search').fill('group:Team');await pending.started;
+  await page.evaluate(()=>{state.agentSearch='other';document.querySelector('#agent-search').value='other';clearTimeout(agentSearchTimer);agentSearchTimer=null;});
+  pending.release();await pending.remove();await page.waitForFunction(()=>state.agentQuery?.raw==='group:Team'&&!state.agentQuery.pending);
+  await page.locator('#agent-search').fill('group:Team');await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('[data-edit-agent-filter=group]').count(),1);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/agent-query?')&&new URL(url,'http://test').searchParams.get('search')==='group:Team').length,2);
+}));
+
+test('selected stale chips cannot edit or remove a different current query clause', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Group worker',group:'Team',state:'idle'},{id:2,project:1,name:'Other worker',group:'Elsewhere',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('group:Team');
+  await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  await page.locator('#agent-search').blur();
+  await selectText(page,'[data-edit-agent-filter=group]');
+  await page.evaluate(()=>{state.agentSearch='provider:codex';return refreshAgentBrowser();});
+  assert.equal(await page.locator('[data-edit-agent-filter=group]').count(),1,'selected old chip deliberately remains until selection clears');
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.locator('[data-remove-agent-clause="0"]').dispatchEvent('click');
+  assert.equal(await page.evaluate(()=>state.agentSearch),'provider:codex');
+  await page.locator('[data-edit-agent-filter=group]').dispatchEvent('click');
+  assert.equal(await page.locator('#agent-filters').evaluate(el=>el.open),false);
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-edit-agent-filter=provider]').count(),1);assert.deepEqual(errors,[]);
+}));
+
+test('picker quoting preserves literal whitespace accepted by the shared query parser', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Tabbed group',group:'Line\tBreak',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);
+  await page.locator('#agent-search').fill('group:"Line\tBreak"');
+  await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  await page.locator('[data-edit-agent-filter=group]').click();await page.locator('#apply-agent-filter').click();
+  await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agent-search').inputValue(),'group:"Line\tBreak"');assert.equal(await page.locator('#agent-query-error').isVisible(),false);
+  assert.equal(await page.evaluate(()=>quotedQueryValue('Line\nBreak')),'"Line\nBreak"');
+  const quoted=await page.evaluate(()=>quotedQueryValue('Line\nBreak'));
+  assert.equal(agentQueryFixture(`group:${quoted}`).clauses[0].values[0],'Line\nBreak');
 }));
 
 test('workspace connection failures retain the last view and Retry now recovers without overlapping requests', async () => fixture(async (page,data) => {

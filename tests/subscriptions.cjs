@@ -174,6 +174,128 @@ test('subscription validation, project permissions, listing, and cancellation', 
   assert.equal((await record(api, second.id, 0)).state, 'canceled');
 }));
 
+test('watch requests reject typos, malformed filters, and unknown queries without consuming updates', async () => fixture(async ({ api, cli, db, runs }) => {
+  const snapshot = () => db(connection => Object.fromEntries([
+    'agents', 'subscriptions', 'subscription_updates', 'events', 'wait_watch_cursors',
+    'update_deliveries', 'summary_cursors', 'members', 'notices',
+  ].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+  const subscription = await api('POST', '/subscriptions', { agent: 1, agents: [2], states: ['done'] });
+  db(connection => connection.exec("UPDATE agents SET state='done' WHERE id=2"));
+  const receipt = await api('POST', '/wait/1', { timeout: 1 });
+  assert.ok(receipt.delivery_id > 0);
+  for (const [route, body] of [
+    ['/subscriptions', { agent: 1, agents: [2], state: ['done'] }],
+    ['/subscriptions', { agent: 1, agents: [2], states: 'done' }],
+    ['/subscriptions', { agent: 1, agents: [2], status_text: null }],
+    ['/subscriptions', { agent: 1, agents: null }],
+    ['/subscriptions', { agent: 1, agents: [2], timeout: null }],
+    ['/subscriptions', { agent: 1, agents: [2], after: null }],
+    ['/subscriptions', { agent: 1, states: ['done'] }],
+    ['/subscriptions', { agent: 1, usage: { provider: 'claude', window: 'five_hour', condition: 'reset', typo: true } }],
+    ['/wait/1', { timeout: 1, agents: [2], state: ['done'] }],
+    ['/wait/1', { timeout: '1' }],
+    ['/wait/1', { timeout: 1, agents: [2, '3'] }],
+    ['/wait/1', { timeout: 1, status_text: true }],
+    ['/wait/1?state=done', { timeout: 1 }],
+    ['/wait/1/ack', { delivery_id: receipt.delivery_id, typo: true }],
+    [`/subscriptions/${subscription.id}/cancel`, { agent: 1, typo: true }],
+  ]) {
+    const before = snapshot();
+    const rejected = await api('POST', route, body, 400);
+    assert.equal(typeof rejected.error, 'string'); assert.ok(rejected.error.length > 0);
+    assert.deepEqual(snapshot(), before, `${route} ${JSON.stringify(body)} must not alter registrations, cursors, or deliveries`);
+  }
+  for (const route of [
+    '/subscriptions?agent=1&state=active', '/subscriptions?agent=1&agent=2',
+    '/subscriptions?agent=1&viewer=', '/subscriptions?agent=1&%73tate=active',
+    '/subscriptions?agent=1&viewer=%zz', '/subscriptions?agent=1&viewer',
+  ]) {
+    const before = snapshot();
+    assert.equal(typeof (await api('GET', route, undefined, 400)).error, 'string');
+    assert.deepEqual(snapshot(), before, `invalid query ${route} must not mutate state`);
+  }
+  for (const args of [
+    ['subscribe', '--agents', '2', '--state', 'done'],
+    ['subscribe', '--usage', 'claude', '--window', 'five_horu', '--reset'],
+    ['wait', '--idle', '--usage', 'claude', '--window', 'five_horu', '--reset'],
+    ['wait', '--timeout', '1s', '--usage', 'claude', '--window', 'five_horu', '--reset'],
+  ]) {
+    const before = snapshot();
+    const rejected = await cli(args, 1);
+    assert.notEqual(rejected.status, 0, `${args.join(' ')} must fail`);
+    assert.ok(rejected.stderr.length > 0); assert.doesNotMatch(rejected.stdout, /registered|acknowledged/i);
+    assert.deepEqual(snapshot(), before, 'invalid CLI input must not consume an already-pending receipt');
+  }
+  assert.deepEqual(await api('POST', '/wait/1', { timeout: 1 }), receipt);
+  assert.equal((await record(api, subscription.id, 1)).state, 'active');
+  assert.equal(runs().length, 0, 'validation must not start workers');
+}));
+
+test('display usage-window aliases normalize and match events across persistent, idle, and foreground CLI waits', async () => fixture(async ({ api, cli, db, project }) => {
+  db(connection => {
+    const insert = connection.prepare("INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES('claude',?,20,unixepoch()+3600,unixepoch())");
+    for (const window of ['five_hour', 'seven_day']) insert.run(window);
+  });
+  const persistent = await cli(['subscribe', '--usage', 'claude', '--window', 'five-hour', '--above', '80'], 1);
+  assert.equal(persistent.status, 0, persistent.stderr);
+  const persistentRow = JSON.parse(persistent.stdout.split('\n')[0]);
+  assert.equal(persistentRow.watch.usage.window, 'five_hour');
+  const deferred = await cli(['wait', '--idle', '--timeout', '10s', '--usage', 'claude', '--window', 'weekly', '--above', '80'], 2);
+  assert.equal(deferred.status, 0, deferred.stderr);
+  const deferredRow = JSON.parse(deferred.stdout.split('\n')[0]);
+  assert.equal(deferredRow.watch.usage.window, 'seven_day');
+  const foreground = cli(['wait', '--timeout', '5s', '--usage', 'claude', '--window', 'five-hour', '--above', '80'], 3);
+  await until(async () => Boolean((await api('GET', '/agents/3')).waiting), 'foreground alias registration');
+  db(connection => {
+    const insert = connection.prepare("INSERT INTO events(project,at,kind,actor,details) VALUES(?,unixepoch(),'usage.observed','acom',?)");
+    for (const window of ['five_hour', 'seven_day']) insert.run(project.id, JSON.stringify({ provider: 'claude', window, before_used: 20, used: 90, reset: false }));
+  });
+  const delivered = await foreground;
+  assert.equal(delivered.status, 0, delivered.stderr); assert.match(delivered.stdout, /90/); assert.match(delivered.stdout, /five_hour/);
+  assert.match((await hook(api, 1)).text, /five_hour/);
+  assert.match((await hook(api, 2)).text, /seven_day/);
+  assert.equal((await record(api, persistentRow.id, 1)).state, 'active');
+  assert.equal((await record(api, deferredRow.id, 2)).state, 'resolved');
+  assert.equal((await hook(api, 1)).text, ''); assert.equal((await hook(api, 2)).text, ''); assert.equal((await hook(api, 3)).text, '');
+}));
+
+test('usage-window discovery distinguishes absent known windows, observed dynamic windows, and unknown names', async () => fixture(async ({ api, cli, db, project }) => {
+  for (const [provider, window, canonical] of [
+    ['claude', 'five-hour', 'five_hour'], ['claude', 'weekly', 'seven_day'], ['claude', 'weekly Fable', 'seven_day_fable'],
+    ['codex', 'codex primary', 'codex primary'], ['codex', 'codex secondary', 'codex secondary'],
+    ['codex', 'account limit', 'account limit'], ['codex', 'codex account limit', 'codex account limit'],
+  ]) {
+    const row = await api('POST', '/subscriptions', { agent: 1, usage: { provider, window, condition: 'reset' } });
+    assert.equal(row.watch.usage.window, canonical, 'known windows need not have a current reading');
+  }
+  db(connection => {
+    connection.prepare("INSERT INTO usage(provider,win,used_pct,at) VALUES('codex','custom-bucket primary',25,unixepoch())").run();
+    connection.prepare("INSERT INTO usage_observations(provider,win,used_pct,at) VALUES('claude','optional_window',40,unixepoch()-60)").run();
+  });
+  for (const [provider, window] of [['codex', 'custom-bucket primary'], ['claude', 'optional_window']]) {
+    const row = await api('POST', '/subscriptions', { agent: 1, usage: { provider, window, condition: 'reset' } });
+    assert.equal(row.watch.usage.window, window);
+  }
+  const limits = await cli(['limits'], 1);
+  assert.equal(limits.status, 0, limits.stderr);
+  assert.match(limits.stdout, /custom-bucket primary/);
+  const before = db(connection => connection.prepare('SELECT count(*) count FROM subscriptions').get().count);
+  for (const [provider, window] of [
+    ['claude', 'five_horu'], ['codex', 'five-hour'], ['codex', 'optional_window'],
+    ['claude', 'custom-bucket primary'], ['codex', 'CUSTOM-BUCKET PRIMARY'],
+  ]) {
+    for (const route of ['/subscriptions', '/wait/1']) {
+      const error = await api('POST', route, { ...(route === '/subscriptions' ? { agent: 1 } : { timeout: 1 }), usage: { provider, window, condition: 'reset' } }, 400);
+      assert.match(error.error, /window/i); assert.match(error.error, /acom limits/);
+    }
+  }
+  assert.equal(db(connection => connection.prepare('SELECT count(*) count FROM subscriptions').get().count), before);
+  const missing = await api('POST', '/subscriptions', { agent: 2, timeout: 30, usage: { provider: 'claude', window: 'five-hour', condition: 'below', percent: 50 } });
+  assert.equal(missing.state, 'active', 'a valid missing window is not zero and must not resolve below-threshold');
+  assert.equal((await hook(api, 2)).text, '');
+  assert.equal((await api('GET', `/limits?project=${project.id}`)).usage.some(row => row.win === 'five_hour'), false);
+}));
+
 test('persistent status subscriptions retain transitions and share durable receipt delivery', async () => fixture(async ({ api, db, start, stop }) => {
   const subscription = await api('POST', '/subscriptions', { agent: 1, agents: [2], states: ['done', 'crashed'], status_text: true });
   db(connection => connection.exec("UPDATE agents SET state='done' WHERE id=2; UPDATE agents SET state='idle' WHERE id=2; UPDATE agents SET state='crashed',problem='fixture crash' WHERE id=2; UPDATE agents SET status_text='UNIQUE_PEER_STATUS' WHERE id=2; UPDATE agents SET status_text='UNSELECTED_STATUS' WHERE id=3;"));

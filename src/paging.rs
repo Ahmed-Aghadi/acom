@@ -179,6 +179,9 @@ pub fn bounded_record(
     expected: Option<&str>,
 ) -> R<Value> {
     validate_budget(max_bytes)?;
+    if expected.is_some() && offset.is_none() {
+        return Err(bad("version requires an explicit record offset"));
+    }
     let text = value.to_string();
     if offset.is_none() && text.len() <= max_bytes as usize {
         return Ok(value);
@@ -259,6 +262,9 @@ mod tests {
     #[test]
     fn record_chunks_are_lossless_budgeted_and_version_pinned() {
         let value = json!({"id":1,"text":"☃\\\"\n😀".repeat(1000)});
+        for record in [json!({"id":1}), value.clone()] {
+            assert!(bounded_record(record, None, 512, Some("ignored-before")).is_err());
+        }
         let mut offset = 0;
         let mut version = None;
         let mut result = String::new();
