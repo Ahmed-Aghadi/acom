@@ -92,3 +92,7 @@ cargo fmt --check
 ```
 
 The [development instructions](docs/development.md#tests) cover isolated API/CLI and browser tests. Real-provider tests spend usage and require explicit approval; routine tests use fake clients.
+
+## License
+
+[MIT](LICENSE).
