@@ -540,7 +540,7 @@
       try { if (value) localStorage.setItem(key, value); else localStorage.removeItem(key); return true; }
       catch (_) { return false; }
     }
-    const pendingSends = new Set(), pendingMembership = new Set(), pendingUsage = new Set();
+    const pendingSends = new Set(), pendingMembership = new Set(), pendingUsage = new Set(), pendingProjectRemovals = new Set();
     const drafts = new Map();
     const draftEdits = new Map();
     const draftKey = (project, thread) => `acom:draft:${project}:${thread}`;
@@ -855,12 +855,13 @@
       const active = state.agentCounts?.active ?? project?.active;
       const attention = state.agentCounts?.attention;
       const held = state.locks.filter(l => l.holder || l.holder_stopping).length;
+      const lockTotal = state.pages.locks?.total ?? state.locks.length;
       const partialLocks = state.pages.locks?.has_more;
       const metrics = [
         ['agents','Active agents',active,total == null ? 'Checking project totals' : `${fmt(total)} agents in this project`,''],
         ['warning','Needs attention',attention,attention == null ? 'Checking project totals' : attention ? 'Paused, failed or waiting agents' : 'No agents need attention','attention'],
         ['chat','Unread messages',project?.unread ?? 0,'Conversations you have joined',''],
-        ['lock','Locks held',held,partialLocks ? 'In loaded locks · load more below' : `${fmt(state.pages.locks?.total ?? state.locks.length)} shared locks`,''],
+        ['lock','Locks held',held,partialLocks ? 'In loaded locks · load more below' : `${fmt(lockTotal)} shared lock${lockTotal === 1 ? '' : 's'}`,''],
       ];
       setHTML($('#workspace-stats'), metrics.map(([icon,label,value,note,kind]) => `<div class="stat ${kind}"><div class="stat-label">${svgIcon(icon)}${label}</div><div class="stat-value">${value == null ? '—' : fmt(value)}${label === 'Locks held' && partialLocks ? '+' : ''}</div><div class="stat-note">${note}</div></div>`).join(''));
     }
@@ -891,7 +892,7 @@
       setText($('#project-url'), state.url || '');
       setText($('#overview-title'), p?.name || (p ? `Project #${p.id}` : 'Workspace overview'));
       setText($('#overview-scope'), p ? 'Project overview' : 'Getting started');
-      $('#remove-project').disabled = state.saving || !p || p.truncated || (p.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
+      $('#remove-project').disabled = state.saving || !p || p.truncated || pendingProjectRemovals.has(p.id) || (p.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
       $('#remove-project').title = state.agents.length ? 'Projects with agents cannot be removed' : 'Remove the registration, not files';
       const unread = state.unreadTotal ?? state.projects.reduce((n, p) => n + (p.unread || 0), 0);
       $('#unread-total').hidden = !unread;
@@ -1166,7 +1167,7 @@
       const joined = t => typeof t.user_member === 'boolean' ? t.user_member : Array.isArray(t.members) ? t.members.includes(0) : null;
       const search = $('#thread-search').value.trim().toLowerCase();
       const threads = state.threads.filter(t => !search || `${t.title || ''} ${t.id}`.toLowerCase().includes(search)).filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
-      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"${state.selectedThread === t.id ? ' aria-current="true"' : ''}><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} messages`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${search ? 'No threads match your search. Try another title or thread ID.' : state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
+      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"${state.selectedThread === t.id ? ' aria-current="true"' : ''}><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} message${t.messages === 1 ? '' : 's'}`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${search ? 'No threads match your search. Try another title or thread ID.' : state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
 
     function threadAccess(thread) {
@@ -2281,12 +2282,18 @@
     });
     $('#remove-project').addEventListener('click', async () => {
       const p = state.project;
+      if (!p || pendingProjectRemovals.has(p.id)) return;
       if (!discardSettings()) return;
-      if (!p || !confirm(`Remove project “${p.name}” from acom? Its files will not be deleted.`)) return;
+      if (!confirm(`Remove project “${p.name}” from acom? Its files will not be deleted.`)) return;
+      pendingProjectRemovals.add(p.id); renderProject();
       try {
         await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
-        state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread(); await refresh();
+        if (state.selectedProject === p.id) {
+          state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread();
+        }
+        await refresh();
       } catch (error) { toast(error.message, true); }
+      finally { pendingProjectRemovals.delete(p.id); renderProject(); }
     });
     $('#settings-form').addEventListener('change', async event => {
       if (event.target.id === 'config-select') {
@@ -2629,7 +2636,7 @@
       state.saving = busy;
       $('#project-select').disabled = busy || !state.projects.length;
       $('[data-open="project-dialog"]').disabled = busy;
-      $('#remove-project').disabled = busy || !state.project || (state.project.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
+      $('#remove-project').disabled = busy || !state.project || state.project.truncated || pendingProjectRemovals.has(state.project.id) || (state.project.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
       $('#project-form button.primary').disabled = busy;
       setSettingsControls();
       $('#config-form button.primary').disabled = busy;

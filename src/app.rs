@@ -1975,9 +1975,10 @@ impl App {
             Ok(turn) => turn,
             Err(e) => {
                 st.atomic(|st| {
+                let a=st.agent(id)?;
+                st.remember_crash(id,&a)?;
                 st.set_state(id, "crashed")?;
                 st.db.execute("UPDATE agents SET problem=?2 WHERE id=?1",params![id,e.1])?;
-                let a=st.agent(id)?;
                 st.event(a.project,Some(id),None,"agent.failed","acom",json!({"reason":e.1,"harness":a.harness,"model":a.model,"effort":a.effort,"phase":"launch"}))?;
                 if handoff {
                     st.db.execute("UPDATE agents SET done_req=?2 WHERE id=?1",params![by,was_done])?;
@@ -12052,6 +12053,95 @@ mod tests {
         assert_eq!(app.agent_view(1).unwrap()["replacement"], new);
         assert_eq!(app.agents(None, None).unwrap().len(), 4);
         assert!(app.lock().procs.is_empty());
+    }
+
+    #[test]
+    fn initial_startup_failure_uses_its_bounded_retry_chain() {
+        let mut app = app_with_two_projects();
+        let bin = app.home.join("missing-clients");
+        std::fs::create_dir(&bin).unwrap();
+        Arc::get_mut(&mut app).unwrap().exe = bin.join("acom");
+        app.lock()
+            .db
+            .execute(
+                "UPDATE projects SET path=?1 WHERE id=1",
+                [app.home.to_string_lossy()],
+            )
+            .unwrap();
+        custom(&app, 1, |s| {
+            s.crash_retries.insert(
+                "gpt-6-sol".into(),
+                RetryRule {
+                    harness: "codex".into(),
+                    model: "gpt-6-luna".into(),
+                    same_model_retries: 1,
+                },
+            );
+        });
+        let error = app
+            .launch(
+                0,
+                None,
+                Some(1),
+                LaunchReq {
+                    task: "Missing fake clients must never reach a provider".into(),
+                    harness: Some("codex".into()),
+                    model: Some("gpt-6-sol".into()),
+                    effort: Some("high".into()),
+                    name: None,
+                    group: None,
+                    force: false,
+                    done: false,
+                    ack_crashes: false,
+                },
+            )
+            .unwrap_err();
+        assert!(error.1.contains("can't start codex"));
+        let first = app.agent_view(3).unwrap();
+        assert_eq!(first["state"], "crashed");
+        assert_eq!(first["turns"], 0);
+        assert_eq!(first["retry"]["source"], "gpt-6-sol");
+        assert_eq!(first["retry"]["effort"], "high");
+        assert_eq!(first["retry"]["same_model_attempts"], 0);
+        assert_eq!(first["retry"]["handled"], 0);
+        assert!(first["retry"]["eligible_at"].as_i64().unwrap() > now());
+        for (model, attempts) in [("gpt-6-sol", 1), ("gpt-6-luna", 0)] {
+            app.lock()
+                .db
+                .execute(
+                    "UPDATE agent_retries SET eligible_at=0 WHERE agent_id=3",
+                    [],
+                )
+                .unwrap();
+            app.tick().unwrap();
+            let retry = app.agent_view(3).unwrap();
+            assert_eq!(retry["state"], "crashed");
+            assert_eq!(retry["model"], model);
+            assert_eq!(retry["effort"], "high");
+            assert_eq!(retry["retry"]["source"], model);
+            assert_eq!(retry["retry"]["same_model_attempts"], attempts);
+            assert_eq!(retry["turns"], 0);
+        }
+        app.tick().unwrap();
+        let st = app.lock();
+        assert!(st.procs.is_empty());
+        assert!(
+            !st.db
+                .query_row("SELECT session_started FROM agents WHERE id=3", [], |r| {
+                    r.get::<_, bool>(0)
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            rows(
+                &st.db,
+                "SELECT * FROM events WHERE agent=3 AND kind='agent.failed'",
+                []
+            )
+            .unwrap()
+            .len(),
+            3
+        );
     }
 
     #[test]

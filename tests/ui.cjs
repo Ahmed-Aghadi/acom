@@ -168,7 +168,7 @@ async function fixture(run) {
       if(key==='agents') {
         const category=params.get('category')||'all', search=params.get('search')||'',state=params.get('state'),reason=params.get('pause_reason'),parsed=agentQueryFixture(search);
         if(parsed.error)return send(parsed);
-        const matched=data.agents.filter(agent=>agent.project===project&&(!state||agent.state===state)&&(!reason||(agent.state==='paused'&&(reason==='manual'?['user','all'].includes(agent.pause_reason):agent.pause_reason===reason)))&&parsed.clauses.every(clause=>clause.field==null?[agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].join(' ').toLowerCase().includes(clause.values[0].toLowerCase()):clause.field==='pause_reason'?agent.state==='paused'&&clause.values.includes(['user','all'].includes(agent.pause_reason)?'manual':agent.pause_reason):clause.values.includes(String(clause.field==='provider'?agent.harness:clause.field==='group'?agent.group||'':agent[clause.field]))));
+        const matched=data.agents.filter(agent=>agent.project===project&&(!state||agent.state===state)&&(!reason||(agent.state==='paused'&&(reason==='manual'?['user','all'].includes(agent.pause_reason):agent.pause_reason===reason)))&&parsed.clauses.every(clause=>clause.field==null?[agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].some(value=>String(value ?? '').toLowerCase().includes(clause.values[0].toLowerCase())):clause.field==='pause_reason'?agent.state==='paused'&&clause.values.includes(['user','all'].includes(agent.pause_reason)?'manual':agent.pause_reason):clause.values.includes(String(clause.field==='provider'?agent.harness:clause.field==='group'?agent.group||'':agent[clause.field]))));
         const ids=new Set(matched.filter(agent=>agentCategory(agent,category)).map(agent=>agent.id));
         const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search,state,reason]));
         return send(result.error||result.unchanged ? result : {...result,counts:agentCounts(matched),project_total:data.agents.filter(agent=>agent.project===project).length});
@@ -554,6 +554,64 @@ test('empty project list prompts for a folder; add and remove never delete files
   await page.locator('#remove-project').click();
   await page.waitForFunction(() => document.querySelector('#project-select').disabled);
   assert.equal(data.requests.at(-1).url, '/projects/1/remove');
+}));
+
+test('a delayed project removal preserves another project selection and unsaved settings', async () => fixture(async (page, data) => {
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const pending = new Promise(resolve => { started = resolve; });
+  await page.route('**/projects/1/remove', async route => { started(); await gate; await route.continue(); });
+  try {
+    await page.locator('#remove-project').click();
+    await pending;
+    await page.locator('#project-select').selectOption('2');
+    await page.locator('[data-page=settings]').click();
+    await page.locator('[name=max_lock_ttl_secs]').fill('777');
+    const response = page.waitForResponse(response => response.url().endsWith('/projects/1/remove'));
+    release();
+    await response;
+    await page.waitForFunction(() => !state.projects.some(project => project.id === 1) && refreshPending === 0);
+    assert.equal(await page.locator('#project-select').inputValue(), '2');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(), '777');
+    assert.equal(await page.locator('#settings-save-state').textContent(), 'Unsaved changes');
+    assert.deepEqual(data.requests.map(request => request.url), ['/projects/1/remove']);
+  } finally { release(); }
+}));
+
+test('project removal remains single-flight through polling and unlocks after failure', async () => fixture(async (page, data) => {
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const pending = new Promise(resolve => { started = resolve; });
+  let attempts = 0;
+  await page.route('**/projects/1/remove', async route => {
+    attempts++; started(); await gate;
+    await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Project changed; try again after inspecting it'})});
+  });
+  try {
+    await page.locator('#remove-project').click();
+    await pending;
+    await page.evaluate(() => refresh());
+    assert.equal(await page.locator('#remove-project').isDisabled(), true);
+    await page.locator('#remove-project').evaluate(button => button.click());
+    assert.equal(attempts, 1);
+    release();
+    await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Project changed'));
+    assert.equal(await page.locator('#remove-project').isEnabled(), true);
+    assert.equal(await page.locator('#project-select').inputValue(), '1');
+    assert.equal(data.projects.length, 2);
+  } finally { release(); }
+}));
+
+test('shared-lock and thread-message counts use singular only for one item', async () => fixture(async (page, data) => {
+  await manualPolling(page); await reloadPage(page);
+  for (const count of [0,1,2]) {
+    data.locks = Array.from({length:count}, (_, index) => ({project:1,name:`lock-${index}`,holder:null}));
+    data.threads = [conversation(Array.from({length:count}, (_, index) => ({id:index+1,sender:0,at:1700000000,text:'Sample'})))];
+    await page.evaluate(() => refresh());
+    assert.equal(await page.locator('#workspace-stats .stat').last().locator('.stat-note').textContent(), `${count} shared lock${count === 1 ? '' : 's'}`);
+    assert.ok((await page.locator('[data-thread="1"] .meta').textContent()).includes(`· ${count} message${count === 1 ? '' : 's'} ·`));
+  }
+  assert.equal(data.requests.length, 0);
 }));
 
 test('launch effort choices follow the selected model capabilities', async () => fixture(async page => {
@@ -2875,7 +2933,7 @@ test('oversized thread summaries retain exact participation and unread filters w
     await page.locator(`[data-thread-filter=${filter}]`).click();
     const row=page.locator('[data-thread="1"]');
     assert.equal(await row.count(),1);
-    assert.match(await row.textContent(),/You’re a member.*1 messages.*Member list exceeds the preview budget/);
+    assert.match(await row.textContent(),/You’re a member.*1 message ·.*Member list exceeds the preview budget/);
     assert.doesNotMatch(await row.textContent(),/Agent-only|no members/);
   }
   await page.locator('[data-thread-filter=agents]').click(); assert.equal(await page.locator('[data-thread="1"]').count(),0);
@@ -3413,6 +3471,10 @@ test('workspace agent search combines with accessible state filters and preserve
   }
   const search=page.locator('#agent-search');
   assert.ok(await search.getAttribute('aria-label') || await search.evaluate(el=>el.labels?.length));
+  await search.fill('"Alpha review 1"');
+  await expectIds([]);
+  await search.fill('"Alpha review"');
+  await expectIds([1]);
   await search.fill('REVIEW');
   await expectIds([1,2,3]);
   await page.locator('[data-agent-filter=active]').click();
