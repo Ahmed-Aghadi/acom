@@ -22,7 +22,9 @@ A turn runs until your process exits. Between turns no model turn runs, but an i
 
 End your turn normally to become idle. Register any needed event/deadline trigger **before** yielding: ending a turn alone schedules nothing. Use `acom done` only when the task is finished, then end your turn. It requests the briefing's `closed` (default) or `done` outcome; it does not stop your process immediately, and failure can still become a crash. A message-woken done agent normally returns to done rather than staying active.
 
-`acom status "<text>"` is descriptive, not a lifecycle change. `acom group <name>` changes your group. `acom me` shows identity, current/next-turn configuration, pending requests and history/output paths; `acom agent <ID>` inspects a peer.
+`acom status "<text>"` sets a user-visible progress summary, not your lifecycle state. Prefer setting a short status at task start. Update it when the overall phase, blocker or outcome meaningfully changes, including before yielding or finishing if it would otherwise be misleading. No per-step or periodic updates are needed.
+
+`acom group <name>` changes your group. `acom me` shows identity, current/next-turn configuration, pending requests and history/output paths; `acom agent <ID>` inspects a peer.
 
 While working, `[acom]` hook notices report new messages, limits, lost locks, subscribed events and coordination warnings. Message notifications contain counts/senders, not bodies: use `acom inbox`. Shortened notices identify `acom notices <ID>` for the full text. Turn-start and membership/lock summaries give nonzero counts and point to `acom history` for details.
 
