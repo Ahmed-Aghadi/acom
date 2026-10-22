@@ -9,6 +9,9 @@
       let theme;
       try { theme = localStorage.getItem('acom:theme'); } catch (_) {}
       document.documentElement.dataset.theme = ['light','dark'].includes(theme) ? theme : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      let sidebar;
+      try { sidebar = localStorage.getItem('acom:sidebar-collapsed'); } catch (_) {}
+      document.documentElement.dataset.sidebarCollapsed = ['true','false'].includes(sidebar) ? sidebar : String(matchMedia('(max-width: 800px)').matches);
     })();
   </script>
   <style>
@@ -19,6 +22,7 @@
       --muted: #617087; --line: #e1e7ef; --accent: #365ce5; --accent-soft: #edf1ff;
       --warn: #9a620d; --danger: #bd3549; --success: #168467;
       --shadow: 0 3px 16px rgba(24,39,75,.035); --sidebar: #111b2e;
+      --workspace-gutter: 24px; --sidebar-width: 228px;
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
@@ -37,14 +41,18 @@
     a { color: var(--accent); text-underline-offset: 3px; }
     .skip-link { position: fixed; top: 10px; left: 10px; z-index: 50; padding: 10px 16px; background: var(--panel); border-radius: 8px; transform: translateY(-150%); }
     .skip-link:focus { transform: none; }
-    .app-shell { display: grid; grid-template-columns: 244px minmax(0,1fr); min-height: 100dvh; }
-    .sidebar { position: sticky; top: 0; height: 100dvh; overflow-y: auto; display: flex; flex-direction: column; padding: 28px 18px 18px; background: var(--sidebar); color: #e8edf7; }
+    .app-shell { display: grid; grid-template-columns: var(--sidebar-width) minmax(0,1fr); min-height: 100dvh; }
+    :root[data-sidebar-collapsed="true"] .app-shell { grid-template-columns: minmax(0,1fr); }
+    :root[data-sidebar-collapsed="true"] .sidebar { display: none; }
+    .sidebar { position: sticky; top: 0; height: 100dvh; overflow-y: auto; display: flex; flex-direction: column; padding: 20px 16px 16px; background: var(--sidebar); color: #e8edf7; }
+    .brand-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .sidebar-close { width: 30px; min-height: 30px; padding: 4px; border-color: transparent !important; font-size: 20px; }
     .brand { display: flex; align-items: center; gap: 11px; padding: 0 9px; font-size: 24px; font-weight: 750; letter-spacing: -.8px; }
     .brand-mark { display: grid; place-items: center; width: 35px; height: 35px; border-radius: 10px; background: #4968ef; color: #fff; font: 700 19px ui-monospace, monospace; box-shadow: 0 4px 14px #4968ef30; }
-    .brand-subtitle { margin: 9px 9px 31px; color: #91a1ba; font-size: 12px; }
+    .brand-subtitle { margin: 7px 9px 22px; color: #91a1ba; font-size: 12px; }
     .sidebar-label, .eyebrow { font-size: 10px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
     .sidebar-label { margin: 0 10px 10px; color: #95a5bf; }
-    .project-banner { margin-bottom: 26px; min-width: 0; }
+    .project-banner { margin-bottom: 20px; min-width: 0; }
     .project-banner label { margin: 0 8px 10px; color: #aebbd0; }
     .project-banner select { padding: 10px; border-color: #35425a; background: #1d2b43; color: #f0f4ff; }
     .project-banner code { display: block; margin: 9px; color: #aebbd0; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
@@ -52,12 +60,12 @@
     .sidebar button { border-color: #35425a; background: transparent; color: #d4def0; }
     .sidebar button:hover { background: #263650; border-color: #637495; }
     .project-actions button { flex: 1; padding: 7px 4px; font-size: 11px; }
-    .navigation { display: grid; gap: 6px; margin-bottom: 25px; }
-    .navigation button { display: flex; align-items: center; gap: 11px; width: 100%; padding: 11px 13px; border: 1px solid transparent; text-align: left; font-weight: 600; color: #aebbd0; }
+    .navigation { display: grid; gap: 4px; margin-bottom: 20px; }
+    .navigation button { display: flex; align-items: center; gap: 11px; width: 100%; padding: 9px 13px; border: 1px solid transparent; text-align: left; font-weight: 600; color: #aebbd0; }
     .navigation button.active { border-color: #3d5487; background: #263859; color: #fff; }
     .icon { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
     .navigation .pill { margin-left: auto; font-size: 10px; padding: 2px 5px; }
-    .system-controls { margin-top: auto; padding-top: 30px; }
+    .system-controls { margin-top: auto; padding-top: 20px; }
     .system-menu > summary { margin: 12px 8px 0; padding: 8px 11px; border: 1px solid #35425a; border-radius: 7px; color: #d4def0; font-size: 11px; cursor: pointer; }
     .system-controls .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 0 8px; }
     .system-controls button { font-size: 11px; }
@@ -66,9 +74,10 @@
     #restart-paused-count { display: block; color: #aebbd0; font-size: 10px; margin-top: 3px; }
     .sidebar-footer { display: flex; align-items: center; gap: 7px; margin: 20px 9px 0; color: #95a5bf; font-size: 11px; }
     .sidebar-footer .dot { width: 6px; height: 6px; box-shadow: none; }
-    .workspace { min-width: 0; }
-    .top { min-height: 76px; display: flex; align-items: center; gap: 18px; padding: 16px 34px; border-bottom: 1px solid var(--line); background: var(--panel); }
-    .breadcrumb { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+    .workspace { min-width: 0; min-height: 100dvh; display: flex; flex-direction: column; }
+    .top { flex: none; min-height: 54px; display: flex; align-items: center; gap: 14px; padding: 8px var(--workspace-gutter); border-bottom: 1px solid var(--line); background: var(--panel); }
+    .breadcrumb { display: flex; align-items: center; gap: 12px; min-width: 0; color: var(--muted); font-size: 12px; }
+    #workspace-project { max-width: 28vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .breadcrumb strong { color: var(--ink); font-weight: 600; }
     .top .actions { margin-left: auto; align-items: center; }
     .live { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
@@ -82,15 +91,15 @@
     button.danger { color: var(--danger); }
     button.small { min-height: 32px; padding: 5px 9px; font-size: 11px; }
     .icon-button { display: grid; place-items: center; width: 38px; padding: 8px; }
-    main { max-width: 1740px; margin: 0 auto; padding: 28px 34px 44px; }
+    main { width: 100%; min-height: 0; flex: 1; padding: 20px var(--workspace-gutter) 28px; }
     .page { display: none; }
     .page.active { display: block; }
-    .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
-    .eyebrow { margin: 0 0 8px; color: var(--muted); }
+    .page-heading { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
+    .eyebrow { margin: 0 0 5px; color: var(--muted); }
     h1 { margin: 0; font-size: clamp(23px, 2.4vw, 30px); font-weight: 700; letter-spacing: -.8px; line-height: 1.3; overflow-wrap: anywhere; }
     .page-description { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
     .page-heading .scope-note { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; white-space: nowrap; }
-    .usage-bar { display: flex; align-items: center; gap: 22px; margin-bottom: 28px; padding: 15px 20px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
+    .usage-bar { display: flex; align-items: center; gap: 22px; margin-bottom: 18px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
     .usage-heading { min-width: 95px; }
     .usage-heading strong { display: block; font-size: 12px; }
     .usage-heading span { color: var(--muted); font-size: 10px; }
@@ -103,10 +112,10 @@
     .fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s; }
     .mark { position: absolute; top: 0; bottom: 0; z-index: 1; width: 1px; background: var(--panel); box-shadow: 0 0 0 1px #61708766; }
     .fill.warn { background: var(--warn); } .fill.hard { background: var(--danger); }
-    .stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 16px; margin-bottom: 25px; }
-    .stat { padding: 18px 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); }
+    .stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; margin-bottom: 20px; }
+    .stat { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); }
     .stat-label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
-    .stat-value { margin-top: 10px; font-size: 28px; font-weight: 650; letter-spacing: -1px; line-height: 1.2; }
+    .stat-value { margin-top: 7px; font-size: 28px; font-weight: 650; letter-spacing: -1px; line-height: 1.2; }
     .stat-note { margin-top: 6px; font-size: 11px; color: var(--muted); }
     .stat.attention .stat-value { color: var(--warn); }
     .grid { display: grid; grid-template-columns: minmax(0,2.4fr) minmax(265px,1fr); gap: 22px; align-items: start; }
@@ -182,7 +191,13 @@
     .event time { padding-top: 2px; color: var(--muted); font: 10px/1.6 ui-monospace, monospace; }
     .activity .event time { white-space: nowrap; }
     .actor { color: var(--accent); font-size: 11px; }
-    .thread-layout { display: grid; grid-template-columns: 300px minmax(0,1fr); min-height: 630px; height: calc(100dvh - 310px); max-height: 950px; }
+    body:has(#page-threads.active) .workspace { height: 100dvh; min-height: 560px; }
+    main:has(> #page-threads.active) { display: flex; flex-direction: column; }
+    #page-threads.active { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+    #page-threads .page-heading { margin-bottom: 14px; }
+    #page-threads .eyebrow, #page-threads .page-description { display: none; }
+    #page-threads h1 { font-size: 23px; }
+    .thread-layout { display: grid; grid-template-columns: clamp(250px,24%,340px) minmax(0,1fr); flex: 1; min-height: 0; }
     .thread-list { min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); background: var(--surface); }
     .thread-list .panel-head { padding: 15px; background: var(--panel); }
     .thread-tools { padding: 13px 14px; border-bottom: 1px solid var(--line); }
@@ -195,11 +210,11 @@
     .thread-row .meta { font-size: 10px; margin-top: 7px; }
     .thread-main { display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--panel); }
     .thread-main > .empty { margin: auto; }
-    .thread-header { position: relative; padding: 20px 50px 17px 22px; border-bottom: 1px solid var(--line); }
+    .thread-header { position: relative; flex: none; max-height: 45%; overflow-y: auto; padding: 14px 50px 12px 18px; border-bottom: 1px solid var(--line); }
     #close-thread { position: absolute; top: 13px; right: 12px; font-size: 21px; width: 32px; min-height: 32px; padding: 0; border-color: transparent; color: var(--muted); }
     .thread-header h2 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.3px; overflow-wrap: anywhere; }
     .thread-header > .meta { white-space: normal; font-size: 11px; }
-    .thread-header .actions { margin-top: 13px; gap: 5px; }
+    .thread-header .actions { margin-top: 9px; gap: 5px; }
     .thread-header .actions button { min-height: 30px; padding: 5px 8px; font-size: 10px; }
     .thread-header details { font-size: 11px; margin-top: 12px; }
     #thread-events { max-height: 180px; overflow: auto; }
@@ -209,6 +224,10 @@
     .messages { flex: 1; min-height: 160px; padding: 22px; overflow: auto; background: var(--surface); }
     .message { max-width: min(88%,760px); width: fit-content; margin-bottom: 18px; padding: 13px 16px; border: 1px solid var(--line); border-radius: 3px 12px 12px 12px; background: var(--panel); font-size: 13px; }
     .message.user { margin-left: auto; border-color: transparent; border-radius: 12px 3px 12px 12px; background: var(--accent-soft); }
+    .message.sending .message-text { opacity: .75; }
+    .message.failed, .message.unconfirmed { border-color: var(--warn); }
+    .message-delivery { margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .message.failed .message-delivery, .message.unconfirmed .message-delivery { color: var(--warn); }
     .message-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 22px; margin-bottom: 7px; color: var(--muted); font-size: 10px; }
     .message-head > span:first-child { font-weight: 650; color: var(--ink); }
     .message-text, .record-text { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -234,7 +253,14 @@
     .details { display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 0 16px; font-size: 12px; }
     .details dt, .details dd { padding: 8px 0; border-bottom: 1px solid var(--line); }
     .details dt { color: var(--muted); }
-    .details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: start; gap: 8px; }
+    .detail-value { min-width: 0; }
+    .copy-line { display: flex; align-items: start; gap: 6px; min-width: 0; }
+    .project-banner .copy-line { margin: 9px; }
+    .project-banner .copy-line code { flex: 1; min-width: 0; margin: 0; }
+    button.copy-button { display: inline-grid; place-items: center; flex: none; width: 28px; min-height: 28px; padding: 5px; color: var(--muted); background: transparent; border-color: transparent; }
+    .copy-button .icon { width: 15px; height: 15px; }
+    .agent-task-label { color: var(--muted); font-weight: 600; }
     .coordination-warning { margin: 12px 0; padding: 12px; border: 1px solid var(--warn); border-radius: 8px; overflow-wrap: anywhere; }
     #agent-subscriptions, #agent-diagnostics, #agent-lifecycle { margin-top: 16px; }
     #agent-subscription-items .event > div { min-width: 0; overflow-wrap: anywhere; }
@@ -282,21 +308,23 @@
     .panel > [data-more] { margin: 12px 20px; }
     @media (min-width: 1600px) { .agent { grid-template-columns: minmax(0,1fr) minmax(0,1.3fr) auto; } .agent-buttons { grid-column: auto; justify-content: flex-end; max-width: 245px; } }
     @media (max-width: 1200px) {
-      .app-shell { grid-template-columns: 210px minmax(0,1fr); }
+      :root { --sidebar-width: 210px; --workspace-gutter: 20px; }
       .sidebar { padding-left: 12px; padding-right: 12px; }
-      main { padding: 26px 24px; } .top { padding: 16px 24px; }
       .grid { grid-template-columns: minmax(0,1fr); } .activity { max-height: 320px; }
       .usage { gap: 14px; } .usage-bar { gap: 15px; padding: 15px; }
-      .thread-layout { grid-template-columns: 260px minmax(0,1fr); }
+      .thread-layout { grid-template-columns: 240px minmax(0,1fr); }
       .stat { padding: 16px; } .stat-note { font-size: 10px; }
     }
     @media (max-width: 800px) {
+      :root { --workspace-gutter: 16px; }
       html { scroll-padding-top: 14px; }
       .app-shell { display: block; }
       .sidebar { position: static; height: auto; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px; padding: 18px 20px 0; overflow: visible; }
+      .brand-row { grid-column: 1/-1; }
       .brand { padding: 0; font-size: 22px; } .brand-subtitle { display: none; }
       .project-banner { grid-column: 1/-1; margin: 0; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 5px 12px; }
       .project-banner label { margin: 0; } .project-banner code { margin: 0; grid-column: 1/-1; }
+      .project-banner .copy-line { grid-column: 1/-1; margin: 0; }
       .project-actions { margin: 0; align-self: end; } .project-actions button { padding: 9px; }
       .navigation { grid-column: 1/-1; display: flex; margin: 0 -4px; gap: 8px; }
       .navigation button { width: auto; padding: 10px 13px; border-radius: 7px 7px 0 0; font-size: 12px; }
@@ -310,27 +338,28 @@
       .system-menu .actions { position: absolute; top: 38px; left: 0; z-index: 10; width: min(100%, 300px); padding: 12px; gap: 8px; border: 1px solid #35425a; border-radius: 9px; background: var(--sidebar); box-shadow: 0 10px 30px #07132640; }
       .system-controls button { min-height: 36px; padding: 8px; font-size: 11px; }
       #resume-restart { max-width: none; padding: 10px; font-size: 11px; } #restart-paused-count { font-size: 10px; }
-      .top { min-height: 62px; padding: 12px 20px; gap: 12px; }
+      .top { gap: 10px; }
       .breadcrumb { font-size: 11px; } .top .live { margin-left: auto; } .top .actions { margin-left: 0; }
-      main { padding: 23px 20px 35px; }
+      main { padding-top: 18px; padding-bottom: 20px; }
       .usage-bar { display: block; } .usage-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; }
       .usage { gap: 15px; } .usage .meta { font-size: 9px; }
       .page-heading .scope-note { display: none; } .page-heading { margin-bottom: 20px; }
       .stats { gap: 10px; } .stat { padding: 14px; } .stat-value { font-size: 24px; } .stat-label { font-size: 10px; gap: 6px; } .stat-label .icon { width: 14px; }
-      .thread-layout { grid-template-columns: 1fr; height: calc(100dvh - 180px); min-height: 580px; }
+      .thread-layout { grid-template-columns: 1fr; }
       .thread-list { border-right: 0; } .thread-main { display: none; }
       .thread-layout.conversation-open .thread-list { display: none; }
       .thread-layout.conversation-open .thread-main { display: flex; }
-      .thread-layout.conversation-open { height: calc(100dvh - 28px); min-height: 0; }
+      .thread-layout.conversation-open { flex: none; height: calc(100dvh - 28px); min-height: 420px; }
       #back-to-threads { display: inline-flex; margin-bottom: 12px; min-height: 32px; padding: 5px 9px; font-size: 11px; }
       .thread-header { padding: 14px 45px 14px 18px; } .messages { padding: 18px; }
       .settings { padding: 0 20px 20px; } .settings-jump { padding: 14px 20px; }
     }
     @media (max-width: 480px) {
+      :root { --workspace-gutter: 14px; }
       .sidebar { padding: 15px 14px 0; gap: 14px 6px; } .brand { gap: 7px; font-size: 19px; } .brand-mark { width: 28px; height: 28px; font-size: 16px; border-radius: 8px; }
       .navigation { gap: 2px; } .navigation button { padding: 10px 8px; font-size: 11px; gap: 6px; } .navigation .pill { font-size: 8px; }
-      .top { padding: 11px 14px; } .breadcrumb > span:first-child, .breadcrumb > span:nth-child(2) { display: none; } .top .live { margin-left: 0; } .top .actions { margin-left: auto; }
-      main { padding: 20px 14px 28px; } .usage { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px 24px; } .usage-bar { margin-bottom: 23px; }
+      .breadcrumb > span:first-child, .breadcrumb > span:nth-child(2) { display: none; } .top .live { margin-left: 0; } .top .actions { margin-left: auto; }
+      .usage { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px 24px; } .usage-bar { margin-bottom: 23px; }
       .stats { grid-template-columns: repeat(2,minmax(0,1fr)); } .stat-note { font-size: 10px; }
       .agent { grid-template-columns: minmax(0,1fr); gap: 10px; padding: 16px; } .agent-buttons { grid-column: auto; }
       .panel-head { padding: 14px 16px; } .agent-toolbar { padding: 12px 16px; }
@@ -348,13 +377,13 @@
 <body>
   <a class="skip-link" href="#main-content">Skip to workspace</a>
   <div class="app-shell">
-    <aside class="sidebar" aria-label="Workspace navigation">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">a.</span>acom</div>
+    <aside class="sidebar" id="workspace-sidebar" aria-label="Workspace navigation">
+      <div class="brand-row"><div class="brand"><span class="brand-mark" aria-hidden="true">a.</span>acom</div><button class="sidebar-close" data-sidebar-toggle aria-controls="workspace-sidebar" aria-label="Hide sidebar" title="Hide sidebar">×</button></div>
       <p class="brand-subtitle">Your agents. One workspace.</p>
       <div class="project-banner">
         <label>Project <select id="project-select" aria-label="Project"></select></label>
         <button class="small" data-more="projects" hidden>More projects</button>
-        <code id="project-path">Connecting…</code>
+        <div class="copy-line"><code id="project-path">Connecting…</code><button type="button" class="copy-button" data-copy-target="project-path" data-copy-label="Project path" aria-label="Copy project path" title="Copy project path" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/></svg></button></div>
         <div class="project-actions"><button data-open="project-dialog">Add project</button><button id="remove-project">Remove</button></div>
       </div>
       <nav class="navigation" aria-label="Project views">
@@ -381,7 +410,8 @@
     </aside>
     <div class="workspace">
       <header class="top">
-        <div class="breadcrumb"><span>Workspace</span><span aria-hidden="true">/</span><strong id="current-view">Overview</strong></div>
+        <button class="icon-button" id="sidebar-toggle" data-sidebar-toggle aria-controls="workspace-sidebar" aria-expanded="true" aria-label="Hide sidebar" title="Hide sidebar"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button>
+        <div class="breadcrumb"><span id="workspace-project">Workspace</span><span aria-hidden="true">/</span><strong id="current-view">Overview</strong></div>
         <div class="live" role="status"><span class="dot" id="live-dot"></span><span id="live-text">connecting</span></div>
         <div class="actions"><button class="icon-button" id="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z"/></svg></button><button class="primary" data-open="launch-dialog"><span aria-hidden="true">＋ </span>Launch</button></div>
       </header>
@@ -501,7 +531,7 @@
   <dialog id="folder-dialog" aria-labelledby="folder-title"><form id="folder-form">
     <h2 id="folder-title">Choose a project folder</h2>
     <div class="actions"><button type="button" id="folder-home">Home</button><button type="button" id="folder-up">Up</button></div>
-    <p class="launch-project"><code id="folder-path"></code></p>
+    <p class="launch-project copy-line"><code id="folder-path"></code><button type="button" class="copy-button" data-copy-target="folder-path" data-copy-label="Folder path" aria-label="Copy folder path" title="Copy folder path"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/></svg></button></p>
     <label class="inline-check"><input type="checkbox" id="folder-hidden"> Show hidden files</label>
     <div class="folder-list" id="folder-list"></div><button type="button" class="small" id="folder-more" hidden>Load more entries</button><p class="inline-error" id="folder-error" role="alert"></p>
     <div class="custom-model-row"><label>New folder name <input name="name" placeholder="optional"></label><button type="submit">Create folder</button></div>
@@ -541,6 +571,8 @@
       catch (_) { return false; }
     }
     const pendingSends = new Set(), pendingMembership = new Set(), pendingUsage = new Set(), pendingProjectRemovals = new Set();
+    const outgoingMessages = new Map();
+    let outgoingSequence = 0;
     const drafts = new Map();
     const draftEdits = new Map();
     const draftKey = (project, thread) => `acom:draft:${project}:${thread}`;
@@ -559,7 +591,13 @@
     }
     const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
     const icons = {"overview": "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>", "chat": "<path d=\"M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z\"/>", "settings": "<path d=\"m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>", "search": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/>", "agents": "<rect x=\"4\" y=\"7\" width=\"16\" height=\"13\" rx=\"3\"/><path d=\"M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4\"/>", "warning": "<path d=\"m12 3 10 18H2zM12 9v4M12 17h.01\"/>", "lock": "<rect x=\"4\" y=\"10\" width=\"16\" height=\"11\" rx=\"2\"/><path d=\"M8 10V7a4 4 0 0 1 8 0v3M12 14v3\"/>", "moon": "<path d=\"M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z\"/>", "sun": "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5\"/>", "check": "<path d=\"m5 12 4 4L19 6\"/>"};
+    icons.copy = '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/>';
     const svgIcon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || ''}</svg>`;
+    const copyButton = (target, label) => `<button type="button" class="copy-button" data-copy-target="${esc(target)}" data-copy-label="${esc(label)}" aria-label="Copy ${esc(label.toLowerCase())}" title="Copy ${esc(label.toLowerCase())}">${svgIcon('copy')}</button>`;
+    async function copyText(text, label = 'Text') {
+      try { await navigator.clipboard.writeText(text); toast(`${label} copied`); }
+      catch (_) { toast(`Couldn't copy ${label.toLowerCase()}. Select the text and copy it manually.`, true); }
+    }
     const emptyState = (icon, title, description = '') => `<div class="empty"><div class="empty-symbol">${svgIcon(icon)}</div><strong>${esc(title)}</strong>${description ? `<p>${esc(description)}</p>` : ''}</div>`;
     state.agentFilter = 'all'; state.agentSearch = ''; state.agentQuery = null; state.agentFilterDraft = {field:'group',values:[]}; state.agentBrowser = [];
     state.confirmAgentActions = stored('acom:confirm-agent-actions') !== 'false';
@@ -582,6 +620,26 @@
     themeMedia.addEventListener('change', event => { if (!explicitTheme) applyTheme(event.matches ? 'dark' : 'light'); });
     applyTheme(document.documentElement.dataset.theme);
     const compactNavigation = matchMedia('(max-width: 800px)');
+    let sidebarPreference = stored('acom:sidebar-collapsed');
+    function applySidebar(collapsed, persist = false) {
+      document.documentElement.dataset.sidebarCollapsed = String(collapsed);
+      const sidebar = document.getElementById('workspace-sidebar');
+      sidebar.inert = collapsed;
+      sidebar.setAttribute('aria-hidden', String(collapsed));
+      document.querySelectorAll('[data-sidebar-toggle]').forEach(button => {
+        button.setAttribute('aria-expanded', String(!collapsed));
+        button.setAttribute('aria-label', collapsed ? 'Show sidebar' : 'Hide sidebar');
+        button.title = collapsed ? 'Show sidebar' : 'Hide sidebar';
+      });
+      if (collapsed && sidebar.contains(document.activeElement)) document.getElementById('sidebar-toggle').focus();
+      if (persist) {
+        sidebarPreference = String(collapsed);
+        if (!storeValue('acom:sidebar-collapsed', sidebarPreference)) toast('Sidebar preference applies to this tab, but browser storage is unavailable.', true);
+      }
+    }
+    document.querySelectorAll('[data-sidebar-toggle]').forEach(button => button.addEventListener('click', () => applySidebar(document.documentElement.dataset.sidebarCollapsed !== 'true', true)));
+    compactNavigation.addEventListener('change', event => { if (!['true','false'].includes(sidebarPreference)) applySidebar(event.matches); });
+    applySidebar(document.documentElement.dataset.sidebarCollapsed === 'true');
     const reading = new Set();
     const waitingReceipts = new WeakMap(), waitingClocks = new Map();
     let serverClock = null;
@@ -889,6 +947,9 @@
       setHTML($('#project-select'), state.projects.length ? projectOptions(state.selectedProject) : '<option>No projects yet</option>');
       $('#project-select').disabled = state.saving || !state.projects.length;
       setText($('#project-path'), p?.path || (p?.truncated ? 'Loading project details…' : 'Add a project folder to get started'));
+      $('[data-copy-target="project-path"]').disabled = !p?.path;
+      setText($('#workspace-project'), p?.name || (p ? `Project #${p.id}` : 'Workspace'));
+      $('#workspace-project').title = p?.path || '';
       setText($('#project-url'), state.url || '');
       setText($('#overview-title'), p?.name || (p ? `Project #${p.id}` : 'Workspace overview'));
       setText($('#overview-scope'), p ? 'Project overview' : 'Getting started');
@@ -1139,7 +1200,7 @@
       const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta wait-reason">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${queued}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta agent-task" title="${esc(task)}">${esc(a.status || task)}</div>${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta agent-task" title="${esc(`${a.status ? 'Status' : 'Task'}: ${a.status || task}`)}"><span class="agent-task-label">${a.status ? 'Status' : 'Task'}: </span>${esc(a.status || task)}</div>${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -1183,7 +1244,73 @@
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
     function messageHtml(m) {
-      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''}" data-message="${m.id}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span></div><div class="message-text">${esc(m.text)}</div></div>`;
+      const local = typeof m.id === 'string';
+      const delivery = {sending:'Sending…',failed:'Failed · Not sent. Your text is kept here for retry.',unconfirmed:'Delivery unconfirmed · Check the conversation before retrying.'}[m.delivery] || '';
+      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span><button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-text">${esc(m.text)}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div>`;
+    }
+    function messageText(id) {
+      return state.thread?.messages.find(message => String(message.id) === id)?.text ?? [...outgoingMessages.values()].find(message => message.id === id || String(message.serverId) === id)?.text;
+    }
+    function syncMessageBubbles(thread = state.thread) {
+      const messages = $('#messages');
+      if (!thread || !messages || state.selectedThread !== thread.id || state.selectedProject !== thread.project) return;
+      const outgoing = [...outgoingMessages.values()].filter(message => message.project === thread.project && message.thread === thread.id);
+      const byId = new Map(thread.messages.map(message => [message.id, message]));
+      for (const message of outgoing) {
+        if (message.serverId && byId.has(message.serverId)) {
+          byId.set(message.serverId, {...byId.get(message.serverId),localId:message.id});
+          outgoingMessages.delete(message.id);
+        }
+        else if (message.serverId) byId.set(message.serverId, {...message,id:message.serverId,delivery:null,localId:message.id});
+      }
+      const visible = !!messages.getClientRects().length;
+      const atBottom = visible ? messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36 : messages._followLatest;
+      const anchor = messages.querySelector('[data-message], [data-pending-message]'), top = anchor?.getBoundingClientRect().top;
+      const items = [...byId.values()].sort((a,b) => a.id - b.id);
+      const nodes = new Map([...messages.children].filter(node => node.dataset.message || node.dataset.pendingMessage).map(node => [node.dataset.message || node.dataset.pendingMessage, node]));
+      const inFlight = outgoing.filter(message => message.delivery === 'sending');
+      // A polled user message has no request identity until POST returns its ID.
+      // Briefly defer new user bubbles rather than guessing from equal text.
+      const shown = items.filter(message => message.sender !== 0 || !inFlight.some(send => message.id > send.after) || nodes.has(String(message.id)));
+      shown.push(...outgoing.filter(message => !message.serverId));
+      if (shown.length) $('.empty', messages)?.remove();
+      for (const message of shown) {
+        const local = typeof message.id === 'string';
+        let node = nodes.get(String(message.id)) || (message.localId && nodes.get(message.localId));
+        const header = JSON.stringify([message.id,message.sender,message.at,message.membership_unknown,message.outside_membership,message.delivery]);
+        if (node) {
+          if (node._messageHeader === header) continue;
+          if (local) node.dataset.pendingMessage = message.id;
+          else { node.dataset.message = message.id; delete node.dataset.pendingMessage; }
+          node.classList.remove('sending','failed','unconfirmed');
+          if (message.delivery) node.classList.add(message.delivery);
+          const template = document.createElement('template'); template.innerHTML = messageHtml(message);
+          setHTML($('.message-head', node), $('.message-head', template.content).innerHTML);
+          const delivery = $('.message-delivery', node), next = $('.message-delivery', template.content);
+          if (next) { if (delivery) setText(delivery, next.textContent); else node.append(next); }
+          else delivery?.remove();
+          node._messageHeader = header;
+          if (!local) {
+            const before = [...messages.children].find(child => child !== node && (child.dataset.pendingMessage || Number(child.dataset.message) > message.id)) || null;
+            if (node.nextElementSibling !== before) {
+              const selection = getSelection();
+              const selected = selection?.anchorNode && (node.contains(selection.anchorNode) || node.contains(selection.focusNode)) ? [selection.anchorNode,selection.anchorOffset,selection.focusNode,selection.focusOffset] : null;
+              if (messages.moveBefore) messages.moveBefore(node, before);
+              else messages.insertBefore(node, before);
+              if (selected) selection.setBaseAndExtent(...selected);
+            }
+          }
+        } else {
+          const before = !local && [...messages.children].find(child => child.dataset.pendingMessage || Number(child.dataset.message) > message.id);
+          if (before) before.insertAdjacentHTML('beforebegin', messageHtml(message));
+          else messages.insertAdjacentHTML('beforeend', messageHtml(message));
+          (before ? before.previousElementSibling : messages.lastElementChild)._messageHeader = header;
+        }
+      }
+      const known = new Set(shown.map(message => String(message.id)));
+      for (const node of messages.querySelectorAll('[data-pending-message]')) if (!known.has(node.dataset.pendingMessage)) node.remove();
+      if (visible && atBottom) messages.scrollTop = messages.scrollHeight;
+      else if (visible && anchor?.isConnected) messages.scrollTop += anchor.getBoundingClientRect().top - top;
     }
 
     let threadLoading = null;
@@ -1220,7 +1347,6 @@
         const previous = state.thread?.id === t.id ? state.thread : null;
         const sameThread = previous && $('#messages');
         const messagesById = new Map((previous?.messages || []).map(m => [m.id, m]));
-        const added = incoming.filter(m => !messagesById.has(m.id));
         incoming.forEach(m => messagesById.set(m.id, m));
         t.messages = [...messagesById.values()].sort((a,b) => a.id - b.id);
         const forward = cursor.after != null;
@@ -1238,7 +1364,7 @@
           saveVisibleDraft();
           $('#thread-main').innerHTML = `<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><button type="button" id="back-to-threads">← All threads</button><h2>${esc(t.title)}</h2><div class="meta"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button><button type="button" id="thread-unread" hidden></button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events"></div></details><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span></div>
-            <div class="messages" id="messages" role="region" aria-label="Conversation messages" tabindex="0">${(t.messages || []).map(messageHtml).join('') || '<div class="empty">No messages yet</div>'}</div>
+            <div class="messages" id="messages" role="region" aria-label="Conversation messages" tabindex="0"><div class="empty">No messages yet</div></div>
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary"${pendingSends.has(draftKey(t.project, t.id)) ? ' disabled' : ''}>Send</button><span class="composer-hint">Enter for a new line · Ctrl / ⌘ + Enter to send</span></form>`;
           $('.thread-layout').classList.add('conversation-open');
           $('#message-form textarea').value = threadDraft(t.project, t.id);
@@ -1252,20 +1378,6 @@
           });
           if (compactNavigation.matches && $('#page-threads').classList.contains('active')) $('.thread-layout').scrollIntoView({block:'start'});
         } else {
-          const messages = $('#messages');
-          const visible = !!messages.getClientRects().length;
-          const atBottom = visible ? messages.scrollHeight - messages.scrollTop - messages.clientHeight < 36 : messages._followLatest;
-          if (added.length) {
-            const anchor = messages.querySelector('[data-message]'), top = anchor?.getBoundingClientRect().top;
-            $('.empty', messages)?.remove();
-            for (const message of added) {
-              const before = [...messages.children].find(node => Number(node.dataset.message) > message.id);
-              if (before) before.insertAdjacentHTML('beforebegin', messageHtml(message));
-              else messages.insertAdjacentHTML('beforeend', messageHtml(message));
-            }
-            if (visible && atBottom) messages.scrollTop = messages.scrollHeight;
-            else if (visible && anchor) messages.scrollTop += anchor.getBoundingClientRect().top - top;
-          }
           setText($('.thread-header h2', $('#thread-main')), t.title);
         }
         setHTML($('.thread-header .meta', $('#thread-main')), `Thread #${t.id} · ${threadAccess(t)} · Owner: ${esc(threadOwner(t))} · Members: ${memberNames(t.members)} · ${t.members?.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread'}`);
@@ -1283,6 +1395,7 @@
         const history = events + (t.events_more ? '<p class="meta">Earlier thread events are not shown.</p>' : '');
         setHTML($('#thread-events'), history);
         state.thread = t;
+        syncMessageBubbles(t);
         updateUnread(t.id, t.project, t.unread, previous?.unread);
         $('#thread-older').hidden = t.oldestReached || t.total <= t.messages.length;
         setText($('#thread-catchup'), t.resume ? 'Loading new messages…' : '');
@@ -1567,7 +1680,11 @@
           pair = [document.createElement('dt'),document.createElement('dd')];
           pair[0].dataset.key = key; pair[0].textContent = label; root.append(...pair);
         }
-        setHTML(pair[1], content);
+        if (!pair[1].querySelector('.detail-value')) {
+          pair[1].innerHTML = `<span class="detail-value" id="agent-field-${esc(key)}"></span>${copyButton(`agent-field-${key}`, label.charAt(0).toUpperCase() + label.slice(1))}`;
+        }
+        setHTML($('.detail-value', pair[1]), content);
+        $('.copy-button', pair[1]).hidden = content === '—' || !content;
         existing.delete(key);
       }
       for (const pair of existing.values()) pair.forEach(node => node.remove());
@@ -1893,6 +2010,12 @@
     }
 
     document.addEventListener('click', async event => {
+      const copy = event.target.closest('[data-copy-target]');
+      if (copy && !copy.disabled) {
+        const target = document.getElementById(copy.dataset.copyTarget);
+        if (target) await copyText(target.innerText, copy.dataset.copyLabel);
+        return;
+      }
       if (event.target.closest('#retry-connection')) {
         const button = $('#retry-connection'); if (button.disabled) return; button.disabled = true;
         try { await refresh(); } finally { button.disabled = false; } return;
@@ -1965,6 +2088,12 @@
         return;
       }
       if (event.target.closest('#thread-older')) { await olderMessages(); return; }
+      const copyMessage = event.target.closest('[data-copy-message]');
+      if (copyMessage) {
+        const text = messageText(copyMessage.dataset.copyMessage);
+        if (typeof text === 'string') await copyText(text, 'Message');
+        return;
+      }
       if (event.target.closest('#lifecycle-older')) {await loadAgentLifecycle(selectedAgent,agentRequest,true);return;}
       if (event.target.closest('#diagnostics-older')) {await loadAgentDiagnostics(selectedAgent,agentRequest,true);return;}
       if (event.target.closest('#subscriptions-more')) {await loadAgentSubscriptions(selectedAgent,agentRequest,true);return;}
@@ -2169,6 +2298,7 @@
         });
         document.querySelectorAll('.page').forEach(x => x.classList.toggle('active', x.id === `page-${page.dataset.page}`));
         setText($('#current-view'), page.textContent.trim().split(' ')[0]);
+        if (compactNavigation.matches) { applySidebar(true); $('#main-content').focus({preventScroll:true}); }
         if (page.dataset.page === 'threads' && state.selectedThread) { restoreThreadScroll(); await refreshThread(false); }
         return;
       }
@@ -2486,19 +2616,32 @@
       const { draftProject: project, draftThread: thread } = form.dataset, text = $('[name=text]', form).value;
       const key = draftKey(project, thread), edits = draftEdits.get(key) || 0;
       if (pendingSends.has(key) || !text.trim()) return;
+      const previous = [...outgoingMessages.values()].filter(message => message.project === Number(project) && message.thread === Number(thread) && message.text === text && ['failed','unconfirmed'].includes(message.delivery));
+      if (previous.some(message => message.delivery === 'unconfirmed') && !confirm('Delivery is unconfirmed. This message may already be saved. Have you checked the conversation and want to send it again?')) return;
+      previous.forEach(message => outgoingMessages.delete(message.id));
+      const outgoing = {id:`pending-${++outgoingSequence}`,project:Number(project),thread:Number(thread),sender:0,text,at:Date.now()/1000,delivery:'sending',after:state.thread?.id === Number(thread) ? state.thread.messages.at(-1)?.id || 0 : 0};
+      outgoingMessages.set(outgoing.id, outgoing);
       pendingSends.add(key);
       saveDraft(project, thread, text);
       button.disabled = true;
+      syncMessageBubbles();
       try {
         const result = await api('/messages', { method: 'POST', body: JSON.stringify({ thread: Number(thread), text }) });
+        if (!Number.isSafeInteger(result.id) || result.id < 1) throw new Error('Delivery unconfirmed: the server response did not contain a message ID. Check the conversation before retrying.');
+        outgoing.serverId = result.id; outgoing.delivery = null;
+        syncMessageBubbles();
         const unchanged = (draftEdits.get(key) || 0) === edits && threadDraft(project, thread) === text;
         if (unchanged) saveDraft(project, thread, '');
         const current = $('#message-form');
         if (unchanged && current?.dataset.draftProject === project && current.dataset.draftThread === thread && $('[name=text]', current).value === text) current.reset();
-        await refresh();
+        void refresh();
         if (result.result_truncated && result.counts?.not_woken) toast(`Message sent; ${fmt(result.counts.not_woken)} agents weren't woken. See the completed-action result below.`);
         else if (result.not_woken?.length) toast(result.not_woken.map(x => `Agent ${x.agent} wasn't woken: ${x.reason}.`).join('\n'));
-      } catch (error) { toast(error.message, true); }
+      } catch (error) {
+        outgoing.delivery = error.status >= 400 && error.status < 500 && error.status !== 408 ? 'failed' : 'unconfirmed';
+        syncMessageBubbles();
+        toast(error.message, true);
+      }
       finally {
         pendingSends.delete(key); button.disabled = false;
         const current = $('#message-form');

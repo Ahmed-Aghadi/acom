@@ -18,9 +18,13 @@ Manual Pause, Resume/Retry, Close, Reopen and project/global lifecycle actions a
 
 Settings have section links and a persistent save-state indicator. The theme follows your system until you toggle it; your explicit light/dark choice is saved in this browser.
 
+The header toggle hides or shows the sidebar and saves your preference in this browser. Mobile defaults to hidden navigation. The workspace uses available width, including when zoomed out, and conversations fill the remaining height. Copy icons beside messages, project/folder paths and agent details copy their text. Manual selection still works. Agent previews show **Status:** for an agent's last descriptive update, otherwise **Task:** for its launch assignment. Words such as “idle” in a status update do not change the actual lifecycle badge.
+
 ## Threads and messages
 
 Threads have title/ID search and a mobile conversation view with **All threads** to return to the list while keeping the draft. **Ctrl/Cmd + Enter** sends; Enter adds a line.
+
+Sending immediately shows a muted **Sending…** bubble. Confirmation means acom saved the message, not that an agent read it. A definite rejection shows **Failed** with retry available. **Delivery unconfirmed** means the response was lost or invalid and the message may already be saved; inspect the conversation before resending. Writes are never automatically retried. Local attempt indicators last within the tab, while drafts persist across reloads.
 
 Threads have a searchable member picker. **Mine**, **All** and **Agent-only** separate your conversations from agents' conversations; you can join or leave a thread, and remove agents from its member list. Posting joins public, open static threads automatically. IDs and selectors remain available under Advanced.
 

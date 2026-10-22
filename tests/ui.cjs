@@ -386,11 +386,12 @@ async function fixture(run) {
     }
     if (req.url === '/messages') {
       if (data.messageDelay) await new Promise(resolve => setTimeout(resolve, data.messageDelay));
-      if (data.messageFailure) { res.statusCode = 503; return send({error:'Message send failed'}); }
+      if (data.messageFailure) { res.statusCode = data.messageFailureStatus || 503; return send({error:'Message send failed'}); }
       const t = data.threads.find(t => t.id === body.thread);
       t.members=[...new Set([0,...t.members])];
-      t.messages.push({ id: t.messages.length + 1, sender: 0, at: Date.now() / 1000, text: body.text });
-      return send({});
+      const id = Math.max(0,...data.threads.flatMap(thread=>thread.messages.map(message=>message.id))) + 1;
+      t.messages.push({ id, sender: 0, at: Date.now() / 1000, text: body.text });
+      return send({id});
     }
     if(req.method==='GET' && /^\/messages\/\d+$/.test(pathname))return send(bounded(data.threads.flatMap(t=>t.messages).find(m=>m.id===Number(pathname.split('/')[2])),params));
     res.statusCode = 404; send({ error: 'not found' });
@@ -413,7 +414,8 @@ async function fixture(run) {
   }
 }
 const openLaunch = page => page.locator('[data-open="launch-dialog"]').click();
-const openGlobalActions = async page => { if (!await page.locator('#system-menu').evaluate(menu=>menu.open)) await page.locator('#system-menu > summary').click(); };
+const openSidebar = async page => { if(await page.locator('#sidebar-toggle').getAttribute('aria-expanded')==='false')await page.locator('#sidebar-toggle').click(); };
+const openGlobalActions = async page => { await openSidebar(page); if (!await page.locator('#system-menu').evaluate(menu=>menu.open)) await page.locator('#system-menu > summary').click(); };
 const saveSettings = async page => {
   await page.locator('[form="settings-form"]').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
@@ -688,6 +690,9 @@ test('project identity and settings fit a narrow screen', async () => fixture(as
   data.projects[0].path = '/projects/' + 'long-folder-name-'.repeat(10);
   await page.setViewportSize({ width: 390, height: 844 });
   await reloadPage(page);
+  await openSidebar(page);
+  assert.ok(await page.locator('#project-select').evaluate(node=>node.clientWidth>=140));
+  assert.ok(await page.locator('.project-actions button').first().evaluate(node=>node.clientWidth>=60));
   await page.locator('[data-page=settings]').click();
   await page.locator('[data-harness=codex]').waitFor();
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
@@ -1403,6 +1408,7 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   assert.match(await page.title(), /^\(2\)/);
   assert.match(await page.locator('#project-select option[value="2"]').textContent(), /1 unread/);
+  await openSidebar(page);
   await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread-filter=unread]').click();
   assert.equal(await page.locator('.thread-row').count(), 1);
@@ -1411,9 +1417,11 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
   assert.equal(data.reads[1], 2);
   assert.equal(await page.locator('.thread-row').count(), 0);
   await reloadPage(page);
+  await openSidebar(page);
   await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('.thread-row').count(), 0);
   assert.equal(data.reads[2], undefined);
+  await openSidebar(page);
   await page.locator('#project-select').selectOption('2');
   await page.locator('[data-thread="2"]').waitFor();
   await page.locator('[data-thread="2"]').click();
@@ -2301,6 +2309,93 @@ test('thread list, header and membership-history selections survive polling whil
   assert.equal(await page.locator('.thread-header h2').textContent(), 'Latest conversation');
   await page.evaluate(() => getSelection().removeAllRanges());
   await page.waitForFunction(() => document.querySelector('#thread-list strong').textContent === 'Latest conversation');
+}));
+
+test('workspace expands with the viewport and sidebar collapse preserves conversation state', async () => fixture(async (page,data) => {
+  data.threads=[conversation([incoming(1,'Select this reply without losing the draft.')])];
+  await manualPolling(page); await page.setViewportSize({width:1280,height:900}); await reloadPage(page);
+  assert.ok(await page.locator('.top').evaluate(node=>node.getBoundingClientRect().height<=60));
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep this draft');
+  const selected=await selectText(page,'[data-message="1"] .message-text');
+  const width=await page.locator('#main-content').evaluate(node=>node.clientWidth);
+  await page.locator('#sidebar-toggle').click();
+  assert.equal(await page.locator('#sidebar-toggle').getAttribute('aria-expanded'),'false');
+  assert.equal(await page.locator('#workspace-sidebar').evaluate(node=>node.inert),true);
+  assert.ok(await page.locator('#main-content').evaluate((node,width)=>node.clientWidth>=width+200,width));
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this draft');
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await reloadPage(page);
+  assert.equal(await page.locator('#sidebar-toggle').getAttribute('aria-expanded'),'false');
+  await page.locator('#sidebar-toggle').focus(); await page.keyboard.press('Enter');
+  assert.equal(await page.locator('#sidebar-toggle').getAttribute('aria-expanded'),'true');
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this draft');
+  await page.setViewportSize({width:2400,height:1600});
+  assert.ok(await page.locator('#main-content').evaluate(node=>node.getBoundingClientRect().width>2000),'wide and zoomed-out workspaces use available width');
+  assert.ok(await page.locator('.thread-layout').evaluate(node=>node.getBoundingClientRect().height>1300),'tall workspaces are not capped at the old height');
+  assert.ok(await page.locator('.thread-layout').evaluate(node=>node.getBoundingClientRect().bottom<=innerHeight));
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+}));
+
+test('mobile sidebar defaults closed and navigation gives the conversation the viewport', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await page.setViewportSize({width:320,height:568}); await reloadPage(page);
+  assert.equal(await page.locator('#sidebar-toggle').getAttribute('aria-expanded'),'false');
+  assert.equal(await page.locator('#workspace-sidebar').isVisible(),false);
+  await openSidebar(page);
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('#sidebar-toggle').getAttribute('aria-expanded'),'false');
+  await page.locator('[data-thread="1"]').click();
+  assert.ok(await page.locator('#message-form button').evaluate(node=>node.getBoundingClientRect().bottom<=innerHeight));
+  assert.ok(await page.locator('#messages').evaluate(node=>node.clientHeight>=100));
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+}));
+
+test('copy controls preserve exact project paths and agent detail values across polling', async () => fixture(async (page, data) => {
+  const task = 'Review "quoted" paths & <tags>\nKeep this second line.';
+  data.projects[0].path = '/projects/example with "quotes" & spaces';
+  data.agents = [{id:1,project:1,name:'Reviewer',state:'paused',pause_reason:'limit',task,status:'Waiting for usage',history_path:'/sessions/a "review".jsonl'}];
+  await reloadPage(page); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  assert.equal(await page.locator('[data-copy-target="project-path"]').count(),1);
+  await page.locator('[data-copy-target="project-path"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Project path copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),data.projects[0].path);
+  await page.locator('[data-agent="1"] [data-action="details"]').click();
+  await page.locator('#agent-details dt[data-key="task"]').waitFor();
+  await page.locator('[data-copy-target="agent-field-task"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Task copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),task);
+  assert.equal(await page.locator('#agent-details dt[data-key="task"] + dd').textContent(),task);
+  const selected = await selectText(page,'#agent-field-task');
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>document.querySelector('#agent-field-task')===window.selectedNode),true);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  data.agents[0].status='Ready after recovery';
+  await page.evaluate(()=>refresh());
+  await page.locator('[data-copy-target="agent-field-status"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Status copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),'Ready after recovery');
+  await page.evaluate(()=>{navigator.clipboard.writeText=async()=>{throw new Error('Permission denied');};});
+  await page.locator('[data-copy-target="agent-field-task"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Select the text and copy it manually'));
+  assert.equal(await page.locator('#agent-field-task').textContent(),task);
+  assert.equal(data.requests.length,0,'copying never mutates server state');
+}));
+
+test('agent previews label descriptive status separately from launch tasks and lifecycle state', async () => fixture(async (page,data) => {
+  data.agents=[
+    {id:1,project:1,name:'Status reporter',state:'paused',pause_reason:'limit',task:'Original review assignment',status:'Phase 4 complete. Idle until review.'},
+    {id:2,project:1,name:'Task fallback',state:'paused',pause_reason:'limit',task:'Original second assignment',status:null},
+  ];
+  await reloadPage(page);
+  assert.equal(await page.locator('[data-agent="1"] .agent-task').textContent(),'Status: Phase 4 complete. Idle until review.');
+  assert.equal(await page.locator('[data-agent="1"] .agent-task').getAttribute('title'),'Status: Phase 4 complete. Idle until review.');
+  assert.equal(await page.locator('[data-agent="2"] .agent-task').textContent(),'Task: Original second assignment');
+  for(const id of [1,2]) assert.match(await page.locator(`[data-agent="${id}"] .pill.paused`).textContent(),/paused.*limit/);
 }));
 
 test('thread identifiers are visible and copyable for references in another conversation', async () => fixture(async (page, data) => {
@@ -3982,6 +4077,7 @@ test('workspace mobile Back preserves the selected conversation and draft withou
   const history=Array.from({length:30},(_,i)=>incoming(i+1,`Earlier reply ${i+1}. ${'A useful update from the project team. '.repeat(3)}`));
   data.threads=[conversation(history),conversation([],{id:2,title:'Other discussion'})];
   await manualPolling(page); await page.setViewportSize({width:390,height:844}); await reloadPage(page);
+  await openSidebar(page);
   await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('.thread-list').isVisible(),true);
   await page.locator('[data-thread="1"]').click();
@@ -4453,4 +4549,146 @@ test('workspace connection failures retain the last view and Retry now recovers 
   assert.equal(await page.locator('#project-select').inputValue(),'1');
   assert.equal(data.getRequests.filter(url=>url.startsWith('/overview')).length-before,1);
   assert.equal(data.requests.length,0);
+}));
+
+async function holdMessageReceipt(page) {
+  let release, saved, finished;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { saved = resolve; });
+  const completed = new Promise(resolve => { finished = resolve; });
+  const handler = async route => {
+    const response = await route.fetch(); saved();
+    await gate;
+    await route.fulfill({response}).catch(() => {});
+    finished();
+  };
+  await page.route('**/messages', handler);
+  return {started,release,remove:async() => {await completed; await page.unroute('**/messages',handler);}};
+}
+
+test('sending messages appear immediately, remain copyable, and confirm without waiting for a refresh', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const pending=await holdRequest(page,'**/messages');
+  const text='Keep exact text <tag>\nwith another line';
+  await page.locator('#message-form textarea').fill(text); await page.locator('#message-form button').click(); await pending.started;
+  assert.equal(await page.locator('.message.sending .message-text').textContent(),text);
+  assert.equal(await page.locator('.message-delivery').textContent(),'Sending…');
+  assert.equal(await page.locator('.message.sending').evaluate(node=>getComputedStyle(node).opacity),'1');
+  assert.equal(await page.locator('.message.sending .message-text').evaluate(node=>getComputedStyle(node).opacity),'0.75');
+  assert.equal(await page.locator('#messages .empty').count(),0);
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('.message.sending [data-copy-message]').click();
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),text);
+  await page.route(/\/threads\/1\/messages(?:\?|$)/,route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Refresh unavailable'})}));
+  pending.release(); await pending.remove();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),text);
+  assert.equal(await page.locator('.message.sending, .message-delivery').count(),0);
+  assert.deepEqual(await page.evaluate(()=>state.thread.messages.map(message=>message.id)),[],'the POST confirmation cannot move the polling cursor');
+  await page.locator('[data-message="1"] [data-copy-message]').click();
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),text);
+  assert.equal(data.requests.filter(request=>request.url==='/messages').length,1);
+}));
+
+test('post confirmations cannot skip intervening peer messages or duplicate paged results', async () => fixture(async (page,data) => {
+  data.threads=[conversation([incoming(10)])]; data.reads={1:10}; data.pageLimit=1;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const poll=await holdRequest(page,/\/threads\/1\/messages\?after=10(?:&|$)/,'GET');
+  await page.evaluate(()=>{window.heldMessagePoll=refreshThread();}); await poll.started;
+  data.threads[0].messages.push(incoming(11,'Intervening peer message'));
+  await page.locator('#message-form textarea').fill('Confirmed outgoing'); await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.deepEqual(await messageIds(page),[10,12]);
+  assert.deepEqual(await page.evaluate(()=>state.thread.messages.map(message=>message.id)),[10]);
+  poll.release(); await poll.remove(); await page.evaluate(()=>window.heldMessagePoll);
+  assert.deepEqual(await messageIds(page),[10,11,12]);
+  assert.equal(await page.locator('[data-message="12"]').count(),1);
+  assert.equal(await page.locator('[data-pending-message]').count(),0);
+  assert.deepEqual(await page.evaluate(()=>state.thread.messages.map(message=>message.id)),[10,11,12]);
+  assert.ok(data.getRequests.some(url=>url.startsWith('/threads/1/messages?after=10')));
+  await page.evaluate(()=>refreshThread()); assert.deepEqual(await messageIds(page),[10,11,12]);
+}));
+
+for (const moveFallback of [false,true]) test(`polling before the POST receipt reconciles by IDs and preserves selection (${moveFallback ? 'move fallback' : 'native move'})`, async () => fixture(async (page,data) => {
+  data.threads=[conversation([{id:1,sender:0,text:'Same text',at:1}])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  if (moveFallback) await page.locator('#messages').evaluate(node=>{node.moveBefore=undefined;});
+  const receipt=await holdMessageReceipt(page);
+  await page.locator('#message-form textarea').fill('Same text'); await page.locator('#message-form button').click(); await receipt.started;
+  data.threads[0].messages.push({id:3,sender:0,text:'Same text',at:2},incoming(4,'Peer still appears immediately'));
+  await page.evaluate(()=>refreshThread());
+  assert.deepEqual(await page.evaluate(()=>state.thread.messages.map(message=>message.id)),[1,2,3,4]);
+  assert.deepEqual(await messageIds(page),[1,4]);
+  assert.equal(await page.locator('.message.sending').count(),1);
+  assert.equal(await page.locator('.message-text').filter({hasText:'Same text'}).count(),2,'a polled copy does not duplicate the pending bubble');
+  const selected = await selectText(page,'.message.sending .message-text');
+  receipt.release(); await receipt.remove();
+  await page.waitForFunction(()=>!document.querySelector('#message-form button').disabled);
+  assert.deepEqual(await messageIds(page),[1,2,3,4]);
+  assert.equal(await page.locator('.message-text').filter({hasText:'Same text'}).count(),3,'separate identical messages survive reconciliation');
+  assert.equal(await page.locator('[data-pending-message]').count(),0);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>window.selectedNode === document.querySelector('[data-message="2"] .message-text')),true,'confirmation reuses the selected pending text node');
+}));
+
+test('definite message rejections show Failed, retain the draft, and permit an explicit retry', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])]; data.messageFailure=true; data.messageFailureStatus=400;
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Retry this rejected message'); await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>document.querySelector('.message.failed'));
+  assert.match(await page.locator('.message-delivery').textContent(),/^Failed/);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retry this rejected message');
+  assert.equal(data.threads[0].messages.length,0);
+  data.messageFailure=false; await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.equal(await page.locator('.message').count(),1);
+  assert.equal(await page.locator('.message-delivery').count(),0);
+  assert.equal(data.requests.filter(request=>request.url==='/messages').length,2);
+}));
+
+test('a lost message receipt stays unconfirmed, flushes polled messages, and never silently retries', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const abort=async route=>{await route.fetch(); await route.abort('failed');};
+  await page.route('**/messages',abort);
+  await page.locator('#message-form textarea').fill('Possibly saved'); await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>document.querySelector('.message.unconfirmed'));
+  assert.match(await page.locator('.message-delivery').textContent(),/^Delivery unconfirmed/);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Possibly saved');
+  await page.evaluate(()=>refreshThread());
+  assert.deepEqual(await messageIds(page),[1]);
+  assert.equal(await page.locator('.message.unconfirmed').count(),1,'matching text does not invent request identity');
+  assert.equal(data.requests.filter(request=>request.url==='/messages').length,1);
+  page.once('dialog',dialog=>dialog.dismiss()); await page.locator('#message-form button').click();
+  assert.equal(data.requests.filter(request=>request.url==='/messages').length,1,'retry requires an explicit uncertainty confirmation');
+  await page.unroute('**/messages',abort);
+}));
+
+test('a malformed successful message receipt cannot clear a draft or claim delivery', async () => fixture(async (page,data) => {
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.route('**/messages',route=>route.fulfill({status:200,contentType:'application/json',body:'{}'}));
+  await page.locator('#message-form textarea').fill('Keep this without a receipt ID'); await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>document.querySelector('.message.unconfirmed'));
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this without a receipt ID');
+  assert.equal(await page.locator('[data-message]').count(),0);
+  assert.match(await page.locator('#toast').textContent(),/did not contain a message ID/);
+  assert.equal(data.requests.filter(request=>request.url==='/messages').length,0);
+}));
+
+test('an outgoing receipt cannot replace another project or erase its newer draft', async () => fixture(async (page,data) => {
+  data.threads=[conversation([]),conversation([],{id:2,project:2,title:'Other project'})];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const receipt=await holdMessageReceipt(page);
+  await page.locator('#message-form textarea').fill('Sent in first project'); await page.locator('#message-form button').click(); await receipt.started;
+  await page.locator('#project-select').selectOption('2'); await page.locator('[data-thread="2"]').click();
+  await page.locator('#message-form textarea').fill('Other project draft');
+  receipt.release(); await receipt.remove(); await page.waitForFunction(()=>pendingSends.size===0);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Other project draft');
+  assert.equal(await page.locator('.message').count(),0);
+  assert.equal(await page.evaluate(()=>state.thread.id),2);
+  await page.locator('#project-select').selectOption('1'); await page.locator('[data-thread="1"]').click();
+  assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),'Sent in first project');
+  assert.equal(await page.locator('.message').count(),1);
 }));
