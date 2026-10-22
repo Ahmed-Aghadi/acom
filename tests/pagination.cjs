@@ -11,17 +11,26 @@ const { DatabaseSync } = require('node:sqlite');
 const { spawn } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
 
-async function cli(args, { cwd, env }) {
-  const child = spawn(binary, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+async function cli(args, { cwd, env }, { closedStdout = false, stdout: destination = 'pipe' } = {}) {
+  const child = spawn(closedStdout ? '/bin/sh' : binary, closedStdout
+    ? ['-c', 'read -r acom_ready; exec "$@"', 'acom-output-test', binary, ...args]
+    : args, { cwd, env, stdio: [closedStdout ? 'pipe' : 'ignore', destination, 'pipe'] });
   let stdout = '', stderr = '';
-  child.stdout.on('data', chunk => stdout += chunk);
+  child.stdout?.on('data', chunk => stdout += chunk);
   child.stderr.on('data', chunk => stderr += chunk);
   const timeout = setTimeout(() => child.kill('SIGKILL'), 15000);
+  const finished = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (status, signal) => resolve([status, signal]));
+  });
   try {
-    const [status, signal] = await new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', (status, signal) => resolve([status, signal]));
-    });
+    if (closedStdout) {
+      const closed = new Promise(resolve => child.stdout.once('close', resolve));
+      child.stdout.destroy();
+      await closed;
+      child.stdin.end('go\n');
+    }
+    const [status, signal] = await finished;
     assert.equal(signal, null, `CLI timed out: ${stderr}`);
     return { status, stdout, stderr };
   } finally {
@@ -60,6 +69,138 @@ async function mock(handler, run) {
     fs.rmSync(root,{recursive:true,force:true});
   }
 }
+
+test('CLI closed stdout exits quietly for local and API-backed output', async t => {
+  for (const args of [['--help'], ['guide'], ['models'], ['models', '--catalog'], ['agents']]) {
+    await t.test(args.join(' '), async () => {
+      await mock((req, res) => {
+        req.resume();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(req.url === '/agents/7/project' ? { project: 9 } : {
+          items: [{ id: 12, name: 'fixture', state: 'paused', harness: 'codex', model: 'gpt-6-sol', effort: 'medium', context: 0 }], has_more: false,
+          next_before: null, next_after: null, total: 1, through: 12, revision: 'closed-output',
+        }));
+      }, async fixture => {
+        fixture.env.ACOM_ID = '7';
+        fixture.env.RUST_BACKTRACE = '1';
+        const result = await cli(args, fixture, { closedStdout: true });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stderr, '', 'an intentionally closed consumer must not emit a panic or warning');
+        assert.equal(fixture.requests.length, args[0] === 'agents' ? 2 : 0);
+      });
+    });
+  }
+});
+
+test('CLI stdout failure never acknowledges incomplete wait output', async t => {
+  for (const mode of ['closed pipe', 'full device', 'complete output']) {
+    await t.test(mode, async () => {
+      await mock((req, res) => {
+        req.resume();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(req.url.endsWith('/ack') ? { acknowledged: true } : {
+          delivery_id: 51, text: '[acom] 1 new message from user.', timed_out: false,
+        }));
+      }, async fixture => {
+        fixture.env.ACOM_ID = '7';
+        fixture.env.RUST_BACKTRACE = '1';
+        const fd = mode === 'full device' ? fs.openSync('/dev/full', 'w') : undefined;
+        let result;
+        try {
+          result = await cli(['wait', '--timeout', '1s'], fixture, {
+            closedStdout: mode === 'closed pipe', ...(fd === undefined ? {} : { stdout: fd }),
+          });
+        } finally {
+          if (fd !== undefined) fs.closeSync(fd);
+        }
+        assert.equal(fixture.requests.filter(request => request.url === '/wait/7').length, 1);
+        assert.equal(fixture.requests.filter(request => request.url === '/wait/7/ack').length, mode === 'complete output' ? 1 : 0);
+        if (mode === 'full device') {
+          assert.notEqual(result.status, 0);
+          assert.match(result.stderr, /No space left|can't write/i);
+          assert.doesNotMatch(result.stderr, /panicked|backtrace/);
+        } else {
+          assert.equal(result.status, 0, result.stderr);
+          assert.equal(result.stderr, '');
+          if (mode === 'complete output') assert.match(result.stdout, /Delivery #51\n\[acom\] 1 new message/);
+        }
+      });
+    });
+  }
+});
+
+test('CLI closed stdout does not mark unseen thread messages read', async t => {
+  for (const closedStdout of [true, false]) await t.test(closedStdout ? 'closed output' : 'complete output', async () => {
+    await mock((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.url.endsWith('/read') ? {} : {
+        id: 4, title: 'read acknowledgement fixture', members: [0, 7],
+        private: false, joinable: true, events: [], last_read: 0,
+        messages: { items: [{ id: 9, sender: 7, text: 'unseen message', at: 0 }], has_more: false },
+      }));
+    }, async fixture => {
+      const result = await cli(['thread', 'read', '4'], fixture, { closedStdout });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stderr, '');
+      assert.equal(fixture.requests.filter(request => request.method === 'GET').length, 1);
+      assert.deepEqual(fixture.requests.filter(request => request.method === 'POST'), closedStdout
+        ? [] : [{ method: 'POST', url: '/threads/4/read' }]);
+      if (!closedStdout) assert.match(result.stdout, /unseen message/);
+    });
+  });
+});
+
+test('CLI stdout failure handling preserves other output and command errors', async t => {
+  await t.test('non-pipe stdout errors remain diagnosed', async () => {
+    await mock((_, res) => res.end('{}'), async fixture => {
+      const fd = fs.openSync('/dev/full', 'w');
+      let result;
+      try { result = await cli(['guide'], fixture, { stdout: fd }); }
+      finally { fs.closeSync(fd); }
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /No space left|can't write/i);
+      assert.doesNotMatch(result.stderr, /panicked|backtrace/);
+      assert.deepEqual(fixture.requests, []);
+    });
+  });
+  await t.test('invalid commands stay nonzero with a closed stdout consumer', async () => {
+    await mock((_, res) => res.end('{}'), async fixture => {
+      const result = await cli(['agents', '--not-an-option'], fixture, { closedStdout: true });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /unexpected argument/);
+      assert.deepEqual(fixture.requests, []);
+    });
+  });
+  await t.test('API errors stay nonzero with a closed stdout consumer', async () => {
+    await mock((req, res) => {
+      req.resume();
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'fixture state unavailable' }));
+    }, async fixture => {
+      const result = await cli(['read', '7'], fixture, { closedStdout: true });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /fixture state unavailable/);
+      assert.equal(fixture.requests.length, 1);
+    });
+  });
+  for (const errors of [1, 0]) await t.test(`compact resume result keeps ${errors ? 'failure' : 'success'} with closed stdout`, async () => {
+    await mock((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        result_truncated: true, counts: { ids: 2, errors, warnings: 0 },
+        ids: [], errors: [], warnings: [], receipt_event: 77,
+      }));
+    }, async fixture => {
+      const result = await cli(['resume-restart'], fixture, { closedStdout: true });
+      assert.equal(result.status, errors ? 1 : 0, result.stderr);
+      assert.match(result.stderr, /acom receipt 77/);
+      assert.doesNotMatch(result.stderr, /panicked|backtrace|Broken pipe/);
+      assert.deepEqual(fixture.requests, [{ method: 'POST', url: '/resume-restart' }]);
+    });
+  });
+});
 
 test('CLI thread creation sends explicit access settings', async t => {
   for (const [flags, expected] of [

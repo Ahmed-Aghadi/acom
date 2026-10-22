@@ -11,6 +11,38 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::process::exit;
 
+// CLI output may be piped to a reader that exits early. Server logging is separate.
+macro_rules! print {
+    ($($args:tt)*) => { write_stdout(format_args!($($args)*)) };
+}
+
+macro_rules! println {
+    () => { write_stdout(format_args!("\n")) };
+    ($($args:tt)*) => { write_stdout(format_args!("{}\n", format_args!($($args)*))) };
+}
+
+fn check_stdout(result: std::io::Result<()>, context: &str, exit_status: i32) {
+    if let Err(error) = result {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            exit(exit_status);
+        }
+        die(&format!("{context}: {error}"));
+    }
+}
+
+fn write_stdout(args: std::fmt::Arguments<'_>) {
+    write_stdout_status(args, 0);
+}
+
+fn write_stdout_status(args: std::fmt::Arguments<'_>, exit_status: i32) {
+    let mut stdout = std::io::stdout().lock();
+    check_stdout(
+        stdout.write_fmt(args).and_then(|_| stdout.flush()),
+        "can't write stdout",
+        exit_status,
+    );
+}
+
 const HELP: &str = "\
 acom: launch coding agents and let them talk and share locks.
 
@@ -1877,14 +1909,13 @@ fn main() {
                 .unwrap_or_else(|(_, error)| die(&format!("{error}. No delivery was acknowledged. Retry `acom wait` to retrieve any pending delivery.")));
             let (output, delivery) = wait_output(&v).unwrap_or_else(|e| die(e));
             let mut stdout = std::io::stdout().lock();
-            if let Err(e) = stdout
-                .write_all(output.as_bytes())
-                .and_then(|_| stdout.flush())
-            {
-                die(&format!(
-                    "can't write wait response: {e}; delivery was not acknowledged"
-                ));
-            }
+            check_stdout(
+                stdout
+                    .write_all(output.as_bytes())
+                    .and_then(|_| stdout.flush()),
+                "can't write wait response; delivery was not acknowledged",
+                0,
+            );
             drop(stdout);
             if let Some(n) = delivery {
                 acknowledge(n);
@@ -2618,10 +2649,7 @@ fn main() {
         }
         Cmd::ResumeRestart => {
             let v = post("/resume-restart", user_body(json!({})));
-            println!(
-                "resumed {} restart-paused agent(s) across all projects",
-                result_count(&v, "ids")
-            );
+            let failed = result_count(&v, "errors") > 0;
             for key in ["warnings", "errors"] {
                 for message in v[key].as_array().into_iter().flatten() {
                     eprintln!(
@@ -2631,7 +2659,14 @@ fn main() {
                     );
                 }
             }
-            if result_count(&v, "errors") > 0 {
+            write_stdout_status(
+                format_args!(
+                    "resumed {} restart-paused agent(s) across all projects\n",
+                    result_count(&v, "ids")
+                ),
+                i32::from(failed),
+            );
+            if failed {
                 exit(1);
             }
         }
