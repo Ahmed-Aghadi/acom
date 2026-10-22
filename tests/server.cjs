@@ -2509,8 +2509,13 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     await page.locator('[data-open=thread-dialog]').click();
     await page.locator('#thread-form [name=title]').fill('Browser notes');
     await page.locator('#thread-form button.primary').click();
+    await page.locator('#thread-summary').waitFor();
+    assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),false);
+    assert.equal(await page.locator('#thread-metadata').isHidden(),true);
+    assert.ok(await page.locator('.thread-header').evaluate(header=>header.getBoundingClientRect().height<=95));
+    await page.locator('#thread-details > summary').click();
     await page.locator('#thread-membership').waitFor();
-    assert.match(await page.locator('.thread-header .meta').first().textContent(),/Thread #\d+/);
+    assert.match(await page.locator('#thread-summary').textContent(),/Thread #\d+/);
     assert.equal(await page.locator('#thread-membership').textContent(),'Leave thread');
     await page.locator('#thread-membership').click();
     await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread');

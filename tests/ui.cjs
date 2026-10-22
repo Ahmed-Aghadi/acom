@@ -416,10 +416,109 @@ async function fixture(run) {
 const openLaunch = page => page.locator('[data-open="launch-dialog"]').click();
 const openSidebar = async page => { if(await page.locator('#sidebar-toggle').getAttribute('aria-expanded')==='false')await page.locator('#sidebar-toggle').click(); };
 const openGlobalActions = async page => { await openSidebar(page); if (!await page.locator('#system-menu').evaluate(menu=>menu.open)) await page.locator('#system-menu > summary').click(); };
+const openThreadDetails = async page => {
+  await page.locator('#thread-details').waitFor({state:'attached'});
+  if (!await page.locator('#thread-details').evaluate(details=>details.open)) await page.locator('#thread-details > summary').click();
+};
 const saveSettings = async page => {
   await page.locator('[form="settings-form"]').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
 };
+
+for (const viewport of [{width:1280,height:900,header:95,messages:400},{width:390,height:844,header:120,messages:350},{width:320,height:568,header:120,messages:250}]) {
+  test(`compact thread header leaves reading space with many members at ${viewport.width}px`, async () => fixture(async (page,data) => {
+    data.agents=Array.from({length:36},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
+    const title='A long discussion title about reviewing the complete project and coordinating detailed follow-up work '.repeat(3);
+    data.threads=[conversation([incoming(1,'A useful message remains easy to read.')],{title,members:[0,...data.agents.map(agent=>agent.id)],private:true,joinable:false,owner:1})];
+    await manualPolling(page); await page.setViewportSize({width:viewport.width,height:viewport.height}); await reloadPage(page);
+    await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+    await page.locator('#message-form textarea').waitFor();
+    const height=await page.locator('.thread-header').evaluate(node=>node.getBoundingClientRect().height);
+    assert.ok(height<=viewport.header,`collapsed header is ${height}px rather than at most ${viewport.header}px`);
+    const readingHeight=await page.locator('#messages').evaluate(node=>node.clientHeight);
+    assert.ok(readingHeight>=viewport.messages,`timeline is ${readingHeight}px rather than at least ${viewport.messages}px`);
+    assert.equal(await page.locator('.thread-header h2').textContent(),title,'the full title remains available even when visually truncated');
+    assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),false);
+    assert.match(await page.locator('#thread-summary').textContent(),/Thread #1.*Private.*37 members.*You’re a member/);
+    assert.equal(await page.locator('#thread-metadata').isHidden(),true);
+    assert.equal(await page.locator('#close-thread').isVisible(),true);
+    assert.equal(await page.locator('#thread-unread').evaluate(node=>node.closest('#thread-details')===null),true,'unread navigation remains outside collapsed administration');
+    assert.equal(await page.locator('#thread-read-error').evaluate(node=>node.closest('#thread-details')===null),true,'read failures are not concealed in details');
+    if(viewport.width<600)assert.equal(await page.locator('#back-to-threads').isVisible(),true);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    const disclosure=page.locator('#thread-details > summary');
+    await disclosure.focus(); await disclosure.press('Enter');
+    assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),true,'native disclosure is keyboard operable');
+    assert.equal(await page.locator('#thread-full-title').textContent(),title,'expanded details expose the complete title');
+    assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #1 Reviewer 1.*Members:.*Reviewer 36/);
+    for(const id of ['copy-thread','thread-membership','add-thread-members','remove-thread-members','change-thread-owner'])assert.equal(await page.locator(`#${id}`).isVisible(),true,`${id} stays accessible in details`);
+    assert.ok(await page.locator('#messages').evaluate(node=>node.clientHeight>=160),'expanded details still leave the timeline usable');
+    assert.equal(await page.locator('#message-form button').evaluate(node=>node.getBoundingClientRect().bottom<=innerHeight),true,'expanded details keep the send button within the viewport');
+    await disclosure.press('Space');
+    assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),false);
+    assert.equal(data.requests.filter(request=>request.method!=='GET'&&!request.url.endsWith('/read')).length,0);
+  }));
+}
+
+test('thread details preserve disclosure, selected metadata, draft and scroll across polling without leaking to another thread', async () => fixture(async (page,data) => {
+  const messages=Array.from({length:30},(_,i)=>incoming(i+1,`Reply ${i+1}. ${'Detailed project update. '.repeat(8)}`));
+  data.threads=[conversation(messages,{owner:0,watch:['working','idle','group:review'],events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'acom',details:{reason:'working matched'}}]}),conversation([],{id:2,title:'Other conversation'})];
+  await manualPolling(page); await page.setViewportSize({width:1280,height:900}); await reloadPage(page);
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await openThreadDetails(page); await page.locator('#thread-history > summary').click();
+  assert.match(await page.locator('#thread-watch').textContent(),/Live filters: working, idle, group:review/);
+  assert.match(await page.locator('#thread-events').textContent(),/working matched/);
+  await page.locator('#message-form textarea').fill('Retain this detailed conversation draft');
+  await page.locator('#messages').evaluate(node=>{node.scrollTop=160;});
+  const selected=await selectText(page,'#thread-metadata');
+  const scroll=await page.locator('#messages').evaluate(node=>node.scrollTop);
+  data.threads[0].owner=2;data.threads[0].messages.push(incoming(31,'Arrived while reading details'));
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),true);
+  assert.equal(await page.locator('#thread-history').evaluate(details=>details.open),true);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>window.selectedNode.isConnected),true);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retain this detailed conversation draft');
+  assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),scroll);
+  assert.equal(await page.locator('[data-message="31"] .message-text').textContent(),'Arrived while reading details');
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.waitForFunction(()=>document.querySelector('#thread-metadata').textContent.includes('Owner: #2'));
+  await page.locator('[data-thread="2"]').click();
+  await page.waitForFunction(()=>state.thread?.id===2);
+  assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),false,'another conversation starts with compact details');
+  assert.equal((await page.locator('#thread-summary').textContent()).includes('Thread #2'),true);
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread?.id===1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retain this detailed conversation draft');
+  assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),false,'reopening does not inherit another pane’s disclosure state');
+}));
+
+test('thread disclosure resizing keeps latest readers at the bottom and does not move selected earlier messages', async () => fixture(async (page,data) => {
+  data.agents=Array.from({length:12},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
+  data.threads=[conversation(Array.from({length:30},(_,i)=>incoming(i+1,`Reply ${i+1}. ${'Detailed project update. '.repeat(8)}`)),{
+    members:[0,...data.agents.map(agent=>agent.id)],
+    events:Array.from({length:8},(_,i)=>({id:i+1,at:i+1,kind:'thread.joined',agent:i+1,actor:'acom',details:{reason:'Review group matched'}})),
+  })];
+  await manualPolling(page); await page.setViewportSize({width:1280,height:900}); await reloadPage(page);
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>{const messages=document.querySelector('#messages');return messages&&messages._followLatest&&messages.scrollHeight-messages.scrollTop-messages.clientHeight<2;});
+  for(const selector of ['#thread-details','#thread-history','#thread-history','#thread-details']) {
+    await page.locator(`${selector} > summary`).click();
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const position=await page.locator('#messages').evaluate(node=>({gap:node.scrollHeight-node.scrollTop-node.clientHeight,following:node._followLatest}));
+    assert.ok(position.gap<2,`${selector} left the latest reader ${position.gap}px above the bottom`);
+    assert.equal(position.following,true,`${selector} preserves follow-latest mode`);
+  }
+  await page.locator('#messages').evaluate(node=>{node.scrollTop=160;});
+  const selected=await selectText(page,'[data-message="2"] .message-text');
+  const scroll=await page.locator('#messages').evaluate(node=>node.scrollTop);
+  for(const selector of ['#thread-details','#thread-history','#thread-details']) {
+    await page.locator(`${selector} > summary`).focus(); await page.locator(`${selector} > summary`).press('Enter');
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),scroll,`${selector} keeps the earlier reading position`);
+    assert.equal(await page.evaluate(()=>getSelection().toString()),selected,`${selector} preserves selected message text`);
+  }
+}));
 
 test('empty dialogs cancel without validation or writes; Task is still required', async () => fixture(async (page, data) => {
   assert.equal(await page.locator('#project-path').textContent(), '/projects/example');
@@ -995,18 +1094,18 @@ test('thread filters distinguish participation; joining, leaving and adding memb
   await page.locator('[data-thread-filter=all]').click();
   assert.equal(await page.locator('[data-thread]').count(),2);
   await page.locator('[data-thread="2"]').click();
-  await page.locator('#thread-membership').waitFor();
+  await openThreadDetails(page); await page.locator('#thread-membership').waitFor();
   assert.equal(await page.locator('#thread-membership').textContent(),'Join thread');
-  await page.locator('#thread-membership').click();
+  await openThreadDetails(page); await page.locator('#thread-membership').click();
   await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Leave thread');
   assert.ok(data.threads[1].members.includes(0));
-  await page.locator('#add-thread-members').click();
+  await openThreadDetails(page); await page.locator('#add-thread-members').click();
   assert.equal(await page.locator('#add-member-picker [name=member]').count(),1);
   await page.locator('#add-member-picker [name=member]').check();
   await page.locator('#members-form button.primary').click();
   await page.waitForFunction(()=>!document.querySelector('#members-dialog').open);
   assert.ok(data.threads[1].members.includes('2'));
-  await page.locator('#thread-membership').click();
+  await openThreadDetails(page); await page.locator('#thread-membership').click();
   await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Join thread');
   await page.locator('[data-thread-filter=agents]').click();
   assert.equal(await page.locator('[data-thread]').count(),1);
@@ -1036,6 +1135,7 @@ test('live thread creation sends explicit state/group filters, retains user choi
     assert.deepEqual([...request.watch].sort(), [...c.states,...c.groups.split(',').map(g=>g.trim()).filter(Boolean).map(g=>`group:${g}`)].sort());
     assert.equal(Object.hasOwn(request, 'members'), false);
     assert.equal(request.include_user, c.include);
+    await openThreadDetails(page);
     assert.match(await page.locator('#thread-watch').textContent(), /Live filters:/);
     assert.equal(await page.locator('#add-thread-members').isHidden(), true);
     assert.equal(await page.locator('#thread-mode').inputValue(), 'fixed');
@@ -1076,7 +1176,7 @@ test('thread creation distinguishes public open, public no-self-join and private
     assert.equal(body.joinable, access === 'open');
     assert.equal(Object.hasOwn(body,'watch'), false);
     const label=access === 'private' ? 'Private · members only' : access === 'invite' ? 'Public · no self-join' : 'Public · open to join';
-    assert.ok((await page.locator('.thread-header > div.meta').textContent()).includes(label));
+    assert.ok((await page.locator('#thread-metadata').textContent()).includes(label));
     assert.ok((await page.locator(`[data-thread="${index+1}"] .meta`).textContent()).includes(label));
     assert.equal(await page.locator('#thread-access').inputValue(), 'open', 'successful creation resets access for the next thread');
   }
@@ -1109,7 +1209,7 @@ test('user removal includes members absent from the bounded agent preview and pr
   data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
   data.threads=[conversation([incoming(1,'Existing conversation')],{members:[0,1,3],private:true,joinable:false})]; data.reads[1]=1;
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#remove-thread-members').click();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click();
   assert.deepEqual(await page.locator('#remove-member-picker [name=member]').evaluateAll(nodes=>nodes.map(n=>Number(n.value))),[1,3]);
   assert.match(await page.locator('#remove-member-picker').textContent(), /Agent #1/);
   assert.equal(await page.locator('#remove-member-picker [name=member][value="0"]').count(),0);
@@ -1121,23 +1221,23 @@ test('user removal includes members absent from the bounded agent preview and pr
   assert.deepEqual(data.threads[0].members,[0,3]);
   assert.deepEqual(data.requests.find(r=>r.url==='/threads/1/members/remove').body,{members:['1']});
   assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),'Existing conversation');
-  await page.locator('#thread-history summary').click();
+  await openThreadDetails(page); await page.locator('#thread-history summary').click();
   assert.match(await page.locator('#thread-events').textContent(), /agent 1 left · by user.*Removed by user/);
-  await page.locator('#remove-thread-members').click();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click();
   assert.deepEqual(await page.locator('#remove-member-picker [name=member]').evaluateAll(nodes=>nodes.map(n=>Number(n.value))),[3]);
 }));
 
 test('live member removals explain durable exclusions and offer explicit restoration by ID', async () => fixture(async (page, data) => {
   data.threads=[conversation([],{watch:['working','idle'],excluded_members:[]})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#remove-thread-members').click();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click();
   assert.match(await page.locator('#remove-members-help').textContent(),/stay excluded.*until explicitly added/);
   await page.locator('#remove-member-picker [name=member][value="1"]').check(); await page.locator('#remove-members-form button.danger').click();
   await page.waitForFunction(()=>!document.querySelector('#remove-members-dialog').open);
   assert.deepEqual(data.threads[0].excluded_members,[1]);
   assert.equal(await page.locator('#remove-thread-members').isDisabled(),true);
   assert.equal(await page.locator('#add-thread-members').textContent(),'Restore members');
-  await page.locator('#add-thread-members').click();
+  await openThreadDetails(page); await page.locator('#add-thread-members').click();
   assert.equal(await page.getByRole('dialog',{name:'Restore thread members',exact:true}).count(),1);
   assert.match(await page.locator('#members-help').textContent(),/matching the live filters/);
   assert.match(await page.locator('#add-member-picker').textContent(),/Agent #1/);
@@ -1152,7 +1252,7 @@ test('live member removals explain durable exclusions and offer explicit restora
 test('failed and empty member removals retain the dialog selection and do not retry mutations', async () => fixture(async (page, data) => {
   data.threads=[conversation([])]; data.removeMembersFailure=true;
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#remove-thread-members').click();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click();
   assert.match(await page.locator('#remove-members-help').textContent(), /join again because this thread is open/);
   await page.locator('#remove-members-form button.danger').click();
   assert.equal(data.requests.filter(r=>r.url.endsWith('/members/remove')).length,0);
@@ -1169,8 +1269,8 @@ test('ownership can transfer directly to an off-page agent without changing memb
   data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
   data.threads=[conversation([],{created_by:0,owner:0,private:true,joinable:false})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  assert.match(await page.locator('.thread-header > div.meta').textContent(), /Owner: you/);
-  await page.locator('#change-thread-owner').click();
+  assert.match(await page.locator('#thread-metadata').textContent(), /Owner: you/);
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click();
   assert.equal(await page.getByRole('dialog',{name:'Change thread owner',exact:true}).count(),1);
   assert.match(await page.locator('#thread-owner-form').textContent(),/Ownership changes do not add or remove members/);
   assert.deepEqual(await page.locator('#thread-owner-options option').evaluateAll(nodes=>nodes.map(node=>Number(node.value))),[3]);
@@ -1180,8 +1280,8 @@ test('ownership can transfer directly to an off-page agent without changing memb
   assert.equal(data.threads[0].owner,2);
   assert.equal(data.threads[0].created_by,0);
   assert.deepEqual(data.threads[0].members,[0,1]);
-  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: #2/);
-  await page.locator('#thread-history summary').click();
+  assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #2/);
+  await openThreadDetails(page); await page.locator('#thread-history summary').click();
   assert.match(await page.locator('#thread-events').textContent(),/Owner changed: user → agent 2 · by user/);
   assert.equal(data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length,0);
 }));
@@ -1192,8 +1292,8 @@ test('owner selection loads suggestions without clearing explicit IDs and reject
   data.agents.push({id:5,project:1,name:'Replaced agent',state:'replaced'});
   data.threads=[conversation([],{created_by:1})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: #1/);
-  await page.locator('#change-thread-owner').click();
+  assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #1/);
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click();
   await page.locator('#thread-owner-form [name=owner]').fill('2');
   for (const count of [1,2,3]) {
     await page.locator('#thread-owner-dialog [data-more=agents]').click();
@@ -1214,7 +1314,7 @@ test('owner selection loads suggestions without clearing explicit IDs and reject
 test('ownership errors retain input without retrying and transfers remain single-flight during polling', async () => fixture(async (page, data) => {
   data.agents=[{id:2,project:1,name:'Target',state:'idle'}]; data.threads=[conversation([])]; data.ownerFailure=true;
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
   await page.locator('#thread-owner-form button.primary').click();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Ownership change unavailable');
   assert.equal(await page.locator('#thread-owner-dialog').isVisible(),true);
@@ -1235,16 +1335,16 @@ test('ownership history and names are escaped and selected ownership details sur
   data.agents=[{id:1,project:1,name:'<img src=x onerror="window.ownerUnsafe=true">',state:'idle'}];
   data.threads=[conversation([],{owner:1,events:[{id:1,at:1,kind:'thread.owner-changed',agent:1,actor:'<script>bad()</script>',details:{from:0,to:1,reason:'<b>new owner</b>'}}]})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: #1 <img/);
+  assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #1 <img/);
   assert.equal(await page.locator('.thread-header img').count(),0);
-  await page.locator('#thread-history summary').click();
+  await openThreadDetails(page); await page.locator('#thread-history summary').click();
   assert.match(await page.locator('#thread-events').textContent(),/Owner changed: user → agent 1.*<script>bad\(\)<\/script>.*<b>new owner<\/b>/);
   assert.equal(await page.locator('#thread-events script, #thread-events b').count(),0);
-  const selected=await selectText(page,'.thread-header > div.meta');
+  const selected=await selectText(page,'#thread-metadata');
   data.threads[0].owner=2; await page.evaluate(()=>refresh());
   assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
   await page.evaluate(()=>getSelection().removeAllRanges());
-  await page.waitForFunction(()=>document.querySelector('.thread-header > div.meta').textContent.includes('Owner: #2'));
+  await page.waitForFunction(()=>document.querySelector('#thread-metadata').textContent.includes('Owner: #2'));
   assert.equal(await page.evaluate(()=>window.ownerUnsafe),undefined);
 }));
 
@@ -1256,22 +1356,22 @@ test('missing owner metadata never implies that the original creator or user sti
     await route.fulfill({response,json:body});
   });
   await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  assert.match(await page.locator('.thread-header > div.meta').textContent(),/Owner: unavailable/);
-  assert.doesNotMatch(await page.locator('.thread-header > div.meta').textContent(),/Owner: #1|Owner: you/);
-  await page.locator('#change-thread-owner').click();
+  assert.match(await page.locator('#thread-metadata').textContent(),/Owner: unavailable/);
+  assert.doesNotMatch(await page.locator('#thread-metadata').textContent(),/Owner: #1|Owner: you/);
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click();
   assert.equal(await page.locator('#thread-owner-current').textContent(),'Current owner: unavailable');
   assert.equal(data.requests.filter(r=>r.url.endsWith('/owner')).length,0);
 }));
 
 test('live threads expose escaped membership history and mark outside-membership messages without counting them unread', async () => fixture(async (page, data) => {
-  data.threads = [conversation([{...incoming(1,'Before you joined'),outside_membership:true},{...incoming(2,'Current reply'),membership_unknown:true}], {
+  data.threads = [conversation([{...incoming(1,'Before you joined'),outside_membership:true},{...incoming(2,`Current reply\n${'Retained conversation context.\n'.repeat(30)}`),membership_unknown:true}], {
     watch:['working','idle','group:review'],events_more:true,
     events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'user',details:{reason:'group <review> matched'}}],
   })];
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.evaluate(() => { document.hasFocus = () => false; });
   await page.locator('[data-thread="1"]').click();
-  await page.locator('#thread-history').waitFor();
+  await openThreadDetails(page); await page.locator('#thread-history').waitFor();
   assert.equal(await page.locator('#add-thread-members').isHidden(), true);
   assert.equal(await page.locator('#thread-membership').textContent(), 'Leave thread');
   await page.locator('#thread-older').click();
@@ -1279,7 +1379,7 @@ test('live threads expose escaped membership history and mark outside-membership
   assert.match(await page.locator('[data-message="2"] .message-head').textContent(), /Membership at send time unknown/);
   assert.equal(await page.locator('[data-message="2"] .pill').count(), 0);
   assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
-  await page.locator('#thread-history summary').click();
+  await openThreadDetails(page); await page.locator('#thread-history summary').click();
   assert.match(await page.locator('#thread-events').textContent(), /agent 1 joined.*group <review> matched/);
   assert.match(await page.locator('#thread-events').textContent(), /Earlier thread events are not shown/);
   assert.equal(await page.locator('#thread-events review').count(), 0);
@@ -1288,13 +1388,14 @@ test('live threads expose escaped membership history and mark outside-membership
   await page.evaluate(() => refresh());
   assert.match(await page.locator('#thread-events').textContent(), /agent 1 left.*state changed/);
   assert.equal(await page.locator('#thread-history').evaluate(el=>el.open), true, 'polling preserves the opened history');
+  await page.locator('#messages').evaluate(node=>{node.scrollTop=0;});
   await page.evaluate(() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); });
-  // Expanded membership history can make the two-message timeline scrollable.
+  assert.equal(await page.locator('#thread-unread').isVisible(),true,'earlier history does not acknowledge the unread reply');
   await page.locator('#thread-unread').click();
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
   assert.equal(data.reads[1], 2);
   assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length, 1);
-  await page.locator('#thread-membership').click();
+  await openThreadDetails(page); await page.locator('#thread-membership').click();
   await page.waitForFunction(() => document.querySelector('#thread-membership').textContent === 'Join thread');
   assert.equal(await page.locator('#add-thread-members').isHidden(), true);
 }));
@@ -2284,8 +2385,8 @@ test('thread list, header and membership-history selections survive polling whil
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Keep draft');
-  await page.locator('#thread-history summary').click();
-  for (const selector of ['#thread-list strong','.thread-header h2','.thread-header > div.meta','#thread-events .event > div']) {
+  await openThreadDetails(page); await page.locator('#thread-history summary').click();
+  for (const selector of ['#thread-list strong','.thread-header h2','#thread-metadata','#thread-events .event > div']) {
     const selected = await selectText(page, selector);
     await page.evaluate(() => refresh());
     assert.equal(await page.evaluate(() => getSelection().toString()), selected);
@@ -2404,8 +2505,8 @@ test('thread identifiers are visible and copyable for references in another conv
   await page.locator('[data-page=threads]').click();
   assert.match(await page.locator('[data-thread="1"] .meta').textContent(), /Thread #1/);
   await page.locator('[data-thread="1"]').click();
-  assert.match(await page.locator('.thread-header > div.meta').textContent(), /Thread #1/);
-  await page.locator('#copy-thread').click();
+  assert.match(await page.locator('#thread-summary').textContent(), /Thread #1/);
+  await openThreadDetails(page); await page.locator('#copy-thread').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Copied thread #1');
   assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'thread #1');
   await page.locator('[data-thread="2"]').click();
@@ -2484,7 +2585,7 @@ test('switching threads removes old controls immediately and closing the loading
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'First draft');
   await page.locator('[data-thread="2"]').click();
   await page.waitForFunction(() => document.querySelector('#thread-membership')?.textContent === 'Join thread');
-  await page.locator('#thread-membership').click();
+  await openThreadDetails(page); await page.locator('#thread-membership').click();
   await page.waitForFunction(() => document.querySelector('#thread-membership')?.textContent === 'Leave thread');
   assert.deepEqual(data.requests.find(r => r.url === '/threads/2/user').body, {joined:true});
 }));
@@ -2603,7 +2704,7 @@ test('late config and member saves preserve newer dialog input', async () => fix
   data.agents = [1,2].map(id => ({id,project:1,name:`Worker ${id}`,state:'idle'}));
   data.threads = [conversation([], {members:[0]})];
   await page.evaluate(() => refresh()); await page.locator('[data-page=threads]').click();
-  await page.locator('[data-thread="1"]').click(); await page.locator('#add-thread-members').click();
+  await page.locator('[data-thread="1"]').click(); await openThreadDetails(page); await page.locator('#add-thread-members').click();
   const members = await holdRequest(page, '**/threads/1/members');
   await page.locator('#add-member-picker [name=member][value="1"]').check();
   await page.locator('#members-form button.primary').click(); await members.started;
@@ -2619,11 +2720,11 @@ test('late config and member saves preserve newer dialog input', async () => fix
 test('late removal keeps reopened selections and never removes members from a different thread', async () => fixture(async (page, data) => {
   data.threads=[conversation([]),conversation([],{id:2,title:'Second',members:[0,2]})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="1"]').check();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="1"]').check();
   const pending=await holdRequest(page,'**/threads/1/members/remove');
   await page.locator('#remove-members-form button.danger').click(); await pending.started;
   await page.locator('[data-close=remove-members-dialog]').click(); await page.locator('[data-thread="2"]').click();
-  await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="2"]').check();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="2"]').check();
   pending.release(); await pending.remove();
   await page.waitForFunction(()=>!document.querySelector('#remove-members-form button.danger').disabled);
   assert.equal(await page.locator('#remove-members-dialog').isVisible(),true);
@@ -2632,7 +2733,7 @@ test('late removal keeps reopened selections and never removes members from a di
   assert.deepEqual(data.threads[1].members,[0,2]);
   assert.equal(data.requests.filter(r=>r.url.endsWith('/members/remove')).length,1);
   await page.locator('[data-close=remove-members-dialog]').click();
-  await page.locator('#remove-thread-members').click();
+  await openThreadDetails(page); await page.locator('#remove-thread-members').click();
   await page.evaluate(()=>resetThread());
   assert.equal(await page.locator('#remove-members-dialog').isVisible(),false);
   assert.equal(await page.locator('#thread-main .empty strong').textContent(),'Select a thread');
@@ -2642,7 +2743,7 @@ test('late ownership transfers preserve edited or reopened owner drafts and neve
   data.agents=[2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
   data.threads=[conversation([],{owner:0}),conversation([],{id:2,title:'Second',owner:0})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
   const first=await holdRequest(page,'**/threads/1/owner');
   await page.locator('#thread-owner-form button.primary').click(); await first.started;
   await page.locator('#thread-owner-form [name=owner]').fill('3');
@@ -2655,7 +2756,7 @@ test('late ownership transfers preserve edited or reopened owner drafts and neve
   const second=await holdRequest(page,'**/threads/1/owner');
   await page.locator('#thread-owner-form button.primary').click(); await second.started;
   await page.locator('[data-close=thread-owner-dialog]').click(); await page.locator('[data-thread="2"]').click();
-  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
   second.release(); await second.remove();
   await page.waitForFunction(()=>!document.querySelector('#thread-owner-form button.primary').disabled);
   assert.equal(data.threads[0].owner,3);
@@ -2668,7 +2769,7 @@ test('late ownership transfers preserve edited or reopened owner drafts and neve
 test('project switching invalidates ownership dialogs and prevents stale owner form submissions', async () => fixture(async (page, data) => {
   data.agents=[{id:2,project:1,name:'Target',state:'idle'}]; data.threads=[conversation([])];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
+  await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
   await page.locator('#project-select').selectOption('2');
   await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
   assert.equal(await page.locator('#thread-owner-dialog').isVisible(),false);
@@ -2681,6 +2782,7 @@ test('switching projects invalidates open add and removal dialogs before a stale
   data.agents=[{id:2,project:1,name:'Additional',state:'idle'}]; data.threads=[conversation([])];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   for(const [control,dialog,form] of [['#add-thread-members','#members-dialog','#members-form'],['#remove-thread-members','#remove-members-dialog','#remove-members-form']]) {
+    await openThreadDetails(page);
     await page.locator(control).click();
     await page.locator(`${form} [name=member]`).check();
     const before=data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length;
@@ -3058,6 +3160,7 @@ test('rejoining backfills earlier unread messages in order and a failed middle p
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread-filter=all]').click(); await page.locator('[data-thread="1"]').click();
   await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
   assert.deepEqual(await messageIds(page),[5,6]);
+  await openThreadDetails(page);
   await page.locator('#message-form textarea').fill('Retain rejoin draft');
   await page.locator('#messages').evaluate(node=>{node.scrollTop=10;});
   const selected=await selectText(page,'[data-message="5"] .message-text');
@@ -3068,7 +3171,7 @@ test('rejoining backfills earlier unread messages in order and a failed middle p
     if(!failed) {failed=true;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Backfill temporarily unavailable'})});}
     return route.fallback();
   });
-  await page.locator('#thread-membership').click();
+  await openThreadDetails(page); await page.locator('#thread-membership').click();
   await page.waitForFunction(()=>state.thread?.resume?.after===2 && !state.thread.loadingNew);
   assert.deepEqual(await messageIds(page),[1,2,5,6]);
   assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
@@ -4234,7 +4337,7 @@ test('workspace membership and usage scheduling remain single-flight through pan
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   const membership=await holdRequest(page,'**/threads/1/user');
-  await page.locator('#thread-membership').click(); await membership.started;
+  await openThreadDetails(page); await page.locator('#thread-membership').click(); await membership.started;
   await page.locator('#close-thread').click(); await page.locator('[data-thread="1"]').click();
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#thread-membership').isDisabled(),true);
@@ -4492,7 +4595,7 @@ test('returning to a discarded in-flight query starts a fresh parse instead of r
   await page.locator('#agent-search').fill('group:Team');await pending.started;
   await page.evaluate(()=>{state.agentSearch='other';document.querySelector('#agent-search').value='other';clearTimeout(agentSearchTimer);agentSearchTimer=null;});
   pending.release();await pending.remove();await page.waitForFunction(()=>state.agentQuery?.raw==='group:Team'&&!state.agentQuery.pending);
-  await page.locator('#agent-search').fill('group:Team');await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  await page.locator('#agent-search').fill('group:Team');await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
   assert.equal(await page.locator('[data-edit-agent-filter=group]').count(),1);
   assert.equal(data.getRequests.filter(url=>url.startsWith('/agent-query?')&&new URL(url,'http://test').searchParams.get('search')==='group:Team').length,2);
 }));
