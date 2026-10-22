@@ -449,7 +449,12 @@ for (const viewport of [{width:1280,height:900,header:95,messages:400},{width:39
     const disclosure=page.locator('#thread-details > summary');
     await disclosure.focus(); await disclosure.press('Enter');
     assert.equal(await page.locator('#thread-details').evaluate(details=>details.open),true,'native disclosure is keyboard operable');
-    assert.equal(await page.locator('#thread-full-title').textContent(),title,'expanded details expose the complete title');
+    assert.equal(await page.locator('.thread-header h2').textContent(),title,'expanded details keep the complete title in its original heading');
+    assert.equal(await page.locator('.thread-header h2').evaluate(node=>getComputedStyle(node).whiteSpace),'normal','the original title expands in place');
+    if(viewport.width<600)assert.equal(await page.locator('#back-to-threads').evaluate(node=>{
+      const button=node.getBoundingClientRect(),header=node.closest('.thread-header').getBoundingClientRect();
+      return button.top>=header.top&&button.bottom<=header.bottom;
+    }),true,'expanded long titles keep Back within the visible header');
     assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #1 Reviewer 1.*Members:.*Reviewer 36/);
     for(const id of ['copy-thread','thread-membership','add-thread-members','remove-thread-members','change-thread-owner'])assert.equal(await page.locator(`#${id}`).isVisible(),true,`${id} stays accessible in details`);
     assert.ok(await page.locator('#messages').evaluate(node=>node.clientHeight>=160),'expanded details still leave the timeline usable');
@@ -459,6 +464,24 @@ for (const viewport of [{width:1280,height:900,header:95,messages:400},{width:39
     assert.equal(data.requests.filter(request=>request.method!=='GET'&&!request.url.endsWith('/read')).length,0);
   }));
 }
+
+test('expanded thread details add controls and metadata without repeating the visible title or summary', async () => fixture(async (page,data) => {
+  const title='One compact conversation';
+  data.agents=[{id:1,project:1,name:'Reviewer',state:'idle'}];
+  data.threads=[conversation([],{title,owner:1,watch:['working','idle'],events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'acom',details:{reason:'Review started'}}]})];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const summary=await page.locator('#thread-summary').textContent();
+  await openThreadDetails(page);
+  const details=await page.locator('#thread-details .thread-details-content').textContent();
+  assert.doesNotMatch(details,/One compact conversation|Thread #1|Public|You’re a member/,'details do not repeat the visible title, ID, access or participation');
+  assert.match(details,/Owner: #1 Reviewer.*Members:.*Reviewer.*Live filters: working, idle/);
+  for(const id of ['copy-thread','thread-membership','remove-thread-members','change-thread-owner','thread-history'])assert.equal(await page.locator(`#${id}`).isVisible(),true,`${id} remains available`);
+  assert.equal(await page.locator('#thread-summary').textContent(),summary);
+  assert.equal(await page.locator('.thread-header h2').count(),1);
+  assert.equal(await page.locator('#thread-full-title').count(),0);
+  await page.locator('#thread-history > summary').click();
+  assert.match(await page.locator('#thread-events').textContent(),/Review started/);
+}));
 
 test('thread details preserve disclosure, selected metadata, draft and scroll across polling without leaking to another thread', async () => fixture(async (page,data) => {
   const messages=Array.from({length:30},(_,i)=>incoming(i+1,`Reply ${i+1}. ${'Detailed project update. '.repeat(8)}`));
@@ -1176,7 +1199,7 @@ test('thread creation distinguishes public open, public no-self-join and private
     assert.equal(body.joinable, access === 'open');
     assert.equal(Object.hasOwn(body,'watch'), false);
     const label=access === 'private' ? 'Private · members only' : access === 'invite' ? 'Public · no self-join' : 'Public · open to join';
-    assert.ok((await page.locator('#thread-metadata').textContent()).includes(label));
+    assert.ok((await page.locator('#thread-summary').textContent()).includes(label));
     assert.ok((await page.locator(`[data-thread="${index+1}"] .meta`).textContent()).includes(label));
     assert.equal(await page.locator('#thread-access').inputValue(), 'open', 'successful creation resets access for the next thread');
   }

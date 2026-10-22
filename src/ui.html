@@ -215,12 +215,13 @@
     .thread-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 32px; padding-right: 110px; }
     #close-thread { position: absolute; top: 10px; right: 12px; font-size: 21px; width: 32px; min-height: 32px; padding: 0; border-color: transparent; color: var(--muted); }
     .thread-header h2 { min-width: 0; margin: 0; font-size: 17px; letter-spacing: -.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .thread-header:has(#thread-details[open]) h2 { white-space: normal; overflow-wrap: anywhere; }
+    .thread-header:has(#thread-details[open]) .thread-title-row { align-items: flex-start; }
     #thread-summary { margin: 2px 0 0; font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
     #thread-details { margin: 0; }
     #thread-details > summary { position: absolute; top: 11px; right: 51px; min-height: 30px; padding: 5px 7px; border: 1px solid transparent; border-radius: 6px; color: var(--muted); font-size: 11px; }
     #thread-details > summary:hover, #thread-details[open] > summary { background: var(--surface); color: var(--ink); border-color: var(--line); }
     .thread-details-content { margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
-    #thread-full-title { margin: 0 0 8px; font-size: 14px; overflow-wrap: anywhere; }
     #thread-metadata { white-space: normal; font-size: 11px; }
     .thread-header .actions { margin-top: 9px; gap: 5px; }
     .thread-header .actions button { min-height: 30px; padding: 5px 8px; font-size: 10px; }
@@ -1371,7 +1372,7 @@
         }
         if (!sameThread) {
           saveVisibleDraft();
-          $('#thread-main').innerHTML = `<div class="thread-header"><div class="thread-title-row"><button type="button" id="back-to-threads" aria-label="All threads" title="All threads">←</button><h2>${esc(t.title)}</h2></div><p class="meta" id="thread-summary"></p><details id="thread-details"><summary aria-label="Thread details">Details</summary><div class="thread-details-content"><h3 id="thread-full-title">${esc(t.title)}</h3><div class="meta" id="thread-metadata"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events"></div></details></div></details><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><div class="thread-title-row"><button type="button" id="back-to-threads" aria-label="All threads" title="All threads">←</button><h2>${esc(t.title)}</h2></div><p class="meta" id="thread-summary"></p><details id="thread-details"><summary aria-label="Thread details">Details</summary><div class="thread-details-content"><div class="meta" id="thread-metadata"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events"></div></details></div></details><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span><button type="button" class="small" id="thread-unread" hidden></button></div>
             <div class="messages" id="messages" role="region" aria-label="Conversation messages" tabindex="0"><div class="empty">No messages yet</div></div>
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary"${pendingSends.has(draftKey(t.project, t.id)) ? ' disabled' : ''}>Send</button><span class="composer-hint">Enter for a new line · Ctrl / ⌘ + Enter to send</span></form>`;
@@ -1401,12 +1402,11 @@
           setText($('.thread-header h2', $('#thread-main')), t.title);
         }
         $('.thread-header h2', $('#thread-main')).title = t.title;
-        setText($('#thread-full-title'), t.title);
         const membership = Array.isArray(t.members) ? t.members.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread' : 'Membership unavailable';
         const summary = `Thread #${t.id} · ${threadAccess(t)}${t.watch?.length ? ' · Live' : ''} · ${Array.isArray(t.members) ? `${fmt(t.members.length)} member${t.members.length === 1 ? '' : 's'}` : 'Member count unavailable'} · ${membership}`;
         setText($('#thread-summary'), summary);
         $('#thread-summary').title = summary;
-        setHTML($('#thread-metadata'), `Thread #${t.id} · ${threadAccess(t)} · Owner: ${esc(threadOwner(t))} · Members: ${memberNames(t.members)} · ${membership}`);
+        setHTML($('#thread-metadata'), `Owner: ${esc(threadOwner(t))} · Members: ${memberNames(t.members)}`);
         if ($('#thread-owner-dialog').open && Number($('#thread-owner-form').dataset.ownerThread) === t.id) setText($('#thread-owner-current'), `Current owner: ${threadOwner(t)}`);
         setText($('#thread-membership'), t.members?.includes(0) ? 'Leave thread' : 'Join thread');
         $('#thread-membership').disabled = pendingMembership.has(t.id);
