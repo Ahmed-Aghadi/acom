@@ -606,6 +606,27 @@ process.stdin.on('end', async () => {
       await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
       return;
     }
+    const parserAsset='/assets/markdown-it-15.0.3.min.js';
+    for(const [asset,file,mime] of [[parserAsset,'markdown-it-15.0.3.min.js',/^(?:text|application)\/javascript(?:;|$)/],['/assets/markdown-NOTICES.txt','NOTICES.txt',/^text\/plain(?:;|$)/]]) {
+      const response=await fetch(url+asset);
+      assert.equal(response.status,200);
+      assert.match(response.headers.get('content-type'),mime);
+      assert.equal(response.headers.get('x-content-type-options'),'nosniff');
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()),fs.readFileSync(path.join(__dirname,'../src/vendor',file)),'the binary serves exactly the reviewed local asset');
+      await api('GET',asset+'?unknown=1',null,400);
+      await api('POST',asset,{},404);
+      const invalidBody=JSON.stringify({unexpected:true});
+      const bodyResponse=await new Promise((resolve,reject)=>{
+        const request=http.request(url+asset,{method:'GET',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(invalidBody)}},response=>{
+          let body='';response.on('data',chunk=>body+=chunk);response.on('end',()=>resolve({status:response.statusCode,body}));
+        });
+        request.on('error',reject);request.end(invalidBody);
+      });
+      assert.equal(bodyResponse.status,400);
+      assert.match(JSON.parse(bodyResponse.body).error,/unknown request field/);
+    }
+    await api('GET','/assets/unknown.js',null,404);
+    await api('GET',parserAsset+'/extra',null,404);
     assert.equal(defaults.harnesses.codex.model,'gpt-6-sol');
     await api('PUT','/configs/1',{settings:defaults},409);
     await api('PUT','/configs/1',{name:'Changed Default',settings:defaults},409);
@@ -731,7 +752,7 @@ process.stdin.on('end', async () => {
     await finished(one.id); await finished(two.id);
     const cliThread=await api('POST','/threads',{project:a.id,title:'CLI stdin delivery',members:[]});
     const actor={ACOM_ID:String(one.id),ACOM_URL:url};
-    const multiline='First line from stdin\nSecond line from stdin\n';
+    const multiline='**First line from stdin**\n`Second line from stdin`\n';
     const acknowledged=cli(first,['send','--thread',String(cliThread.id)],actor,multiline);
     const sent=acknowledged.match(/^sent #(\d+) to thread (\d+)$/m);
     assert.ok(sent,'success reports the real message ID');
@@ -748,6 +769,7 @@ process.stdin.on('end', async () => {
     assert.deepEqual(delivered.messages.map(m=>m.text),[multiline,'Positional text']);
     assert.ok(delivered.messages.every(m=>m.sender===one.id));
     assert.equal(delivered.unread,2);
+    assert.ok(cli(first,['thread','read',String(cliThread.id)],actor).includes(multiline),'CLI output retains the original Markdown source');
     for(const failure of [
       {args:['send','--thread',String(cliThread.id),'--stdin'],input:multiline,error:/unexpected argument.*--stdin/},
       {args:['send','--thread',String(cliThread.id),'--invented-input'],input:multiline,error:/unexpected argument.*--invented-input/},
@@ -2334,6 +2356,25 @@ async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defau
   return project;
 }
 
+async function browserMarkdownSendCheck(page,api) {
+  const source='**Sent through the UI** <exact text>\nSecond line with `code`';
+  const receipt=page.waitForResponse(response=>new URL(response.url()).pathname==='/messages'&&response.request().method()==='POST');
+  await page.locator('#message-form textarea').fill(source); await page.locator('#message-form button').click();
+  const sent=await(await receipt).json();
+  assert.ok(Number.isSafeInteger(sent.id)&&sent.id>0);
+  await page.locator(`[data-message="${sent.id}"] .message-text strong`).waitFor();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
+  assert.equal(await page.locator(`[data-message="${sent.id}"] .message-text strong`).textContent(),'Sent through the UI');
+  assert.equal(await page.locator(`[data-message="${sent.id}"] .message-text code`).textContent(),'code');
+  assert.equal(await page.locator('.message.sending').count(),0);
+  assert.equal((await api('GET',`/messages/${sent.id}?agent=0`)).text,source);
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']); await page.locator(`[data-copy-message="${sent.id}"]`).click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Message copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+  await page.evaluate(async()=>{await refreshThread();await refreshThread();});
+  assert.equal(await page.locator(`[data-message="${sent.id}"]`).count(),1,'real POST and polling reconcile without duplicate bubbles');
+}
+
 async function browserMessageChecks(url, api, project, agent, thread, home) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
@@ -2377,23 +2418,7 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     await page.locator(`[data-message="${message.id}"]`).waitFor();
     await until(async () => (await api('GET', `/threads/${thread}`)).unread === 0, 'open thread clears new reply');
     assert.equal(await page.locator('#message-form textarea').inputValue(), 'Preserve this draft');
-    const outgoingText = 'Sent through the UI <exact text>\nSecond line';
-    const receipt = page.waitForResponse(response => new URL(response.url()).pathname === '/messages' && response.request().method() === 'POST');
-    await page.locator('#message-form textarea').fill(outgoingText);
-    await page.locator('#message-form button').click();
-    const sent = await (await receipt).json();
-    assert.ok(Number.isSafeInteger(sent.id) && sent.id > 0);
-    await page.locator(`[data-message="${sent.id}"]`).waitFor();
-    await page.waitForFunction(() => document.querySelector('#message-form textarea').value === '');
-    assert.equal(await page.locator(`[data-message="${sent.id}"] .message-text`).textContent(), outgoingText);
-    assert.equal(await page.locator('.message.sending').count(), 0);
-    assert.equal((await api('GET', `/messages/${sent.id}?agent=0`)).text, outgoingText);
-    await page.context().grantPermissions(['clipboard-read','clipboard-write']);
-    await page.locator(`[data-copy-message="${sent.id}"]`).click();
-    await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Message copied');
-    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), outgoingText);
-    await page.evaluate(async () => { await refreshThread(); await refreshThread(); });
-    assert.equal(await page.locator(`[data-message="${sent.id}"]`).count(), 1, 'real POST and polling reconcile without duplicate bubbles');
+    await browserMarkdownSendCheck(page,api);
     await page.locator('#message-form textarea').fill('Preserve this draft');
     await page.locator('#close-thread').click();
     await page.waitForFunction(()=>document.querySelector('#thread-main .empty strong')?.textContent==='Select a thread' && !document.querySelector('#message-form'));
@@ -2524,6 +2549,7 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     assert.equal(await page.locator('[data-thread]').count(),1);
     await page.locator('#thread-membership').click();
     await page.waitForFunction(()=>document.querySelector('#thread-membership').textContent==='Leave thread');
+    await browserMarkdownSendCheck(page,api);
     await page.locator('[data-page=overview]').click();
     await page.locator('[data-usage=codex]').click();
     await page.locator('[data-check-usage=codex]').click();

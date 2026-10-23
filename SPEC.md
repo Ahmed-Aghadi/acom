@@ -31,7 +31,7 @@ You drive it from a web page or the `acom` command. Agents use the `acom` comman
 - Messages sent outside membership appear as catch-up without normal unread notifications or wake-ups. Rejoining preserves earlier membership periods and marks; reading does not change live membership. Thread reads include recent membership and ownership events.
 - Membership changes alone are passive: they do not resolve foreground/deferred waits or wake idle agents. They remain in history and hook/next-turn summaries, including live-filter changes caused by going idle. New messages from others in member threads already notify working agents and wake idle ones without a subscription. Public reads without membership do not subscribe to messages.
 
-**Message.** Plain text, from an agent or from `user`. Each agent puts its own mark on each message in its threads:
+**Message.** Original text, from an agent or from `user`; the browser renders basic Markdown without changing stored text or API/CLI output. Each agent puts its own mark on each message in its threads:
 
 - `new`: not dealt with yet. Every message starts here, and an agent can leave a message here to come back to later
 - `in-progress`: read, and being acted on now
@@ -252,6 +252,8 @@ The sidebar can be hidden with the header toggle, with the preference saved in t
 
 Outgoing messages appear immediately with a **Sending…** label. The POST receipt confirms persistence, not recipient read status, and makes the message visible without waiting for a general refresh. Pending/confirmed overlays do not advance canonical message cursors; receipt and polling reconciliation uses server IDs, never text, preserving intervening and identical messages. Definite rejection retains the draft with a failure label for explicit retry through the composer. A missing or invalid receipt is **Delivery unconfirmed**, not a definite failure, and is never automatically retried. Local attempt indicators last within the tab; drafts persist as described below. In-flight polling may defer newly observed user bubbles until their receipt arrives so a pending attempt is not shown twice.
 
+Message bodies render basic Markdown (headings, emphasis, lists, quotes, links, code and tables) for both agents and users; ordinary line breaks remain visible. The locally bundled, pinned parser permits no raw HTML, image loading, plugins or automatic bare-URL linkification. Links require explicit HTTP, HTTPS or mailto schemes and open with no opener/referrer. Code info strings do not create attributes. Copy returns the exact original text. Only new message bodies are rendered; polling and sending confirmations preserve existing body nodes. Unavailable/failed parsing, over 65,536 UTF-16 code units, over 8,192 tokens (including inline children), or nesting near the parser limit displays the full escaped source instead, never truncated. Code blocks and tables scroll within their bubbles. See [dependency review and notices](src/vendor/README.md) for bundled components, provenance and upgrade checks.
+
 Conversation headers show a single-line title and compact ID/access/member-count/participation summary, with a live-filter marker where applicable. Native **Details** is collapsed on opening another conversation, expands long titles in place and adds the owner/member list, filters, management actions, copy reference and history without repeating the summary. Polling preserves the disclosure, selections, drafts and reading position. Expanded metadata remains height-bounded; unread navigation and read-status errors stay outside the disclosure. Mobile Back shares the title row rather than taking another line.
 
 - **Project picker:** every project with its folder, plus adding and removing projects. The folder browser starts at Home, shows files and folders, navigates up and into folders, and creates new folders; exact-path entry remains available. Agents, threads, locks and activity below are for the selected project.
@@ -311,7 +313,7 @@ Defaults: active agents soft 6 / hard 8, per harness 4 / 6, subscription usage 8
 
 ## HTTP API
 
-Used by the CLI and UI. Bodies/results are JSON except `GET /` (HTML) and `GET /models` (plain text); errors have a non-2xx status and `{"error":"..."}` (oversized errors are explicitly shortened). Times in JSON are Unix seconds. User identity is `0`; caller/viewer identity is carried by `agent` or `viewer`, or the agent ID in a route such as `/wait/{id}`. Missing caller/viewer defaults to the user where supported. `via` records a user control run through an agent; none of these fields authenticate a process.
+Used by the CLI and UI. Bodies/results are JSON except `GET /` (HTML), `GET /models` (plain text), and fixed `GET /assets/markdown-it-15.0.3.min.js` / `GET /assets/markdown-NOTICES.txt` (JavaScript / plain text). Static assets are compiled into the binary, accept no body/query parameters, and use `nosniff`; there is no general filesystem asset route. Errors have a non-2xx status and `{"error":"..."}` (oversized errors are explicitly shortened). Times in JSON are Unix seconds. User identity is `0`; caller/viewer identity is carried by `agent` or `viewer`, or the agent ID in a route such as `/wait/{id}`. Missing caller/viewer defaults to the user where supported. `via` records a user control run through an agent; none of these fields authenticate a process.
 
 The server only answers requests whose `Host` (and `Origin`, if any) is this server, and writes must be `Content-Type: application/json`. There's no auth, but a web page elsewhere can't drive it.
 
@@ -429,5 +431,5 @@ The lock table retains `frozen` and `frozen_left` storage fields; current contro
 - Harnesses other than Claude Code and Codex
 - Authentication or a security sandbox between local processes; remote listening (loopback only). Private-thread rules are coordination access rules, not OS isolation
 - Editing or deleting messages, threads, locks or agents
-- Attachments or formatting; messages are plain text
+- Attachments, raw HTML or rich-text editing; messages retain their original text
 - Rules for how agents coordinate

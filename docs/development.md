@@ -4,6 +4,8 @@
 
 Read [AGENTS.md](../AGENTS.md) for contributor rules and [SPEC.md](../SPEC.md) for behavioral contracts, including [request validation and outcomes](../SPEC.md#request-validation-and-outcomes). These apply to CLI, server and UI changes.
 
+The only browser library is a pinned local Markdown parser; its [dependency review, digests and licenses](../src/vendor/README.md) document what ships. No npm installation is needed to build or run acom. Updates require renewed artifact/source/dependency/advisory review and the injection, fallback, copy, paging and polling regressions; never replace it with a CDN or floating version.
+
 The server rejects unknown request fields/query parameters, duplicate keys and malformed supplied values before applying an action; CLI/UI checks are additional safeguards. Defaults apply only to documented omissions/nulls. Failures return an HTTP error and a nonzero CLI exit status. A successful registration or queued action is not a completed event or provider turn: inspect its receipt and subsequent status. If a write's result is uncertain, inspect state before retrying.
 
 ## Tests

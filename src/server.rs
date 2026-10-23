@@ -17,6 +17,8 @@ use std::thread;
 use std::time::Duration;
 
 const UI: &str = include_str!("ui.html");
+const MARKDOWN: &str = include_str!("vendor/markdown-it-15.0.3.min.js");
+const MARKDOWN_NOTICES: &str = include_str!("vendor/NOTICES.txt");
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -142,6 +144,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let (code, body, ctype) = match res {
         Ok(Reply::Html(h)) => (200, h.to_string(), "text/html; charset=utf-8"),
         Ok(Reply::Text(t)) => (200, t.to_string(), "text/plain; charset=utf-8"),
+        Ok(Reply::Script(s)) => (200, s.to_string(), "text/javascript; charset=utf-8"),
         Ok(Reply::Json(v)) => (200, v.to_string(), "application/json"),
         Err(Fail(code, msg)) => (code, error_body(&msg), "application/json"),
     };
@@ -149,7 +152,10 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let _ = req.respond(
         tiny_http::Response::from_string(body)
             .with_status_code(code)
-            .with_header(header),
+            .with_header(header)
+            .with_header(
+                tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
+            ),
     );
 }
 
@@ -276,6 +282,7 @@ enum Reply {
     Json(Value),
     Html(&'static str),
     Text(&'static str),
+    Script(&'static str),
 }
 
 struct Query<'a>(&'a str);
@@ -460,6 +467,13 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
     const LAUNCH: &str = "task harness model effort name group force done ack_crashes";
     let (body, query, extra) = match (method, p) {
         ("GET", []) => ("", "project", ""),
+        (
+            "GET",
+            [
+                "assets",
+                "markdown-it-15.0.3.min.js" | "markdown-NOTICES.txt",
+            ],
+        ) => ("", "", ""),
         ("GET", ["models"] | ["catalog"] | ["agents", _, "project"]) => ("", "", ""),
         ("GET", ["overview"]) => ("", "project since", RECORD),
         ("GET", ["settings"] | ["limits"] | ["locks", _]) => ("", "project", RECORD),
@@ -768,6 +782,8 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
     }
     let reply = match (method, p) {
         ("GET", []) => Reply::Html(UI),
+        ("GET", ["assets", "markdown-it-15.0.3.min.js"]) => Reply::Script(MARKDOWN),
+        ("GET", ["assets", "markdown-NOTICES.txt"]) => Reply::Text(MARKDOWN_NOTICES),
         ("GET", ["models"]) => Reply::Text(crate::app::MODELS),
         ("POST", ["agent-config"]) => {
             app.configure_agent(

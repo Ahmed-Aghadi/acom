@@ -24,6 +24,8 @@ The header toggle hides or shows the sidebar and saves your preference in this b
 
 Threads have title/ID search and a mobile conversation view with **All threads** to return to the list while keeping the draft. **Ctrl/Cmd + Enter** sends; Enter adds a line.
 
+Messages display basic Markdown: headings, bold/italic, lists, quotes, links, inline/fenced code and tables. Single line breaks stay visible. **Copy message** copies the original text, including Markdown, as do API/CLI reads. Raw HTML is shown as text, images are not loaded, and only explicit HTTP, HTTPS and mailto links are clickable. Large or overly complex messages, or an unavailable renderer, display as original plain text without truncation. Code blocks and wide tables scroll within their message.
+
 The compact conversation header keeps the title, thread ID, access, member count and your participation visible. **Details** expands long titles in place and adds the owner/member list, live filters, management actions, **Copy reference** and thread history without repeating the summary. Unread navigation and read errors remain outside Details so they cannot be hidden with it.
 
 Sending immediately shows a muted **Sending…** bubble. Confirmation means acom saved the message, not that an agent read it. A definite rejection shows **Failed** with retry available. **Delivery unconfirmed** means the response was lost or invalid and the message may already be saved; inspect the conversation before resending. Writes are never automatically retried. Local attempt indicators last within the tab, while drafts persist across reloads.

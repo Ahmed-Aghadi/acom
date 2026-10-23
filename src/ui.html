@@ -197,7 +197,7 @@
     #page-threads .page-heading { margin-bottom: 14px; }
     #page-threads .eyebrow, #page-threads .page-description { display: none; }
     #page-threads:has(.thread-layout.conversation-open) > .page-heading { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-    #page-threads h1 { font-size: 23px; }
+    #threads-title { font-size: 23px; }
     .thread-layout { display: grid; grid-template-columns: clamp(250px,24%,340px) minmax(0,1fr); flex: 1; min-height: 0; }
     .thread-list { min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); background: var(--surface); }
     .thread-list .panel-head { padding: 15px; background: var(--panel); }
@@ -240,7 +240,21 @@
     .message.failed .message-delivery, .message.unconfirmed .message-delivery { color: var(--warn); }
     .message-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 22px; margin-bottom: 7px; color: var(--muted); font-size: 10px; }
     .message-head > span:first-child { font-weight: 650; color: var(--ink); }
-    .message-text, .record-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .record-text, .message-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message-text { white-space: normal; overflow-wrap: anywhere; min-width: 0; }
+    .message-text p, .message-text ul, .message-text ol, .message-text blockquote, .message-text pre, .message-table { margin: 10px 0; }
+    .message-text > :first-child { margin-top: 0; }
+    .message-text > :last-child { margin-bottom: 0; }
+    .message-text h1, .message-text h2, .message-text h3, .message-text h4, .message-text h5, .message-text h6 { margin: 12px 0 6px; font-size: 15px; line-height: 1.4; }
+    .message-text ul, .message-text ol { padding-left: 24px; }
+    .message-text li > p { margin: 4px 0; }
+    .message-text blockquote { padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
+    .message-text code { font-family: ui-monospace, monospace; font-size: .92em; background: var(--surface); border-radius: 4px; padding: 2px 4px; }
+    .message-text pre { max-width: 100%; overflow-x: auto; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); white-space: pre; overflow-wrap: normal; }
+    .message-text pre code { padding: 0; background: none; white-space: inherit; }
+    .message-table { max-width: 100%; overflow-x: auto; }
+    .message-table table { border-collapse: collapse; font-size: inherit; }
+    .message-table th, .message-table td { padding: 6px 10px; border: 1px solid var(--line); }
     .composer { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px 12px; padding: 15px 20px 12px; border-top: 1px solid var(--line); align-items: center; }
     .composer textarea { min-height: 66px; max-height: 200px; resize: vertical; background: var(--surface); }
     .composer-hint { grid-column: 1/-1; color: var(--muted); font-size: 10px; }
@@ -574,6 +588,7 @@
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
+  <script src="/assets/markdown-it-15.0.3.min.js" integrity="sha384-ARStLecQmtLYjBgfD3+w+irhiSoLTnFk/ne6c0gRWQKQtC9791ZLMQ9D3OaBISt3"></script>
   <script>
     function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
     function storeValue(key, value) {
@@ -1253,10 +1268,41 @@
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
-    function messageHtml(m) {
+    const messageMarkdown = (() => {
+      try {
+        const md = window.markdownit({html:false, breaks:true, linkify:false, typographer:false, maxNesting:20});
+        md.disable('image');
+        const validate = md.validateLink;
+        md.validateLink = url => /^(https?:\/\/|mailto:)/i.test(url) && validate(url);
+        md.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
+          tokens[index].attrSet('target', '_blank');
+          tokens[index].attrSet('rel', 'noopener noreferrer');
+          return renderer.renderToken(tokens, index, options);
+        };
+        md.renderer.rules.fence = md.renderer.rules.code_block = (tokens, index) => `<pre tabindex="0" aria-label="Code block"><code>${esc(tokens[index].content)}</code></pre>\n`;
+        md.renderer.rules.table_open = () => '<div class="message-table" tabindex="0" role="region" aria-label="Scrollable table"><table>\n';
+        md.renderer.rules.table_close = () => '</table></div>\n';
+        return md;
+      } catch (_) { return null; }
+    })();
+    function renderMessageText(value) {
+      const text = String(value ?? ''), plain = () => `<span class="message-plain">${esc(text)}</span>`;
+      if (!messageMarkdown || text.length > 65536) return plain();
+      try {
+        const env = {}, tokens = messageMarkdown.parse(text, env);
+        let count = 0;
+        for (const token of tokens) {
+          count += 1 + (token.children?.length || 0);
+          // Near the parser's depth cap it can omit content; preserve the full source instead.
+          if (count > 8192 || token.level >= 18 || token.children?.some(child => child.level >= 18)) return plain();
+        }
+        return messageMarkdown.renderer.render(tokens, messageMarkdown.options, env).trimEnd();
+      } catch (_) { return plain(); }
+    }
+    function messageHtml(m, includeText = true) {
       const local = typeof m.id === 'string';
       const delivery = {sending:'Sending…',failed:'Failed · Not sent. Your text is kept here for retry.',unconfirmed:'Delivery unconfirmed · Check the conversation before retrying.'}[m.delivery] || '';
-      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span><button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-text">${esc(m.text)}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div>`;
+      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span><button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-text">${includeText ? renderMessageText(m.text) : ''}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div>`;
     }
     function messageText(id) {
       return state.thread?.messages.find(message => String(message.id) === id)?.text ?? [...outgoingMessages.values()].find(message => message.id === id || String(message.serverId) === id)?.text;
@@ -1294,7 +1340,7 @@
           else { node.dataset.message = message.id; delete node.dataset.pendingMessage; }
           node.classList.remove('sending','failed','unconfirmed');
           if (message.delivery) node.classList.add(message.delivery);
-          const template = document.createElement('template'); template.innerHTML = messageHtml(message);
+          const template = document.createElement('template'); template.innerHTML = messageHtml(message, false);
           setHTML($('.message-head', node), $('.message-head', template.content).innerHTML);
           const delivery = $('.message-delivery', node), next = $('.message-delivery', template.content);
           if (next) { if (delivery) setText(delivery, next.textContent); else node.append(next); }
@@ -1458,7 +1504,7 @@
         }
         const known = new Set(state.thread.messages.map(m => m.id)), added = incoming.filter(m => !known.has(m.id)).sort((a,b) => a.id - b.id);
         const top = messages.scrollTop, height = messages.scrollHeight;
-        messages.insertAdjacentHTML('afterbegin', added.map(messageHtml).join(''));
+        messages.insertAdjacentHTML('afterbegin', added.map(message => messageHtml(message)).join(''));
         messages.scrollTop = top + messages.scrollHeight - height;
         state.thread.messages = [...added, ...state.thread.messages].sort((a,b) => a.id - b.id);
         state.thread.oldestReached = !page.has_more;

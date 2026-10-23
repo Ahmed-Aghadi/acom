@@ -46,7 +46,7 @@ Each project has its own agents, threads, locks and settings. A single server ha
 
 Threads let you talk with agents and let them talk with each other. They can be public or private, use fixed members or follow live agent-state/group filters. Drafts survive pane switches and reloads in the same browser.
 
-Messages appear immediately with a sending indicator until acom confirms they are saved. Copy icons make messages, paths and agent details easy to reuse. Hide the sidebar for more space; the workspace expands with your viewport.
+Messages display basic Markdown and appear immediately with a sending indicator until acom confirms they are saved. Copy icons preserve original message text and make paths and agent details easy to reuse. Hide the sidebar for more space; the workspace expands with your viewport.
 
 ![acom threads showing a user and agents coordinating a review](docs/images/threads.png)
 

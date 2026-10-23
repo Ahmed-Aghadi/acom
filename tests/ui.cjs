@@ -8,6 +8,17 @@ const http = require('node:http');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const markdownAsset = '/assets/markdown-it-15.0.3.min.js';
+
+test('chat Markdown uses the reviewed local parser artifact with matching script integrity', () => {
+  const bytes=fs.readFileSync(path.join(__dirname,'../src/vendor/markdown-it-15.0.3.min.js'));
+  assert.equal(createHash('sha256').update(bytes).digest('hex'),'391f2aa638e75e6c7859d0a5c5650ef0956722a45998f17e05b83bc655778e1e');
+  const html=fs.readFileSync(path.join(__dirname,'../src/ui.html'),'utf8');
+  const script=html.match(/<script\b[^>]*\bsrc=["']\/assets\/markdown-it-15\.0\.3\.min\.js["'][^>]*>/);
+  assert.ok(script,'the parser is loaded from the same server, not a CDN');
+  const integrity=script[0].match(/\bintegrity=["']([^"']+)["']/);
+  assert.equal(integrity?.[1],`sha384-${createHash('sha384').update(bytes).digest('base64')}`,'browser integrity verifies the exact vendored bytes');
+});
 
 const catalog = {
   claude: [{ id: 'claude-sonnet-5-5', name: 'Sonnet 5.5', efforts: ['low', 'medium', 'high'] }, { id: 'claude-opus-5-5', name: 'Opus 5.5', efforts: ['low', 'medium', 'high', 'max'] }],
@@ -139,6 +150,13 @@ async function fixture(run) {
     if (new URL(req.url, 'http://localhost').pathname === '/') {
       res.setHeader('Content-Type', 'text/html');
       return res.end(fs.readFileSync(path.join(__dirname, '../src/ui.html')));
+    }
+    if (req.method === 'GET' && pathname === markdownAsset) {
+      const asset = path.join(__dirname, '../src/vendor/markdown-it-15.0.3.min.js');
+      if (!fs.existsSync(asset)) return send({status:404,error:'Markdown asset is unavailable'});
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.end(fs.readFileSync(asset));
     }
     if (req.url.startsWith('/overview')) {
       const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
@@ -3170,7 +3188,11 @@ test('chunked oversized outside-membership messages keep their context and do no
   await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
   data.threads[0].messages.push({...incoming(2,text),outside_membership:true});
   await page.evaluate(()=>refresh());
-  assert.equal(await page.locator('[data-message="2"] .message-text').textContent(),text);
+  assert.equal(await page.locator('[data-message="2"] .message-text').textContent(),text.trimEnd(),'Markdown normalizes presentation whitespace, not the stored source');
+  assert.equal(await page.evaluate(()=>state.thread.messages.find(message=>message.id===2).text),text);
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']); await page.locator('[data-copy-message="2"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Message copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),text,'copy retains even the trailing source whitespace');
   assert.match(await page.locator('[data-message="2"] .message-head').textContent(),/Outside your membership/);
   assert.equal(await page.evaluate(()=>state.thread.unread),0);
   assert.equal(data.requests.filter(r=>r.url.endsWith('/read')).length,0);
@@ -4691,6 +4713,207 @@ async function holdMessageReceipt(page) {
   await page.route('**/messages', handler);
   return {started,release,remove:async() => {await completed; await page.unroute('**/messages',handler);}};
 }
+
+test('chat Markdown formats basic blocks and inline text while copying exact source', async () => fixture(async (page,data) => {
+  const source = '# Review\n\nA **bold** and *italic* paragraph with `x < y`.\n\n- First item\n- Second item\n\n1. One\n2. Two\n\n> Quoted advice\n\n```solidity\nif (x < y) return "safe";\n```\n\n| Field | Value |\n| --- | --- |\n| owner | alice |\n\n[Docs](https://example.com/review) and [Email](mailto:review@example.com)\n';
+  data.threads=[conversation([incoming(1,source)])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('h1').count(),1,'Markdown headings render as headings');
+  assert.equal(await message.locator('h1').textContent(),'Review');
+  assert.equal(await message.locator('h1').evaluate(node=>getComputedStyle(node).fontSize),'15px','chat headings do not inherit page-heading styling');
+  assert.equal(await message.locator('strong').textContent(),'bold');
+  assert.equal(await message.locator('em').textContent(),'italic');
+  assert.equal(await message.locator('p code').textContent(),'x < y');
+  assert.deepEqual(await message.locator('ul > li').allTextContents(),['First item','Second item']);
+  assert.deepEqual(await message.locator('ol > li').allTextContents(),['One','Two']);
+  assert.match(await message.locator('blockquote').textContent(),/Quoted advice/);
+  assert.match(await message.locator('pre > code').textContent(),/if \(x < y\) return "safe";/);
+  assert.deepEqual(await message.locator('thead th').allTextContents(),['Field','Value']);
+  assert.deepEqual(await message.locator('tbody td').allTextContents(),['owner','alice']);
+  assert.equal(await message.getByRole('link',{name:'Docs',exact:true}).getAttribute('href'),'https://example.com/review');
+  assert.equal(await message.getByRole('link',{name:'Email',exact:true}).getAttribute('href'),'mailto:review@example.com');
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('[data-copy-message="1"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Message copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+  assert.equal(await page.evaluate(()=>state.thread.messages[0].text),source);
+  assert.equal(data.threads[0].messages[0].text,source);
+}));
+
+test('chat Markdown preserves plain-message line breaks without requiring Markdown punctuation', async () => fixture(async (page,data) => {
+  data.threads=[conversation([incoming(1,'First line\nSecond line')])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('br').count(),1,'an ordinary newline remains a visible line break');
+  assert.match(await message.textContent(),/First line\s*Second line/);
+  assert.equal(await page.evaluate(()=>state.thread.messages[0].text),'First line\nSecond line');
+}));
+
+test('chat Markdown treats hostile HTML, images and unsafe or obfuscated destinations as inert text', async () => fixture(async (page,data) => {
+  const source = [
+    '<script>window.markdownUnsafe=true</script>',
+    '<img src="https://attacker.example/raw" onerror="window.markdownUnsafe=true">',
+    '<svg onload="window.markdownUnsafe=true"><a href="javascript:alert(1)">svg</a></svg>',
+    '<iframe src="https://attacker.example/frame"></iframe>',
+    '![pixel](https://attacker.example/pixel)',
+    '[script](javascript:alert(1))', '[mixed](JaVaScRiPt:alert(1))',
+    '[entity](java&#x73;cript:alert(1))', '[colon](javascript&#58;alert(1))',
+    '[tab](java&#x09;script:alert(1))', '[encoded](%6aavascript:alert(1))',
+    '[data](data:text/html;base64,PHNjcmlwdD4=)', '[file](file:///etc/passwd)',
+    '[relative](/unexpected)', '[fragment](#unexpected)', '[protocol-relative](//attacker.example/link)',
+    '[attribute](https://example.com/\"onmouseover=\"alert)',
+    '```\"><img/src=x/onerror=window.markdownUnsafe=true>\nLiteral code\n```',
+    '[allowed](https://example.com/review)',
+  ].join('\n\n');
+  data.threads=[conversation([incoming(1,source)])];
+  const external=[]; const origin=new URL(page.url()).origin;
+  page.on('request',request=>{if(new URL(request.url()).origin!==origin)external.push(request.url());});
+  await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('script,img,svg,iframe,object,embed,style,link').count(),0);
+  assert.equal(await message.locator('[onerror],[onload],[onmouseover],[src],[srcdoc]').count(),0);
+  assert.equal(await page.evaluate(()=>window.markdownUnsafe),undefined);
+  const hrefs=await message.locator('a').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('href')));
+  assert.ok(hrefs.length>=1,'allowed links still render');
+  assert.ok(hrefs.every(href=>/^(?:https?:\/\/|mailto:)/i.test(href)),`unsafe links rendered: ${JSON.stringify(hrefs)}`);
+  for(const anchor of await message.locator('a[target="_blank"]').all())assert.match(await anchor.getAttribute('rel'),/noopener/);
+  assert.match(await message.textContent(),/window\.markdownUnsafe=true/);
+  assert.deepEqual(external,[],'message contents cannot trigger network requests');
+}));
+
+for(const failure of ['missing','tampered','throwing','rendering'])test(`chat Markdown ${failure} parser falls back to escaped plain source`, async () => fixture(async (page,data) => {
+  const source='**Keep this source**\n<script>window.markdownUnsafe=true</script>\n![pixel](https://attacker.example/pixel)';
+  data.threads=[conversation([incoming(1,source)])];
+  if(failure==='missing')await page.route(`**${markdownAsset}`,route=>route.abort());
+  if(failure==='tampered')await page.route(`**${markdownAsset}`,route=>route.fulfill({contentType:'text/javascript',body:'window.markdownTamperedExecuted = true;'}));
+  if(failure==='throwing')await page.addInitScript(()=>Object.defineProperty(window,'markdownit',{
+    configurable:true,set(){},get(){return()=>{window.markdownFactoryFailed=true;throw new Error('Parser unavailable');};},
+  }));
+  await manualPolling(page); await reloadPage(page);
+  if(failure==='rendering')await page.evaluate(()=>{messageMarkdown.parse=()=>{window.markdownRenderingFailed=true;throw new Error('Rendering unavailable');};});
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('.message-plain').count(),1,'unavailable formatting keeps an explicit plain-text fallback');
+  assert.equal(await message.textContent(),source);
+  assert.equal(await message.locator('script,img,strong').count(),0);
+  assert.equal(await message.locator('.message-plain').evaluate(node=>getComputedStyle(node).whiteSpace),'pre-wrap');
+  assert.equal(await page.evaluate(()=>window.markdownUnsafe),undefined);
+  if(failure==='tampered')assert.equal(await page.evaluate(()=>window.markdownTamperedExecuted),undefined,'SRI prevents altered dependency bytes from executing');
+  if(failure==='throwing')assert.equal(await page.evaluate(()=>window.markdownFactoryFailed),true,'the real factory failure path is exercised, not an SRI rejection');
+  if(failure==='rendering')assert.equal(await page.evaluate(()=>window.markdownRenderingFailed),true);
+}));
+
+test('chat Markdown deep nesting falls back without dropping quoted or listed source', async () => fixture(async (page,data) => {
+  const sources=[`${'> '.repeat(30)}Keep the deeply quoted tail`,Array.from({length:30},(_,i)=>`${'  '.repeat(i)}- Nested item ${i}`).join('\n')+'\n'+'  '.repeat(30)+'- Keep the deeply listed tail'];
+  data.threads=[conversation(sources.map((source,i)=>incoming(i+1,source)))];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  for(const [index,source] of sources.entries()) {
+    const message=page.locator(`[data-message="${index+1}"] .message-text`);
+    await message.waitFor();
+    assert.equal(await message.locator('.message-plain').count(),1,'depth limits preserve the full source instead of silently discarding its tail');
+    assert.equal(await message.textContent(),source);
+  }
+}));
+
+test('chat Markdown large source falls back losslessly and copies without truncation', async () => fixture(async (page,data) => {
+  const source='**Large message**\n'+('retained source '.repeat(5000))+'\nKeep the final <tail>.';
+  data.threads=[conversation([incoming(1,source)])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('.message-plain').count(),1);
+  assert.equal(await message.textContent(),source);
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('[data-copy-message="1"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Message copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+  assert.equal(await page.evaluate(()=>state.thread.messages[0].text),source);
+}));
+
+test('chat Markdown token amplification falls back without truncating large tables', async () => fixture(async (page,data) => {
+  const source='| Item | First | Second |\n| --- | --- | --- |\n'+Array.from({length:1000},(_,i)=>`| ${i} | a | b |`).join('\n');
+  assert.ok(source.length<65536,'the token budget is tested independently from the source-length budget');
+  data.threads=[conversation([incoming(1,source)])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('.message-plain').count(),1);
+  assert.equal(await message.locator('table').count(),0);
+  assert.equal(await message.textContent(),source);
+  assert.equal(await page.evaluate(()=>state.thread.messages[0].text),source);
+}));
+
+test('chat Markdown pending receipt and polling reuse selected rendered content while preserving raw copy', async () => fixture(async (page,data) => {
+  const source='**Review update**\n\n`x < y` stays literal in code.';
+  data.threads=[conversation([])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const receipt=await holdMessageReceipt(page);
+  await page.locator('#message-form textarea').fill(source); await page.locator('#message-form button').click(); await receipt.started;
+  assert.equal(await page.locator('.message.sending strong').textContent(),'Review update');
+  assert.equal(await page.locator('.message.sending code').textContent(),'x < y');
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('.message.sending [data-copy-message]').click();
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+  const selected=await selectText(page,'.message.sending .message-text');
+  await page.evaluate(()=>refreshThread());
+  assert.equal(await page.locator('#messages .message').count(),1);
+  receipt.release(); await receipt.remove();
+  await page.waitForFunction(()=>!document.querySelector('#message-form button').disabled);
+  await page.evaluate(()=>refreshThread());
+  assert.deepEqual(await messageIds(page),[1]);
+  assert.equal(await page.locator('[data-pending-message]').count(),0);
+  assert.equal(await page.locator('[data-message="1"] .message-text strong').textContent(),'Review update');
+  assert.equal(await page.evaluate(()=>window.selectedNode===document.querySelector('[data-message="1"] .message-text')),true);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  await page.evaluate(()=>getSelection().removeAllRanges());
+  await page.locator('[data-copy-message="1"]').click();
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+  assert.equal(data.threads[0].messages[0].text,source);
+}));
+
+test('chat Markdown renders the first older-page message and retains its exact copy source', async () => fixture(async (page,data) => {
+  const source='**Earlier review** with `original code`';
+  data.pageLimit=2;data.reads[1]=4;
+  data.threads=[conversation([incoming(1,source),incoming(2,'Second earlier reply'),incoming(3,'Recent reply'),incoming(4,'Latest reply')])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('[data-message="4"]').waitFor();
+  assert.deepEqual(await messageIds(page),[3,4]);
+  await page.locator('#thread-older').click(); await page.locator('[data-message="1"]').waitFor();
+  assert.deepEqual(await messageIds(page),[1,2,3,4]);
+  assert.equal(await page.locator('[data-message="1"] .message-text strong').count(),1,'the first prepended message keeps its rendered body');
+  assert.equal(await page.locator('[data-message="1"] .message-text strong').textContent(),'Earlier review');
+  assert.equal(await page.locator('[data-message="1"] .message-text code').textContent(),'original code');
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']); await page.locator('[data-copy-message="1"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Message copied');
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+  await page.evaluate(()=>refreshThread()); assert.deepEqual(await messageIds(page),[1,2,3,4]);
+}));
+
+test('chat Markdown wide code and tables scroll inside mobile messages without widening the page', async () => fixture(async (page,data) => {
+  const source=`\`\`\`text\n${'long_code_value_'.repeat(35)}\n\`\`\`\n\n| ${Array.from({length:20},(_,i)=>`Column ${i}`).join(' | ')} |\n| ${Array(20).fill('---').join(' | ')} |\n| ${Array(20).fill('Value').join(' | ')} |`;
+  data.threads=[conversation([incoming(1,source)])];
+  await manualPolling(page); await page.setViewportSize({width:320,height:568}); await reloadPage(page); await openSidebar(page);
+  await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const message=page.locator('[data-message="1"] .message-text');
+  await message.waitFor();
+  assert.equal(await message.locator('pre').count(),1);
+  assert.equal(await message.locator('table').count(),1);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  for(const selector of ['pre','table'])assert.equal(await message.locator(selector).evaluate(node=>{
+    let scroller=node;
+    while(scroller!==node.closest('.message-text')&&!['auto','scroll'].includes(getComputedStyle(scroller).overflowX))scroller=scroller.parentElement;
+    const messages=document.querySelector('#messages').getBoundingClientRect(),bounds=scroller.getBoundingClientRect();
+    return ['auto','scroll'].includes(getComputedStyle(scroller).overflowX)&&scroller.scrollWidth>scroller.clientWidth&&bounds.left>=messages.left&&bounds.right<=messages.right;
+  }),true,`${selector} scrolls inside the message viewport`);
+  assert.equal(await message.locator('pre').evaluate(node=>getComputedStyle(node).overflowX==='auto'&&node.scrollWidth>node.clientWidth),true,'wide code stays horizontally scrollable');
+  assert.equal(await page.locator('#message-form button').evaluate(node=>node.getBoundingClientRect().bottom<=innerHeight),true);
+}));
 
 test('sending messages appear immediately, remain copyable, and confirm without waiting for a refresh', async () => fixture(async (page,data) => {
   data.threads=[conversation([])];
