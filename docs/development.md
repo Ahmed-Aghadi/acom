@@ -33,6 +33,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-access.cjs tests/wait-watch.cjs tests/subscriptions.cjs
+node --test tests/storage.cjs
 ```
 
 Browser tests for the UI (optional; no model turns or provider login):

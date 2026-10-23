@@ -279,6 +279,8 @@ Every dialog can be cancelled without filling it in.
 
 Manual Pause, Resume/Retry, Close, Reopen and all project/global lifecycle actions require one confirmation by default, identifying the agent name/ID or scope and consequences. Existing explicit review dialogs suffice; no duplicate confirmation follows. Settings has a separate Browser preferences panel, usable even with read-only Default: Confirm agent actions applies immediately across projects in this browser at the same server address, independent of project config and its Save/dirty state. Missing or invalid stored preferences default on; storage failures warn rather than claiming persistence. Disabling it skips only these lifecycle confirmations, not unrelated destructive or hard-limit checks. CLI commands and automatic recovery remain noninteractive. Pausing releases locks automatically after cleanup and does not offer a keep-locks option.
 
+Settings has an independent **Storage** panel, usable with Default and without a selected project. **Calculate disk usage** makes one request; opening pages, polling and changing projects never scan. Last reports remain in tab memory per project, with scope and scan start/end times; errors preserve but clearly label the previous result. Busy state prevents overlapping clicks, and a project-selection revision rejects late results even after switching away and back. Partial reports are marked explicitly, not presented as complete measurements. This panel does not dirty or save configurations.
+
 ### Agent query
 
 - `search`/CLI `--search` accepts uppercase AND, OR, NOT and parentheses, with precedence NOT > AND > OR. Adjacent clauses imply AND. Exact fields are `group`, `provider`, `model`, `effort`, `state`, `pause_reason`; unquoted commas within a field mean OR. Example: `group:"Security review" (state:idle OR pause_reason:limit) NOT model:unwanted`. Field values are case-sensitive. Double quotes protect spaces, commas, literal colons/parentheses and operator words; `\"` and `\\` escape quotes/backslashes. Quoting a whole token (`"group:x"` or `"OR"`) makes it a literal free term. Lowercase operator words and bare commas outside field clauses are literal.
@@ -337,6 +339,7 @@ The server only answers requests whose `Host` (and `Origin`, if any) is this ser
 | Configs | `GET /configs` (virtual Default and saved configs with settings/project IDs); `GET /configs/{id}`; `POST /configs` (`name`, `settings`); `PUT /configs/{id}` (`settings`, optional `name`); `POST /configs/{id}/remove`; `PUT /projects/{id}/config` (`config` ID, or `custom` settings) |
 | History & notices | `GET /history?project=&viewer=&agent=&thread=&lock=&kind=`; `GET /history/{id}?project=&viewer=`; `GET /activity?project=&agent=`; `GET /activity/{id}?project=&agent=`; `GET /notices/{agent}`; `GET /notices/{agent}/{id}`; `GET /receipts/{id}?agent=` |
 | Usage | `GET /limits?project=` (includes usage/check status); `POST /usage/check` (`provider`) |
+| Storage | `GET /storage?project=` (optional positive existing project ID; fixed disk-usage summary, no paging/budget parameters) |
 
 This inventory shows route-specific parameters, not every optional response field. Shared read protocols:
 
@@ -346,6 +349,8 @@ This inventory shows route-specific parameters, not every optional response fiel
 - **Logs** return bounded readable `text` with byte `start`/`end`, `through`, `version`, `revision`, `next_before`/`next_after`, `has_more` and partial-line flags. Default is the latest 200 lines, still byte-bounded. Continue with the returned version/ceiling and concatenate partial chunks; a changed file identity or incompatible ceiling gives 409. **Folders** instead return `entries` and opaque `d:`/`f:` name cursors tied to a required revision on continuation.
 
 Private-thread access and project scoping apply to agent-personalized reads; log reads are limited to that agent or the user. Reading/acknowledging content remains separate from work marks.
+
+`GET /storage` is a fixed-size read-only metadata summary: `{home, project, started_at, completed_at, complete, limited, entries, skipped, bytes:{project_logs, all_project_logs, database, other, total}}`. `project_logs` is null without a selected project, otherwise its captured-log subtotal. Unknown query fields, including record/collection paging controls, are rejected. It does not use record hydration or rescan automatically. A concurrent calculation returns 409.
 
 ### Request validation and outcomes
 
@@ -426,6 +431,10 @@ view_ids (name, id)                                   -- retained ID high-water 
 The lock table retains `frozen` and `frozen_left` storage fields; current controls never freeze a lease. Incompatible schemas are rejected without clearing saved data; startup explains using a separate data directory. SQLite also creates its own transaction/index metadata.
 
 `logs/<agent ID>.jsonl` captures harness stdout, `.err` appends stderr, and `.txt` contains readable event captures with UTC timestamp/type headers. Native JSONL truncation/rewriting does not rewrite these captured output files. Native transcript paths are resolved by the harness; resumptions use only confirmed sessions. Browser drafts/theme preferences are not in SQLite.
+
+Manual storage reporting walks only the configured data directory, using allocated inode blocks (`st_blocks × 512`) without reading file contents or following descendant symlinks. It snapshots agent/project attribution under the application mutex, then releases it before filesystem traversal. Known agents' root `logs/<ID>.jsonl|txt|err` count as captured logs; `acom.db` and its journal/WAL/SHM files count as the database. Directory blocks, orphan logs and remaining entries count as other data. Hardlinks are deduplicated by device/inode, with database then log attribution taking precedence over other paths; a selected project's subtotal includes shared log inodes once when any link belongs to it. Global log/database/other totals are disjoint and sum to total.
+
+One process-wide scan may run at a time. Traversal is bounded to 100,000 entries or 10 seconds, checked between filesystem operations; hitting either sets `limited:true`. Metadata/traversal failures increment `skipped`; either condition makes `complete:false` and reports only observed allocations. Root-directory failure is an error, never a false zero. Concurrent writers and renames make all reports non-atomic approximations, even when complete. No server scan cache, background scan, compression, cleanup or data migration is added.
 
 ## Not included
 

@@ -14,6 +14,7 @@ use crate::paging::fingerprint;
 pub use crate::paging::{PageQuery, bounded_record};
 mod agent_query;
 mod diagnostics;
+mod storage;
 mod subscriptions;
 pub use agent_query::ParsedAgentQuery;
 pub use subscriptions::UsageWatch;

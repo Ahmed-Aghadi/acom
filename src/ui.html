@@ -498,6 +498,7 @@
 
     <section class="page" id="page-settings" aria-labelledby="settings-title"><div class="page-heading"><div><p class="eyebrow">Project configuration</p><h1 id="settings-title">Settings</h1><p class="page-description">Choose how your agents work, coordinate, and recover.</p></div></div>
       <section class="panel preference-panel" aria-labelledby="preferences-title"><div class="panel-head"><h2 id="preferences-title">Browser preferences</h2></div><div class="preference-body"><label class="inline-check"><input type="checkbox" id="confirm-agent-actions" checked>Confirm agent actions</label><p>Ask before pausing, resuming, retrying, closing or reopening agents, including bulk actions. Applies immediately to all projects in this browser at this server address; not part of saved configurations.</p><p id="preferences-status" role="status"></p></div></section>
+      <section class="panel preference-panel" id="storage-panel" aria-labelledby="storage-title" aria-busy="false"><div class="panel-head"><h2 id="storage-title">Storage</h2><button type="button" class="small" id="storage-calculate">Calculate disk usage</button></div><div class="preference-body"><p>Allocated disk space in acom’s data directory, calculated only on request. Project files and native Claude/Codex histories elsewhere are not scanned. Files may change during or after calculation.</p><p id="storage-scope"></p><p id="storage-status" role="status" aria-label="Disk usage calculation">Not calculated yet.</p><dl class="details" id="storage-report" hidden><dt id="storage-project-label">This project’s captured logs</dt><dd id="storage-project"></dd><dt>All projects’ captured logs</dt><dd id="storage-all-projects"></dd><dt>Shared database</dt><dd id="storage-database"></dd><dt>Other / unassigned data</dt><dd id="storage-other"></dd><dt>Total acom data</dt><dd id="storage-total"></dd><dt>Data directory</dt><dd id="storage-home"></dd><dt>Last calculation</dt><dd id="storage-scanned"></dd></dl></div></section>
       <section class="panel settings-panel">
         <div class="panel-head"><h2>Configuration</h2><span class="settings-save-state" id="settings-save-state" role="status">All changes saved</span><button class="primary" form="settings-form">Save</button></div><div class="settings-jump" id="settings-jump" aria-label="Settings sections"></div>
         <form class="settings" id="settings-form"></form>
@@ -636,6 +637,7 @@
     const emptyState = (icon, title, description = '') => `<div class="empty"><div class="empty-symbol">${svgIcon(icon)}</div><strong>${esc(title)}</strong>${description ? `<p>${esc(description)}</p>` : ''}</div>`;
     state.agentFilter = 'all'; state.agentSearch = ''; state.agentQuery = null; state.agentFilterDraft = null; state.agentBrowser = [];
     state.confirmAgentActions = stored('acom:confirm-agent-actions') !== 'false';
+    const storage = { scope: null, revision: 0, pending: null, reports: new Map(), errors: new Map() };
     let agentSearchTimer = null;
     let agentQuerySequence = 0;
     let filterNodeSequence = 0;
@@ -898,7 +900,7 @@
           state.project = overview.project;
           if (state.project?.truncated) state.project = await record(`/projects/${state.project.id}`);
           if (request !== state.overviewRequest) return;
-          state.selectedProject = state.project?.id ?? null;
+          setSelectedProject(state.project?.id ?? null);
           state.limits = overview.limits; state.url = overview.url;
           state.unreadTotal = overview.unread_total;
           state.restartPaused = overview.restart_paused;
@@ -942,7 +944,62 @@
       ]);
     }
 
-    function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); updatePaging(); }
+    function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); renderStorage(); updatePaging(); }
+
+    function setSelectedProject(project) {
+      if (state.selectedProject !== project) { storage.scope = project; storage.revision++; }
+      state.selectedProject = project;
+    }
+
+    function renderStorage() {
+      const project = state.selectedProject;
+      if (storage.scope !== project) { storage.scope = project; storage.revision++; }
+      const report = storage.reports.get(project), error = storage.errors.get(project);
+      const name = state.projects.find(p => p.id === project)?.name;
+      const busy = !!storage.pending;
+      setText($('#storage-scope'), project == null ? 'All projects; no project selected.' : `Project #${project}${name ? ` · ${name}` : ''}`);
+      $('#storage-panel').setAttribute('aria-busy', String(busy));
+      $('#storage-calculate').disabled = busy;
+      setText($('#storage-calculate'), busy ? 'Calculating…' : report ? 'Calculate again' : 'Calculate disk usage');
+      let status = 'Not calculated yet.';
+      if (busy) status = storage.pending.project === project && storage.pending.revision === storage.revision ? 'Calculating disk usage…' : 'A previous selection’s calculation is still running. Wait before calculating this selection.';
+      else if (error) status = `Calculation failed: ${error}${report ? ' Previous result retained.' : ''}`;
+      else if (report) status = report.complete ? 'Calculation complete. Usage may have changed since this scan.' : `Partial calculation${report.limited ? ' (scan limit reached)' : ''}: totals are lower bounds. ${fmt(report.skipped)} entries skipped; additional entries may not have been visited.`;
+      setText($('#storage-status'), status);
+      $('#storage-status').classList.toggle('inline-error', !!error && !busy);
+      $('#storage-report').hidden = !report;
+      if (!report) return;
+      $('#storage-project-label').hidden = project == null; $('#storage-project').hidden = project == null;
+      for (const [id, value] of [['project', report.bytes.project_logs], ['all-projects', report.bytes.all_project_logs], ['database', report.bytes.database], ['other', report.bytes.other], ['total', report.bytes.total]]) {
+        const node = $(`#storage-${id}`);
+        if (value == null) { setText(node, 'Unavailable'); node.removeAttribute('title'); continue; }
+        const unit = Math.min(5, Math.floor(Math.log2(Math.max(1, value)) / 10));
+        const size = `${(value / 1024 ** unit).toLocaleString(undefined, {maximumFractionDigits:unit ? 2 : 0})} ${['B','KiB','MiB','GiB','TiB','PiB'][unit]}`;
+        setText(node, `${report.complete ? '' : 'At least '}${size}`); node.title = `${fmt(value)} allocated bytes`;
+      }
+      setText($('#storage-home'), report.home);
+      setText($('#storage-scanned'), `${when(report.started_at)} → ${when(report.completed_at)}`);
+    }
+
+    $('#storage-calculate').addEventListener('click', async () => {
+      if (storage.pending) return;
+      renderStorage();
+      const project = state.selectedProject, revision = storage.revision;
+      storage.pending = {project, revision}; storage.errors.delete(project); renderStorage();
+      try {
+        const report = await api(query('/storage', {project}));
+        const count = value => Number.isSafeInteger(value) && value >= 0;
+        if (report.project !== project || typeof report.home !== 'string' || typeof report.complete !== 'boolean' || typeof report.limited !== 'boolean'
+            || ![report.started_at, report.completed_at, report.entries, report.skipped, report.bytes?.all_project_logs, report.bytes?.database, report.bytes?.other, report.bytes?.total].every(count)
+            || (project == null ? report.bytes?.project_logs !== null : !count(report.bytes?.project_logs))
+            || report.completed_at < report.started_at || (report.complete && (report.limited || report.skipped !== 0))
+            || report.bytes.total !== report.bytes.all_project_logs + report.bytes.database + report.bytes.other
+            || (project != null && report.bytes.project_logs > report.bytes.all_project_logs)) throw new Error('Invalid disk usage response.');
+        if (state.selectedProject === project && storage.revision === revision) storage.reports.set(project, report);
+      } catch (error) {
+        if (state.selectedProject === project && storage.revision === revision) storage.errors.set(project, error.message);
+      } finally { storage.pending = null; renderStorage(); }
+    });
 
     function renderStats() {
       const project = state.projects.find(p => p.id === state.selectedProject) || state.project;
@@ -2579,7 +2636,7 @@
       if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
       getSelection()?.removeAllRanges();
       state.editor = null;
-      filterContextRevision++; state.selectedProject = Number(event.target.value);
+      filterContextRevision++; setSelectedProject(Number(event.target.value));
       state.projectActions = null;
       state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
@@ -2596,7 +2653,7 @@
       try {
         await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
         if (state.selectedProject === p.id) {
-          filterContextRevision++; state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread();
+          filterContextRevision++; setSelectedProject(null); state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
       } catch (error) { toast(error.message, true); }
@@ -2778,7 +2835,7 @@
         if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
         if (submission.current() && project === state.selectedProject) {
-          filterContextRevision++; state.selectedProject = Number(result.id); state.overviewRevision = null; state.editor = null; resetThread();
+          filterContextRevision++; setSelectedProject(Number(result.id)); state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
         if (submission.current()) { $('#project-dialog').close(); form.reset(); }

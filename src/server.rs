@@ -477,6 +477,7 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
         ("GET", ["models"] | ["catalog"] | ["agents", _, "project"]) => ("", "", ""),
         ("GET", ["overview"]) => ("", "project since", RECORD),
         ("GET", ["settings"] | ["limits"] | ["locks", _]) => ("", "project", RECORD),
+        ("GET", ["storage"]) => ("", "project", ""),
         ("GET", ["projects"]) if q.get("path").is_some() => ("", "path", RECORD),
         ("GET", ["projects"] | ["configs"] | ["notices", _]) => ("", "", PAGE),
         ("GET", ["projects", _] | ["configs", _] | ["notices", _, _]) => ("", "", RECORD),
@@ -809,6 +810,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             q,
         )?),
         ("GET", ["settings"]) => J(record(json!(app.settings(q.int("project")?)), q)?),
+        ("GET", ["storage"]) => J(app.storage_usage(q.int("project")?)?),
         ("GET", ["catalog"]) => {
             J(json!({ "claude": catalog("claude"), "codex": catalog("codex") }))
         }

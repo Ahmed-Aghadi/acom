@@ -2524,6 +2524,9 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
   const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
   const page = await browser.newPage();
   const errors = []; page.on('pageerror', e => errors.push(e.message));
+  const storageRequests = []; page.on('request', request => {
+    if (new URL(request.url()).pathname === '/storage') storageRequests.push(request.url());
+  });
   const add = async folder => {
     await page.locator('[data-open="project-dialog"]').click();
     await page.locator('#project-form [name=path]').fill(folder);
@@ -2567,6 +2570,20 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     assert.equal(await page.locator('#project-path').textContent(), second);
     await page.locator('[data-page=settings]').click();
     await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    assert.equal(storageRequests.length, 0, 'opening Settings never calculates disk usage');
+    const storageResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/storage');
+    await page.locator('#storage-calculate').click();
+    const storageReport = await (await storageResponse).json();
+    assert.equal(storageReport.project, secondId);
+    assert.equal(storageReport.complete, true);
+    assert.equal(storageReport.bytes.project_logs, 0);
+    assert.equal(storageReport.bytes.total, storageReport.bytes.all_project_logs + storageReport.bytes.database + storageReport.bytes.other);
+    await page.waitForFunction(() => document.querySelector('#storage-report').hidden === false);
+    assert.equal(await page.locator('#storage-home').textContent(), storageReport.home);
+    assert.equal(await page.locator('#storage-project').textContent(), '0 B');
+    assert.match(await page.locator('#storage-status').textContent(), /Calculation complete/);
+    assert.equal(storageRequests.length, 1, 'one click performs one non-hydrated scan');
+    assert.equal(await page.locator('[form=settings-form]').isDisabled(), true, 'storage calculation does not dirty Default');
     assert.equal(await page.locator('#confirm-agent-actions').isChecked(), true);
     const configBeforePreference = await api('GET', '/configs');
     await page.locator('#confirm-agent-actions').uncheck();
@@ -2574,6 +2591,8 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     await page.reload();
     await page.locator('[data-page=settings]').click();
     await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    assert.equal(storageRequests.length, 1, 'reload and reopening Settings do not scan automatically');
+    assert.equal(await page.locator('#storage-report').isHidden(), true, 'storage reports are tab-memory only');
     assert.equal(await page.locator('#confirm-agent-actions').isChecked(), false, 'preference survives reload against the real server');
     await page.locator('#confirm-agent-actions').check();
     assert.deepEqual(await api('GET', '/configs'), configBeforePreference, 'browser preferences never write project configurations');

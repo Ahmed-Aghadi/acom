@@ -187,6 +187,10 @@ Agents run unattended, so nobody can answer a permission prompt. By default they
 
 Open <http://127.0.0.1:7400/> (`--port` picks another port). One server handles all your projects; a second `acom serve` using the same data directory refuses to start. Its data (database, logs, port) lives in `~/.acom`, or in `ACOM_HOME` if you set it; acom keeps none of its own state in your projects (the agents, of course, work on their files).
 
+**Settings → Storage → Calculate disk usage** reads file metadata only when clicked. It reports allocated bytes for the selected project's captured logs, all projects' captured logs, the shared database (including SQLite sidecars), other/unassigned data and the total data directory. The database is shared, so no per-project share is guessed. Directory metadata and orphaned logs count as other data; hardlinks count once in the total and descendant symlink targets are excluded. Project files and native provider histories outside this directory are not scanned.
+
+The last result stays in the tab for its project until you calculate again or reload; switching projects never starts a scan. Scan start/end times make its age explicit. Concurrent file changes mean this is not an atomic snapshot. Scans stop after 100,000 entries or 10 seconds, checked between filesystem operations; skipped entries or a reached bound produce a clearly marked partial result. Only one calculation runs at a time. Nothing is compressed, cleaned up or changed.
+
 Incompatible development databases and invalid stored settings are left untouched; startup explains the problem instead of silently replacing settings with Default.
 
 Before upgrading an older running instance, pause or stop its agents through the old server. If a worker without a data-home marker remains live, new startup refuses and identifies its PID; stop that worker before retrying.

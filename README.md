@@ -64,6 +64,8 @@ Spaces combine conditions with AND; commas within a field give alternatives. Thi
 
 acom stores its database and captured logs in `~/.acom`; set `ACOM_HOME` for a separate data directory. Native conversations remain in each provider CLI's storage. Browser drafts and preferences stay in that browser. Agents edit project files, but acom keeps none of its own state there.
 
+**Settings → Storage → Calculate disk usage** checks allocated disk space on demand: the selected project's captured logs, all projects' logs, the shared database and other data. Results include scan times and may change while agents work; no scans run automatically. See [storage details](docs/usage.md#storage-restarts-and-upgrades).
+
 Ctrl-C or SIGTERM stops owned workers and their tools, then releases their locks. Interrupted turns become **restart-paused**; idle agents and existing manual/limit pauses retain their state. Starting the server does not automatically resume interrupted turns. Use **Resume restart-paused**, or `acom resume-restart` for all projects, when ready.
 
 Before upgrading, stop working agents through the old server. Incompatible data or invalid stored settings produce an error without silently replacing your configuration. See [storage, restarts and upgrades](docs/usage.md#storage-restarts-and-upgrades).

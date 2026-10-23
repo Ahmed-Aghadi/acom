@@ -203,6 +203,13 @@ async function fixture(run) {
       return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),...(data.unknownGlobalCounts?{}:{restart_paused:restartPaused,...globalEligible()}),...(data.unknownProjectCounts?{}:{project_actions:projectActions}),agent_counts:agentCounts(projectAgents), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
     }
     if(req.method==='GET' && pathname==='/catalog') return send(bounded(catalog,params));
+    if(req.method==='GET' && pathname==='/storage') {
+      const project=params.has('project')?Number(params.get('project')):null;
+      const report=structuredClone(data.storageReports?.[project] || {home:'/home/example/.acom',project,started_at:1720000000,completed_at:1720000001,complete:true,limited:false,entries:8,skipped:0,bytes:{project_logs:project===null?null:0,all_project_logs:4096,database:8192,other:4096,total:16384}});
+      if(data.storageDelay)await new Promise(resolve=>setTimeout(resolve,data.storageDelay));
+      if(data.storageError)return send({status:503,error:data.storageError});
+      return send(report);
+    }
     if(req.method==='GET' && pathname==='/agent-query') {
       const result=agentQueryFixture(params.get('search')||'');
       return send(result.error?result:bounded(result,params));
@@ -473,6 +480,137 @@ const saveSettings = async page => {
   await page.locator('[form="settings-form"]').click();
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
 };
+
+test('disk usage is calculated only on demand and stays independent of project settings', async () => fixture(async (page,data) => {
+  data.projects[0].config=1;
+  await manualPolling(page); await reloadPage(page);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,0);
+  await page.locator('[data-page=settings]').click();
+  assert.equal(await page.locator('#storage-report').isHidden(),true);
+  assert.match(await page.locator('#storage-status').textContent(),/not calculated|calculate|not measured/i);
+  assert.equal(await page.locator('#storage-calculate').isEnabled(),true,'Default remains measurable');
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(),true);
+  assert.equal(await page.locator('#storage-calculate').evaluate(node=>node.closest('form')),null);
+  const configs=JSON.stringify(data.configs);
+  for(let i=0;i<3;i++)await page.evaluate(()=>refresh());
+  await page.locator('[data-page=overview]').click();await page.locator('[data-page=settings]').click();
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,0,'polls and opening Settings do not scan');
+  await page.locator('#storage-calculate').click();
+  await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1);
+  assert.equal(data.getRequests.find(url=>url.startsWith('/storage')),'/storage?project=1');
+  assert.match(await page.locator('#storage-project').textContent(),/^0\s*(?:B|bytes)$/);
+  assert.match(await page.locator('#storage-total').textContent(),/16.*KiB/);
+  assert.match(await page.locator('#storage-scanned').textContent(),/\d/);
+  assert.match(await page.locator('#storage-panel').textContent(),/chang|snapshot|scan/i);
+  assert.match(await page.locator('#storage-panel').textContent(),/native|Claude.*Codex/i);
+  for(let i=0;i<3;i++)await page.evaluate(()=>refresh());
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1);
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(),true);
+  assert.equal(JSON.stringify(data.configs),configs);assert.equal(data.requests.length,0);
+  await reloadPage(page);await page.locator('[data-page=settings]').click();
+  assert.equal(await page.locator('#storage-report').isHidden(),true,'reload does not present a stale persisted measurement');
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1,'reload never scans automatically');
+}));
+
+test('disk usage remains single-flight and rejects stale results after project A to B to A', async () => fixture(async (page,data) => {
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  const held=await holdRequest(page,'**/storage*','GET');
+  try {
+    await page.locator('#storage-calculate').click();await held.started;
+    assert.equal(await page.locator('#storage-calculate').isDisabled(),true);
+    assert.equal(await page.locator('#storage-panel').getAttribute('aria-busy'),'true');
+    await page.locator('#storage-calculate').dispatchEvent('click');await page.evaluate(()=>refresh());
+    await page.locator('#project-select').selectOption('2');
+    await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+    assert.match(await page.locator('#storage-scope').textContent(),/Project #2.*other/);
+    assert.equal(await page.locator('#storage-report').isHidden(),true);
+    assert.match(await page.locator('#storage-status').textContent(),/previous selection/i);
+    await page.locator('#storage-calculate').dispatchEvent('click');
+    await page.locator('#project-select').selectOption('1');
+    await page.waitForFunction(()=>state.selectedProject===1&&refreshPending===0);
+    held.release();await held.remove();
+    await page.waitForFunction(()=>!document.querySelector('#storage-calculate').disabled);
+    assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1);
+    assert.equal(await page.locator('#storage-report').isHidden(),true,'an earlier calculation is stale even when its project becomes selected again');
+    assert.match(await page.locator('#storage-status').textContent(),/not calculated/i);
+    await page.locator('#storage-calculate').click();
+    await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
+    assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,2);
+  } finally {held.release();await held.remove();}
+}));
+
+test('disk usage invalidates asynchronous project selection before its first render', async () => fixture(async page => {
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  const scan=await holdRequest(page,'**/storage*','GET'),overview=await holdRequest(page,/\/overview\?project=3(?:&|$)/,'GET');
+  try {
+    await page.locator('#storage-calculate').click();await scan.started;
+    await page.locator('[data-open=project-dialog]').click();
+    await page.locator('#project-form [name=path]').fill('/projects/third');
+    await page.locator('#project-form button.primary').click();await overview.started;
+    assert.equal(await page.evaluate(()=>state.selectedProject),3,'selection changes before the new overview renders');
+    await page.locator('[data-close=project-dialog]').click();
+    // Exercise the selection handler even while the DOM still displays its prior value.
+    await page.locator('#project-select').selectOption('1');
+    await page.waitForFunction(()=>state.selectedProject===1);
+    scan.release();await scan.remove();
+    await page.waitForFunction(()=>!document.querySelector('#storage-calculate').disabled);
+    assert.equal(await page.locator('#storage-report').isHidden(),true,'an intervening unrendered selection also invalidates the earlier calculation');
+    assert.match(await page.locator('#storage-status').textContent(),/not calculated/i);
+  } finally {scan.release();overview.release();await scan.remove();await overview.remove();}
+}));
+
+test('disk usage labels partial lower bounds, escapes paths and preserves selected values through polling', async () => fixture(async (page,data) => {
+  const home='/home/<img src=x onerror="window.storageInjection=true">/.acom';
+  data.storageReports={1:{home,project:1,started_at:1720000000,completed_at:1720000001,complete:false,limited:true,entries:50,skipped:3,bytes:{project_logs:0,all_project_logs:4096,database:8192,other:4096,total:16384}}};
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  await page.locator('#storage-calculate').click();await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
+  assert.match(await page.locator('#storage-status').textContent(),/Partial.*scan limit reached.*lower bounds.*3.*skipped/i);
+  for(const selector of ['project','all-projects','database','other','total'])assert.match(await page.locator(`#storage-${selector}`).textContent(),/^At least /);
+  assert.equal(await page.locator('#storage-home').textContent(),home);
+  assert.equal(await page.locator('#storage-home img').count(),0);assert.equal(await page.evaluate(()=>window.storageInjection),undefined);
+  const selected=await selectText(page,'#storage-home');
+  for(let i=0;i<3;i++)await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>window.selectedNode.isConnected),true);
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1);
+  assert.equal(await page.getByRole('status',{name:'Disk usage calculation',exact:true}).count(),1);
+}));
+
+test('disk usage errors retain only the current scope result and invalid values never become zero', async () => fixture(async (page,data) => {
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  await page.locator('#storage-calculate').click();await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
+  const total=await page.locator('#storage-total').textContent(),scanned=await page.locator('#storage-scanned').textContent();
+  data.storageError='Scan unavailable <script>window.storageInjection=true</script>';
+  await page.locator('#storage-calculate').click();await page.waitForFunction(()=>document.querySelector('#storage-status').textContent.includes('Calculation failed'));
+  assert.match(await page.locator('#storage-status').textContent(),/Previous result retained/);
+  assert.equal(await page.locator('#storage-total').textContent(),total);assert.equal(await page.locator('#storage-scanned').textContent(),scanned);
+  assert.equal(await page.locator('#storage-status script').count(),0);assert.equal(await page.evaluate(()=>window.storageInjection),undefined);
+  await page.locator('#project-select').selectOption('2');await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  assert.equal(await page.locator('#storage-report').isHidden(),true);assert.match(await page.locator('#storage-status').textContent(),/not calculated/i);
+  await page.locator('#storage-calculate').click();await page.waitForFunction(()=>document.querySelector('#storage-status').textContent.includes('Calculation failed'));
+  assert.equal(await page.locator('#storage-report').isHidden(),true,'another project never inherits the prior result');
+  data.storageError=null;
+  for(const invalid of [null,-1,'0']) {
+    data.storageReports={2:{home:'/tmp/acom',project:2,started_at:1720000000,completed_at:1720000001,complete:true,limited:false,entries:0,skipped:0,bytes:{project_logs:invalid,all_project_logs:4096,database:8192,other:4096,total:16384}}};
+    await page.locator('#storage-calculate').click();
+    await page.waitForFunction(()=>!document.querySelector('#storage-calculate').disabled);
+    assert.match(await page.locator('#storage-status').textContent(),/Invalid disk usage response/);
+    assert.equal(await page.locator('#storage-report').isHidden(),true);
+  }
+}));
+
+test('disk usage supports all-project totals without requiring a selected project', async () => fixture(async (page,data) => {
+  data.projects=[];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,0);
+  await page.locator('#storage-calculate').click();await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
+  assert.equal(data.getRequests.find(url=>url.startsWith('/storage')),'/storage');
+  assert.match(await page.locator('#storage-scope').textContent(),/all projects.*no project selected/i);
+  assert.equal(await page.locator('#storage-project').isHidden(),true);
+  assert.match(await page.locator('#storage-all-projects').textContent(),/4.*KiB/);
+  assert.match(await page.locator('#storage-total').textContent(),/16.*KiB/);
+}));
 
 for (const viewport of [{width:1280,height:900,header:95,messages:400},{width:390,height:844,header:120,messages:350},{width:320,height:568,header:120,messages:250}]) {
   test(`compact thread header leaves reading space with many members at ${viewport.width}px`, async () => fixture(async (page,data) => {
