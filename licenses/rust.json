@@ -1,7 +1,7 @@
 {
   "targets": ["aarch64-unknown-linux-gnu","x86_64-unknown-linux-gnu"],
-  "lock_sha256": "299d06614059518416bdec7b14271e2f30d1303ff7d8c26a25af51925c3c2061",
-  "manifest_sha256": "8deb00ad12341c3aae4d25916c4b63f7fc73a7e2c4d124dd6c98e4c1f061d249",
+  "lock_sha256": "b09745ce6e116096be1be89f432131c2b717848ebecba4173e26de232215f0e9",
+  "manifest_sha256": "85800470e144588d46ad8b557209d6dfbc5e4d6317c2f4e52716a0fef7ee6c7a",
   "packages": [
     {"name":"anstream","version":"1.0.0","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6"}},
     {"name":"anstyle","version":"1.0.14","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6"}},
@@ -127,9 +127,9 @@
       "note": "Includes Apache/ISC source headers, fiat-crypto Apache notice and the bundled once_cell MIT license. Identical headers are represented once; coverage conservatively includes source for other architectures and build tools."
     },
     {"name":"rusqlite","version":"0.40.2","license":"MIT","selected":"MIT","files":["LICENSE"],"file_sha256":{"LICENSE":"c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f"}},
-    {"name":"rustls","version":"0.23.45","license":"Apache-2.0 OR ISC OR MIT","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c"}},
+    {"name":"rustls","version":"0.23.46","license":"Apache-2.0 OR ISC OR MIT","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c"}},
     {"name":"rustls-pki-types","version":"1.15.1","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"9117d922e667125508dde62b02c1f57ed22f5ad21eb536aa2e2d99e1c796e639"}},
-    {"name":"rustls-webpki","version":"0.103.15","license":"ISC","selected":"ISC","files":["LICENSE"],"file_sha256":{"LICENSE":"5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a"},
+    {"name":"rustls-webpki","version":"0.103.16","license":"ISC","selected":"ISC","files":["LICENSE"],"file_sha256":{"LICENSE":"5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a"},
       "headers": [
         {"file":"src/crl/mod.rs","start":1,"end":13,"sha256":"9ef9c18e5cee19599fa2cd605674497ec7c7a702ebbb8310903cb60c540d5c39"},
         {"file":"src/end_entity.rs","start":1,"end":13,"sha256":"baf9e2a528dd5202334bb6cd06c145b3c7c7c91f3fab874f39c9321d2e51ae07"},
@@ -147,7 +147,7 @@
     {"name":"strsim","version":"0.11.1","license":"MIT","selected":"MIT","files":["LICENSE"],"file_sha256":{"LICENSE":"1e697ce8d21401fbf1bddd9b5c3fd4c4c79ae1e3bdf51f81761c85e11d5a89cd"}},
     {"name":"subtle","version":"2.6.1","license":"BSD-3-Clause","selected":"BSD-3-Clause","files":["LICENSE"],"file_sha256":{"LICENSE":"d1fc1bc0d155df60b2e7705b6b2ae02a05c96f948e1cec6e2fb86360b09f346b"}},
     {"name":"syn","version":"3.0.6","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"}},
-    {"name":"tiny_http","version":"0.12.0","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"e69bb98ae371fc43e5ef9cb1fc648762faf92edd93a8afd71411fac419b1b550"}},
+    {"name":"tiny_http","version":"0.12.0","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"e69bb98ae371fc43e5ef9cb1fc648762faf92edd93a8afd71411fac419b1b550"},"note":"Locally patched for bounded discard and rejection of truncated chunked bodies; upstream license unchanged. Provenance and source checksums: vendor/tiny_http/ACOM_PATCH.md."},
     {"name":"unicode-ident","version":"1.0.26","license":"(MIT OR Apache-2.0) AND Unicode-3.0","selected":"MIT AND Unicode-3.0","files":["LICENSE-MIT","LICENSE-UNICODE"],"file_sha256":{"LICENSE-MIT":"23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3","LICENSE-UNICODE":"f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1"}},
     {"name":"untrusted","version":"0.9.0","license":"ISC","selected":"ISC","files":["LICENSE.txt"],"file_sha256":{"LICENSE.txt":"7abd9b6960dcf7d4d0a48606a5b71bfe37d472db68d70637f3a58a56785f1621"},
       "headers": [
@@ -159,7 +159,7 @@
     {"name":"utf8-zero","version":"0.8.1","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"}},
     {"name":"utf8parse","version":"0.2.2","license":"Apache-2.0 OR MIT","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"e4c9b06fa850cb9b540a5e400e9f6394cf15efcf4098144de477d1d3dae10150"}},
     {"name":"vcpkg","version":"0.2.15","license":"MIT/Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"016d20f335060a70e79d9fcf8dfaa6201114d65d592211f4bdfb8ae9ca2bc1dc"}},
-    {"name":"webpki-roots","version":"1.0.9","license":"CDLA-Permissive-2.0","selected":"CDLA-Permissive-2.0","files":["LICENSE"],"file_sha256":{"LICENSE":"e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8"}},
+    {"name":"webpki-roots","version":"1.0.10","license":"CDLA-Permissive-2.0","selected":"CDLA-Permissive-2.0","files":["LICENSE"],"file_sha256":{"LICENSE":"e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8"}},
     {"name":"zeroize","version":"1.9.1","license":"Apache-2.0 OR MIT","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"8c7516d4b27b1e495be5e38b612298b63de48d05f49cdac94f70f3cd70f8864b"}},
     {"name":"zmij","version":"1.0.23","license":"MIT","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"}}
   ]

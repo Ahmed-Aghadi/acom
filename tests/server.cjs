@@ -1018,6 +1018,7 @@ process.stdin.on('end', async () => {
     await api('POST',`/agents/${manual.id}/resume`,{});
     await until(()=>runs().filter(r=>r.id===manual.id).length===4,'manual retry has a new same-model budget');
     assert.deepEqual(runs().filter(r=>r.id===manual.id).map(r=>r.model),Array(4).fill('gpt-6-sol'));
+    await finished(manual.id,'crashed');
     await api('POST',`/agents/${manual.id}/close`,{});
     retryConfig.crash_retries['gpt-6-sol'].same_model_retries=0;
 
@@ -1029,6 +1030,7 @@ process.stdin.on('end', async () => {
     await new Promise(r=>setTimeout(r,2100));
     assert.equal((await api('GET',`/agents/${paused.id}`)).state,'paused');
     assert.equal(runs().filter(r=>r.id===paused.id).length,1);
+    await until(async()=>!(await api('GET',`/agents/${paused.id}`)).stopping,'paused worker cleanup finishes');
     await api('POST',`/agents/${paused.id}/close`,{});
     const shutdown=await api('POST','/agents',{project:a.id,harness:'codex',task:'SERVER_STOP_TEST'});
     await until(()=>runs().some(r=>r.id===shutdown.id),'shutdown fixture started');
@@ -1295,6 +1297,7 @@ process.stdin.on('end', async () => {
       const paused=await api('GET',`/agents/${quota.id}`);
       assert.equal(paused.state,'paused'); assert.equal(paused.retry,null);
       assert.equal(runs().filter(run=>run.id===quota.id).length,1,'quota must not consume configured crash retries');
+      await until(async()=>!(await api('GET',`/agents/${quota.id}`)).stopping,'quota worker cleanup finishes');
       await api('POST',`/agents/${quota.id}/close`,{});
       uncapped.crash_retries={};
       await api('PUT',`/projects/${a.id}/config`,{custom:uncapped});
@@ -1671,6 +1674,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   const configure=(id,extra,status=200)=>api('POST','/agent-config',{id,agent:id,...extra},status);
   const noFollowup=async (id,state)=>{
     await finished(id,state);
+    await until(async()=>!(await view(id)).stopping,'cancelled turn cleanup finishes');
     await new Promise(resolve=>setTimeout(resolve,1100));
     assert.equal(captures(id).length,1,'cancelled or absent intent must not start another turn');
     assert.equal((await view(id)).continuation,null);
@@ -2385,11 +2389,11 @@ async function browserAddFilterCondition(page,group,field,value) {
 
 async function browserApplyFilters(page) {
   await page.locator('#apply-agent-filter').click();
-  await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&document.querySelector('#apply-agent-filter').disabled&&!document.querySelector('#agent-filter-draft-error').textContent);
+  await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!!state.pages.agentBrowser.revision&&!state.pages.agentBrowser.pending&&!state.agentFilterDraft?.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&document.querySelector('#apply-agent-filter').disabled&&!document.querySelector('#agent-filter-draft-error').textContent);
 }
 
 async function browserBooleanQueryChecks(page,api,project) {
-  const settled=async search=>page.waitForFunction(search=>currentAgentQuery()?.raw===search&&!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser'),search);
+  const settled=async search=>page.waitForFunction(search=>currentAgentQuery()?.raw===search&&!!currentAgentQuery()?.value&&!!state.pages.agentBrowser.revision&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser'),search);
   for(const search of ['state:idle OR pause_reason:limit','NOT (state:closed OR state:replaced)','state:closed OR (state:paused NOT pause_reason:limit)']) {
     const expected=await api('GET',`/agents?project=${project}&search=${encodeURIComponent(search)}`);
     await page.locator('#agent-search').fill(search); await settled(search);

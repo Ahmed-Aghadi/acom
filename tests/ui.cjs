@@ -1124,6 +1124,152 @@ test('config selection alone survives polling and switches without discard confi
   assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
 }));
 
+test('loading a configuration locks dependent editing and survives polling without saving the previous shared config', async () => fixture(async (page, data) => {
+  await manualPolling(page);
+  const next=settings(); next.prompts.launch='x'.repeat(20000); next.max_lock_ttl_secs=1234;
+  data.configs.push({id:3,name:'Large config',settings:next});
+  await reloadPage(page); await page.locator('[data-page=settings]').click();
+  const pending=await holdRequest(page,'**/configs/3*','GET');
+  try {
+    await page.locator('#config-select').selectOption('3'); await pending.started;
+    assert.match(await page.locator('#settings-save-state').textContent(),/loading.*config/i);
+    for(const selector of ['[name=max_lock_ttl_secs]','[name=config_name]','#save-config-as','#remove-config','[form=settings-form]'])assert.equal(await page.locator(selector).isDisabled(),true,selector);
+    assert.equal(await page.locator('#config-select').isEnabled(),true);
+    assert.equal(await page.locator('#project-select').isEnabled(),true);
+    const input=await page.locator('[name=max_lock_ttl_secs]').elementHandle();
+    data.projects[0].name='Updated project'; await page.evaluate(()=>refresh());
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').evaluate((node,previous)=>node===previous,input),true,'polling preserves the loading editor DOM');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').isDisabled(),true);
+    assert.equal(await page.evaluate(()=>state.editor.dirty),false,'loading is not an edit');
+    await page.locator('#save-config-as').dispatchEvent('click');
+    await page.locator('#remove-config').dispatchEvent('click');
+    await page.locator('#settings-form').dispatchEvent('submit');
+    await page.locator('#config-form').dispatchEvent('submit');
+    assert.equal(await page.locator('#config-dialog').isVisible(),false);
+    assert.deepEqual(data.requests,[],'forced events cannot mutate the previous config');
+    pending.release(); await pending.remove();
+    await page.waitForFunction(()=>state.editor.config===3);
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'1234');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
+    await page.locator('[name=max_lock_ttl_secs]').fill('777'); await saveSettings(page);
+    assert.equal(data.configs.find(config=>config.id===2).settings.max_lock_ttl_secs,900);
+    assert.equal(data.configs.find(config=>config.id===3).settings.max_lock_ttl_secs,777);
+    assert.equal(data.projects[0].config,3);
+  } finally {pending.release();await pending.remove();}
+}));
+
+test('a forced submit during configuration loading never writes the previously selected shared config', async () => fixture(async (page, data) => {
+  await manualPolling(page);
+  const next=settings();next.prompts.launch='x'.repeat(20000);
+  data.configs.push({id:3,name:'Large config',settings:next});
+  await reloadPage(page);await page.locator('[data-page=settings]').click();
+  const pending=await holdRequest(page,'**/configs/3*','GET');
+  try {
+    await page.locator('#config-select').selectOption('3');await pending.started;
+    await page.locator('[name=max_lock_ttl_secs]').evaluate(input=>{input.value='777';input.dispatchEvent(new Event('input',{bubbles:true}));});
+    await page.locator('#settings-form').dispatchEvent('submit');
+    await page.waitForTimeout(100);
+    assert.deepEqual(data.requests,[]);
+    assert.equal(data.configs.find(config=>config.id===2).settings.max_lock_ttl_secs,900);
+    assert.equal(await page.locator('[form=settings-form]').isDisabled(),true);
+    pending.release();await pending.remove();await page.waitForFunction(()=>state.editor.config===3);
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'900');
+  } finally {pending.release();await pending.remove();}
+}));
+
+test('late configuration failures cannot reset or unlock a newer pending selection', async () => fixture(async (page, data) => {
+  await manualPolling(page);
+  for(const id of [3,4]) {const next=settings();next.prompts.launch='x'.repeat(20000);next.max_lock_ttl_secs=id*100;data.configs.push({id,name:`Large ${id}`,settings:next});}
+  await reloadPage(page);await page.locator('[data-page=settings]').click();
+  while(await page.locator('#settings-form [data-more=configs]').isVisible()) {await page.locator('#settings-form [data-more=configs]').click();await page.waitForFunction(()=>!state.pages.configs.pending);}
+  let release,started;
+  const gate=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{started=resolve;});
+  const reject=async route=>{started();await gate;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Old config unavailable'})});};
+  await page.route('**/configs/3*',reject);
+  const newer=await holdRequest(page,'**/configs/4*','GET');
+  try {
+    await page.locator('#config-select').selectOption('3');await entered;
+    await page.locator('#config-select').selectOption('4');await newer.started;
+    release();await page.waitForTimeout(100);
+    assert.equal(await page.locator('#config-select').inputValue(),'4');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').isDisabled(),true);
+    assert.match(await page.locator('#settings-save-state').textContent(),/loading.*config/i);
+    assert.doesNotMatch(await page.locator('#toast').textContent(),/Old config unavailable/);
+    newer.release();await newer.remove();await page.waitForFunction(()=>state.editor.config===4);
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'400');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
+    assert.deepEqual(data.requests,[]);
+  } finally {release();newer.release();await newer.remove();await page.unroute('**/configs/3*',reject);}
+}));
+
+test('a failed configuration load restores the previous unsaved draft and selection', async () => fixture(async (page,data)=>{
+  await manualPolling(page);
+  const next=settings();next.prompts.launch='x'.repeat(20000);data.configs.push({id:3,name:'Large config',settings:next});
+  await reloadPage(page);await page.locator('[data-page=settings]').click();
+  await page.locator('[name=max_lock_ttl_secs]').fill('777');
+  const reject=route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Config unavailable'})});
+  await page.route('**/configs/3*',reject);
+  await page.locator('#config-select').selectOption('3');
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Config unavailable'));
+  assert.equal(await page.locator('#config-select').inputValue(),'2');
+  assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'777');
+  assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
+  assert.equal(await page.evaluate(()=>state.editor.dirty),true);
+  assert.equal(await page.locator('[form=settings-form]').isEnabled(),true);
+  assert.deepEqual(data.requests,[]);await page.unroute('**/configs/3*',reject);
+}));
+
+test('rapid configuration A to B to A selections accept only the latest load, even before the editor changes', async () => fixture(async (page,data)=>{
+  await manualPolling(page);
+  for(const id of [3,4]) {const next=settings();next.prompts.launch='x'.repeat(20000);next.max_lock_ttl_secs=id*100;data.configs.push({id,name:`Large ${id}`,settings:next});}
+  await reloadPage(page);await page.locator('[data-page=settings]').click();
+  while(await page.locator('#settings-form [data-more=configs]').isVisible()) {await page.locator('#settings-form [data-more=configs]').click();await page.waitForFunction(()=>!state.pages.configs.pending);}
+  const requests=[];
+  const hold=async route=>{
+    if(new URL(route.request().url()).searchParams.has('offset'))return route.continue();
+    let release;const gate=new Promise(resolve=>{release=resolve;});requests.push({id:Number(new URL(route.request().url()).pathname.split('/').at(-1)),release});
+    await gate;await route.continue().catch(()=>{});
+  };
+  await page.route(/\/configs\/[34](?:\?|$)/,hold);
+  try {
+    for(const [index,id] of [3,4,3].entries()) {await page.locator('#config-select').selectOption(String(id));for(let attempt=0;attempt<100&&requests.length<=index;attempt++)await page.waitForTimeout(20);assert.equal(requests.length,index+1);}
+    for(const index of [0,1]) {
+      requests[index].release();await page.waitForTimeout(100);
+      assert.equal(await page.locator('#config-select').inputValue(),'3');
+      assert.equal(await page.evaluate(()=>state.editor.config),2);
+      assert.equal(await page.locator('[name=max_lock_ttl_secs]').isDisabled(),true);
+      assert.equal(await page.evaluate(()=>state.configs.find(config=>config.id===3).settings),undefined,'stale hydration does not replace the cache');
+    }
+    requests[2].release();await page.waitForFunction(()=>state.editor.config===3);
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'300');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
+    assert.deepEqual(data.requests,[]);
+  } finally {requests.forEach(request=>request.release());await page.unroute(/\/configs\/[34](?:\?|$)/,hold);}
+}));
+
+test('configuration load failures from an earlier project selection leave the current draft untouched after switching away and back', async () => fixture(async (page,data)=>{
+  await manualPolling(page);
+  const next=settings();next.prompts.launch='x'.repeat(20000);data.configs.push({id:3,name:'Large config',settings:next});
+  await reloadPage(page);await page.locator('[data-page=settings]').click();
+  let release,started;
+  const gate=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{started=resolve;});
+  const reject=async route=>{started();await gate;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Obsolete config failure'})});};
+  await page.route('**/configs/3*',reject);
+  try {
+    await page.locator('#config-select').selectOption('3');await entered;
+    for(const project of ['2','1']) {await page.locator('#project-select').selectOption(project);await page.waitForFunction(id=>state.selectedProject===id&&refreshPending===0&&!!state.editor,Number(project));}
+    await page.locator('[name=max_lock_ttl_secs]').fill('777');
+    release();await page.waitForTimeout(100);
+    assert.equal(await page.locator('#config-select').inputValue(),'2');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'777');
+    assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
+    assert.equal(await page.evaluate(()=>state.editor.dirty),true);
+    assert.equal(await page.locator('[form=settings-form]').isEnabled(),true);
+    assert.doesNotMatch(await page.locator('#toast').textContent(),/Obsolete config failure/);
+    assert.deepEqual(data.requests,[]);
+  } finally {release();await page.unroute('**/configs/3*',reject);}
+}));
+
 test('Save reflects semantic settings, names and bindings; reverted edits leave the applied config unchanged', async () => fixture(async (page, data) => {
   await page.locator('[data-page=settings]').click();
   const save = page.locator('[form=settings-form]');

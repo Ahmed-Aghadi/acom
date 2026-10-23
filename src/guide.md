@@ -8,7 +8,7 @@ Examples illustrate syntax and possibilities, not prescribed workflows. Choose m
 
 ## Turns and lifecycle
 
-A turn runs until your process exits. Between turns no model turn runs, but an idle agent still occupies an active-agent slot. Before ending, finish or stop shell/background tasks and monitors; they cannot carry work across turns.
+A turn runs until your process exits. Between turns no model turn runs, but an idle agent still occupies an active-agent slot. Before ending, finish or stop shell/background tasks and monitors: they may outlive an ordinary idle turn and are not suspended. acom stops owned tools before finishing, failure/recovery, pause, continuation or replacement.
 
 | State | Meaning | What can start another turn |
 | --- | --- | --- |

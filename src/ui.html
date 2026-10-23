@@ -625,7 +625,7 @@
       const form = $('#message-form');
       if (form) saveDraft(form.dataset.draftProject, form.dataset.draftThread, $('[name=text]', form).value);
     }
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, configLoading: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
     const icons = {"overview": "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>", "chat": "<path d=\"M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z\"/>", "settings": "<path d=\"m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>", "search": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/>", "agents": "<rect x=\"4\" y=\"7\" width=\"16\" height=\"13\" rx=\"3\"/><path d=\"M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4\"/>", "warning": "<path d=\"m12 3 10 18H2zM12 9v4M12 17h.01\"/>", "lock": "<rect x=\"4\" y=\"10\" width=\"16\" height=\"11\" rx=\"2\"/><path d=\"M8 10V7a4 4 0 0 1 8 0v3M12 14v3\"/>", "moon": "<path d=\"M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z\"/>", "sun": "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5\"/>", "check": "<path d=\"m5 12 4 4L19 6\"/>"};
     icons.copy = '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/>';
     const svgIcon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || ''}</svg>`;
@@ -865,11 +865,13 @@
         button.hidden = !page?.has_more || (button.dataset.more === 'agentBrowser' && (page.scope !== collectionPath('agentBrowser') || !currentAgentQuery()?.value)); button.disabled = !!page?.pending;
       });
     }
-    async function configSettings(id) {
+    async function configSettings(id, current = () => true) {
       const config = state.configs.find(c => c.id === id);
       if (config?.settings) return config.settings;
-      const full = await record(`/configs/${id}`);
-      if (config) { Object.assign(config, full); delete config.truncated; }
+      const full = await record(`/configs/${id}`, undefined, current);
+      if (!current()) return null;
+      const cached = state.configs.find(c => c.id === id);
+      if (cached) { Object.assign(cached, full); delete cached.truncated; }
       else state.configs.push(full);
       return full.settings;
     }
@@ -947,7 +949,7 @@
     function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); renderStorage(); updatePaging(); }
 
     function setSelectedProject(project) {
-      if (state.selectedProject !== project) { storage.scope = project; storage.revision++; }
+      if (state.selectedProject !== project) { storage.scope = project; storage.revision++; state.configLoading = null; }
       state.selectedProject = project;
     }
 
@@ -1931,7 +1933,7 @@
     window.addEventListener('focus', markThreadRead);
 
     function syncSettings(force = false) {
-      if (!state.settings || state.saving || ((state.editor?.dirty || state.editor?.pending) && !force)) return;
+      if (!state.settings || state.saving || state.configLoading || ((state.editor?.dirty || state.editor?.pending) && !force)) return;
       const project = state.project?.id ?? null;
       const config = state.project ? state.project.config : (state.editor?.project == null ? state.editor?.config ?? 1 : 1);
       const s = config == null ? state.settings : state.configs.find(c => c.id === config)?.settings || state.settings;
@@ -2437,6 +2439,7 @@
       }
       if(event.target.closest('#thread-unread')) { $('#messages').scrollTop = $('#messages').scrollHeight; await markThreadRead(); return; }
       if (event.target.closest('#save-config-as')) {
+        if (state.saving || state.configLoading) return;
         if ($('#settings-form').reportValidity()) {
           try {
             collectSettings(); $('#config-form').reset();
@@ -2448,6 +2451,7 @@
         return;
       }
       if (event.target.closest('#remove-config')) {
+        if (state.saving || state.configLoading) return;
         const config = state.configs.find(c => c.id === state.editor.config);
         if (!config || !confirm(`Remove config “${config.name}”?`)) return;
         setSettingsBusy(true);
@@ -2661,16 +2665,27 @@
     });
     $('#settings-form').addEventListener('change', async event => {
       if (event.target.id === 'config-select') {
-        if (!discardSettings()) { event.target.value = state.editor.config ?? 'custom'; return; }
+        if (state.saving) { event.target.value = state.editor.config ?? 'custom'; return; }
+        if (!discardSettings()) { state.configLoading = null; event.target.value = state.editor.config ?? 'custom'; setSettingsControls(); return; }
         const config = event.target.value === 'custom' ? null : Number(event.target.value);
-        const project = state.selectedProject;
-        let s;
-        try { s = config == null && state.project?.config == null ? state.settings : await configSettings(config ?? 1); }
-        catch (error) { toast(error.message, true); event.target.value = state.editor.config ?? 'custom'; return; }
-        if (project !== state.selectedProject || $('#config-select') !== event.target || event.target.value !== (config ?? 'custom').toString()) return;
-        state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: false, pending: !!state.project && config !== state.project.config };
-        renderSettings(); return;
+        const project = state.selectedProject, select = event.target;
+        const selection = state.configLoading = {project, config};
+        const current = () => state.configLoading === selection && project === state.selectedProject && $('#config-select') === select && select.value === (config ?? 'custom').toString();
+        setSettingsControls();
+        try {
+          const s = config == null && state.project?.config == null ? state.settings : await configSettings(config ?? 1, current);
+          if (!current()) return;
+          state.configLoading = null;
+          state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: false, pending: !!state.project && config !== state.project.config };
+          renderSettings();
+        } catch (error) {
+          if (current()) { select.value = state.editor.config ?? 'custom'; toast(error.message, true); }
+        } finally {
+          if (state.configLoading === selection) { state.configLoading = null; setSettingsControls(); }
+        }
+        return;
       }
+      if (state.saving || state.configLoading) return;
       const retry = event.target.closest('[data-retry-rule]');
       if (retry) { syncRetryChoices(retry, event.target.name === 'retry_harness'); updateSettingsDirty(); return; }
       const root = event.target.closest('[data-harness]');
@@ -2681,6 +2696,7 @@
       updateSettingsDirty();
     });
     $('#settings-form').addEventListener('input', event => {
+      if (state.saving || state.configLoading) return;
       const retry = event.target.closest('[data-retry-rule]');
       if (retry && ['retry_custom_source', 'retry_custom_model'].includes(event.target.name)) syncRetryChoices(retry);
       if (event.target.id !== 'config-select') updateSettingsDirty();
@@ -3039,7 +3055,7 @@
       return JSON.stringify([...new FormData($('#settings-form'))].filter(([name]) => !['add_model', 'config_name'].includes(name)));
     }
     function updateSettingsDirty() {
-      if (!state.editor) return;
+      if (!state.editor || state.configLoading) return;
       try { state.editor.dirty = settingsFingerprint(collectSettings()) !== state.editor.baseline; }
       catch (_) { state.editor.dirty = settingsFormFingerprint() !== state.editor.formBaseline; }
       const name = $('[name=config_name]', $('#settings-form'))?.value.trim();
@@ -3048,12 +3064,14 @@
       setSettingsControls();
     }
     function setSettingsControls() {
-      const busy = state.saving, readOnly = state.editor?.config === 1;
-      setText($('#settings-save-state'), busy ? 'Saving…' : state.editor?.dirty ? 'Unsaved changes' : state.editor?.pending ? 'Selection not applied' : readOnly ? 'Default · read-only' : 'All changes saved');
-      $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (readOnly && !el.dataset.more && !['config-select','save-config-as'].includes(el.id)));
-      $('[form="settings-form"]').disabled = busy || !(state.editor?.dirty || state.editor?.pending);
+      const busy = state.saving, loading = !!state.configLoading, readOnly = state.editor?.config === 1;
+      setText($('#settings-save-state'), busy ? 'Saving…' : loading ? 'Loading configuration…' : state.editor?.dirty ? 'Unsaved changes' : state.editor?.pending ? 'Selection not applied' : readOnly ? 'Default · read-only' : 'All changes saved');
+      $('#settings-form').setAttribute('aria-busy', String(busy || loading));
+      $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (loading && el.id !== 'config-select' && el.dataset.more !== 'configs') || (readOnly && !el.dataset.more && !['config-select','save-config-as'].includes(el.id)));
+      $('[form="settings-form"]').disabled = busy || loading || !(state.editor?.dirty || state.editor?.pending);
+      $('#config-form button.primary').disabled = busy || loading;
       const config = state.configs.find(c => c.id === state.editor?.config);
-      if ($('#remove-config')) $('#remove-config').disabled = busy || !!config?.projects.length;
+      if ($('#remove-config')) $('#remove-config').disabled = busy || loading || !!config?.projects.length;
     }
     function setSettingsBusy(busy) {
       state.saving = busy;
@@ -3062,9 +3080,9 @@
       $('#remove-project').disabled = busy || !state.project || state.project.truncated || pendingProjectRemovals.has(state.project.id) || (state.project.agents ?? state.pages.agents?.total ?? state.agents.length) > 0;
       $('#project-form button.primary').disabled = busy;
       setSettingsControls();
-      $('#config-form button.primary').disabled = busy;
     }
     async function saveConfig(name) {
+      if (state.saving || state.configLoading) throw new Error('Wait for the current configuration request to finish before saving.');
       const editor = state.editor;
       const next = collectSettings();
       setSettingsBusy(true);

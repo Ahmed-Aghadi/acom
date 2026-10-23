@@ -3,8 +3,8 @@ Third-party notices for acom
 
 acom's own source is MIT-licensed (see LICENSE). Third-party components retain the terms below.
 Reviewed Cargo targets: aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu.
-Cargo.lock SHA-256: 299d06614059518416bdec7b14271e2f30d1303ff7d8c26a25af51925c3c2061.
-Cargo.toml SHA-256: 8deb00ad12341c3aae4d25916c4b63f7fc73a7e2c4d124dd6c98e4c1f061d249.
+Cargo.lock SHA-256: b09745ce6e116096be1be89f432131c2b717848ebecba4173e26de232215f0e9.
+Cargo.toml SHA-256: 85800470e144588d46ad8b557209d6dfbc5e4d6317c2f4e52716a0fef7ee6c7a.
 Build-time dependencies and bundled dependency source are included conservatively; not all are linked.
 Rust toolchain/standard-library and separately supplied system-library notices are outside this inventory.
 Before publishing binaries, include the matching toolchain/platform notices for that release.
@@ -3022,10 +3022,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-rustls 0.23.45
+rustls 0.23.46
 Upstream license: Apache-2.0 OR ISC OR MIT
 Selected terms: MIT
-Source: https://crates.io/crates/rustls/0.23.45
+Source: https://crates.io/crates/rustls/0.23.46
 
 LICENSE-MIT
 ----------------------------------------
@@ -3088,10 +3088,10 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-rustls-webpki 0.103.15
+rustls-webpki 0.103.16
 Upstream license: ISC
 Selected terms: ISC
-Source: https://crates.io/crates/rustls-webpki/0.103.15
+Source: https://crates.io/crates/rustls-webpki/0.103.16
 
 LICENSE
 ----------------------------------------
@@ -3484,6 +3484,7 @@ tiny_http 0.12.0
 Upstream license: MIT OR Apache-2.0
 Selected terms: MIT
 Source: https://crates.io/crates/tiny_http/0.12.0
+Locally patched for bounded discard and rejection of truncated chunked bodies; upstream license unchanged. Provenance and source checksums: vendor/tiny_http/ACOM_PATCH.md.
 
 LICENSE-MIT
 ----------------------------------------
@@ -3764,10 +3765,10 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-webpki-roots 1.0.9
+webpki-roots 1.0.10
 Upstream license: CDLA-Permissive-2.0
 Selected terms: CDLA-Permissive-2.0
-Source: https://crates.io/crates/webpki-roots/1.0.9
+Source: https://crates.io/crates/webpki-roots/1.0.10
 
 LICENSE
 ----------------------------------------

@@ -19,6 +19,7 @@ use std::time::Duration;
 const UI: &str = include_str!("ui.html");
 const MARKDOWN: &str = include_str!("vendor/markdown-it-15.0.3.min.js");
 const MARKDOWN_NOTICES: &str = include_str!("vendor/NOTICES.txt");
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -119,21 +120,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let method = req.method().as_str().to_string();
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
-    let mut body = String::new();
-    let read = req.as_reader().read_to_string(&mut body);
-    let res = if !same_origin(app, &req, &method) {
-        Err(Fail(
-            403,
-            "requests must come from this server's own page or the acom command".into(),
-        ))
-    } else if let Err(error) = read {
-        Err(bad(format!("cannot read request body: {error}")))
-    } else if body.trim().is_empty() {
-        Ok(json!({}))
-    } else {
-        parse_body(&body)
-    }
-    .and_then(|b| {
+    let res = request_body(app, &mut req, &method).and_then(|b| {
         let segs: Vec<&str> = path
             .trim_matches('/')
             .split('/')
@@ -157,6 +144,39 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
             ),
     );
+}
+
+fn request_body(app: &App, req: &mut tiny_http::Request, method: &str) -> R<Value> {
+    if !same_origin(app, req, method) {
+        return Err(Fail(
+            403,
+            "requests must come from this server's own page or the acom command".into(),
+        ));
+    }
+    let too_large = || Fail(413, "request body exceeds 16 MiB (16777216 bytes)".into());
+    let expected = req.body_length();
+    if expected.is_some_and(|bytes| bytes > MAX_REQUEST_BYTES) {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    req.as_reader()
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| bad(format!("cannot read request body: {error}")))?;
+    if bytes.len() > MAX_REQUEST_BYTES {
+        return Err(too_large());
+    }
+    if expected.is_some_and(|length| length != bytes.len()) {
+        return Err(bad(
+            "incomplete request body: Content-Length does not match",
+        ));
+    }
+    let body = std::str::from_utf8(&bytes).map_err(|_| bad("request body must be valid UTF-8"))?;
+    if body.trim().is_empty() {
+        Ok(json!({}))
+    } else {
+        parse_body(body)
+    }
 }
 
 fn error_body(msg: &str) -> String {
@@ -274,7 +294,11 @@ fn same_origin(app: &App, req: &tiny_http::Request, method: &str) -> bool {
     });
     let origin_ok = header("Origin").is_none_or(|o| o == app.url || o == local);
     let json_ok = method == "GET"
-        || header("Content-Type").is_some_and(|c| c.starts_with("application/json"));
+        || header("Content-Type").is_some_and(|c| {
+            c.split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
     host_ok && origin_ok && json_ok
 }
 

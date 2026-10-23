@@ -8,6 +8,8 @@ The only browser library is a pinned local Markdown parser; its [dependency revi
 
 The server rejects unknown request fields/query parameters, duplicate keys and malformed supplied values before applying an action; CLI/UI checks are additional safeguards. Defaults apply only to documented omissions/nulls. Failures return an HTTP error and a nonzero CLI exit status. A successful registration or queued action is not a completed event or provider turn: inspect its receipt and subsequent status. If a write's result is uncertain, inspect state before retrying.
 
+Request bodies are capped at 16 MiB after transfer decoding. A [narrow local tiny_http patch](../vendor/tiny_http/ACOM_PATCH.md) bounds unread-body discard allocation and rejects truncated chunks; retain its provenance and regressions when updating the dependency. The handler rejects invalid origins/media types before reading, but the library can prebuffer small bodies. Body draining still waits for data/disconnection: this is not general slow-client or denial-of-service protection.
+
 ## Licenses and releases
 
 Keep the project's MIT [LICENSE](../LICENSE) unchanged when updating third-party notices. [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt) is generated from the reviewed [Rust inventory](../licenses/rust.json) and existing Markdown notices. It includes build dependencies and bundled native-source notices conservatively, not a claim that every listed source file is linked. `acom licenses` embeds and prints the project's license followed by these notices without using a server, provider or data directory.
@@ -30,10 +32,13 @@ When developing beside a running instance, use a separate `CARGO_TARGET_DIR` and
 
 ```sh
 cargo test
+cargo test --locked --offline -p tiny_http --lib
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-access.cjs tests/wait-watch.cjs tests/subscriptions.cjs
-node --test tests/storage.cjs
+node --test tests/storage.cjs tests/http-boundaries.cjs tests/process-cleanup.cjs
+node --test tests/licenses.cjs
+cargo audit
 ```
 
 Browser tests for the UI (optional; no model turns or provider login):

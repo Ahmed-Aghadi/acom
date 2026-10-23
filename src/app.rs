@@ -2374,6 +2374,12 @@ impl App {
     /// Called when an agent's process exits. `error` explains a failed exit, if known.
     pub fn turn_ended(self: &Arc<Self>, id: i64, pid: u32, ok: bool, error: Option<&str>) -> R<()> {
         let mut st = self.lock();
+        while !st.shutting_down
+            && st.stopping_agents.contains(&id)
+            && st.procs.get(&id).is_some_and(|p| p.pid == pid)
+        {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
         if st.procs.get(&id).is_some_and(|p| p.pid != pid) {
             return Ok(()); // not this process's entry; never happens since turns don't overlap
         }
@@ -2516,18 +2522,18 @@ impl App {
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
         }
-        self.finish_stop(st, id, "pause", "you were paused")?;
+        self.finish_stop(st, id, "pause", Some("you were paused"))?;
         self.cv.notify_all();
         Ok(())
     }
 
     /// Stop asynchronously: the process waiter needs this mutex to record exit.
-    fn finish_stop(
+    pub(crate) fn finish_stop(
         self: &Arc<Self>,
         st: &mut St,
         id: i64,
         action: &'static str,
-        reason: &'static str,
+        reason: Option<&'static str>,
     ) -> R<()> {
         if st.stopping_agents.contains(&id) {
             return Ok(());
@@ -2554,7 +2560,20 @@ impl App {
                 let result = stopped.and_then(|_| {
                     let mut st = app.lock();
                     st.atomic(|st| {
-                        st.release_all(id, reason)?;
+                        // A pause/close can supersede turn cleanup while its tools stop.
+                        let state: String =
+                            st.db
+                                .query_row("SELECT state FROM agents WHERE id=?1", [id], |r| {
+                                    r.get(0)
+                                })?;
+                        let reason = match state.as_str() {
+                            "paused" => Some("you were paused"),
+                            "closed" => Some("you were closed"),
+                            _ => reason,
+                        };
+                        if let Some(reason) = reason {
+                            st.release_all(id, reason)?;
+                        }
                         st.db.execute(
                             "UPDATE view_revisions SET value=value+1 WHERE name='agents'",
                             [],
@@ -2880,7 +2899,7 @@ impl App {
         if let Some(p) = st.procs.get_mut(&id) {
             p.stopping = true;
         }
-        self.finish_stop(&mut st, id, "close", "you were closed")?;
+        self.finish_stop(&mut st, id, "close", Some("you were closed"))?;
         self.cv.notify_all();
         Ok(())
     }
@@ -3085,18 +3104,17 @@ impl App {
             st.notice(id,"Replacement queued. End this turn without acom done. After your successful exit, ownership transfers permanently to a new agent, even if its startup waits or fails. It receives your task summary, history paths and static memberships.")?;
             Ok(())
         })?;
-        Self::cleanup_reaped_followup(&st, id);
+        self.cleanup_reaped_turn(&mut st, id)?;
         Ok(warnings)
     }
 
-    fn cleanup_reaped_followup(st: &St, id: i64) {
+    fn cleanup_reaped_turn(self: &Arc<Self>, st: &mut St, id: i64) -> R<()> {
         // A request may arrive after the parent exits but before inherited stdout
         // closes. Clean its remaining tools now so turn_ended can proceed.
-        if st.reaped.contains(&id)
-            && let Some(proc) = st.procs.get(&id)
-        {
-            run::kill_group(proc.pid, libc::SIGKILL);
+        if st.reaped.contains(&id) && st.procs.contains_key(&id) {
+            self.finish_stop(st, id, "turn", None)?;
         }
+        Ok(())
     }
 
     fn has_start(st: &St, id: i64) -> R<bool> {
@@ -3332,7 +3350,7 @@ impl App {
 
     /// Change the requested model/effort for the next turn; never interrupt tools.
     pub fn configure_agent(
-        &self,
+        self: &Arc<Self>,
         id: i64,
         by: i64,
         model: Option<&str>,
@@ -3436,7 +3454,7 @@ impl App {
             Ok(())
         })?;
         if continuation.is_some() {
-            Self::cleanup_reaped_followup(&st, id);
+            self.cleanup_reaped_turn(&mut st, id)?;
         }
         Ok(())
     }
@@ -3476,7 +3494,7 @@ impl App {
         Ok(())
     }
 
-    pub fn mark_done(&self, id: i64) -> R<()> {
+    pub fn mark_done(self: &Arc<Self>, id: i64) -> R<()> {
         let mut st = self.lock();
         if st.agent(id)?.state != "working" {
             return Err(conflict("only a working agent can mark itself done"));
@@ -3486,7 +3504,8 @@ impl App {
             st.db
                 .execute("UPDATE agents SET done_req=1 WHERE id=?1", [id])?;
             Ok(())
-        })
+        })?;
+        self.cleanup_reaped_turn(&mut st, id)
     }
 
     fn normalize_watch(st: &St, id: i64, options: &WaitOptions) -> R<Option<AgentWatch>> {
@@ -4668,24 +4687,24 @@ impl App {
 
     /// A provider reported a failed turn, even if its process later exits with status zero.
     /// Do not recover until stdout and side-file workers finish and the child is reaped.
-    pub fn fail_turn(&self, id: i64, reason: &str) -> R<()> {
+    pub fn fail_turn(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
         let mut st = self.lock();
         let reaped = st.reaped.contains(&id);
         if let Some(p) = st.procs.get_mut(&id) {
             p.failure.get_or_insert_with(|| reason.into());
-            if reaped {
-                run::kill_group(p.pid, libc::SIGKILL);
-            }
+        }
+        if reaped && st.procs.contains_key(&id) {
+            self.finish_stop(&mut st, id, "turn", None)?;
         }
         Ok(())
     }
 
     /// Stop a reported model substitution without turning it into a user/quota pause.
-    pub fn fail_and_stop(&self, id: i64, reason: &str) -> R<()> {
-        self.fail_turn(id, reason)?;
-        let st = self.lock();
-        if let Some(p) = st.procs.get(&id) {
-            run::stop(p.pid);
+    pub fn fail_and_stop(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
+        let mut st = self.lock();
+        if let Some(p) = st.procs.get_mut(&id) {
+            p.failure.get_or_insert_with(|| reason.into());
+            self.finish_stop(&mut st, id, "turn", None)?;
         }
         Ok(())
     }
@@ -10851,6 +10870,9 @@ mod tests {
             let app = self_change_app();
             let mut child = std::process::Command::new("sleep")
                 .arg("30")
+                .env("ACOM_ID", "1")
+                .env("ACOM_URL", &app.url)
+                .env("ACOM_HOME", &app.home)
                 .process_group(0)
                 .spawn()
                 .unwrap();
@@ -10895,6 +10917,10 @@ mod tests {
                     panic!("committed followup did not clean the reaped worker's group");
                 }
                 std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut st = app.lock();
+            while st.stopping_agents.contains(&1) {
+                st = app.cv.wait(st).unwrap();
             }
         }
     }

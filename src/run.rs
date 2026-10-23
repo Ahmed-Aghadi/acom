@@ -354,17 +354,6 @@ pub fn is_our_agent_group(group: u32, id: i64, url: &str) -> bool {
     })
 }
 
-/// SIGTERM the agent's process group, then SIGKILL whatever is left a few seconds later.
-pub fn stop(pid: u32) {
-    kill_group(pid, libc::SIGTERM);
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(5));
-        if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
-            kill_group(pid, libc::SIGKILL);
-        }
-    });
-}
-
 pub fn log_path(app: &App, id: i64, ext: &str) -> PathBuf {
     app.home.join("logs").join(format!("{id}.{ext}"))
 }
@@ -693,7 +682,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             thread::spawn(move || {
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
                 let ended_at = capture_time();
-                cleanup_failed_group(&app, id, pid, ok);
+                cleanup_ended_turn(&app, id, pid, ok);
                 (ok, ended_at)
             })
         };
@@ -708,7 +697,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             .flatten();
         done.store(true, Ordering::SeqCst);
         let _ = side.join();
-        cleanup_failed_group(&app, id, pid, ok);
+        cleanup_ended_turn(&app, id, pid, ok);
         append_entry(
             &log_path(&app, id, "txt"),
             &ended_at,
@@ -730,8 +719,8 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
     });
 }
 
-/// Failed/stopped turns must not leave old background tools running into recovery.
-fn cleanup_failed_group(app: &App, id: i64, pid: u32, ok: bool) {
+/// Only unfinished idle success may keep owned background tools.
+fn cleanup_ended_turn(app: &Arc<App>, id: i64, pid: u32, ok: bool) {
     let mut st = app.lock();
     let current = st.procs.get(&id).is_some_and(|p| p.pid == pid);
     if current {
@@ -741,18 +730,21 @@ fn cleanup_failed_group(app: &App, id: i64, pid: u32, ok: bool) {
         .procs
         .get(&id)
         .is_some_and(|p| p.pid == pid && (!ok || p.failure.is_some() || p.stopping));
-    let followup = current
+    let finishing = current
         && st
             .db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_handoffs WHERE agent_id=?1)
-                OR EXISTS(SELECT 1 FROM agent_continuations WHERE agent_id=?1)",
+                OR EXISTS(SELECT 1 FROM agent_continuations WHERE agent_id=?1)
+                OR EXISTS(SELECT 1 FROM agents WHERE id=?1 AND (done_req=1 OR rest='done'))",
                 [id],
                 |r| r.get::<_, bool>(0),
             )
-            .unwrap_or(false);
-    if kill || followup {
-        kill_group(pid, libc::SIGKILL);
+            .unwrap_or(true);
+    if (kill || finishing)
+        && let Err(error) = app.finish_stop(&mut st, id, "turn", None)
+    {
+        eprintln!("agent {id}: couldn't begin owned-tool cleanup: {}", error.1);
     }
 }
 
@@ -1058,7 +1050,9 @@ mod tests {
 
     fn test_app(pid: u32) -> Arc<App> {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT); INSERT INTO agents VALUES(1,'working');").unwrap();
+        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT,done_req INTEGER DEFAULT 0,rest TEXT DEFAULT 'idle'); INSERT INTO agents(id,state) VALUES(1,'working');
+            CREATE TABLE view_revisions(name TEXT PRIMARY KEY,value INTEGER); INSERT INTO view_revisions VALUES('agents',0);
+            CREATE TABLE agent_handoffs(agent_id INTEGER); CREATE TABLE agent_continuations(agent_id INTEGER);").unwrap();
         Arc::new(App {
             st: Mutex::new(St {
                 db,
@@ -1473,22 +1467,26 @@ mod tests {
             (true, true, false),
             (true, false, true),
         ] {
+            let app = test_app(0);
             let mut child = std::process::Command::new("sleep")
                 .arg("30")
+                .env("ACOM_ID", "1")
+                .env("ACOM_URL", &app.url)
+                .env("ACOM_HOME", &app.home)
                 .process_group(0)
                 .spawn()
                 .unwrap();
             let pid = child.id();
-            let app = test_app(pid);
             {
                 let mut st = app.lock();
                 let worker = st.procs.get_mut(&1).unwrap();
+                worker.pid = pid;
                 worker.failure = failed.then(|| "turn failed".into());
                 worker.stopping = stopping;
             }
-            cleanup_failed_group(&app, 1, pid + 1, false);
+            cleanup_ended_turn(&app, 1, pid + 1, false);
             let unaffected = child.try_wait().unwrap().is_none();
-            cleanup_failed_group(&app, 1, pid, ok);
+            cleanup_ended_turn(&app, 1, pid, ok);
             let successful_still_running = if ok && !failed && !stopping {
                 let running = child.try_wait().unwrap().is_none();
                 kill_group(pid, libc::SIGKILL);
@@ -1497,6 +1495,10 @@ mod tests {
                 true
             };
             let status = child.wait().unwrap();
+            let mut st = app.lock();
+            while st.stopping_agents.contains(&1) {
+                st = app.cv.wait(st).unwrap();
+            }
             assert!(unaffected, "an unrelated PID must not affect this worker");
             assert!(
                 successful_still_running,
@@ -1508,17 +1510,25 @@ mod tests {
 
     #[test]
     fn late_failure_cleans_a_reaped_workers_remaining_group() {
+        let app = test_app(0);
         let mut child = std::process::Command::new("sleep")
             .arg("30")
+            .env("ACOM_ID", "1")
+            .env("ACOM_URL", &app.url)
+            .env("ACOM_HOME", &app.home)
             .process_group(0)
             .spawn()
             .unwrap();
         let pid = child.id();
-        let app = test_app(pid);
-        cleanup_failed_group(&app, 1, pid, true);
+        app.lock().procs.get_mut(&1).unwrap().pid = pid;
+        cleanup_ended_turn(&app, 1, pid, true);
         assert!(child.try_wait().unwrap().is_none());
         assert!(app.lock().reaped.contains(&1));
         app.fail_turn(1, "late buffered failure").unwrap();
         assert!(!child.wait().unwrap().success());
+        let mut st = app.lock();
+        while st.stopping_agents.contains(&1) {
+            st = app.cv.wait(st).unwrap();
+        }
     }
 }
