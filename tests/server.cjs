@@ -2375,6 +2375,19 @@ async function browserMarkdownSendCheck(page,api) {
   assert.equal(await page.locator(`[data-message="${sent.id}"]`).count(),1,'real POST and polling reconcile without duplicate bubbles');
 }
 
+async function browserAddFilterCondition(page,group,field,value) {
+  await group.locator(':scope > .filter-editor-actions > [data-add-filter-condition]').click();
+  const condition=group.locator('.filter-condition').last();
+  await condition.locator('[data-filter-field]').selectOption(field);
+  await condition.locator('[data-filter-value]').first().fill(value);
+  return condition;
+}
+
+async function browserApplyFilters(page) {
+  await page.locator('#apply-agent-filter').click();
+  await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&document.querySelector('#apply-agent-filter').disabled&&!document.querySelector('#agent-filter-draft-error').textContent);
+}
+
 async function browserBooleanQueryChecks(page,api,project) {
   const settled=async search=>page.waitForFunction(search=>currentAgentQuery()?.raw===search&&!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser'),search);
   for(const search of ['state:idle OR pause_reason:limit','NOT (state:closed OR state:replaced)','state:closed OR (state:paused NOT pause_reason:limit)']) {
@@ -2385,32 +2398,42 @@ async function browserBooleanQueryChecks(page,api,project) {
     assert.equal(await page.evaluate(()=>state.pages.agentBrowser.total),expected.length);
     assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'false');
   }
-  const search='state:idle OR pause_reason:limit';
-  await page.locator('#agent-search').fill(search); await settled(search);
+  await page.locator('#clear-agent-filters').click(); await settled('');
   if(!await page.locator('#agent-filters').evaluate(details=>details.open))await page.locator('#agent-filters > summary').click();
-  await page.locator('#agent-filter-field').selectOption('state');
-  await page.locator('#agent-filter-value').fill('paused');
-  await page.locator('#apply-agent-filter').click();
-  await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentSearch.includes('AND'));
+  const root=page.locator('[data-filter-root]');
+  await root.locator('[data-filter-op]').first().selectOption('or');
+  await browserAddFilterCondition(page,root,'state','idle');
+  assert.equal(await root.locator('[data-filter-op]').first().inputValue(),'or','Match any remains selected with one draft condition');
+  await browserAddFilterCondition(page,root,'pause_reason','limit');
+  assert.equal(await page.locator('#agent-search').inputValue(),'','draft editing does not change the applied query');
+  await browserApplyFilters(page);
   const combined=await page.locator('#agent-search').inputValue();
   await settled(combined);
   const parsed=await api('GET',`/agent-query?search=${encodeURIComponent(combined)}`);
-  assert.equal(parsed.expression.op,'and');
-  assert.ok(parsed.expression.children.some(child=>child.op==='or'),'adding a filter preserves the OR branch');
+  assert.equal(parsed.expression.op,'or');
+  assert.deepEqual(parsed.expression.children.map(child=>child.clause.field),['state','pause_reason']);
   assert.equal(await page.evaluate(()=>state.pages.agentBrowser.total),(await api('GET',`/agents?project=${project}&search=${encodeURIComponent(combined)}`)).length);
-  await page.locator('[data-edit-agent-query]').click();
-  assert.equal(await page.locator('#agent-search').evaluate(input=>document.activeElement===input),true);
+  await browserAddFilterCondition(page,root,'provider','unknown-provider');
+  const appliedSearch=await page.locator('#agent-search').inputValue();
+  await page.waitForFunction(()=>!!document.querySelector('#agent-filter-draft-error').textContent);
+  assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true,'invalid visual values cannot be applied');
+  assert.equal(await page.locator('#agent-search').inputValue(),appliedSearch,'invalid draft leaves the applied query intact');
+  await page.locator('#cancel-agent-filter').click();
   const deepest='NOT '.repeat(32)+'state:idle';
   await page.locator('#agent-search').fill(deepest); await settled(deepest);
-  await page.locator('#agent-filter-field').selectOption('group');
-  await page.locator('#agent-filter-value').fill('Boundary');
-  const parsedAddition=page.waitForResponse(response=>{
-    const url=new URL(response.url());
-    return url.pathname==='/agent-query'&&url.searchParams.get('search')?.includes('group:"Boundary"');
-  });
-  await page.locator('#apply-agent-filter').click();
-  assert.equal((await parsedAddition).status(),200,'adding an AND filter must not introduce unnecessary nesting beyond the supported depth');
+  await browserAddFilterCondition(page,root,'group','Boundary');
+  await browserApplyFilters(page);
   await settled(await page.locator('#agent-search').inputValue());
+  assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'false','visual serialization does not introduce unnecessary nesting beyond the supported depth');
+  for(const [field,literal] of [['group','A\u0085B'],[null,'Task\u0085phrase']]) {
+    const search=(field?`${field}:`:'')+JSON.stringify(literal);
+    await page.locator('#agent-search').fill(search); await settled(search);
+    await root.locator('[data-filter-op]').first().selectOption('or');
+    await browserApplyFilters(page);
+    const actual=await api('GET',`/agent-query?search=${encodeURIComponent(await page.locator('#agent-search').inputValue())}`);
+    assert.equal(actual.expression.clause.field,field);
+    assert.deepEqual(actual.expression.clause.values,[literal],'visual round-trip preserves Unicode whitespace inside a literal');
+  }
   await page.locator('#clear-agent-filters').click(); await settled('');
 }
 
@@ -2556,16 +2579,10 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     assert.deepEqual(await api('GET', '/configs'), configBeforePreference, 'browser preferences never write project configurations');
     await page.locator('[data-page=overview]').click();
     await page.locator('#agent-filters summary').click();
-    const filteredResponse = page.waitForResponse(response => {
-      const query = new URL(response.url());
-      return query.pathname === '/agents' && query.searchParams.get('search') === 'pause_reason:"limit"';
-    });
-    await page.locator('#agent-filter-field').selectOption('pause_reason');
-    await page.locator('#agent-filter-value').fill('limit');
-    await page.locator('#apply-agent-filter').click();
-    const filtered = await (await filteredResponse).json();
-    assert.equal(filtered.total, 0);
-    assert.deepEqual(filtered.counts, { all: 0, active: 0, attention: 0, finished: 0 });
+    await browserAddFilterCondition(page,page.locator('[data-filter-root]'),'pause_reason','limit');
+    await browserApplyFilters(page);
+    assert.equal(await page.evaluate(()=>state.pages.agentBrowser.total),0);
+    assert.deepEqual(await page.evaluate(()=>state.pages.agentBrowser.counts),{ all: 0, active: 0, attention: 0, finished: 0 });
     await page.locator('[data-edit-agent-filter=pause_reason]').waitFor();
     assert.match(await page.locator('[data-edit-agent-filter=pause_reason]').textContent(), /limit/);
     assert.match(await page.locator('#agent-filter-scope').textContent(), /ignore these filters/);

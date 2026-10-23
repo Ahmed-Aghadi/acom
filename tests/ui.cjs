@@ -48,8 +48,9 @@ const reloadPage = async page => {
 function agentQueryFixture(source) {
   const fields=['group','provider','model','effort','state','pause_reason']; let i=0;
   const quote=value=>'"'+value.replaceAll('\\','\\\\').replaceAll('"','\\"')+'"',fail=message=>{throw new Error(message);};
-  const space=()=>{while(i<source.length&&/\s/.test(source[i]))i++;};
-  const operator=word=>source.startsWith(word,i)&&(i+word.length===source.length||/[\s()]/.test(source[i+word.length]));
+  const isSpace=char=>/[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/.test(char);
+  const space=()=>{while(i<source.length&&isSpace(source[i]))i++;};
+  const operator=word=>source.startsWith(word,i)&&(i+word.length===source.length||isSpace(source[i+word.length])||/[()]/.test(source[i+word.length]));
   const value=(field=false)=>{
     if(source[i]==='"') {
       i++;let text='';
@@ -59,7 +60,7 @@ function agentQueryFixture(source) {
       }
       fail('Unclosed quote');
     }
-    const start=i;while(i<source.length&&!/[\s:()"\\]/.test(source[i])&&(!field||source[i]!==','))i++;
+    const start=i;while(i<source.length&&!isSpace(source[i])&&!/[:()"\\]/.test(source[i])&&(!field||source[i]!==','))i++;
     if(start===i)fail('Missing or malformed value');return source.slice(start,i);
   };
   const combine=(op,children)=>children.length===1?children[0]:{op,children:children.flatMap(child=>child.op===op?child.children:[child])};
@@ -76,7 +77,7 @@ function agentQueryFixture(source) {
       if(valid&&values.some(value=>!valid.includes(value)))fail(`Unknown ${field} value`);
       values=[...new Set(values)].sort();
     } else if(first==='')fail('Empty text term');
-    if(i<source.length&&!/[\s()]/.test(source[i]))fail('Expected space between clauses');
+    if(i<source.length&&!isSpace(source[i])&&!/[()]/.test(source[i]))fail('Expected space between clauses');
     return {op:'clause',clause:{field,values,text:field?`${field}:${values.map(quote).join(',')}`:quote(first)}};
   };
   const not=()=>{space();if(operator('NOT')){i+=3;return {op:'not',child:not()};}return primary();};
@@ -4533,23 +4534,297 @@ test('missing or invalid confirmation preferences default to enabled and unavail
   await reloadPage(page); assert.equal(await page.locator('#confirm-agent-actions').isChecked(),true);
 }));
 
-async function pickAgentFilter(page,field,values) {
+test('visual Boolean filters build idle OR limit without typing query syntax', async () => fixture(async (page,data) => {
+  data.pageLimit=1;
+  data.agents=[{id:1,project:1,name:'Idle',state:'idle'},{id:2,project:1,name:'Limit',state:'paused',pause_reason:'limit'},{id:3,project:1,name:'Manual',state:'paused',pause_reason:'user'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-filters > summary').click();
+  assert.equal(await page.locator('#agent-filter-builder').count(),1,'the filter picker exposes a visual Boolean builder');
+  const root=page.locator('[data-filter-root]');
+  await root.locator('[data-filter-op]').first().selectOption('or');
+  assert.equal(await root.locator('[data-filter-op]').first().inputValue(),'or','an empty group retains Match any');
+  await addVisualCondition(page,root,'state',['idle']);
+  assert.equal(await root.locator('[data-filter-op]').first().inputValue(),'or','adding the first child does not silently switch to Match all');
+  await addVisualCondition(page,root,'pause_reason',['limit']);
+  assert.equal(await page.locator('#agent-search').inputValue(),'','editing a visual draft does not apply it');
+  assert.equal(await page.locator('[data-agent-count=all]').textContent(),'3');
+  await applyVisualFilters(page);
+  assert.equal(await page.locator('[data-agent-count=all]').textContent(),'2');
+  assert.equal(await page.locator('[data-agent-count=active]').textContent(),'1');
+  assert.equal(await page.locator('[data-agent-count=attention]').textContent(),'1');
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2]);
+  assert.match(await page.locator('#agent-search').inputValue(),/state:.*idle.* OR pause_reason:.*limit/);
+  await page.locator('#page-overview [data-more=agentBrowser]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2,1]);
+  await page.evaluate(()=>refresh());
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2,1],'polling preserves loaded matches without duplicates');
+  await page.locator('[data-agent-filter=active]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===1);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1],'category remains separate from the Boolean query');
+  assert.equal(data.requests.length,0);
+}));
+
+async function openVisualFilters(page) {
   if(!await page.locator('#agent-filters').evaluate(el=>el.open))await page.locator('#agent-filters > summary').click();
-  await page.locator('#agent-filter-field').selectOption(field);
-  while(await page.locator('[data-remove-filter-value]').count())await page.locator('[data-remove-filter-value]').first().click();
-  for(const value of values) {
-    if(value==='')await page.locator('#agent-filter-ungrouped').click();
-    else {await page.locator('#agent-filter-value').fill(value);await page.locator('#add-filter-value').click();}
-  }
-  await page.locator('#apply-agent-filter').click();
-  await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser.pending&&!!state.pages.agentBrowser.revision&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&!!currentAgentQuery()?.value);
+  await page.waitForFunction(()=>!!currentAgentQuery()?.value);
 }
+async function addVisualCondition(page,parent,field,values) {
+  const ids=await page.locator('.filter-condition[data-filter-node]').evaluateAll(nodes=>nodes.map(node=>node.dataset.filterNode));
+  await parent.locator(':scope > .filter-editor-actions > [data-add-filter-condition]').click();
+  const id=await page.locator('.filter-condition[data-filter-node]').evaluateAll((nodes,ids)=>nodes.find(node=>!ids.includes(node.dataset.filterNode)).dataset.filterNode,ids);
+  const node=page.locator(`[data-filter-node="${id}"]`);
+  await setVisualCondition(node,field,values);
+  return node;
+}
+async function setVisualCondition(node,field,values) {
+  await node.locator('[data-filter-field]').selectOption(field);
+  while(await node.locator('[data-filter-value]').count()>1)await node.locator('[data-remove-filter-alternative]').last().click();
+  for(let i=0;i<values.length;i++) {
+    if(i)await node.locator('[data-add-filter-alternative]').click();
+    const input=node.locator('[data-filter-value]').nth(i);
+    const ungrouped=input.locator('xpath=ancestor::*[@data-filter-value-row][1]').locator('[data-filter-ungrouped]');
+    if(values[i]===''&&field==='group') {if(await ungrouped.getAttribute('aria-pressed')!=='true')await ungrouped.click();}
+    else {if(await ungrouped.count()&&await ungrouped.getAttribute('aria-pressed')==='true')await ungrouped.click();await input.fill(values[i]);}
+  }
+}
+async function addVisualGroup(page,parent,op='and',exclude=false) {
+  const ids=await page.locator('[data-filter-node]').evaluateAll(nodes=>nodes.map(node=>node.dataset.filterNode));
+  await parent.locator(':scope > .filter-editor-actions > [data-add-filter-group]').click();
+  const id=await page.locator('[data-filter-node]').evaluateAll((nodes,ids)=>nodes.find(node=>!ids.includes(node.dataset.filterNode)).dataset.filterNode,ids);
+  const node=page.locator(`[data-filter-node="${id}"]`);
+  await node.locator('[data-filter-op]').first().selectOption(op);
+  if(exclude)await node.locator('[data-filter-exclude]').first().check();
+  return node;
+}
+async function applyVisualFilters(page) {
+  await page.locator('#apply-agent-filter').click();
+  await page.waitForFunction(()=>!state.agentFilterDraft.pending&&!state.agentFilterDraft.dirty&&!agentSearchTimer&&!state.pages.agentBrowser.pending&&!!state.pages.agentBrowser.revision&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&!!currentAgentQuery()?.value);
+  assert.equal(await page.locator('#agent-filter-draft-error').isVisible(),false);
+}
+async function pickAgentFilter(page,field,values) {
+  await openVisualFilters(page);
+  const id=await page.locator('[data-filter-field]').evaluateAll((selects,field)=>selects.find(select=>select.value===field)?.closest('[data-filter-node]').dataset.filterNode,field);
+  if(id)await setVisualCondition(page.locator(`[data-filter-node="${id}"]`),field,values);
+  else await addVisualCondition(page,page.locator('[data-filter-root]'),field,values);
+  await applyVisualFilters(page);
+}
+
+test('visual groups combine Match all, Match any and Exclude with missing values correctly', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Idle reviewer',group:'Security review',state:'idle',model:'good'},
+    {id:2,project:1,name:'Limit reviewer',group:'Security review',state:'paused',pause_reason:'limit',model:'good'},
+    {id:3,project:1,name:'Manual reviewer',group:'Security review',state:'paused',pause_reason:'user',model:'good'},
+    {id:4,project:1,name:'Closed reviewer',group:'Security review',state:'closed',model:'good'},
+    {id:5,project:1,name:'Bad model',group:'Security review',state:'idle',model:'bad'},
+    {id:6,project:1,name:'Outside',group:'Other',state:'idle',model:'good'}];
+  await manualPolling(page);await reloadPage(page);await openVisualFilters(page);
+  const root=page.locator('[data-filter-root]');
+  await addVisualCondition(page,root,'group',['Security review']);
+  const exclusions=await addVisualGroup(page,root,'or',true);
+  await addVisualCondition(page,exclusions,'state',['closed']);
+  await addVisualCondition(page,exclusions,'pause_reason',['manual']);
+  const model=await addVisualCondition(page,root,'model',['bad']);await model.locator('[data-filter-exclude]').check();
+  await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2,1]);
+  assert.match(await page.locator('#agent-search').inputValue(),/NOT \(.* OR .*\)/);
+  assert.match(await page.locator('#agent-search').inputValue(),/NOT model:/);
+  assert.equal(await page.locator('[data-filter-exclude]:checked').count(),2);
+  await page.evaluate(()=>refresh());assert.equal(await page.locator('[data-filter-exclude]:checked').count(),2);
+  if(process.env.ACOM_UI_SCREENSHOT_DIR) {
+    await page.setViewportSize({width:1440,height:1100});await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'visual-filters-desktop.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'visual-filters-mobile.png'),fullPage:true});
+  }
+}));
+
+test('visual Text is one literal phrase while exact alternatives, Ungrouped and operators stay literal', async () => fixture(async (page,data) => {
+  const group='Team, "Alpha" \\ review',phrase='OR (draft), group:x';
+  data.agents=[{id:1,project:1,name:phrase,state:'idle',group},{id:2,project:1,name:'Second',state:'idle',group:'AND',task:phrase},
+    {id:3,project:1,name:'Ungrouped',state:'idle',group:null,task:phrase},{id:4,project:1,name:'OR (draft),',state:'idle',group:'group:x'},
+    {id:5,project:1,name:phrase,state:'idle',group:'Different'}];
+  await manualPolling(page);await reloadPage(page);await openVisualFilters(page);
+  const root=page.locator('[data-filter-root]');
+  const text=await addVisualCondition(page,root,'',[phrase]);
+  assert.equal(await text.locator('[data-add-filter-alternative]').isDisabled(),true,'Text uses one phrase, not exact-field alternatives');
+  await addVisualCondition(page,root,'group',[group,'AND','']);await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3,2,1],'one phrase cannot span separate name/group fields');
+  assert.equal(await page.locator('#agent-filter-builder img').count(),0);
+  const parsed=agentQueryFixture(await page.locator('#agent-search').inputValue());
+  assert.equal(parsed.expression.children.find(node=>node.clause.field===null).clause.values[0],phrase);
+  assert.deepEqual(parsed.expression.children.find(node=>node.clause.field==='group').clause.values,['','AND',group].sort());
+  assert.equal(await page.locator('[data-filter-ungrouped][aria-pressed=true]').count(),1,'Ungrouped is an explicit alternative, not a manufactured text value');
+}));
+
+test('typed advanced expressions import and edit without losing NOT chains or repeated fields', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',group:'Team',model:'good'},{id:2,project:1,state:'paused',pause_reason:'limit',group:'Team',model:'good'},
+    {id:3,project:1,state:'idle',group:'Other',model:'good'},{id:4,project:1,state:'paused',pause_reason:'user',group:'Team',model:'good'}];
+  await manualPolling(page);await reloadPage(page);
+  await page.locator('#agent-search').fill('NOT NOT (state:idle OR pause_reason:limit) AND NOT NOT group:Team AND group:Team AND NOT model:bad');
+  await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===2);
+  await openVisualFilters(page);
+  assert.equal(await page.locator('[data-filter-field]').evaluateAll(selects=>selects.filter(select=>select.value==='group').length),2);
+  const modelId=await page.locator('[data-filter-field]').evaluateAll(selects=>selects.find(select=>select.value==='model').closest('[data-filter-node]').dataset.filterNode);
+  await page.locator(`[data-filter-node="${modelId}"] [data-filter-value]`).fill('also-bad');await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2,1]);
+  const raw=await page.locator('#agent-search').inputValue();
+  assert.equal((raw.match(/group:/g)||[]).length,2,'repeated field clauses are retained rather than overwritten');
+  assert.equal((raw.match(/NOT/g)||[]).length,5,'even NOT chains survive import and serialization');
+  assert.equal(await page.locator('[data-filter-field]').evaluateAll(selects=>selects.filter(select=>select.value==='group').length),2);
+}));
+
+test('visual limits count exact-field alternatives separately from Text clauses', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',task:'needle',group:'g1'}];
+  await manualPolling(page);await reloadPage(page);
+  const source=Array(63).fill('needle').join(' ')+' group:'+Array.from({length:66},(_,i)=>`g${i}`).join(',');
+  await page.locator('#agent-search').fill(source);await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
+  await openVisualFilters(page);
+  assert.equal(await page.locator('[data-filter-field]').count(),64);
+  const group=page.locator('.filter-condition').filter({has:page.locator('[data-filter-field] option:checked[value=group]')});
+  assert.equal(await group.locator('[data-filter-value]').count(),66);
+  await group.locator('[data-filter-value]').last().fill('new-group');
+  assert.equal(await page.locator('#agent-filter-draft-error').isVisible(),false,'63 text leaves do not consume the separate field-value budget');
+  await applyVisualFilters(page);assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+}));
+
+test('Text clause chips focus their own condition rather than the first Text condition', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',task:'first second'},{id:2,project:1,state:'idle',task:'first changed'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('first second');
+  await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
+  await page.locator('[data-edit-agent-clause="1"]').click();
+  const id=await page.evaluate(()=>document.activeElement.closest('[data-filter-node]').dataset.filterNode);
+  const node=page.locator(`[data-filter-node="${id}"]`);
+  assert.equal(await node.locator('[data-filter-field]').inputValue(),'');assert.equal(await node.locator('[data-filter-value]').inputValue(),'second');
+  await node.locator('[data-filter-value]').fill('changed');await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2]);
+  assert.deepEqual(agentQueryFixture(await page.locator('#agent-search').inputValue()).clauses.map(clause=>clause.values[0]),['first','changed']);
+}));
+
+test('visual serialization quotes Rust whitespace in exact values and Text phrases', async () => fixture(async (page,data) => {
+  const group='A\u0085B',text='Task\u0085phrase';
+  data.agents=[{id:1,project:1,state:'idle',group,task:text},{id:2,project:1,state:'idle',group:'A',task:'B Task phrase'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill(`group:${JSON.stringify(group)} ${JSON.stringify(text)}`);
+  await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
+  await openVisualFilters(page);
+  const input=page.locator('.filter-condition').filter({has:page.locator('[data-filter-field] option:checked[value=group]')}).locator('[data-filter-value]');
+  await input.fill(group+'x');await input.fill(group);await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+  assert.ok((await page.locator('#agent-search').inputValue()).includes(`group:${JSON.stringify(group)}`));
+  assert.ok((await page.locator('#agent-search').inputValue()).includes(JSON.stringify(text)));
+}));
+
+test('a current filter chip safely opens a builder whose selected older DOM is deferred', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',group:'Old'},{id:2,project:1,state:'idle',group:'New'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('group:Old');
+  await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
+  await openVisualFilters(page);await selectText(page,'.filter-condition .filter-node-head label');
+  await page.evaluate(()=>setAgentSearch('group:New'));
+  assert.equal(await page.locator('[data-filter-value]').inputValue(),'Old','selected old builder text defers replacement during the search refresh');
+  assert.match(await page.locator('[data-edit-agent-filter=group]').textContent(),/New/);
+  await page.locator('[data-edit-agent-filter=group]').dispatchEvent('click');
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-filter-value]').inputValue(),'New');
+  assert.equal(await page.locator('#agent-search').inputValue(),'group:New');
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2]);
+}));
+
+test('a structural edit cannot replay an old Exclude checkbox after a later real click', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',group:'Team',model:'good'},{id:2,project:1,state:'idle',group:'Other',model:'good'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('group:Team model:good');
+  await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
+  await openVisualFilters(page);await selectText(page,'[data-filter-root] > .filter-node-head > label:first-child');
+  await page.locator('.filter-condition').filter({has:page.locator('[data-filter-field] option:checked[value=model]')}).locator('[data-remove-filter-node]').click();
+  await page.locator('[data-filter-root] > .filter-node-head [data-filter-exclude]').check();
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-filter-root] > .filter-node-head [data-filter-exclude]').isChecked(),true,'a deferred structural snapshot must not undo the newer visible exclusion');
+  assert.equal(await page.locator('.filter-condition').count(),1);
+  await applyVisualFilters(page);assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2]);
+}));
+
+test('typed and visual positive pause filters both preserve the independent category', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle'},{id:2,project:1,state:'paused',pause_reason:'limit'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=active]').click();
+  await page.locator('#agent-search').fill('pause_reason:limit');
+  await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===0);
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');
+  assert.equal(await page.locator('[data-agent-count=all]').textContent(),'1');
+  await page.locator('#agent-search').fill('');await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
+  await pickAgentFilter(page,'pause_reason',['limit']);
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[]);
+  assert.equal(await page.locator('[data-agent-count=all]').textContent(),'1');
+  await page.locator('[data-agent-filter=all]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===2);
+}));
+
+test('incomplete or rejected visual drafts never change the applied results', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle'},{id:2,project:1,state:'paused',pause_reason:'limit'}];
+  await manualPolling(page);await reloadPage(page);await pickAgentFilter(page,'state',['idle']);
+  const applied=await page.locator('#agent-search').inputValue(),root=page.locator('[data-filter-root]');
+  const leaf=await addVisualCondition(page,root,'model',['']);
+  assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true);
+  assert.equal(await page.locator('#agent-filter-draft-error').isVisible(),true);
+  await page.evaluate(()=>refresh());assert.equal(await page.locator('#agent-search').inputValue(),applied);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+  await leaf.locator('[data-filter-value]').fill('rejected');
+  await page.route('**/agent-query?*',route=>new URL(route.request().url()).searchParams.get('search').includes('rejected')?route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'Rejected test query'})}):route.continue());
+  await page.locator('#apply-agent-filter').click();await page.waitForFunction(()=>document.querySelector('#agent-filter-draft-error').textContent.includes('Rejected test query'));
+  assert.equal(await page.locator('#agent-search').inputValue(),applied);assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+  assert.equal(await page.locator('#connection-banner').isVisible(),false);
+  await page.locator('#cancel-agent-filter').click();
+  const group=await addVisualGroup(page,page.locator('[data-filter-root]'),'or');
+  assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true,'an unfinished empty group is not silently dropped');
+  await group.locator('[data-remove-filter-node]').first().click();
+  assert.equal(await page.locator('#agent-search').inputValue(),applied);
+}));
+
+test('dirty visual drafts survive polling, selection, disclosure and page changes but need reset after direct search', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',group:'Applied'},{id:2,project:1,state:'paused',group:'Draft value'}];
+  await manualPolling(page);await reloadPage(page);await pickAgentFilter(page,'group',['Applied']);
+  let input=page.locator('[data-filter-value]');await input.fill('Draft value');await input.evaluate(el=>el.setSelectionRange(2,7));
+  const handle=await input.elementHandle();await page.evaluate(()=>refresh());
+  assert.equal(await input.evaluate((el,original)=>el===original,handle),true,'polling retains the actual draft input node');
+  assert.equal(await input.inputValue(),'Draft value');assert.deepEqual(await input.evaluate(el=>[el.selectionStart,el.selectionEnd]),[2,7]);
+  await page.locator('#agent-filters > summary').click();await page.evaluate(()=>refresh());await page.locator('#agent-filters > summary').click();
+  await page.locator('[data-page=settings]').click();await page.locator('[data-page=overview]').click();
+  assert.equal(await input.inputValue(),'Draft value');
+  await page.locator('#agent-search').fill('state:paused');await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===2);
+  assert.equal(await input.inputValue(),'Draft value','direct search does not discard unsaved visual input');
+  assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true);assert.match(await page.locator('#agent-filter-draft-status').textContent(),/reset|changed|conflict/i);
+  await page.locator('#cancel-agent-filter').click();input=page.locator('[data-filter-value]');
+  assert.equal(await page.locator('[data-filter-field]').inputValue(),'state');assert.equal(await input.inputValue(),'paused');
+  assert.equal(await page.locator('#agent-search').inputValue(),'state:paused');
+}));
+
+test('delayed visual Apply cannot overwrite newer edits, search or project selection', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,state:'idle',group:'First'},{id:2,project:1,state:'paused',group:'Second'},{id:3,project:2,state:'idle',group:'First'}];
+  await manualPolling(page);await reloadPage(page);await openVisualFilters(page);
+  await addVisualCondition(page,page.locator('[data-filter-root]'),'group',['First']);
+  const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search').includes('First'),'GET');
+  await page.locator('#apply-agent-filter').click();await pending.started;
+  await page.locator('[data-filter-value]').fill('Second');pending.release();await pending.remove();
+  await page.waitForFunction(()=>!state.agentFilterDraft.pending);
+  assert.equal(await page.locator('#agent-search').inputValue(),'');assert.equal(await page.locator('[data-filter-value]').inputValue(),'Second');
+  await applyVisualFilters(page);assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2]);
+  await page.locator('[data-filter-value]').fill('First');
+  const searchRace=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search').includes('First'),'GET');
+  await page.locator('#apply-agent-filter').click();await searchRace.started;
+  await page.locator('#agent-search').fill('state:idle');await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  searchRace.release();await searchRace.remove();await page.waitForFunction(()=>!state.agentFilterDraft.pending);
+  assert.equal(await page.locator('#agent-search').inputValue(),'state:idle');assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true);
+  await page.locator('#cancel-agent-filter').click();await page.locator('[data-filter-value]').fill('paused');
+  const projectRace=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search').includes('paused'),'GET');
+  await page.locator('#apply-agent-filter').click();await projectRace.started;
+  await page.locator('#project-select').selectOption('2');await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0&&state.agentBrowser[0]?.id===3);
+  projectRace.release();await projectRace.remove();await page.waitForFunction(()=>!state.agentFilterDraft.pending);
+  assert.equal(await page.locator('#agent-search').inputValue(),'state:idle');assert.equal(await page.locator('[data-filter-value]').inputValue(),'paused');
+  assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true,'a draft from another project must be explicitly reset');
+}));
 
 test('exact query filters search all pages, preserve polling and expose editable removable chips', async () => fixture(async (page,data) => {
   data.pageLimit=1;
   data.agents=[{id:1,project:1,name:'Usage older',state:'paused',pause_reason:'limit',group:'Security review',harness:'codex',model:'model-one',effort:'high',task:'reentrancy'},{id:2,project:1,name:'Manual',state:'paused',pause_reason:'user'},{id:3,project:1,name:'Bulk manual',state:'paused',pause_reason:'all'},{id:4,project:1,name:'Restart',state:'paused',pause_reason:'restart'},{id:5,project:1,name:'Usage newer',state:'paused',pause_reason:'limit',group:'Security review',harness:'claude',model:'model-two',effort:'medium',task:'reentrancy'},...['working','idle','crashed','done','closed','replaced'].map((state,i)=>({id:6+i,project:1,name:state,state,task:'Security review reentrancy'})),{id:12,project:2,state:'paused',pause_reason:'limit'}];
   await manualPolling(page); await reloadPage(page); await page.locator('#agent-filters > summary').click();
   await page.locator('[data-agent-filter=active]').click(); await pickAgentFilter(page,'pause_reason',['limit']);
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');
+  assert.equal(await page.locator('#agent-count').textContent(),'Showing 0 of 0 matches · 11 total');
+  await page.locator('[data-agent-filter=all]').click();
   await page.waitForFunction(()=>state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
   assert.equal(await page.locator('[data-agent-filter=all]').getAttribute('aria-pressed'),'true');
   assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 2 matches · 11 total');
@@ -4571,13 +4846,17 @@ test('exact query filters search all pages, preserve polling and expose editable
   await page.locator('#agent-search').fill('group:"Security review" state:paused,crashed reentrancy'); await page.waitForFunction(()=>!agentSearchTimer&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
   await pickAgentFilter(page,'provider',['codex']);assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 1 matches · 11 total');
   await pickAgentFilter(page,'model',['model-one']);await pickAgentFilter(page,'effort',['high']);assert.equal(await page.locator('#agents [data-agent]').getAttribute('data-agent'),'1');
-  await page.locator('[data-edit-agent-filter=state]').click(); assert.deepEqual(await page.locator('#agent-filter-values button').allTextContents(),['crashed ×','paused ×']);
-  await page.locator('#agent-filter-value').fill('working'); await page.locator('#agent-filter-value').press('Escape');assert.equal(await page.locator('#agent-filter-value').inputValue(),'');
+  await page.locator('[data-edit-agent-filter=state]').click();
+  let stateNode=page.locator('.filter-condition').filter({has:page.locator('[data-filter-field] option:checked[value=state]')});
+  assert.deepEqual(await stateNode.locator('[data-filter-value]').evaluateAll(inputs=>inputs.map(input=>input.value)),['crashed','paused']);
+  await stateNode.locator('[data-filter-value]').first().fill('working');await page.locator('#cancel-agent-filter').click();
+  stateNode=page.locator('.filter-condition').filter({has:page.locator('[data-filter-field] option:checked[value=state]')});
+  assert.deepEqual(await stateNode.locator('[data-filter-value]').evaluateAll(inputs=>inputs.map(input=>input.value)),['crashed','paused'],'Reset restores the applied alternatives rather than applying partial edits');
   if(process.env.ACOM_UI_SCREENSHOT_DIR) {
     await page.evaluate(()=>{document.activeElement?.blur();window.scrollTo(0,0);});
     await page.setViewportSize({width:1440,height:1000}); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'agent-filters-desktop.png'),fullPage:true});
     await page.setViewportSize({width:390,height:844}); assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'agent-filters-mobile.png'),fullPage:true});
-    await page.locator('[data-page=settings]').click(); await page.evaluate(()=>{document.activeElement?.blur();window.scrollTo(0,0);}); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'preferences-mobile.png')});
+    await openSidebar(page);await page.locator('[data-page=settings]').click(); await page.evaluate(()=>{document.activeElement?.blur();window.scrollTo(0,0);}); await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'preferences-mobile.png')});
   }
 }));
 
@@ -4643,7 +4922,7 @@ test('Boolean query precedence, grouped alternatives and NOT include missing pau
   }
 }));
 
-test('advanced query chip and picker preserve the whole OR expression and separate category', async () => fixture(async (page,data) => {
+test('advanced query chip opens the grouped visual tree without flattening it or changing category', async () => fixture(async (page,data) => {
   data.agents=[{id:1,project:1,name:'Idle reviewer',state:'idle',group:'Security review'},
     {id:2,project:1,name:'Quota reviewer',state:'paused',pause_reason:'limit',group:'Security review'},
     {id:3,project:1,name:'Outside idle',state:'idle',group:'Other'},
@@ -4656,28 +4935,33 @@ test('advanced query chip and picker preserve the whole OR expression and separa
   assert.equal(await page.locator('[data-edit-agent-query]').count(),1);
   assert.match(await page.locator('[data-edit-agent-query]').textContent(),/state:.*idle.* OR pause_reason:.*limit/);
   await page.locator('[data-edit-agent-query]').click();
-  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el&&el.selectionStart===0&&el.selectionEnd===el.value.length),true);
+  assert.equal(await page.locator('#agent-filters').evaluate(el=>el.open),true);
+  assert.equal(await page.locator('[data-filter-root] [data-filter-op]').first().inputValue(),'or');
+  assert.equal(await page.locator('[data-filter-field]').count(),2);
+  assert.equal(await page.locator('#agent-filter-builder').evaluate(el=>el.contains(document.activeElement)),true);
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#agent-search').inputValue(),raw);
-  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el&&el.selectionStart===0&&el.selectionEnd===el.value.length),true);
-  await page.locator('#agent-filters > summary').click();
-  assert.equal(await page.locator('#agent-filter-mode').isVisible(),true);
-  assert.equal(await page.locator('#apply-agent-filter').textContent(),'Add AND filter');
-  await pickAgentFilter(page,'group',['Security review']);
+  await page.locator('#agent-search').fill(`(${raw}) AND group:"Security review"`);
+  await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===1);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
-  assert.match(await page.locator('#agent-search').inputValue(),/^\(.* OR .*\) AND group:/);
+  assert.equal(await page.locator('[data-filter-root] [data-filter-op]').first().inputValue(),'and');
+  assert.equal(await page.locator('[data-filter-op]').nth(1).inputValue(),'or');
+  await pickAgentFilter(page,'group',['Other']);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3]);
+  assert.match(await page.locator('#agent-search').inputValue(),/\(.* OR .*\).* AND group:/);
+  await pickAgentFilter(page,'group',['Security review']);
   assert.equal(await page.locator('[data-edit-agent-query]').count(),1);
   await page.locator('[data-agent-filter=all]').click();
   await page.waitForFunction(()=>state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2,1]);
-  await pickAgentFilter(page,'state',['working']);
+  await addVisualCondition(page,page.locator('[data-filter-root]'),'state',['working']);await applyVisualFilters(page);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[],'same-field additions AND the expression rather than overwriting its OR leaves');
   await page.locator('[data-agent-filter=active]').click();
   await page.locator('[data-clear-agent-filter=query]').click();
   await page.waitForFunction(()=>!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===2);
   assert.equal(await page.locator('#agent-search').inputValue(),'');
   assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true','clearing the expression preserves the independent category');
-  assert.equal(await page.locator('#agent-filter-mode').isVisible(),false);
+  assert.equal(await page.locator('.filter-condition').count(),0);
   assert.equal(data.requests.length,0);
 }));
 
@@ -4710,7 +4994,7 @@ test('quoted Boolean words and parentheses remain literal and long expression ch
   await page.setViewportSize({width:390,height:844});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   await page.locator('[data-edit-agent-query]').click();
-  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el),true);
+  assert.equal(await page.locator('#agent-filter-builder').evaluate(el=>el.contains(document.activeElement)),true);
   await page.locator('#clear-agent-filters').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
   await pickAgentFilter(page,'group',['AND']);
   assert.equal(await page.locator('#agent-search').inputValue(),'group:"AND"');
@@ -4822,7 +5106,9 @@ test('picker quoting preserves literal whitespace accepted by the shared query p
   await manualPolling(page);await reloadPage(page);
   await page.locator('#agent-search').fill('group:"Line\tBreak"');
   await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
-  await page.locator('[data-edit-agent-filter=group]').click();await page.locator('#apply-agent-filter').click();
+  await page.locator('[data-edit-agent-filter=group]').click();
+  const input=page.locator('[data-filter-value]');assert.equal(await input.inputValue(),'Line\tBreak');
+  await input.fill('Line\tBreaks');await input.fill('Line\tBreak');await applyVisualFilters(page);
   await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
   assert.equal(await page.locator('#agent-search').inputValue(),'group:"Line\tBreak"');assert.equal(await page.locator('#agent-query-error').isVisible(),false);
   assert.equal(await page.evaluate(()=>quotedQueryValue('Line\nBreak')),'"Line\nBreak"');

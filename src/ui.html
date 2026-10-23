@@ -137,14 +137,24 @@
     .agent-toolbar .filter-actions button { font-size: 11px; }
     .agent-filters { margin-top: 12px; }
     .agent-filters summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: 12px; }
-    .agent-filters .form-grid { margin-top: 12px; }
+    .filter-builder { margin-top: 12px; min-width: 0; max-height: 55vh; overflow: auto; }
+    .filter-group { min-width: 0; border-left: 2px solid var(--line); padding-left: 10px; }
+    .filter-node-head, .filter-value-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .filter-node-head label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+    .filter-node-head select { width: auto; max-width: 100%; }
+    .filter-exclude input { width: auto; }
+    .filter-children { display: grid; gap: 10px; margin-top: 10px; }
+    .filter-condition { min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+    .filter-value-row { margin-top: 8px; }
+    .filter-value-row input { flex: 1 1 180px; width: auto; min-width: 0; }
+    .filter-builder .filter-editor-actions { margin-top: 8px; }
+    .filter-preview { max-height: 110px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
     .filter-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 10px; }
     .filter-chips:empty { display: none; }
     .filter-chips button { max-width: 100%; overflow-wrap: anywhere; text-align: left; background: var(--accent-soft); color: var(--accent); }
     .filter-chips #clear-agent-filters { background: transparent; color: var(--muted); }
     .filter-chip { display: inline-flex; max-width: 100%; }
     .filter-chip button + button { margin-left: 2px; }
-    .filter-values { display: flex; flex-wrap: wrap; gap: 6px; }
     .filter-editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
     .query-help { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
     .query-help code { white-space: normal; }
@@ -452,7 +462,7 @@
           <section class="panel">
             <div class="panel-head"><h2>Agents</h2><span class="count" id="agent-count"></span><span class="panel-caption">Your project team</span></div>
             <div class="agent-toolbar"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="agent-search" aria-label="Search agents" placeholder="Search by name, task, model or group…"></label><div class="filter-actions" aria-label="Filter agents"><button class="small active" data-agent-filter="all" aria-pressed="true">All <span data-agent-count="all">—</span></button><button class="small" data-agent-filter="active" aria-pressed="false">Active <span data-agent-count="active">—</span></button><button class="small" data-agent-filter="attention" aria-pressed="false">Needs attention <span data-agent-count="attention">—</span></button><button class="small" data-agent-filter="finished" aria-pressed="false">Finished <span data-agent-count="finished">—</span></button></div>
-              <details class="agent-filters" id="agent-filters"><summary>Filters</summary><div class="form-grid"><label>Filter field <select id="agent-filter-field"><option value="group">Group</option><option value="provider">Provider</option><option value="model">Model</option><option value="effort">Effort</option><option value="state">State</option><option value="pause_reason">Pause reason</option></select></label><label>Exact value <input id="agent-filter-value" list="agent-filter-options" autocomplete="off" aria-describedby="agent-filter-value-help agent-filter-mode"><datalist id="agent-filter-options"></datalist></label></div><p class="query-help" id="agent-filter-value-help">Add alternatives for OR. Spaces and commas inside a value are literal.</p><p class="query-help" id="agent-filter-mode" hidden>Grouped queries: this adds an AND condition to the whole query. Edit existing conditions in the search box.</p><div class="filter-values" id="agent-filter-values" aria-label="Filter alternatives"></div><div class="filter-editor-actions"><button type="button" class="small" id="add-filter-value">Add alternative</button><button type="button" class="small" id="agent-filter-ungrouped">Ungrouped</button><button type="button" class="small primary" id="apply-agent-filter">Apply filter</button><button type="button" class="small" id="cancel-agent-filter">Reset editor</button></div><p class="query-help">Queries support uppercase <code>NOT</code>, <code>AND</code>, <code>OR</code> in that precedence; spaces mean AND, parentheses group conditions, and commas within a field mean OR. <code>group:&quot;Security review&quot; (state:idle OR pause_reason:limit)</code>. Plain words search agent metadata, not conversations or files. Quote literal operators, parentheses or colons, such as <code>&quot;OR&quot;</code>, <code>&quot;(draft)&quot;</code> or <code>&quot;group:example&quot;</code>. Pause reasons: <code>manual</code>, <code>limit</code>, <code>restart</code>; a positive reason implies paused.</p></details>
+              <details class="agent-filters" id="agent-filters"><summary>Filters</summary><p class="query-help">Match all = AND, match any = OR. Exclude = NOT. Add groups to combine them. Values are literal, including spaces and commas; Text matches one phrase in agent metadata, not conversations or files.</p><div class="filter-builder" id="agent-filter-builder"></div><datalist id="filter-options-provider"><option value="claude"></option><option value="codex"></option></datalist><datalist id="filter-options-state"><option value="working"></option><option value="idle"></option><option value="paused"></option><option value="crashed"></option><option value="done"></option><option value="closed"></option><option value="replaced"></option></datalist><datalist id="filter-options-pause_reason"><option value="manual"></option><option value="limit"></option><option value="restart"></option></datalist><p class="query-help" id="agent-filter-draft-status" role="status"></p><p class="inline-error" id="agent-filter-draft-error" role="alert" hidden></p><pre class="filter-preview" id="agent-filter-preview" aria-label="Filter query preview" hidden></pre><div class="filter-editor-actions"><button type="button" class="small primary" id="apply-agent-filter">Apply filters</button><button type="button" class="small" id="cancel-agent-filter">Reset editor</button></div><p class="query-help">The search box also supports uppercase <code>NOT</code>, <code>AND</code>, <code>OR</code> in that precedence; spaces mean AND and parentheses group conditions. Category buttons above apply separately, in addition to this query. Pause reasons: <code>manual</code>, <code>limit</code>, <code>restart</code>; a positive reason implies paused.</p></details>
               <p class="inline-error" id="agent-query-error" role="alert" hidden></p>
               <div class="filter-chips" id="agent-filter-chips" aria-label="Applied agent filters"></div>
               <p class="filter-scope-note" id="agent-filter-scope" hidden>Project and all-project actions ignore these filters.</p>
@@ -624,10 +634,12 @@
       catch (_) { toast(`Couldn't copy ${label.toLowerCase()}. Select the text and copy it manually.`, true); }
     }
     const emptyState = (icon, title, description = '') => `<div class="empty"><div class="empty-symbol">${svgIcon(icon)}</div><strong>${esc(title)}</strong>${description ? `<p>${esc(description)}</p>` : ''}</div>`;
-    state.agentFilter = 'all'; state.agentSearch = ''; state.agentQuery = null; state.agentFilterDraft = {field:'group',values:[]}; state.agentBrowser = [];
+    state.agentFilter = 'all'; state.agentSearch = ''; state.agentQuery = null; state.agentFilterDraft = null; state.agentBrowser = [];
     state.confirmAgentActions = stored('acom:confirm-agent-actions') !== 'false';
     let agentSearchTimer = null;
     let agentQuerySequence = 0;
+    let filterNodeSequence = 0;
+    let filterContextRevision = 0;
     const themeMedia = matchMedia('(prefers-color-scheme: dark)');
     let explicitTheme = ['light','dark'].includes(stored('acom:theme'));
     function applyTheme(theme) {
@@ -1072,7 +1084,6 @@
             const value = await record(query('/agent-query', {search:raw}), undefined, () => state.agentQuery === parsed && state.agentSearch === raw);
             if (state.agentQuery !== parsed || state.agentSearch !== raw || !value) return null;
             parsed.value = value;
-            if (value.clauses?.some(clause => clause.field === 'pause_reason') && ['active','finished'].includes(state.agentFilter)) state.agentFilter = 'all';
             return value;
           } catch (error) {
             if (state.agentQuery === parsed && state.agentSearch === raw) { if (error.status === 400) parsed.error = error.message; else parsed.failure = error; }
@@ -1087,29 +1098,116 @@
     }
     function currentAgentQuery() { return state.agentQuery?.raw === state.agentSearch ? state.agentQuery : null; }
     function quotedQueryValue(value) { return '"' + value.replaceAll('\\','\\\\').replaceAll('"','\\"') + '"'; }
-    function filterLabel(field) { return {group:'Group',provider:'Provider',model:'Model',effort:'Effort',state:'State',pause_reason:'Pause reason'}[field]; }
-    function renderFilterEditor() {
-      const draft = state.agentFilterDraft, options = {provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']}[draft.field] || [];
-      setHTML($('#agent-filter-options'), options.map(value => `<option value="${esc(value)}"></option>`).join(''));
-      setHTML($('#agent-filter-values'), draft.values.map((value,index) => `<button type="button" class="small" data-remove-filter-value="${index}" aria-label="Remove ${esc(value || 'Ungrouped')} alternative">${esc(value || 'Ungrouped')} ×</button>`).join(''));
-      $('#agent-filter-ungrouped').hidden = draft.field !== 'group';
-      const advanced = currentAgentQuery()?.value?.clauses === null;
-      $('#agent-filter-mode').hidden = !advanced;
-      setText($('#apply-agent-filter'), advanced ? 'Add AND filter' : 'Apply filter');
-      $('#apply-agent-filter').disabled = !currentAgentQuery()?.value || (!draft.values.length && !$('#agent-filter-value').value);
+    function filterLabel(field) { return {group:'Group',provider:'Provider',model:'Model',effort:'Effort',state:'State',pause_reason:'Pause reason'}[field] || 'Text'; }
+    function newFilterValue(text = '', ungrouped = false) { return {id:++filterNodeSequence,text,ungrouped}; }
+    function newFilterGroup(op = 'and', children = []) { return {id:++filterNodeSequence,kind:'group',op,children,negations:0}; }
+    function importFilterNode(expression) {
+      let negations = 0;
+      while (expression.op === 'not') { negations++; expression = expression.child; }
+      const node = expression.op === 'clause'
+        ? {id:++filterNodeSequence,kind:'clause',field:expression.clause.field || '',values:expression.clause.values.map(value => newFilterValue(value, expression.clause.field === 'group' && value === ''))}
+        : newFilterGroup(expression.op, expression.children.map(importFilterNode));
+      node.negations = negations; return node;
     }
-    function editAgentFilter(field) {
-      state.agentFilterDraft = {field,values:[...(currentAgentQuery()?.value?.clauses?.find(clause => clause.field === field)?.values || [])]};
-      $('#agent-filter-field').value = field; $('#agent-filter-value').value = '';
-      renderFilterEditor();
+    function resetFilterEditor() {
+      const parsed = currentAgentQuery()?.value; if (!parsed) return;
+      const expression = parsed.expression && importFilterNode(parsed.expression);
+      state.agentFilterDraft = {root:expression?.kind === 'group' ? expression : newFilterGroup('and',expression ? [expression] : []),base:state.agentSearch,project:state.selectedProject,dirty:false,revision:0,error:null,pending:false};
+      renderFilterEditor(true);
     }
-    function addFilterValue(value) {
-      const values = state.agentFilterDraft.values;
-      if (!values.includes(value)) values.push(value);
-      $('#agent-filter-value').value = ''; renderFilterEditor(); $('#agent-filter-value').focus();
+    function findFilterNode(id, node = state.agentFilterDraft?.root) {
+      if (!node) return null;
+      if (node.id === Number(id)) return node;
+      for (const child of node.children || []) { const found = findFilterNode(id,child); if (found) return found; }
+      return null;
+    }
+    function filterQueryValue(value) { return !value || /[\p{White_Space},:()"\\]/u.test(value) || ['AND','OR','NOT'].includes(value) ? quotedQueryValue(value) : value; }
+    function serializeFilterNode(node) {
+      let text, precedence = 4;
+      if (node.kind === 'clause') text = (node.field ? `${node.field}:` : '') + node.values.map(value => filterQueryValue(value.ungrouped ? '' : value.text)).join(',');
+      else {
+        precedence = node.op === 'and' ? 2 : 1;
+        const children = node.children.map(serializeFilterNode);
+        if (children.length === 1) ({text,precedence} = children[0]);
+        else text = children.map(child => child.precedence < precedence ? `(${child.text})` : child.text).join(node.op === 'and' ? ' AND ' : ' OR ');
+      }
+      if (node.negations) { text = 'NOT '.repeat(node.negations) + (precedence < 3 ? `(${text})` : text); precedence = 3; }
+      return {text,precedence};
+    }
+    function filterDraftError(root) {
+      let leaves = 0, values = 0;
+      const enums = {provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']};
+      function inspect(node, top = false) {
+        if (node.kind === 'group') {
+          if (!node.children.length) return top && !node.negations ? null : 'Add a condition to each group, or remove the empty group.';
+          for (const child of node.children) { const error = inspect(child); if (error) return error; }
+          return null;
+        }
+        leaves++; if (node.field) values += node.values.length;
+        if (!node.values.length) return 'Add a value to each condition, or remove the condition.';
+        if (!node.field && node.values.length !== 1) return 'Text matches one phrase. Remove extra alternatives first.';
+        for (const value of node.values) {
+          if (value.ungrouped && node.field === 'group') continue;
+          if (!value.text.length) return 'Enter a value for each condition. Use Ungrouped to select agents without a group.';
+          if (enums[node.field] && !enums[node.field].includes(value.text)) return `${filterLabel(node.field)} must be ${enums[node.field].join(', ')}.`;
+        }
+        return null;
+      }
+      const error = inspect(root,true);
+      if (error) return error;
+      if (leaves > 64 || values > 128) return 'Use at most 64 conditions and 128 values.';
+      if (new TextEncoder().encode(serializeFilterNode(root).text).length > 4096) return 'The filter query exceeds 4,096 UTF-8 bytes.';
+      return null;
+    }
+    function filterNodeHTML(node, root = false) {
+      const exclude = `<label class="filter-exclude"><input type="checkbox" id="filter-exclude-${node.id}" data-filter-exclude${node.negations % 2 ? ' checked' : ''}>Exclude ${node.kind === 'group' ? 'group' : 'condition'}</label>`;
+      const remove = root ? '' : '<button type="button" class="small" data-remove-filter-node>Remove</button>';
+      if (node.kind === 'group') return `<div class="filter-group" data-filter-node="${node.id}"${root ? ' data-filter-root' : ''}><div class="filter-node-head"><label for="filter-op-${node.id}">Match <select id="filter-op-${node.id}" data-filter-op><option value="and"${node.op === 'and' ? ' selected' : ''}>all (AND)</option><option value="or"${node.op === 'or' ? ' selected' : ''}>any (OR)</option></select></label>${exclude}${remove}</div><div class="filter-children">${node.children.map(child => filterNodeHTML(child)).join('')}</div><div class="filter-editor-actions"><button type="button" class="small" data-add-filter-condition>Add condition</button><button type="button" class="small" data-add-filter-group>Add group</button></div></div>`;
+      const fields = ['', 'group','provider','model','effort','state','pause_reason'];
+      return `<div class="filter-condition" data-filter-node="${node.id}" role="group" aria-label="Filter condition"><div class="filter-node-head"><label for="filter-field-${node.id}">Field <select id="filter-field-${node.id}" data-filter-field>${fields.map(field => `<option value="${field}"${node.field === field ? ' selected' : ''}>${filterLabel(field)}</option>`).join('')}</select></label>${exclude}${remove}</div>${node.values.map(value => `<div class="filter-value-row" data-filter-value-row="${value.id}"><input id="filter-value-${value.id}" data-filter-value aria-label="${esc(filterLabel(node.field))} value" autocomplete="off"${['provider','state','pause_reason'].includes(node.field) ? ` list="filter-options-${node.field}"` : ''} value="${esc(value.ungrouped && node.field === 'group' ? 'Ungrouped' : value.text)}"${value.ungrouped && node.field === 'group' ? ' disabled' : ''}>${node.field === 'group' ? `<button type="button" class="small" data-filter-ungrouped aria-pressed="${value.ungrouped}">${value.ungrouped ? 'Enter group' : 'Ungrouped'}</button>` : ''}${node.values.length > 1 ? '<button type="button" class="small" data-remove-filter-alternative aria-label="Remove alternative">×</button>' : ''}</div>`).join('')}<div class="filter-editor-actions"><button type="button" class="small" data-add-filter-alternative${!node.field ? ' disabled' : ''}>Add alternative</button></div></div>`;
+    }
+    function renderFilterEditor(structure = false) {
+      const parsed = currentAgentQuery(); let draft = state.agentFilterDraft;
+      if (parsed?.value && (!draft || !draft.dirty && (draft.base !== state.agentSearch || draft.project !== state.selectedProject))) { resetFilterEditor(); return; }
+      if (!draft) {
+        setText($('#agent-filter-draft-status'), parsed?.error ? 'Correct the search query to use the editor.' : 'Loading query…');
+        $('#apply-agent-filter').disabled = true; $('#cancel-agent-filter').disabled = true; return;
+      }
+      if (structure) setHTML($('#agent-filter-builder'), filterNodeHTML(draft.root,true));
+      const conflict = draft.base !== state.agentSearch || draft.project !== state.selectedProject;
+      const localError = filterDraftError(draft.root), error = draft.error || localError;
+      setText($('#agent-filter-draft-status'), conflict ? 'Search or project changed. Your draft is preserved; Reset editor to load the current query before applying.' : draft.pending ? 'Validating filters…' : !parsed?.value ? 'Correct the search query before applying filters.' : draft.dirty ? 'Unsaved filters. Apply to update results.' : 'Applied query. Edits stay here until you apply.');
+      $('#agent-filter-draft-error').hidden = !error; setText($('#agent-filter-draft-error'),error || '');
+      const preview = error ? '' : serializeFilterNode(draft.root).text;
+      $('#agent-filter-preview').hidden = !preview; setText($('#agent-filter-preview'),preview);
+      $('#apply-agent-filter').disabled = !parsed?.value || !draft.dirty || draft.pending || conflict || !!localError;
+      $('#cancel-agent-filter').disabled = !parsed?.value || draft.pending;
+    }
+    function clearFilterSelection() {
+      if (hasSelectedText($('#agent-filter-builder'))) getSelection()?.removeAllRanges();
+    }
+    function changeFilterDraft(structure = false) {
+      const draft = state.agentFilterDraft;
+      draft.dirty = true; draft.revision++; draft.error = null;
+      if (structure) clearFilterSelection();
+      renderFilterEditor(structure);
+    }
+    function openFilterEditor(field, clause) {
+      const root = $('#agent-filter-builder');
+      $('#agent-filters').open = true;
+      clearFilterSelection();
+      renderFilterEditor(true);
+      const fields = [...root.querySelectorAll('[data-filter-field]')];
+      const exact = clause && fields.find(input => {
+        const node = findFilterNode(input.closest('[data-filter-node]').dataset.filterNode);
+        return node?.field === (clause.field || '') && JSON.stringify(node.values.map(value => value.ungrouped ? '' : value.text)) === JSON.stringify(clause.values);
+      });
+      const input = exact || (field == null ? $('[data-filter-op]',root) : fields.find(input => input.value === field));
+      (input || $('#cancel-agent-filter')).focus({preventScroll:true});
     }
     function setAgentSearch(text) {
       clearTimeout(agentSearchTimer); agentSearchTimer = null;
+      filterContextRevision++;
       state.agentSearch = text; $('#agent-search').value = text;
       return refreshAgentBrowser();
     }
@@ -1132,7 +1230,7 @@
       const expression = parsed?.value?.clauses === null ? `<span class="filter-chip" data-agent-query="${parsed.id}"><button type="button" class="small" data-edit-agent-query aria-label="Edit query: ${esc(parsed.value.text)}">${esc(parsed.value.text)}</button><button type="button" class="small" data-clear-agent-filter="query" aria-label="Remove query">×</button></span>` : '';
       setHTML($('#agent-filter-chips'), category + expression + clauses.map((clause,index) => {
         const label = clause.field ? `${filterLabel(clause.field)}: ${clause.values.map(value => value || 'Ungrouped').join(' OR ')}` : `Text: ${clause.values[0]}`;
-        return `<span class="filter-chip" data-agent-query="${parsed.id}">${clause.field ? `<button type="button" class="small" data-edit-agent-filter="${clause.field}" aria-label="Edit ${esc(label)}">${esc(label)}</button>` : `<span class="pill">${esc(label)}</span>`}<button type="button" class="small" data-remove-agent-clause="${index}" aria-label="Remove ${esc(label)} filter">×</button></span>`;
+        return `<span class="filter-chip" data-agent-query="${parsed.id}"><button type="button" class="small" data-edit-agent-filter="${clause.field || ''}" data-edit-agent-clause="${index}" aria-label="Edit ${esc(label)}">${esc(label)}</button><button type="button" class="small" data-remove-agent-clause="${index}" aria-label="Remove ${esc(label)} filter">×</button></span>`;
       }).join('') + (state.agentSearch || category ? '<button type="button" class="small" id="clear-agent-filters">Clear filters</button>' : ''));
       $('#agent-filter-scope').hidden = !state.agentSearch && !category; renderFilterEditor();
       if (invalid) { setHTML(root, emptyState('search', 'Invalid search query', 'Correct the query above or clear filters. No unfiltered results are shown.')); return; }
@@ -2106,15 +2204,13 @@
       const editFilter = event.target.closest('[data-edit-agent-filter]');
       if (editFilter) {
         if (Number(editFilter.closest('[data-agent-query]').dataset.agentQuery) !== currentAgentQuery()?.id) return;
-        editAgentFilter(editFilter.dataset.editAgentFilter); $('#agent-filters').open = true; $('#agent-filter-value').focus(); return;
+        openFilterEditor(editFilter.dataset.editAgentFilter,currentAgentQuery().value.clauses[Number(editFilter.dataset.editAgentClause)]); return;
       }
       const editQuery = event.target.closest('[data-edit-agent-query]');
       if (editQuery) {
         if (Number(editQuery.closest('[data-agent-query]').dataset.agentQuery) !== currentAgentQuery()?.id) return;
-        $('#agent-search').focus(); $('#agent-search').select(); return;
+        openFilterEditor(); return;
       }
-      const draftValue = event.target.closest('[data-remove-filter-value]');
-      if (draftValue) { state.agentFilterDraft.values.splice(Number(draftValue.dataset.removeFilterValue),1); renderFilterEditor(); ($('#agent-filter-values button') || $('#agent-filter-value')).focus(); return; }
       const clearAgentFilter = event.target.closest('[data-clear-agent-filter], [data-remove-agent-clause], #clear-agent-filters');
       if (clearAgentFilter) {
         const hadFocus = document.activeElement === clearAgentFilter;
@@ -2483,7 +2579,7 @@
       if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
       getSelection()?.removeAllRanges();
       state.editor = null;
-      state.selectedProject = Number(event.target.value);
+      filterContextRevision++; state.selectedProject = Number(event.target.value);
       state.projectActions = null;
       state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
@@ -2500,7 +2596,7 @@
       try {
         await api(`/projects/${p.id}/remove`, { method: 'POST', body: '{}' });
         if (state.selectedProject === p.id) {
-          state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread();
+          filterContextRevision++; state.selectedProject = null; state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
       } catch (error) { toast(error.message, true); }
@@ -2682,7 +2778,7 @@
         if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
         if (submission.current() && project === state.selectedProject) {
-          state.selectedProject = Number(result.id); state.overviewRevision = null; state.editor = null; resetThread();
+          filterContextRevision++; state.selectedProject = Number(result.id); state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
         if (submission.current()) { $('#project-dialog').close(); form.reset(); }
@@ -2743,26 +2839,70 @@
       $('#confirm-agent-actions').checked = state.confirmAgentActions;
       $('#preferences-status').textContent = '';
     });
-    $('#agent-filter-field').addEventListener('change', event => editAgentFilter(event.target.value));
-    $('#agent-filter-value').addEventListener('input', renderFilterEditor);
-    $('#agent-filter-value').addEventListener('keydown', event => {
-      if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); if (event.target.value) addFilterValue(event.target.value); }
-      if (event.key === 'Escape') { event.preventDefault(); editAgentFilter(state.agentFilterDraft.field); $('#agent-filter-field').focus(); }
+    $('#agent-filter-builder').addEventListener('input', event => {
+      if (!event.target.matches('[data-filter-value]')) return;
+      const node = findFilterNode(event.target.closest('[data-filter-node]').dataset.filterNode);
+      const value = node?.values.find(value => value.id === Number(event.target.closest('[data-filter-value-row]').dataset.filterValueRow));
+      if (!value) return;
+      value.text = event.target.value; value.ungrouped = false; changeFilterDraft();
     });
-    $('#add-filter-value').addEventListener('click', () => { if ($('#agent-filter-value').value) addFilterValue($('#agent-filter-value').value); });
-    $('#agent-filter-ungrouped').addEventListener('click', () => addFilterValue(''));
-    $('#cancel-agent-filter').addEventListener('click', () => { editAgentFilter(state.agentFilterDraft.field); $('#agent-filter-field').focus(); });
+    $('#agent-filter-builder').addEventListener('change', event => {
+      const node = findFilterNode(event.target.closest('[data-filter-node]')?.dataset.filterNode); if (!node) return;
+      if (event.target.matches('[data-filter-op]')) node.op = event.target.value;
+      else if (event.target.matches('[data-filter-exclude]')) node.negations = event.target.checked ? 1 : 0;
+      else if (event.target.matches('[data-filter-field]')) {
+        node.field = event.target.value;
+        if (node.field !== 'group') node.values.forEach(value => { value.ungrouped = false; });
+      } else return;
+      changeFilterDraft(event.target.matches('[data-filter-field]'));
+    });
+    $('#agent-filter-builder').addEventListener('click', event => {
+      const button = event.target.closest('button'); if (!button || button.disabled) return;
+      const node = findFilterNode(button.closest('[data-filter-node]')?.dataset.filterNode); if (!node) return;
+      let focus;
+      if (button.matches('[data-add-filter-condition]')) {
+        const child = {id:++filterNodeSequence,kind:'clause',field:'group',values:[newFilterValue()],negations:0};
+        node.children.push(child); focus = `#filter-field-${child.id}`;
+      } else if (button.matches('[data-add-filter-group]')) {
+        const group = newFilterGroup(); node.children.push(group); focus = `#filter-op-${group.id}`;
+      } else if (button.matches('[data-remove-filter-node]')) {
+        function remove(parent) {
+          const index = parent.children?.indexOf(node) ?? -1;
+          if (index >= 0) { parent.children.splice(index,1); focus = `#filter-op-${parent.id}`; return true; }
+          return (parent.children || []).some(remove);
+        }
+        remove(state.agentFilterDraft.root);
+      } else if (button.matches('[data-add-filter-alternative]')) {
+        const value = newFilterValue(); node.values.push(value); focus = `#filter-value-${value.id}`;
+      } else {
+        const id = Number(button.closest('[data-filter-value-row]')?.dataset.filterValueRow), index = node.values?.findIndex(value => value.id === id);
+        if (!(index >= 0)) return;
+        if (button.matches('[data-remove-filter-alternative]')) { node.values.splice(index,1); focus = `#filter-field-${node.id}`; }
+        else if (button.matches('[data-filter-ungrouped]')) { node.values[index].ungrouped = !node.values[index].ungrouped; focus = node.values[index].ungrouped ? `#filter-field-${node.id}` : `#filter-value-${id}`; }
+        else return;
+      }
+      changeFilterDraft(true); $(focus)?.focus();
+    });
+    $('#cancel-agent-filter').addEventListener('click', () => { clearFilterSelection(); resetFilterEditor(); $('#agent-filter-builder [data-filter-op]')?.focus({preventScroll:true}); });
     $('#apply-agent-filter').addEventListener('click', async () => {
-      const parsed = currentAgentQuery()?.value; if (!parsed) return;
-      const draft = state.agentFilterDraft, value = $('#agent-filter-value').value;
-      const values = [...new Set([...draft.values,...(value ? [value] : [])])]; if (!values.length) return;
-      const clause = `${draft.field}:${values.map(quotedQueryValue).join(',')}`;
-      const base = parsed.expression?.op === 'or' ? `(${parsed.text})` : parsed.text;
-      const text = parsed.clauses === null ? `${base} AND ${clause}` : [...parsed.clauses.filter(clause => clause.field !== draft.field).map(clause => clause.text), clause].join(' ');
-      await setAgentSearch(text);
-      if (currentAgentQuery()?.value) editAgentFilter(draft.field);
+      const draft = state.agentFilterDraft;
+      if ($('#apply-agent-filter').disabled || !draft) return;
+      const revision = draft.revision, context = filterContextRevision, project = state.selectedProject, base = state.agentSearch, text = serializeFilterNode(draft.root).text;
+      const current = () => state.agentFilterDraft === draft && draft.revision === revision && state.selectedProject === project && state.agentSearch === base && filterContextRevision === context;
+      draft.pending = true; draft.error = null; renderFilterEditor();
+      try {
+        const value = await record(query('/agent-query',{search:text}),undefined,current);
+        if (!current() || !value) return;
+        clearTimeout(agentSearchTimer); agentSearchTimer = null;
+        state.agentSearch = text; $('#agent-search').value = text; filterContextRevision++;
+        state.agentQuery = {raw:text,id:++agentQuerySequence,value};
+        draft.base = text; draft.dirty = false;
+        await refreshAgentBrowser();
+      } catch (error) { if (current()) draft.error = error.message; }
+      finally { draft.pending = false; renderFilterEditor(); }
     });
     $('#agent-search').addEventListener('input', () => {
+      filterContextRevision++;
       state.agentSearch = $('#agent-search').value;
       clearTimeout(agentSearchTimer);
       agentSearchTimer = setTimeout(() => { agentSearchTimer = null; refreshAgentBrowser(); }, 200);
