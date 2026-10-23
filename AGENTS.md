@@ -7,6 +7,7 @@ Contributor instructions for editing this repository. These are separate from th
 - Read the relevant [SPEC](SPEC.md) sections and trace the implementation before changing behavior. Code establishes current behavior; SPEC records the agreed contract. Resolve discrepancies explicitly instead of assuming either is correct.
 - Keep changes small and use existing shared helpers. Avoid speculative features, parallel implementations, compatibility layers unless requested, and comments that merely repeat code.
 - Put behavioral contracts in SPEC, user workflows in README, and only runtime-agent instructions in `src/guide.md`. Use code comments for non-obvious reasons/invariants and regression tests for concrete failures. Update affected documents together; never document proposed behavior as already implemented.
+- Dependency/feature updates require license and attribution review, including bundled native code. Keep `licenses/rust.json` and generated notices current using `scripts/licenses.cjs`; follow the documented toolchain/platform checks before binary releases. Do not change the project's MIT license to replace third-party terms.
 
 ## Input and outcome boundaries
 

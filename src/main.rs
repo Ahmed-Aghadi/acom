@@ -11,6 +11,12 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::process::exit;
 
+const LICENSES: &str = concat!(
+    include_str!("../LICENSE"),
+    "\n",
+    include_str!("../THIRD_PARTY_NOTICES.txt")
+);
+
 // CLI output may be piped to a reader that exits early. Server logging is separate.
 macro_rules! print {
     ($($args:tt)*) => { write_stdout(format_args!($($args)*)) };
@@ -50,6 +56,9 @@ One server runs every project: start it once with `acom serve`. A project is a f
 agents run in their project's folder and only see that project's agents, threads and locks.
 
 Agents never run user commands.
+
+Offline command (no server or project needed):
+  licenses                                Print the project and third-party license notices
 
 Agent commands (your ID comes from ACOM_ID; they act on your project):
   guide                                   Print the guide for agents
@@ -856,6 +865,8 @@ fn percentage(value: &str) -> Result<f64, String> {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Print the project and third-party license notices without contacting a server.
+    Licenses,
     Guide,
     Models {
         #[arg(long)]
@@ -1772,6 +1783,7 @@ fn main() {
         Cmd::Serve { port } => server::serve(port),
         Cmd::Hook => hook(),
         Cmd::Guide => print!("{GUIDE}"),
+        Cmd::Licenses => print!("{LICENSES}"),
         Cmd::Models { catalog } => {
             if catalog {
                 for h in harness::KNOWN {

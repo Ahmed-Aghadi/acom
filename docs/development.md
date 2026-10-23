@@ -8,6 +8,20 @@ The only browser library is a pinned local Markdown parser; its [dependency revi
 
 The server rejects unknown request fields/query parameters, duplicate keys and malformed supplied values before applying an action; CLI/UI checks are additional safeguards. Defaults apply only to documented omissions/nulls. Failures return an HTTP error and a nonzero CLI exit status. A successful registration or queued action is not a completed event or provider turn: inspect its receipt and subsequent status. If a write's result is uncertain, inspect state before retrying.
 
+## Licenses and releases
+
+Keep the project's MIT [LICENSE](../LICENSE) unchanged when updating third-party notices. [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt) is generated from the reviewed [Rust inventory](../licenses/rust.json) and existing Markdown notices. It includes build dependencies and bundled native-source notices conservatively, not a claim that every listed source file is linked. `acom licenses` embeds and prints the project's license followed by these notices without using a server, provider or data directory.
+
+After fetching/building the locked dependencies, check without network access or output changes:
+
+```sh
+node scripts/licenses.cjs --check
+```
+
+Dependency or feature changes require license review before editing the inventory: verify upstream license choices, applicable native/file-level copyrights and NOTICE files, then update the manifest/lock hashes, exact package versions, selected terms, file hashes and any source-header ranges/hashes. The generator refuses unreviewed changes; it does not choose licenses or update the inventory. Regenerate with `node scripts/licenses.cjs --write`, inspect the diff, rebuild, and run `node --test tests/licenses.cjs` with `ACOM_BINARY` pointing at that isolated build. License extraction only reads already-fetched package files; it adds no tools or build hooks and executes no package scripts. License text content is retained, with line endings normalized in the combined file.
+
+The reviewed dependency graphs are the default aarch64 and x86_64 GNU Linux builds. Before publishing binaries, check the actual release features, target, compiler/standard-library and bundled system libraries; those toolchain/platform components are not covered by Cargo.lock. Include their matching licenses/notices as well as LICENSE and THIRD_PARTY_NOTICES.txt in the release package, or otherwise supply the required readable materials with the executable. Rust toolchains provide standard-library notices under `share/doc/rust/COPYRIGHT-library.html` in `rustc --print sysroot`. A different build configuration requires renewed coverage review; do not assume this inventory covers it. None of this changes acom's own MIT license.
+
 ## Tests
 
 Deterministic regression tests use fake clients and require Node with `node:sqlite` (Node 24+ is a suitable choice).

@@ -176,6 +176,8 @@ An agent waiting in `lock acquire --wait` when it's paused leaves the queue.
 
 Agent commands use positive `ACOM_ID` caller identity and act on the agent's project. An unset ID denotes the user; a defined malformed/nonpositive ID fails rather than silently issuing a user request. User commands act on the project the current folder is in (the closest project folder at or above it); applicable listings are global outside a project. Durations look like `30s`, `5m`, `1h`. CLI output is text or JSON; errors go to stderr with a nonzero exit code. If `send` gets no text argument, it reads stdin.
 
+`acom licenses` is a shared offline command: print the embedded project LICENSE followed by THIRD_PARTY_NOTICES.txt without contacting a server, resolving caller identity, reading provider credentials or creating state. It accepts no options other than help and preserves complete notice text, including when run outside a project; early pipe closure exits quietly. The reviewed inventory and generation/check workflow are in [licenses and releases](docs/development.md#licenses-and-releases); toolchain/platform-specific distribution notices require a separate release review.
+
 ### Agent commands
 
 | Command | What it does |

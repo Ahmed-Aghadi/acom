@@ -97,4 +97,6 @@ The [development instructions](docs/development.md#tests) cover isolated API/CLI
 
 ## License
 
-[MIT](LICENSE).
+acom's own code is licensed under [MIT](LICENSE). Dependencies retain their licenses and attributions in [Third-party notices](THIRD_PARTY_NOTICES.txt). `acom licenses` prints both from the binary without a server.
+
+See [licenses and releases](docs/development.md#licenses-and-releases) before distributing prebuilt binaries.
