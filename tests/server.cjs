@@ -2375,6 +2375,45 @@ async function browserMarkdownSendCheck(page,api) {
   assert.equal(await page.locator(`[data-message="${sent.id}"]`).count(),1,'real POST and polling reconcile without duplicate bubbles');
 }
 
+async function browserBooleanQueryChecks(page,api,project) {
+  const settled=async search=>page.waitForFunction(search=>currentAgentQuery()?.raw===search&&!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.scope===collectionPath('agentBrowser'),search);
+  for(const search of ['state:idle OR pause_reason:limit','NOT (state:closed OR state:replaced)','state:closed OR (state:paused NOT pause_reason:limit)']) {
+    const expected=await api('GET',`/agents?project=${project}&search=${encodeURIComponent(search)}`);
+    await page.locator('#agent-search').fill(search); await settled(search);
+    assert.equal(await page.locator('[data-edit-agent-query]').count(),1,'real parser preserves grouped expression as one chip');
+    assert.equal(await page.locator('[data-edit-agent-filter]').count(),0,'grouped queries are never flattened into editable clauses');
+    assert.equal(await page.evaluate(()=>state.pages.agentBrowser.total),expected.length);
+    assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'false');
+  }
+  const search='state:idle OR pause_reason:limit';
+  await page.locator('#agent-search').fill(search); await settled(search);
+  if(!await page.locator('#agent-filters').evaluate(details=>details.open))await page.locator('#agent-filters > summary').click();
+  await page.locator('#agent-filter-field').selectOption('state');
+  await page.locator('#agent-filter-value').fill('paused');
+  await page.locator('#apply-agent-filter').click();
+  await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentSearch.includes('AND'));
+  const combined=await page.locator('#agent-search').inputValue();
+  await settled(combined);
+  const parsed=await api('GET',`/agent-query?search=${encodeURIComponent(combined)}`);
+  assert.equal(parsed.expression.op,'and');
+  assert.ok(parsed.expression.children.some(child=>child.op==='or'),'adding a filter preserves the OR branch');
+  assert.equal(await page.evaluate(()=>state.pages.agentBrowser.total),(await api('GET',`/agents?project=${project}&search=${encodeURIComponent(combined)}`)).length);
+  await page.locator('[data-edit-agent-query]').click();
+  assert.equal(await page.locator('#agent-search').evaluate(input=>document.activeElement===input),true);
+  const deepest='NOT '.repeat(32)+'state:idle';
+  await page.locator('#agent-search').fill(deepest); await settled(deepest);
+  await page.locator('#agent-filter-field').selectOption('group');
+  await page.locator('#agent-filter-value').fill('Boundary');
+  const parsedAddition=page.waitForResponse(response=>{
+    const url=new URL(response.url());
+    return url.pathname==='/agent-query'&&url.searchParams.get('search')?.includes('group:"Boundary"');
+  });
+  await page.locator('#apply-agent-filter').click();
+  assert.equal((await parsedAddition).status(),200,'adding an AND filter must not introduce unnecessary nesting beyond the supported depth');
+  await settled(await page.locator('#agent-search').inputValue());
+  await page.locator('#clear-agent-filters').click(); await settled('');
+}
+
 async function browserMessageChecks(url, api, project, agent, thread, home) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
@@ -2390,6 +2429,7 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
     }, agent);
     assert.equal(await page.locator('[data-edit-agent-filter=provider]').count(), 1);
     assert.equal(await page.locator('[data-edit-agent-filter=state]').count(), 1);
+    await browserBooleanQueryChecks(page,api,project);
     await page.locator('#agent-search').fill('provider:made-up');
     await page.waitForFunction(() => document.querySelector('#agent-search').getAttribute('aria-invalid') === 'true');
     assert.match(await page.locator('#agent-query-error').textContent(), /provider/);
@@ -2529,7 +2569,7 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     await page.locator('[data-edit-agent-filter=pause_reason]').waitFor();
     assert.match(await page.locator('[data-edit-agent-filter=pause_reason]').textContent(), /limit/);
     assert.match(await page.locator('#agent-filter-scope').textContent(), /ignore these filters/);
-    await page.locator('#clear-agent-filters').click();
+    await browserBooleanQueryChecks(page,api,secondId);
     await page.locator('[data-page=threads]').click();
     await page.locator('[data-open=thread-dialog]').click();
     await page.locator('#thread-form [name=title]').fill('Browser notes');

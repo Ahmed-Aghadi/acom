@@ -1796,17 +1796,12 @@ mod tests {
             "pause_reason=user",
             "pause_reason=all",
             "pause_reason=unknown",
-            "state=working&pause_reason=limit",
-            "state=closed&pause_reason=manual",
         ] {
             let error = super::route(&app, "GET", &["agents"], &super::Query(query), &Value::Null)
                 .err()
                 .unwrap();
             assert_eq!(error.0, 400, "{query}: {error:?}");
-            assert!(
-                error.1.contains("must be") || error.1.contains("requires state paused"),
-                "{error:?}"
-            );
+            assert!(error.1.contains("must be"), "{error:?}");
             assert_eq!(app.lock().db.total_changes(), before);
         }
         for query in [
@@ -1814,6 +1809,8 @@ mod tests {
             "state=paused&pause_reason=manual",
             "pause_reason=limit",
             "pause_reason=restart",
+            "state=working&pause_reason=limit",
+            "state=closed&pause_reason=manual",
         ] {
             super::route(&app, "GET", &["agents"], &super::Query(query), &Value::Null)
                 .unwrap_or_else(|error| panic!("{query}: {error:?}"));

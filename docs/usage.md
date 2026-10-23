@@ -64,13 +64,24 @@ The UI search box and `acom agents --search` share this syntax:
 group:"Security review" state:paused,crashed reentrancy
 ```
 
-This selects that exact group, either state, and a case-insensitive `reentrancy` match in a name, ID, full task, descriptive status, group, provider or model. Spaces combine conditions with AND; unquoted commas give alternatives within a field. A quoted phrase must match within one metadata field. Bare terms do not search effort, lifecycle state, pause reason, logs or project files.
+This selects that exact group, either state, and a case-insensitive `reentrancy` match in a name, ID, full task, descriptive status, group, provider or model. Spaces mean AND; uppercase `AND`, `OR` and `NOT` are operators, with precedence NOT, AND, OR. Unquoted commas give alternatives within a field. Use parentheses to group conditions:
 
-Exact fields are `group`, `provider`, `model`, `effort`, `state` and `pause_reason`. Their values are case-sensitive. Double quotes protect spaces, literal commas and colons: `group:"Review, security"`; quote a whole term such as `"group:parser"` to search it literally. Inside quotes, escape a quote or backslash as `\"` or `\\`. Use `group:""` for ungrouped agents. Repeat alternatives within one clause, not the field itself. Unknown fields, invalid syntax and invalid closed-set values produce an error, not an unfiltered result.
+```text
+state:idle OR pause_reason:limit
+group:"Security review" (state:idle OR pause_reason:limit)
+state:paused NOT pause_reason:limit
+NOT (state:closed OR state:replaced)
+```
 
-Providers are `claude` or `codex`; states are working, idle, paused, done, closed, crashed or replaced. Pause reasons are manual, limit or restart; **Manual** includes individual and bulk user pauses. A reason narrows to paused and rejects a state condition that excludes paused. Group/model/effort names are open exact values, so an unknown name simply has no matches. The filter picker accepts literal values and adds alternatives without requiring query syntax.
+The first selects idle or limit-paused agents. The second also requires the exact group. The third selects pauses other than limits; the fourth excludes closed and replaced agents. A quoted phrase must match within one metadata field. Bare terms do not search effort, lifecycle state, pause reason, logs or project files.
 
-CLI scalar flags `--group`, `--provider`, `--model`, `--effort`, `--state` and `--pause-reason` select one exact value, including any literal comma. For example, `acom agents --pause-reason limit` lists limit-paused agents; use `acom agents --search 'state:paused,crashed'` for alternatives. Do not specify the same field in both a flag and the query. Queries allow up to 4,096 UTF-8 bytes, 64 clauses and 128 field values. Filters apply before pagination and are retained in continuation hints; they never narrow project/global lifecycle actions.
+Exact fields are `group`, `provider`, `model`, `effort`, `state` and `pause_reason`. Their values are case-sensitive. Double quotes protect spaces, literal commas, colons and parentheses: `group:"Review (security)"`; quote a whole term such as `"group:parser"` or `"OR"` to search it literally. Inside quotes, escape a quote or backslash as `\"` or `\\`. Use `group:""` for ungrouped agents. Repeated fields are predicates too: `group:A OR group:B` selects either group, while `group:A group:B` cannot match two different exact groups. Unknown fields, invalid syntax and invalid closed-set values produce an error, not an unfiltered result. Valid but contradictory conditions return no matches.
+
+Providers are `claude` or `codex`; states are working, idle, paused, done, closed, crashed or replaced. Pause reasons are manual, limit or restart; **Manual** includes individual and bulk user pauses. A pause-reason condition matches only currently paused agents. `NOT pause_reason:limit` therefore includes agents with no pause reason, not just other pauses. Group/model/effort names are open exact values, so an unknown name simply has no matches.
+
+The filter picker accepts literal values and alternatives without query syntax. Simple conditions have individual editable chips. OR, NOT and repeated-field queries appear as one expression chip so editing cannot flatten or change their grouping; edit them in the search box. Adding a picker filter to an expression ANDs it with the entire existing query. Category buttons still narrow the result separately, and their counts reflect the query before category selection.
+
+CLI scalar flags `--group`, `--provider`, `--model`, `--effort`, `--state` and `--pause-reason` select one exact value, including any literal comma, and AND with the entire search expression. For example, `acom agents --group 'Security review' --search 'state:idle OR pause_reason:limit'` restricts both alternatives to that group. Do not specify the same field in both a flag and the query. Queries allow up to 4,096 UTF-8 bytes, 64 leaf conditions, 128 supplied field values and 32 nested groups/negations. Filters apply before pagination and are retained in continuation hints; they never narrow project/global lifecycle actions.
 
 ## Waits and subscriptions
 

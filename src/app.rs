@@ -5659,7 +5659,7 @@ impl App {
         )
     }
 
-    fn agent_source(st: &St) -> String {
+    fn agent_source(st: &St, predicate: &str) -> String {
         let mut stopping: Vec<i64> = st
             .stopping_agents
             .iter()
@@ -5689,20 +5689,12 @@ impl App {
           a.state IN ('working','idle') is_active,
           (a.state IN ('paused','crashed') OR {stopping} OR a.wake_queued_at IS NOT NULL OR EXISTS(SELECT 1 FROM agent_starts s WHERE s.agent_id=a.id)) needs_attention,
           a.state IN ('done','closed','replaced') is_finished
-          FROM agents a WHERE (?1 IS NULL OR a.project=?1)
-          AND (json_array_length(?2)=0 OR coalesce(a.grp,'') IN (SELECT value FROM json_each(?2)))
-          AND (json_array_length(?3)=0 OR a.harness IN (SELECT value FROM json_each(?3)))
-          AND (json_array_length(?4)=0 OR a.model IN (SELECT value FROM json_each(?4)))
-          AND (json_array_length(?5)=0 OR a.effort IN (SELECT value FROM json_each(?5)))
-          AND (json_array_length(?6)=0 OR a.state IN (SELECT value FROM json_each(?6)))
-          AND (json_array_length(?7)=0 OR CASE WHEN a.pause_reason IN ('user','all') THEN 'manual' ELSE a.pause_reason END IN (SELECT value FROM json_each(?7)))
-          AND NOT EXISTS (SELECT 1 FROM json_each(?8) term WHERE NOT EXISTS (
-            SELECT 1 FROM json_each(json_array(a.name,CAST(a.id AS TEXT),a.harness,a.model,a.grp,a.status_text,a.task)) field
-            WHERE instr(acom_lower(coalesce(field.value,'')),term.value)>0))")
+          FROM agents a WHERE (?1 IS NULL OR a.project=?1) AND ({predicate})")
     }
 
     fn agent_counts(st: &St, project: Option<i64>, query: &ParsedAgentQuery) -> R<Value> {
-        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished FROM ({})", Self::agent_source(st)), rusqlite::params_from_iter(query.params(project)))?.remove(0))
+        let (predicate, params) = query.compile(project);
+        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished FROM ({})", Self::agent_source(st, &predicate)), rusqlite::params_from_iter(params))?.remove(0))
     }
 
     pub fn filtered_agents_page(
@@ -5721,12 +5713,13 @@ impl App {
         };
         let mut st = self.lock();
         st.atomic(|st| {
+        let (condition, args) = query.compile(project);
         let sql=format!("SELECT id,project,name,grp \"group\",harness,model,effort,state,status_text status,substr(task,1,400) task_preview,
           substr(problem,1,400) problem_preview,problem IS NOT NULL has_problem,
           (lower(problem) LIKE '%model%not supported%' OR lower(problem) LIKE '%model%not available%'
            OR lower(problem) LIKE '%model%not found%' OR lower(problem) LIKE '%not supported%account%') model_unavailable,launched_by,launched_at,
           pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,turns,ended_at,wake_queued_at,wake_why wake_reason
-          FROM ({}) WHERE {predicate}", Self::agent_source(st));
+          FROM ({}) WHERE {predicate}", Self::agent_source(st, &condition));
         let mut page = self.select_page(
             st,
             &q,
@@ -5739,7 +5732,7 @@ impl App {
             ],
             &Self::agent_scope(st, project, filters.category, &query),
             &sql,
-            &query.params(project),
+            &args,
             true,
         )?;
         for item in &mut page.items {
@@ -13884,13 +13877,22 @@ mod tests {
                 .iter()
                 .all(|item| item["state"] == "paused" && item["pause_reason"] == "limit")
         );
-        for search in [
-            "group:bad group:other",
-            "provider:bad",
-            "task:x",
-            "state:idle pause_reason:limit",
-            "group:",
-        ] {
+        for search in ["group:bad group:other", "state:idle pause_reason:limit"] {
+            assert_eq!(
+                app.filtered_agents_page(
+                    Some(1),
+                    AgentFilter {
+                        search,
+                        ..AgentFilter::default()
+                    },
+                    PageQuery::default()
+                )
+                .unwrap()["total"],
+                0
+            );
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
+        for search in ["provider:bad", "task:x", "group:"] {
             assert_eq!(
                 app.filtered_agents_page(
                     Some(1),
@@ -13940,6 +13942,106 @@ mod tests {
                 .unwrap();
             assert_eq!(result["total"], total, "{search}");
         }
+    }
+
+    #[test]
+    fn boolean_agent_queries_handle_null_reasons_contradictions_and_scalar_scope() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db.execute("UPDATE agents SET state='idle',grp='crew',task='OR (literal)',pause_reason='limit' WHERE id=1", []).unwrap();
+            for (id, state, reason, group) in [
+                (3, "paused", Some("limit"), Some("crew")),
+                (4, "paused", Some("user"), Some("crew")),
+                (5, "paused", None, None),
+                (6, "crashed", Some("limit"), None),
+                (7, "done", None, Some("other")),
+            ] {
+                st.db.execute("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(?1,1,'Worker',?2,'needle','codex','gpt-6-sol','medium',?3,?4,0,0)", params![id, group, state, reason]).unwrap();
+            }
+        }
+        let before = app.lock().db.total_changes();
+        for (search, expected) in [
+            ("state:idle OR pause_reason:limit", vec![3, 1]),
+            ("pause_reason:limit", vec![3]),
+            ("NOT pause_reason:limit", vec![7, 6, 5, 4, 1]),
+            ("state:paused NOT pause_reason:limit", vec![5, 4]),
+            ("NOT group:crew", vec![7, 6, 5]),
+            ("state:idle OR state:paused AND group:crew", vec![4, 3, 1]),
+            ("(state:idle OR state:paused) NOT group:crew", vec![5]),
+            ("state:idle state:paused", vec![]),
+            ("group:crew AND group:other", vec![]),
+            ("state:idle pause_reason:limit", vec![]),
+            ("NOT (state:idle OR state:paused)", vec![7, 6]),
+            ("NOT (state:paused OR NOT group:crew)", vec![1]),
+            ("group:\"x') OR 1=1 --\"", vec![]),
+            ("\"OR\" \"(literal)\"", vec![1]),
+        ] {
+            let page = app
+                .filtered_agents_page(
+                    Some(1),
+                    AgentFilter {
+                        search,
+                        ..AgentFilter::default()
+                    },
+                    PageQuery::default(),
+                )
+                .unwrap();
+            let ids: Vec<_> = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{search}");
+            assert_eq!(page["total"], expected.len(), "{search}");
+            assert_eq!(page["counts"]["all"], expected.len(), "{search}");
+        }
+        let page = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    group: Some("crew"),
+                    search: "state:idle OR state:paused",
+                    ..AgentFilter::default()
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(page["total"], 3, "scalar filter ANDs the entire OR");
+        let page = app
+            .filtered_agents_page(
+                Some(1),
+                AgentFilter {
+                    state: Some("idle"),
+                    pause_reason: Some("limit"),
+                    ..AgentFilter::default()
+                },
+                PageQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            page["total"], 0,
+            "valid scalar contradiction is empty, not rejected"
+        );
+        for search in [
+            format!("{}state:idle", "NOT ".repeat(32)),
+            format!("{}state:idle{}", "(".repeat(32), ")".repeat(32)),
+        ] {
+            assert_eq!(
+                app.filtered_agents_page(
+                    Some(1),
+                    AgentFilter {
+                        search: &search,
+                        ..AgentFilter::default()
+                    },
+                    PageQuery::default()
+                )
+                .unwrap()["total"],
+                1
+            );
+        }
+        assert_eq!(app.lock().db.total_changes(), before);
     }
 
     #[test]
@@ -14131,20 +14233,12 @@ mod tests {
                 pause_reason: Some(" limit "),
                 ..AgentFilter::default()
             },
-            AgentFilter {
-                state: Some("idle"),
-                pause_reason: Some("limit"),
-                ..AgentFilter::default()
-            },
         ] {
             let error = app
                 .filtered_agents_page(Some(1), filter, PageQuery::default())
                 .unwrap_err();
             assert_eq!(error.0, 400, "{filter:?}: {error:?}");
-            assert!(
-                error.1.contains("must be") || error.1.contains("requires state paused"),
-                "{error:?}"
-            );
+            assert!(error.1.contains("must be"), "{error:?}");
             assert_eq!(app.lock().db.total_changes(), before);
         }
     }

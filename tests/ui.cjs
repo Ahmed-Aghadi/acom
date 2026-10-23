@@ -44,11 +44,13 @@ const reloadPage = async page => {
   await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
 };
 
-// Test-server query fixture only; the page obtains clauses from the real server parser.
+// Test-server query fixture only; the page obtains the AST and editable clauses from the server.
 function agentQueryFixture(source) {
-  const fields=['group','provider','model','effort','state','pause_reason'],clauses=[]; let i=0;
+  const fields=['group','provider','model','effort','state','pause_reason']; let i=0;
   const quote=value=>'"'+value.replaceAll('\\','\\\\').replaceAll('"','\\"')+'"',fail=message=>{throw new Error(message);};
-  const value=()=>{
+  const space=()=>{while(i<source.length&&/\s/.test(source[i]))i++;};
+  const operator=word=>source.startsWith(word,i)&&(i+word.length===source.length||/[\s()]/.test(source[i+word.length]));
+  const value=(field=false)=>{
     if(source[i]==='"') {
       i++;let text='';
       while(i<source.length) {
@@ -57,30 +59,58 @@ function agentQueryFixture(source) {
       }
       fail('Unclosed quote');
     }
-    const start=i;while(i<source.length&&!/[\s,:"\\]/.test(source[i]))i++;
+    const start=i;while(i<source.length&&!/[\s:()"\\]/.test(source[i])&&(!field||source[i]!==','))i++;
     if(start===i)fail('Missing or malformed value');return source.slice(start,i);
   };
+  const combine=(op,children)=>children.length===1?children[0]:{op,children:children.flatMap(child=>child.op===op?child.children:[child])};
+  const primary=()=>{
+    space();
+    if(source[i]==='(') {i++;const expression=or();space();if(source[i++]!==')')fail('Missing closing parenthesis');return expression;}
+    if(i===source.length||source[i]===')'||operator('AND')||operator('OR'))fail('Expected condition');
+    const quoted=source[i]==='"',first=value();let field=null,values=[first];
+    if(!quoted&&source[i]===':') {
+      field=first;i++;if(!fields.includes(field))fail(`Unknown search field: ${field}`);
+      values=[value(true)];while(source[i]===','){i++;values.push(value(true));}
+      if(field!=='group'&&values.includes(''))fail(`Empty ${field} value`);
+      const valid={provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']}[field];
+      if(valid&&values.some(value=>!valid.includes(value)))fail(`Unknown ${field} value`);
+      values=[...new Set(values)].sort();
+    } else if(first==='')fail('Empty text term');
+    if(i<source.length&&!/[\s()]/.test(source[i]))fail('Expected space between clauses');
+    return {op:'clause',clause:{field,values,text:field?`${field}:${values.map(quote).join(',')}`:quote(first)}};
+  };
+  const not=()=>{space();if(operator('NOT')){i+=3;return {op:'not',child:not()};}return primary();};
+  const and=()=>{
+    const children=[not()];
+    while(true) {space();if(i===source.length||source[i]===')'||operator('OR'))break;if(operator('AND'))i+=3;children.push(not());}
+    return combine('and',children);
+  };
+  const or=()=>{const children=[and()];while(true){space();if(!operator('OR'))break;i+=2;children.push(and());}return combine('or',children);};
+  const render=(node,parent=0)=>{
+    const precedence={or:1,and:2,not:3,clause:4}[node.op];
+    const text=node.op==='clause'?node.clause.text:node.op==='not'?`NOT ${render(node.child,precedence)}`:node.children.map(child=>render(child,precedence)).join(node.op==='and'?' AND ':' OR ');
+    return precedence<parent?`(${text})`:text;
+  };
   try {
-    while(i<source.length) {
-      while(/\s/.test(source[i]||'')&&i<source.length)i++;if(i===source.length)break;
-      const quoted=source[i]==='"',first=value(); let field=null,values=[first];
-      if(!quoted&&source[i]===':') {
-        field=first;i++;if(!fields.includes(field))fail(`Unknown search field: ${field}`);
-        if(clauses.some(clause=>clause.field===field))fail(`Duplicate search field: ${field}`);
-        values=[value()];while(source[i]===','){i++;values.push(value());}
-        if(field!=='group'&&values.includes(''))fail(`Empty ${field} value`);
-        const valid={provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']}[field];
-        if(valid&&values.some(value=>!valid.includes(value)))fail(`Unknown ${field} value`);
-        values=[...new Set(values)].sort();
-      } else if(first==='')fail('Empty text term');
-      if(i<source.length&&!/\s/.test(source[i]))fail('Expected space between clauses');
-      clauses.push({field,values,text:field?`${field}:${values.map(quote).join(',')}`:quote(first)});
-    }
-    const reason=clauses.find(clause=>clause.field==='pause_reason'),state=clauses.find(clause=>clause.field==='state');
-    if(reason&&state&&!state.values.includes('paused'))fail('Pause reason conflicts with state');
-    clauses.sort((a,b)=>(a.field==null?fields.length:fields.indexOf(a.field))-(b.field==null?fields.length:fields.indexOf(b.field)));
-    return {text:clauses.map(clause=>clause.text).join(' '),clauses};
+    space();if(i===source.length)return {text:'',clauses:[],expression:null};
+    const expression=or();space();if(i!==source.length)fail('Unexpected closing parenthesis');
+    const children=expression.op==='and'?expression.children:[expression];
+    let clauses=children.every(child=>child.op==='clause')?children.map(child=>child.clause):null;
+    if(clauses&&new Set(clauses.filter(clause=>clause.field).map(clause=>clause.field)).size!==clauses.filter(clause=>clause.field).length)clauses=null;
+    if(clauses)clauses.sort((a,b)=>(a.field==null?fields.length:fields.indexOf(a.field))-(b.field==null?fields.length:fields.indexOf(b.field)));
+    return {text:clauses?clauses.map(clause=>clause.text).join(' '):render(expression),clauses,expression};
   } catch(error) {return {status:400,error:error.message};}
+}
+
+function agentQueryMatches(expression,agent) {
+  if(!expression)return true;
+  if(expression.op==='and')return expression.children.every(child=>agentQueryMatches(child,agent));
+  if(expression.op==='or')return expression.children.some(child=>agentQueryMatches(child,agent));
+  if(expression.op==='not')return !agentQueryMatches(expression.child,agent);
+  const clause=expression.clause;
+  if(clause.field==null)return [agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].some(value=>String(value??'').toLowerCase().includes(clause.values[0].toLowerCase()));
+  if(clause.field==='pause_reason')return agent.state==='paused'&&clause.values.includes(['user','all'].includes(agent.pause_reason)?'manual':agent.pause_reason);
+  return clause.values.includes(String(clause.field==='provider'?agent.harness:clause.field==='group'?agent.group||'':agent[clause.field]));
 }
 
 async function fixture(run) {
@@ -186,7 +216,7 @@ async function fixture(run) {
       if(key==='agents') {
         const category=params.get('category')||'all', search=params.get('search')||'',state=params.get('state'),reason=params.get('pause_reason'),parsed=agentQueryFixture(search);
         if(parsed.error)return send(parsed);
-        const matched=data.agents.filter(agent=>agent.project===project&&(!state||agent.state===state)&&(!reason||(agent.state==='paused'&&(reason==='manual'?['user','all'].includes(agent.pause_reason):agent.pause_reason===reason)))&&parsed.clauses.every(clause=>clause.field==null?[agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].some(value=>String(value ?? '').toLowerCase().includes(clause.values[0].toLowerCase())):clause.field==='pause_reason'?agent.state==='paused'&&clause.values.includes(['user','all'].includes(agent.pause_reason)?'manual':agent.pause_reason):clause.values.includes(String(clause.field==='provider'?agent.harness:clause.field==='group'?agent.group||'':agent[clause.field]))));
+        const matched=data.agents.filter(agent=>agent.project===project&&(!state||agent.state===state)&&(!reason||(agent.state==='paused'&&(reason==='manual'?['user','all'].includes(agent.pause_reason):agent.pause_reason===reason)))&&agentQueryMatches(parsed.expression,agent));
         const ids=new Set(matched.filter(agent=>agentCategory(agent,category)).map(agent=>agent.id));
         const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search,state,reason]));
         return send(result.error||result.unchanged ? result : {...result,counts:agentCounts(matched),project_total:data.agents.filter(agent=>agent.project===project).length});
@@ -4512,7 +4542,7 @@ async function pickAgentFilter(page,field,values) {
     else {await page.locator('#agent-filter-value').fill(value);await page.locator('#add-filter-value').click();}
   }
   await page.locator('#apply-agent-filter').click();
-  await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser.pending&&!!currentAgentQuery()?.value);
+  await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser.pending&&!!state.pages.agentBrowser.revision&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&!!currentAgentQuery()?.value);
 }
 
 test('exact query filters search all pages, preserve polling and expose editable removable chips', async () => fixture(async (page,data) => {
@@ -4568,7 +4598,7 @@ test('invalid queries stay local, hide old results and pagination, and never sil
   data.pageLimit=1;data.agents=[{id:1,project:1,name:'First',state:'idle'},{id:2,project:1,name:'Second',state:'paused',pause_reason:'limit'}];
   await manualPolling(page);await reloadPage(page);
   assert.equal(await page.locator('#page-overview [data-more=agentBrowser]').isVisible(),true);
-  for(const source of ['unknown:foo','group:','group:"unterminated','state:paused,','provider:made-up','state:idle pause_reason:limit','group:a group:b']) {
+  for(const source of ['unknown:foo','group:','group:"unterminated','state:paused,','provider:made-up','state:idle OR','NOT','()','state:idle AND OR state:paused','(state:idle']) {
     const before=data.getRequests.filter(url=>url.startsWith('/agents?')).length;
     await page.locator('#agent-search').fill(source);await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.error);
     assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'true');
@@ -4581,6 +4611,131 @@ test('invalid queries stay local, hide old results and pagination, and never sil
   await page.locator('#clear-agent-filters').click();await page.waitForFunction(()=>!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
   assert.equal(await page.locator('#agent-search').getAttribute('aria-invalid'),'false');assert.equal(await page.locator('#agent-query-error').isVisible(),false);
   assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 2 matches · 2 total');
+}));
+
+test('Boolean query precedence, grouped alternatives and NOT include missing pause reasons correctly', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Idle reviewer',group:'Security review',state:'idle'},
+    {id:2,project:1,name:'Limit reviewer',group:'Security review',state:'paused',pause_reason:'limit'},
+    {id:3,project:1,name:'Manual reviewer',group:'Security review',state:'paused',pause_reason:'user'},
+    {id:4,project:1,name:'Outside idle',group:'Other',state:'idle'},
+    {id:5,project:1,name:'Outside limit',group:'Other',state:'paused',pause_reason:'limit'},
+    {id:6,project:1,name:'Closed reviewer',group:'Security review',state:'closed'},
+    {id:7,project:1,name:'Running reviewer',group:'Security review',state:'working',pause_reason:null}];
+  await manualPolling(page);await reloadPage(page);
+  const cases=[
+    ['state:idle OR pause_reason:limit',[5,4,2,1]],
+    ['group:"Security review" (state:idle OR pause_reason:limit)',[2,1]],
+    ['state:idle OR pause_reason:limit group:"Security review"',[4,2,1]],
+    ['state:paused NOT pause_reason:limit',[3]],
+    ['NOT pause_reason:limit',[7,6,4,3,1]],
+    ['NOT (state:closed OR state:working)',[5,4,3,2,1]],
+    ['NOT NOT state:idle',[4,1]],
+    ['state:idle pause_reason:limit',[]],
+    ['group:a group:b',[]],
+  ];
+  for(const [query,ids] of cases) {
+    await page.locator('#agent-search').fill(query);
+    await page.waitForFunction(raw=>!agentSearchTimer&&currentAgentQuery()?.raw===raw&&!!currentAgentQuery()?.value&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&!state.pages.agentBrowser.pending,query);
+    assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),ids,query);
+    assert.equal(await page.locator('#agent-query-error').isVisible(),false);
+    assert.equal(await page.locator('[data-agent-count=all]').textContent(),String(ids.length));
+    assert.equal(new Set(await page.locator('#agents [data-agent]').evaluateAll(rows=>rows.map(row=>row.dataset.agent))).size,ids.length);
+  }
+}));
+
+test('advanced query chip and picker preserve the whole OR expression and separate category', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Idle reviewer',state:'idle',group:'Security review'},
+    {id:2,project:1,name:'Quota reviewer',state:'paused',pause_reason:'limit',group:'Security review'},
+    {id:3,project:1,name:'Outside idle',state:'idle',group:'Other'},
+    {id:4,project:1,name:'Manual reviewer',state:'paused',pause_reason:'user',group:'Security review'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=active]').click();
+  const raw='state:idle OR pause_reason:limit';await page.locator('#agent-search').fill(raw);
+  await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true','a pause-reason OR branch must not reset the active category');
+  assert.equal(await page.locator('[data-edit-agent-filter]').count(),0);
+  assert.equal(await page.locator('[data-edit-agent-query]').count(),1);
+  assert.match(await page.locator('[data-edit-agent-query]').textContent(),/state:.*idle.* OR pause_reason:.*limit/);
+  await page.locator('[data-edit-agent-query]').click();
+  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el&&el.selectionStart===0&&el.selectionEnd===el.value.length),true);
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-search').inputValue(),raw);
+  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el&&el.selectionStart===0&&el.selectionEnd===el.value.length),true);
+  await page.locator('#agent-filters > summary').click();
+  assert.equal(await page.locator('#agent-filter-mode').isVisible(),true);
+  assert.equal(await page.locator('#apply-agent-filter').textContent(),'Add AND filter');
+  await pickAgentFilter(page,'group',['Security review']);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+  assert.match(await page.locator('#agent-search').inputValue(),/^\(.* OR .*\) AND group:/);
+  assert.equal(await page.locator('[data-edit-agent-query]').count(),1);
+  await page.locator('[data-agent-filter=all]').click();
+  await page.waitForFunction(()=>state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2,1]);
+  await pickAgentFilter(page,'state',['working']);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[],'same-field additions AND the expression rather than overwriting its OR leaves');
+  await page.locator('[data-agent-filter=active]').click();
+  await page.locator('[data-clear-agent-filter=query]').click();
+  await page.waitForFunction(()=>!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===2);
+  assert.equal(await page.locator('#agent-search').inputValue(),'');
+  assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true','clearing the expression preserves the independent category');
+  assert.equal(await page.locator('#agent-filter-mode').isVisible(),false);
+  assert.equal(data.requests.length,0);
+}));
+
+test('Boolean query pagination and polling show every matching agent exactly once', async () => fixture(async (page,data) => {
+  data.pageLimit=2;data.agents=Array.from({length:8},(_,index)=>({id:index+1,project:1,name:`Agent ${index+1}`,state:index%2?'paused':'idle',pause_reason:index%2?'limit':null}));
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('state:idle OR pause_reason:limit');
+  await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===8&&!state.pages.agentBrowser.pending);
+  while(await page.locator('#page-overview [data-more=agentBrowser]').isVisible()) {
+    await page.locator('#page-overview [data-more=agentBrowser]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
+  }
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[8,7,6,5,4,3,2,1]);
+  await page.evaluate(()=>refresh());
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[8,7,6,5,4,3,2,1]);
+  assert.equal(await page.locator('#agents [data-agent]').count(),8);
+}));
+
+test('quoted Boolean words and parentheses remain literal and long expression chips fit mobile', async () => fixture(async (page,data) => {
+  const group='OR (draft) <img src=x onerror=alert(1)> '+ 'very-long-value-'.repeat(40);
+  data.agents=[{id:1,project:1,name:'Literal OR (draft)',state:'idle',group},
+    {id:2,project:1,name:'Another',state:'idle',group:'Other'},
+    {id:3,project:1,name:'Literal AND NOT',state:'closed',group:'AND'}];
+  await manualPolling(page);await reloadPage(page);await pickAgentFilter(page,'group',[group]);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
+  const query=await page.locator('#agent-search').inputValue();
+  await page.locator('#agent-search').fill(`(${query}) OR ("AND" "NOT")`);
+  await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3,1]);
+  assert.equal(await page.locator('#agent-filter-chips img').count(),0,'query text cannot inject HTML');
+  assert.match(await page.locator('[data-edit-agent-query]').textContent(),/<img src=x onerror=alert\(1\)>/);
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.locator('[data-edit-agent-query]').click();
+  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el),true);
+  await page.locator('#clear-agent-filters').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
+  await pickAgentFilter(page,'group',['AND']);
+  assert.equal(await page.locator('#agent-search').inputValue(),'group:"AND"');
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3]);
+}));
+
+test('stale advanced chips cannot clear or focus a newer query and malformed expressions recover', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Idle',state:'idle'},{id:2,project:1,name:'Quota',state:'paused',pause_reason:'limit'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('state:idle OR pause_reason:limit');
+  await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
+  await page.locator('#agent-search').blur();await selectText(page,'[data-edit-agent-query]');
+  await page.evaluate(()=>{state.agentSearch='NOT state:idle';return refreshAgentBrowser();});
+  assert.match(await page.locator('[data-edit-agent-query]').textContent(),/ OR /,'selected old expression remains until selection clears');
+  await page.locator('[data-clear-agent-filter=query]').dispatchEvent('click');
+  await page.locator('[data-edit-agent-query]').dispatchEvent('click');
+  assert.equal(await page.evaluate(()=>state.agentSearch),'NOT state:idle');
+  assert.equal(await page.locator('#agent-search').evaluate(el=>document.activeElement===el),false);
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.match(await page.locator('[data-edit-agent-query]').textContent(),/^NOT /);
+  await page.locator('#agent-search').fill('NOT (state:idle OR)');await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.error);
+  assert.equal(await page.locator('#agents [data-agent]').count(),0);
+  assert.equal(await page.locator('#page-overview [data-more=agentBrowser]').isVisible(),false);
+  await page.evaluate(()=>refresh());assert.equal(await page.locator('#live-text').textContent(),'live');
+  await page.locator('#agent-search').fill('NOT pause_reason:limit');await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('#agent-query-error').isVisible(),false);
 }));
 
 test('literal values, alternatives and free words share one server query without rewriting typed input', async () => fixture(async (page,data) => {

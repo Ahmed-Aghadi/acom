@@ -77,7 +77,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   subscription <ID> / unsubscribe <ID>    Read one subscription / cancel your own (user may cancel any)
   agents [--search QUERY] [--group NAME] [--provider claude|codex] [--model ID] [--effort EFFORT]
          [--state STATE] [--pause-reason manual|limit|restart] [--event-cursor]
-                                          Exact filters; query spaces AND, field commas OR, double quotes protect literals
+                                          Query: AND/OR/NOT, parentheses; spaces AND, field commas OR; quote literals
   agent <ID>                              One agent's details
   launch --task <text> [--harness h] [--model m] [--effort e] [--name n] [--group g] [--done|--replace] [--ack-crashes]
                                           Launch a helper agent; --done also marks you done,
@@ -218,6 +218,38 @@ mod cli_tests {
                 }
                 .normalized()
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn agents_accept_boolean_queries_and_reject_incomplete_operators() {
+        for search in [
+            "state:idle OR pause_reason:limit",
+            "group:\"Security review\" (state:idle OR pause_reason:limit)",
+            "state:paused NOT pause_reason:limit",
+            "NOT (state:closed OR state:replaced)",
+        ] {
+            let cli = Cli::try_parse_from(["acom", "agents", "--search", search]).unwrap();
+            let Cmd::Agents { search, .. } = cli.cmd else {
+                panic!("wrong command")
+            };
+            app::AgentFilter {
+                search: search.as_deref().unwrap(),
+                ..app::AgentFilter::default()
+            }
+            .normalized()
+            .unwrap();
+        }
+        for search in ["OR state:idle", "state:idle OR", "NOT", "()"] {
+            assert!(
+                app::AgentFilter {
+                    search,
+                    ..app::AgentFilter::default()
+                }
+                .normalized()
+                .is_err(),
+                "{search}"
             );
         }
     }
@@ -934,7 +966,7 @@ enum Cmd {
     Agents {
         #[arg(
             long,
-            help = "Field-aware query: spaces AND, field commas OR; double quotes protect spaces, commas and colons"
+            help = "Field-aware query: NOT > AND > OR; parentheses group, spaces mean AND, field commas give alternatives; double quotes protect literals"
         )]
         search: Option<String>,
         #[arg(long)]

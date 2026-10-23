@@ -364,7 +364,6 @@ test('CLI agent lifecycle filters validate before requests and retain paging sco
   for (const flags of [
     ['--state', 'unknown'], ['--state', ''], ['--state', 'Paused'],
     ['--pause-reason', 'unknown'], ['--pause-reason', ''], ['--pause-reason', 'user'],
-    ['--state', 'idle', '--pause-reason', 'limit'],
   ]) await t.test(`rejects ${JSON.stringify(flags)}`, async () => {
     await mock((_, res) => res.end('{}'), async fixture => {
       const result = await cli(['agents', ...flags], fixture);
@@ -413,10 +412,10 @@ test('CLI agent queries validate before discovery and preserve every paging filt
     ['--search', 'unknown:value'], ['--search', 'provider:other'],
     ['--search', 'state:paused,unknown'], ['--search', 'pause_reason:user'],
     ['--search', 'group:'], ['--search', 'group:"unterminated'],
-    ['--search', 'model:model-id model:other'],
     ['--search', 'group:team', '--group', 'team'],
     ['--search', 'provider:codex', '--provider', 'codex'],
-    ['--search', 'state:crashed', '--pause-reason', 'limit'],
+    ['--search', 'state:idle OR'], ['--search', 'NOT'],
+    ['--search', '(state:idle'], ['--search', 'state:idle AND OR state:paused'],
     ['--provider', 'other'], ['--model', ''], ['--effort', ''],
   ]) await t.test(`rejects ${JSON.stringify(flags)}`, async () => {
     await mock((_, res) => res.end('{}'), async fixture => {
@@ -426,7 +425,7 @@ test('CLI agent queries validate before discovery and preserve every paging filt
     });
   });
   await t.test('continuation hints retain structured fields, query and event baseline', async () => {
-    const search = 'state:paused,crashed "provider:literal" reentrancy';
+    const search = 'state:idle OR (pause_reason:limit AND NOT "provider:literal")';
     await mock((req, res) => {
       req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(req.url === '/agents/7/project' ? { project: 9 } : {
@@ -671,7 +670,7 @@ async function isolated(run) {
       for (const provider of ['codex', 'claude']) usage.run(provider, now, now + 3600);
       connection.exec('COMMIT');
     });
-    await run({ api, db, start, stop, home, env, project, projectDir, root });
+    await run({ api, db, start, stop, home, env, project, projectDir, root, url });
   } finally {
     await stop();
     fs.rmSync(root,{recursive:true,force:true});
@@ -1114,13 +1113,12 @@ test('structured agent filters preserve exact facets, paging and lifecycle scope
         db(connection => connection.prepare("UPDATE agents SET state='paused',pause_reason='limit' WHERE id=130").run());
       }
     });
-    await t.test('unknown, empty and incompatible filters reject without changing business state', async () => {
+    await t.test('unknown and empty filters reject without changing business state', async () => {
       const snapshot = () => db(connection => Object.fromEntries(['agents', 'locks', 'events', 'notices', 'subscriptions'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
       const before = snapshot();
       for (const filter of [
         { state: '' }, { state: 'all' }, { state: 'Paused' }, { state: ' paused ' }, { state: 'unknown' },
         { pause_reason: '' }, { pause_reason: 'all' }, { pause_reason: 'user' }, { pause_reason: 'unknown' },
-        ...['working', 'idle', 'done', 'closed', 'crashed', 'replaced'].map(state => ({ state, pause_reason: 'limit' })),
         { states: 'paused' }, { 'pause-reason': 'limit' },
       ]) {
         const result = await api('GET', params('/agents', { project: project.id, ...filter }), undefined, 400);
@@ -1239,14 +1237,14 @@ test('agent query fields, literals and alternatives stay exact across bounded pa
       const paused = await api('GET', route({ search: 'state:paused,crashed pause_reason:limit', limit: 1, max_bytes: 512 }), undefined, 200, 512);
       assert.equal(paused.revision, reason.revision, 'a pause reason normalizes a state alternative list containing paused');
     });
-    await t.test('invalid fields, grammar and contradictory or duplicate filters do not mutate or consume state', async () => {
+    await t.test('invalid fields, grammar and scalar duplicates do not mutate or consume state', async () => {
       const snapshot = () => db(connection => Object.fromEntries(['agents', 'locks', 'events', 'notices', 'subscriptions', 'members', 'marks'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
       const before = snapshot();
       for (const search of [
         'unknown:value', 'provider:other', 'provider:Codex', 'state:unknown', 'state:paused,unknown', 'pause_reason:user',
-        'pause_reason:limit state:idle,crashed', 'group:', 'model:""', 'effort:""', 'state:""', 'provider:""',
+        'group:', 'model:""', 'effort:""', 'state:""', 'provider:""',
         'group:a,', 'group:,a', 'group:a,,b', 'group:"unterminated',
-        '"bad\\q"', 'bad\\q', 'model:a model:b', 'state:paused state:paused', '""',
+        '"bad\\q"', 'bad\\q', '""',
       ]) {
         const error = await api('GET', route({ search }), undefined, 400);
         assert.equal(typeof error.error, 'string'); assert.ok(error.error.length > 0, search);
@@ -1305,6 +1303,224 @@ test('agent query fields, literals and alternatives stay exact across bounded pa
       assert.deepEqual(fresh.project_actions, overview.project_actions);
       assert.equal(fresh.pause_eligible, overview.pause_eligible); assert.equal(fresh.resume_eligible, overview.resume_eligible);
       assert.deepEqual(fresh.agent_counts, categories(records));
+    });
+  });
+});
+
+test('Boolean agent queries preserve truth, project scope and bounded traversal', async t => {
+  await isolated(async ({ api, db, project, root, env, url, projectDir }) => {
+    const records = Array.from({ length: 130 }, (_, index) => ({
+      id: index + 1, group: 'team', state: 'closed', reason: null,
+      name: `boolean fixture ${index + 1}`, task: `boolean task ${index + 1}`, status: null,
+    }));
+    const set = (id, values) => Object.assign(records[id - 1], values);
+    set(1, { state: 'idle', group: 'Security review' });
+    set(2, { state: 'paused', reason: 'limit', group: 'Security review' });
+    set(3, { state: 'paused', reason: 'user', group: 'Security review' });
+    set(4, { state: 'paused', reason: 'all', group: 'Other' });
+    set(5, { state: 'paused', reason: 'restart', group: 'Other' });
+    set(6, { state: 'paused', group: null });
+    set(7, { state: 'done', reason: 'limit', group: null });
+    set(8, { state: 'idle', reason: 'limit', group: 'Other' });
+    set(9, { state: 'crashed', group: 'OR', name: 'AND' });
+    set(10, { state: 'working', group: 'Other' });
+    set(11, { group: '', task: 'AND OR NOT parenthetical (value) group:x %_literal' });
+    const injection = "x') OR 1=1 --";
+    set(12, { state: 'paused', reason: 'limit', group: injection });
+    set(127, { state: 'idle', group: 'Security review' });
+    set(130, { state: 'paused', reason: 'limit', group: 'Other' });
+    const counts = rows => ({
+      all: rows.length,
+      active: rows.filter(row => ['working', 'idle'].includes(row.state)).length,
+      attention: rows.filter(row => ['paused', 'crashed'].includes(row.state)).length,
+      finished: rows.filter(row => ['done', 'closed', 'replaced'].includes(row.state)).length,
+    });
+    db(connection => {
+      connection.exec('BEGIN');
+      const statement = connection.prepare('UPDATE agents SET grp=?,state=?,pause_reason=?,name=?,task=?,status_text=? WHERE id=?');
+      for (const row of records) statement.run(row.group, row.state, row.reason, row.name, row.task, row.status, row.id);
+      connection.exec('COMMIT');
+    });
+    const route = filter => params('/agents', { project: project.id, ...filter });
+    const ids = async (search, filter = {}) => (await collect(api, route({ search, ...filter }), { limit: 2, max_bytes: 512 })).items.map(row => row.id);
+    const selected = predicate => records.filter(predicate).map(row => row.id).reverse();
+    const limitPaused = row => row.state === 'paused' && row.reason === 'limit';
+    const manualPaused = row => row.state === 'paused' && ['user', 'all'].includes(row.reason);
+    const emptyGroup = row => row.group === null || row.group === '';
+    const snapshot = () => db(connection => Object.fromEntries(['agents', 'locks', 'events', 'notices', 'subscriptions', 'members', 'marks'].map(table => [table, connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+
+    await t.test('idle OR limit pause returns the union once, with exact category counts', async () => {
+      const search = 'state:idle OR pause_reason:limit';
+      assert.deepEqual(await ids(search), [130, 127, 12, 8, 2, 1]);
+      const expected = { all: 6, active: 3, attention: 3, finished: 0 };
+      for (const category of ['all', 'active', 'attention', 'finished']) {
+        const page = await collect(api, route({ search, category }), { limit: 1, max_bytes: 512 });
+        const predicate = row => (row.state === 'idle' || limitPaused(row))
+          && (category === 'all' || category === 'active' && row.state === 'idle' || category === 'attention' && row.state === 'paused');
+        assert.deepEqual(page.items.map(row => row.id), selected(predicate));
+        assert.deepEqual(page.page.counts, expected);
+        assert.equal(page.page.total, expected[category]);
+        assert.equal(page.page.project_total, 130);
+      }
+    });
+    await t.test('implicit AND and explicit AND bind above OR; parentheses change meaning', async () => {
+      assert.deepEqual(await ids('group:"Security review" state:idle OR pause_reason:limit'), [130, 127, 12, 2, 1]);
+      assert.deepEqual(await ids('group:"Security review" AND state:idle OR pause_reason:limit'), [130, 127, 12, 2, 1]);
+      assert.deepEqual(await ids('group:"Security review" (state:idle OR pause_reason:limit)'), [127, 2, 1]);
+      assert.deepEqual(await ids('state:idle OR pause_reason:limit AND group:"Security review"'), [127, 8, 2, 1]);
+      assert.deepEqual(await ids('(state:idle OR state:paused) NOT (group:"Other" OR group:"")'), [127, 12, 3, 2, 1]);
+      assert.deepEqual(await ids('state:idle,paused NOT pause_reason:limit'), [127, 8, 6, 5, 4, 3, 1]);
+    });
+    await t.test('NOT is two-valued for nullable metadata and stale or missing pause reasons', async () => {
+      assert.deepEqual(await ids('state:paused NOT pause_reason:limit'), [6, 5, 4, 3]);
+      assert.deepEqual(await ids('NOT pause_reason:limit'), selected(row => !limitPaused(row)));
+      assert.deepEqual(await ids('NOT pause_reason:manual'), selected(row => !manualPaused(row)));
+      assert.deepEqual(await ids('NOT group:""'), selected(row => !emptyGroup(row)));
+      assert.deepEqual(await ids('NOT group:Other'), selected(row => row.group !== 'Other'));
+      assert.deepEqual(await ids('NOT absent-needle'), selected(() => true));
+      assert.deepEqual(await ids('NOT NOT state:idle'), [127, 8, 1]);
+      assert.deepEqual(await ids('NOT (state:closed OR state:replaced)'), selected(row => !['closed', 'replaced'].includes(row.state)));
+    });
+    await t.test('deterministic truth tables agree with independent JavaScript predicates', async () => {
+      const atoms = [
+        ['state:idle', row => row.state === 'idle'],
+        ['pause_reason:limit', limitPaused],
+        ['group:""', emptyGroup],
+        ['group:Other', row => row.group === 'Other'],
+      ];
+      for (const [left, a] of atoms) for (const [right, b] of atoms) {
+        for (const [search, predicate] of [
+          [`${left} AND NOT ${right}`, row => a(row) && !b(row)],
+          [`NOT ${left} OR ${right}`, row => !a(row) || b(row)],
+          [`NOT (${left} OR ${right})`, row => !(a(row) || b(row))],
+        ]) {
+          const result = await collect(api, route({ search }), { limit: 200, max_bytes: 65536 });
+          assert.deepEqual(result.items.map(row => row.id), selected(predicate), search);
+          assert.deepEqual(result.page.counts, counts(records.filter(predicate)), search);
+        }
+      }
+    });
+    await t.test('quoted operators and parentheses remain literals, not grammar', async () => {
+      assert.deepEqual(await ids('"AND"'), [11, 9]);
+      for (const search of ['"OR"', 'or']) assert.deepEqual(await ids(search), [12, 11, 9]);
+      for (const search of ['"NOT"', '"(value)"', '"group:x"', '%_literal']) assert.deepEqual(await ids(search), [11]);
+      assert.deepEqual(await ids('group:OR'), [9]);
+      assert.deepEqual(await ids('group:' + JSON.stringify(injection)), [12]);
+    });
+    await t.test('repeated fields and contradictions are valid predicates; scalars AND the whole expression', async () => {
+      for (const search of ['model:a model:b', 'state:idle AND state:paused', 'state:idle pause_reason:limit', 'state:idle NOT state:idle']) {
+        assert.deepEqual(await ids(search), [], search);
+      }
+      assert.deepEqual(await ids('state:idle state:idle'), [127, 8, 1]);
+      assert.deepEqual(await ids('state:idle OR state:idle'), [127, 8, 1]);
+      assert.deepEqual(await ids('state:idle OR pause_reason:limit', { group: 'Security review' }), [127, 2, 1]);
+      assert.deepEqual(await ids('NOT group:Other OR state:idle', { provider: 'codex', model: 'gpt-6-sol' }), selected(row => row.group !== 'Other' || row.state === 'idle'));
+      assert.deepEqual(await ids('', { state: 'idle', pause_reason: 'limit' }), []);
+      for (const filter of [
+        { search: 'NOT group:Other', group: 'team' },
+        { search: 'state:idle OR state:paused', state: 'idle' },
+        { search: 'NOT (pause_reason:limit OR state:idle)', pause_reason: 'manual' },
+      ]) await api('GET', route(filter), undefined, 400);
+    });
+    await t.test('equivalent reordered Boolean trees share cursors, changed grouping rejects continuation', async () => {
+      const search = 'group:"Security review" AND (state:idle OR pause_reason:limit)';
+      const first = await api('GET', route({ search, limit: 1, max_bytes: 512 }), undefined, 200, 512);
+      assert.deepEqual(first.items.map(row => row.id), [127]);
+      const cursor = { before: first.next_before, through: first.through, revision: first.revision, limit: 1, max_bytes: 512 };
+      for (const equivalent of [
+        '(pause_reason:limit OR state:"idle") group:"Security review"',
+        '((state:idle OR pause_reason:limit)) AND group:"Security review"',
+      ]) {
+        const next = await api('GET', route({ ...cursor, search: equivalent }), undefined, 200, 512);
+        assert.deepEqual(next.items.map(row => row.id), [2]);
+      }
+      const direct = await api('GET', route({ ...cursor, group: 'Security review', search: 'pause_reason:limit OR state:idle' }), undefined, 200, 512);
+      assert.deepEqual(direct.items.map(row => row.id), [2]);
+      for (const changed of ['group:"Security review" state:idle OR pause_reason:limit', 'group:"Security review" AND NOT (state:idle OR pause_reason:limit)']) {
+        await api('GET', route({ ...cursor, search: changed }), undefined, 409);
+      }
+    });
+    await t.test('parsed expression view is bounded, round-trips and only exposes safe flat clauses', async () => {
+      const search = 'group:"Security review" (state:idle OR NOT pause_reason:limit)';
+      const view = await api('GET', params('/agent-query', { search }));
+      assert.equal(view.clauses, null);
+      assert.equal(view.expression.op, 'and');
+      const operators = [];
+      const visit = expression => {
+        assert.ok(expression && typeof expression === 'object');
+        operators.push(expression.op);
+        if (expression.op === 'clause') {
+          assert.deepEqual(Object.keys(expression).sort(), ['clause', 'op']);
+          assert.ok(Array.isArray(expression.clause.values));
+          assert.equal(typeof expression.clause.text, 'string');
+        } else if (expression.op === 'not') {
+          assert.deepEqual(Object.keys(expression).sort(), ['child', 'op']); visit(expression.child);
+        } else {
+          assert.ok(['and', 'or'].includes(expression.op));
+          assert.deepEqual(Object.keys(expression).sort(), ['children', 'op']);
+          assert.ok(expression.children.length >= 2); expression.children.forEach(visit);
+        }
+      };
+      visit(view.expression);
+      assert.ok(operators.includes('or') && operators.includes('not'));
+      assert.deepEqual(await ids(view.text), await ids(search));
+      assert.deepEqual((await api('GET', params('/agent-query', { search: view.text }))).expression, view.expression);
+      const flat = await api('GET', params('/agent-query', { search: 'state:idle AND group:Other' }));
+      assert.ok(Array.isArray(flat.clauses)); assert.equal(flat.expression.op, 'and');
+      assert.equal((await api('GET', params('/agent-query', { search: 'state:idle state:paused' }))).clauses, null);
+      const empty = await api('GET', '/agent-query');
+      assert.deepEqual(empty.clauses, []); assert.equal(empty.expression, null);
+      const longSearch = `group:"${'東京🙂'.repeat(160)}" OR NOT state:idle`;
+      const completed = await complete(api, params('/agent-query', { search: longSearch }), 512);
+      assert.equal(completed.value.clauses, null);
+      assert.equal(completed.value.expression.op, 'or');
+      assert.deepEqual(await ids(completed.value.text), await ids(longSearch));
+      assert.equal(Object.hasOwn(completed.value, 'items'), false);
+    });
+    await t.test('invalid syntax, deep trees and enum typos fail without mutations or consumed state', async () => {
+      const before = snapshot();
+      for (const search of [
+        'OR state:idle', 'AND state:idle', 'state:idle OR', 'state:idle AND', 'NOT',
+        'state:idle OR OR state:paused', 'state:idle AND OR state:paused',
+        '()', '( )', '(state:idle', 'state:idle)', '(state:idle OR)',
+        'NOT (state:idle OR)', 'unknown:x OR state:idle', 'state:idle OR provider:Other',
+        'NOT pause_reason:user', 'state:idle OR group:',
+        `${'('.repeat(33)}state:idle${')'.repeat(33)}`, `${'NOT '.repeat(33)}state:idle`,
+        Array(65).fill('state:idle').join(' OR '),
+        `group:${Array(129).fill('x').join(',')}`, 'x'.repeat(4097),
+      ]) {
+        for (const endpoint of [route({ search }), params('/agent-query', { search })]) {
+          const error = await api('GET', endpoint, undefined, 400);
+          assert.ok(typeof error.error === 'string' && error.error.length > 0, search);
+        }
+        assert.deepEqual(snapshot(), before, search);
+      }
+    });
+    await t.test('OR cannot escape project or scalar scope, including SQL-like literal values', async () => {
+      const otherDir = path.join(root, 'boolean-other-project'); fs.mkdirSync(otherDir);
+      const other = await api('POST', '/projects', { path: otherDir });
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,?,'foreign',?,'boolean task','codex','gpt-6-sol','medium','paused','limit',0,0)").run(other.id, injection));
+      const before = await api('GET', `/overview?project=${project.id}`);
+      const search = `state:idle OR group:${JSON.stringify(injection)} OR pause_reason:limit`;
+      assert.deepEqual(await ids(search), [130, 127, 12, 8, 2, 1]);
+      assert.deepEqual(await ids(`group:${JSON.stringify(injection)}`), [12]);
+      const global = await collect(api, params('/agents', { search }), { limit: 1, max_bytes: 512 });
+      assert.deepEqual(global.items.map(row => row.id), [131, 130, 127, 12, 8, 2, 1]);
+      assert.equal(global.page.project_total, 131);
+      const after = await api('GET', `/overview?project=${project.id}`);
+      assert.deepEqual(after.agent_counts, before.agent_counts);
+      assert.deepEqual(after.project_actions, before.project_actions);
+    });
+    await t.test('CLI and direct API use the same Boolean predicates and project scope', async () => {
+      const search = 'state:idle OR (pause_reason:limit NOT group:Other)';
+      const result = await cli(['agents', '--search', search, '--limit', '200', '--max-bytes', '65536'], { cwd: projectDir, env: { ...env, ACOM_URL: url } });
+      assert.equal(result.status, 0, result.stderr);
+      const shown = [...result.stdout.matchAll(/^\s*(\d+)\s{2}/gm)].map(match => Number(match[1]));
+      assert.deepEqual(shown, await ids(search));
+      assert.deepEqual(shown, [127, 12, 8, 2, 1]);
+      const contradiction = await cli(['agents', '--state', 'idle', '--pause-reason', 'limit'], { cwd: projectDir, env: { ...env, ACOM_URL: url } });
+      assert.equal(contradiction.status, 0, contradiction.stderr);
+      assert.equal(contradiction.stdout.trim(), '');
     });
   });
 });

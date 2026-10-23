@@ -58,7 +58,7 @@ Search plain text across agent metadata, or use exact fields:
 group:"Security review" state:paused,crashed reentrancy
 ```
 
-Spaces combine conditions with AND; commas within a field give alternatives. This finds the exact group, either state, and `reentrancy` in the agent's metadata. The filter picker builds the same query without requiring the syntax. See [agent search](docs/usage.md#finding-agents) for all fields and quoting rules.
+Spaces combine conditions with AND; commas within a field give alternatives. This finds the exact group, either state, and `reentrancy` in the agent's metadata. Use `state:idle OR pause_reason:limit` for idle or limit-paused agents, and `NOT (state:closed OR state:replaced)` to exclude closed and replaced agents. Parentheses group conditions; precedence is NOT, AND, OR. The filter picker builds simple queries; grouped queries remain editable in the search box. See [agent search](docs/usage.md#finding-agents) for all fields and quoting rules.
 
 ## Data and shutdown
 
