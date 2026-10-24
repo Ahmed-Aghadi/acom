@@ -68,6 +68,8 @@ Notification delivery, reading and work completion are separate:
 
 ## Waiting and subscriptions
 
+Prefer narrowly filtered event watches over repeated polling for supported changes you need to act on. Register when the need becomes clear: subscriptions for ongoing monitoring, `wait --idle` for one-off waits. Reuse existing registrations and cancel subscriptions that no longer matter.
+
 | Command | Lifetime and effect |
 | --- | --- |
 | `acom wait --timeout 10m [filters]` | Foreground: waits for ordinary notifications, selected events or timeout. You remain working. |
