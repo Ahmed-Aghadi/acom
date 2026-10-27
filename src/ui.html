@@ -32,7 +32,8 @@
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
-    html { scroll-padding-top: 100px; }
+    html { scroll-padding-top: 100px; scrollbar-gutter: stable; }
+    html:has(dialog[open]), body:has(dialog[open]) { overflow: hidden; }
     body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     button, input, select, textarea { font: inherit; }
     button { cursor: pointer; }
@@ -209,7 +210,7 @@
     #page-threads:has(.thread-layout.conversation-open) > .page-heading { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
     #threads-title { font-size: 23px; }
     .thread-layout { display: grid; grid-template-columns: clamp(250px,24%,340px) minmax(0,1fr); flex: 1; min-height: 0; }
-    .thread-list { min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); background: var(--surface); }
+    .thread-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; border-right: 1px solid var(--line); background: var(--surface); }
     .thread-list .panel-head { padding: 15px; background: var(--panel); }
     .thread-tools { padding: 13px 14px; border-bottom: 1px solid var(--line); }
     .thread-tools input { background: var(--panel); font-size: 12px; }
@@ -221,14 +222,14 @@
     .thread-row .meta { font-size: 10px; margin-top: 7px; }
     .thread-main { display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--panel); }
     .thread-main > .empty { margin: auto; }
-    .thread-header { position: relative; flex: 0 1 auto; min-height: 72px; max-height: 45%; overflow-y: auto; padding: 10px 16px; border-bottom: 1px solid var(--line); }
-    .thread-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 32px; padding-right: 110px; }
+    .thread-header { position: relative; display: flex; flex-direction: column; flex: 0 1 auto; min-height: 72px; max-height: 45%; overflow: hidden; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+    .thread-title-row { display: flex; flex: none; align-items: center; gap: 8px; min-width: 0; min-height: 32px; padding-right: 110px; }
     #close-thread { position: absolute; top: 10px; right: 12px; font-size: 21px; width: 32px; min-height: 32px; padding: 0; border-color: transparent; color: var(--muted); }
     .thread-header h2 { min-width: 0; margin: 0; font-size: 17px; letter-spacing: -.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .thread-header:has(#thread-details[open]) h2 { white-space: normal; overflow-wrap: anywhere; }
+    .thread-header:has(#thread-details[open]) h2 { white-space: normal; overflow-wrap: anywhere; max-height: 3.1em; overflow-y: auto; overscroll-behavior: contain; }
     .thread-header:has(#thread-details[open]) .thread-title-row { align-items: flex-start; }
-    #thread-summary { margin: 2px 0 0; font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
-    #thread-details { margin: 0; }
+    #thread-summary { flex: none; margin: 2px 0 0; font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
+    #thread-details { min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin: 0; }
     #thread-details > summary { position: absolute; top: 11px; right: 51px; min-height: 30px; padding: 5px 7px; border: 1px solid transparent; border-radius: 6px; color: var(--muted); font-size: 11px; }
     #thread-details > summary:hover, #thread-details[open] > summary { background: var(--surface); color: var(--ink); border-color: var(--line); }
     .thread-details-content { margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
@@ -241,14 +242,22 @@
     .thread-main > .actions { padding: 8px 18px; align-items: center; }
     .thread-main > .actions:not(:has(> button:not([hidden]))):has(> span:empty) { display: none; }
     #thread-unread { margin-left: auto; }
-    .messages { flex: 1; min-height: 160px; padding: 22px; overflow: auto; background: var(--surface); }
-    .message { max-width: min(88%,760px); width: fit-content; margin-bottom: 18px; padding: 13px 16px; border: 1px solid var(--line); border-radius: 3px 12px 12px 12px; background: var(--panel); font-size: 13px; }
-    .message.user { margin-left: auto; border-color: transparent; border-radius: 12px 3px 12px 12px; background: var(--accent-soft); }
+    .messages { flex: 1; min-height: 160px; padding: 22px; overflow: auto; overscroll-behavior: contain; background: var(--surface); }
+    .message { --message-bg: var(--panel); display: grid; grid-template-columns: 130px minmax(0,1fr); column-gap: 16px; max-width: min(96%,1000px); width: fit-content; margin-bottom: 18px; padding: 13px 16px; border: 1px solid var(--line); border-radius: 3px 12px 12px 12px; background: var(--message-bg); font-size: 13px; }
+    .message.user { --message-bg: var(--accent-soft); grid-template-columns: minmax(0,1fr) 130px; margin-left: auto; border-color: transparent; border-radius: 12px 3px 12px 12px; }
     .message.sending .message-text { opacity: .75; }
     .message.failed, .message.unconfirmed { border-color: var(--warn); }
-    .message-delivery { margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .message-delivery { grid-column: 2; margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .message.user .message-delivery { grid-column: 1; }
     .message.failed .message-delivery, .message.unconfirmed .message-delivery { color: var(--warn); }
-    .message-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 22px; margin-bottom: 7px; color: var(--muted); font-size: 10px; }
+    .message-head { position: sticky; top: 6px; align-self: start; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 4px 6px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+    .message-head > span { grid-column: 1; }
+    .message-head > button { grid-column: 2; grid-row: 1 / 3; }
+    .message-text { grid-column: 2; grid-row: 1; }
+    .message.user .message-head { grid-column: 2; grid-row: 1; }
+    .message.user .message-text { grid-column: 1; }
+    .unread-divider { display: flex; align-items: center; gap: 12px; margin: 8px 0 20px; color: var(--danger); font-size: 11px; font-weight: 650; }
+    .unread-divider::before, .unread-divider::after { content: ''; flex: 1; height: 1px; background: currentColor; }
     .message-head > span:first-child { font-weight: 650; color: var(--ink); }
     .record-text, .message-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
     .message-text { white-space: normal; overflow-wrap: anywhere; min-width: 0; }
@@ -277,10 +286,13 @@
     .inline-check { display: flex; align-items: center; gap: 9px; padding: 7px 0; }
     .form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 17px; }
     .wide { grid-column: 1/-1; }
-    dialog { width: min(620px,calc(100% - 32px)); max-height: 88dvh; padding: 0; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); color: var(--ink); box-shadow: 0 30px 100px #07132640; }
+    dialog { width: min(620px,calc(100% - 32px)); max-height: 88dvh; overflow: auto; overscroll-behavior: contain; padding: 0; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); color: var(--ink); box-shadow: 0 30px 100px #07132640; }
     dialog::backdrop { background: #07132688; backdrop-filter: blur(4px); }
     dialog form { padding: 26px; }
     dialog h2 { margin: 0 0 18px; font-size: 21px; letter-spacing: -.5px; }
+    .dialog-header { position: sticky; top: 0; z-index: 4; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: -26px -26px 20px; padding: 16px 26px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    .dialog-header h2 { margin: 0; align-self: center; min-width: 0; max-height: 3.1em; overflow: auto; overscroll-behavior: contain; overflow-wrap: anywhere; }
+    .dialog-close { flex: none; width: 38px; min-height: 38px; padding: 0; font-size: 24px; line-height: 1; }
     dialog h3 { font-size: 14px; margin-top: 24px; }
     .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 25px; padding-top: 18px; border-top: 1px solid var(--line); }
     #agent-dialog { width: min(800px,calc(100% - 32px)); }
@@ -386,6 +398,8 @@
       .thread-layout.conversation-open { flex: none; height: calc(100dvh - 28px); min-height: 420px; }
       #back-to-threads { display: inline-grid; place-items: center; flex: none; width: 28px; min-height: 30px; padding: 3px; border-color: transparent; font-size: 18px; }
       .messages { padding: 18px; }
+      .message, .message.user { display: block; }
+      .message-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; top: 0; margin: -3px 0 8px; padding: 5px 0; background: var(--message-bg); }
       .settings { padding: 0 20px 20px; } .settings-jump { padding: 14px 20px; }
     }
     @media (max-width: 480px) {
@@ -400,7 +414,7 @@
       .form-grid { grid-template-columns: minmax(0,1fr); }
       .limit-row { grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; } .limit-row strong { grid-column: 1/-1; }
       .model-options label { flex-wrap: wrap; } .model-options code { margin-left: 0; overflow-wrap: anywhere; }
-      dialog form { padding: 20px; } .details { grid-template-columns: 100px minmax(0,1fr); gap: 0 10px; font-size: 11px; }
+      dialog form { padding: 20px; } .dialog-header { margin: -20px -20px 16px; padding: 12px 20px; } .details { grid-template-columns: 100px minmax(0,1fr); gap: 0 10px; font-size: 11px; }
       .composer { padding: 12px; gap: 8px; } .message { max-width: 95%; } .message-head { gap: 3px; }
       .settings-save-state { max-width: 125px; text-align: right; font-size: 10px; } .settings-jump { gap: 8px 15px; }
       .connection-banner { align-items: start; padding: 12px; }
@@ -1470,6 +1484,23 @@
     function messageText(id) {
       return state.thread?.messages.find(message => String(message.id) === id)?.text ?? [...outgoingMessages.values()].find(message => message.id === id || String(message.serverId) === id)?.text;
     }
+    function syncUnreadDivider(thread, messages) {
+      if (thread.unreadBoundary == null && thread.unread > 0 && thread.members?.includes(0)) {
+        const first = thread.first_unread > (thread.last_read || 0) ? thread.first_unread
+          : thread.messages.find(message => message.sender !== 0 && !message.outside_membership && message.id > (thread.last_read || 0))?.id;
+        if (first != null) thread.unreadBoundary = first;
+      }
+      const first = thread.unreadBoundary != null && $(`[data-message="${thread.unreadBoundary}"]`, messages);
+      let divider = $('[data-unread-divider]', messages);
+      if (!first) { divider?.remove(); return; }
+      if (!divider) {
+        divider = document.createElement('div');
+        divider.className = 'unread-divider'; divider.dataset.unreadDivider = '';
+        divider.setAttribute('role', 'separator'); divider.setAttribute('aria-label', 'New messages');
+        divider.textContent = 'New messages';
+      }
+      if (divider.nextElementSibling !== first) messages.insertBefore(divider, first);
+    }
     function syncMessageBubbles(thread = state.thread) {
       const messages = $('#messages');
       if (!thread || !messages || state.selectedThread !== thread.id || state.selectedProject !== thread.project) return;
@@ -1528,6 +1559,7 @@
       }
       const known = new Set(shown.map(message => String(message.id)));
       for (const node of messages.querySelectorAll('[data-pending-message]')) if (!known.has(node.dataset.pendingMessage)) node.remove();
+      syncUnreadDivider(thread, messages);
       if (visible && atBottom) messages.scrollTop = messages.scrollHeight;
       else if (visible && anchor?.isConnected) messages.scrollTop += anchor.getBoundingClientRect().top - top;
     }
@@ -1564,6 +1596,7 @@
         }
         incoming.sort((a,b) => a.id - b.id);
         const previous = state.thread?.id === t.id ? state.thread : null;
+        t.unreadBoundary = previous?.unreadBoundary;
         const sameThread = previous && $('#messages');
         const messagesById = new Map((previous?.messages || []).map(m => [m.id, m]));
         incoming.forEach(m => messagesById.set(m.id, m));
@@ -1581,7 +1614,7 @@
         }
         if (!sameThread) {
           saveVisibleDraft();
-          $('#thread-main').innerHTML = `<div class="thread-header"><div class="thread-title-row"><button type="button" id="back-to-threads" aria-label="All threads" title="All threads">←</button><h2>${esc(t.title)}</h2></div><p class="meta" id="thread-summary"></p><details id="thread-details"><summary aria-label="Thread details">Details</summary><div class="thread-details-content"><div class="meta" id="thread-metadata"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events"></div></details></div></details><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
+          $('#thread-main').innerHTML = `<div class="thread-header"><div class="thread-title-row"><button type="button" id="back-to-threads" aria-label="All threads" title="All threads">←</button><h2>${esc(t.title)}</h2></div><p class="meta" id="thread-summary"></p><details id="thread-details"><summary aria-label="Thread details">Details</summary><div class="thread-details-content"><div class="meta" id="thread-metadata"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events" role="region" aria-label="Thread history" tabindex="0"></div></details></div></details><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
             <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span><button type="button" class="small" id="thread-unread" hidden></button></div>
             <div class="messages" id="messages" role="region" aria-label="Conversation messages" tabindex="0"><div class="empty">No messages yet</div></div>
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary"${pendingSends.has(draftKey(t.project, t.id)) ? ' disabled' : ''}>Send</button><span class="composer-hint">Enter for a new line · Ctrl / ⌘ + Enter to send</span></form>`;
@@ -1611,6 +1644,7 @@
           setText($('.thread-header h2', $('#thread-main')), t.title);
         }
         $('.thread-header h2', $('#thread-main')).title = t.title;
+        $('.thread-header h2', $('#thread-main')).tabIndex = 0;
         const membership = Array.isArray(t.members) ? t.members.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread' : 'Membership unavailable';
         const summary = `Thread #${t.id} · ${threadAccess(t)}${t.watch?.length ? ' · Live' : ''} · ${Array.isArray(t.members) ? `${fmt(t.members.length)} member${t.members.length === 1 ? '' : 's'}` : 'Member count unavailable'} · ${membership}`;
         setText($('#thread-summary'), summary);
@@ -1668,8 +1702,9 @@
         const known = new Set(state.thread.messages.map(m => m.id)), added = incoming.filter(m => !known.has(m.id)).sort((a,b) => a.id - b.id);
         const top = messages.scrollTop, height = messages.scrollHeight;
         messages.insertAdjacentHTML('afterbegin', added.map(message => messageHtml(message)).join(''));
-        messages.scrollTop = top + messages.scrollHeight - height;
         state.thread.messages = [...added, ...state.thread.messages].sort((a,b) => a.id - b.id);
+        syncUnreadDivider(state.thread, messages);
+        messages.scrollTop = top + messages.scrollHeight - height;
         state.thread.oldestReached = !page.has_more;
         button.hidden = state.thread.oldestReached;
       } catch (error) { if (current()) toast(error.message, true); }
@@ -2142,9 +2177,33 @@
       return result;
     }
 
+    for (const dialog of document.querySelectorAll('dialog')) {
+      const title = $('h2', dialog), header = document.createElement('div'), close = document.createElement('button');
+      header.className = 'dialog-header'; close.className = 'dialog-close'; close.type = 'button';
+      close.dataset.close = dialog.id; close.setAttribute('aria-label', `Close ${title.textContent}`); close.textContent = '×';
+      title.tabIndex = 0; title.before(header); header.append(title, close);
+      let backdropPressed = false;
+      const outside = event => {
+        const rect = dialog.getBoundingClientRect();
+        return event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
+      };
+      dialog.addEventListener('pointerdown', event => { backdropPressed = event.button === 0 && event.isPrimary && event.target === dialog && outside(event); });
+      dialog.addEventListener('pointercancel', () => { backdropPressed = false; });
+      dialog.addEventListener('close', () => { backdropPressed = false; });
+      dialog.addEventListener('click', event => {
+        const dismiss = backdropPressed && event.detail > 0 && event.target === dialog && outside(event);
+        backdropPressed = false;
+        if (dismiss) dialog.close('cancel');
+      });
+    }
+    for (const [id, label] of [['agent-subscription-items','Agent subscriptions'],['agent-diagnostics-items','Coordination warnings'],['agent-lifecycle-items','Lifecycle changes']]) {
+      const region = document.getElementById(id);
+      region.tabIndex = 0; region.setAttribute('role', 'region'); region.setAttribute('aria-label', label);
+    }
     function openDialog(dialog) {
       dialog._session = (dialog._session || 0) + 1;
       dialog.showModal();
+      dialog.scrollTop = 0;
     }
     function dialogSubmission(form) {
       const dialog = form.closest('dialog'), session = dialog._session;

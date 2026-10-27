@@ -549,7 +549,7 @@ test('disk usage invalidates asynchronous project selection before its first ren
     await page.locator('#project-form [name=path]').fill('/projects/third');
     await page.locator('#project-form button.primary').click();await overview.started;
     assert.equal(await page.evaluate(()=>state.selectedProject),3,'selection changes before the new overview renders');
-    await page.locator('[data-close=project-dialog]').click();
+    await page.locator('[data-close=project-dialog]:not(.dialog-close)').click();
     // Exercise the selection handler even while the DOM still displays its prior value.
     await page.locator('#project-select').selectOption('1');
     await page.waitForFunction(()=>state.selectedProject===1);
@@ -737,11 +737,11 @@ test('empty dialogs cancel without validation or writes; Task is still required'
   assert.match(await page.locator('#launch-project').textContent(), /\/projects\/example/);
   await page.locator('#launch-form button.primary').click();
   assert.equal(await page.locator('#launch-dialog').isVisible(), true);
-  await page.locator('[data-close="launch-dialog"]').click();
+  await page.locator('[data-close="launch-dialog"]:not(.dialog-close)').click();
   assert.equal(await page.locator('#launch-dialog').isVisible(), false);
   await page.locator('[data-page="threads"]').click();
   await page.locator('[data-open="thread-dialog"]').click();
-  await page.locator('[data-close="thread-dialog"]').click();
+  await page.locator('[data-close="thread-dialog"]:not(.dialog-close)').click();
   assert.equal(await page.locator('#thread-dialog').isVisible(), false);
   assert.deepEqual(data.requests, []);
 }));
@@ -853,7 +853,7 @@ test('empty project list prompts for a folder; add and remove never delete files
   await page.waitForFunction(() => document.querySelector('#project-select').disabled);
   await openLaunch(page);
   assert.equal(await page.locator('#project-dialog').isVisible(), true);
-  await page.locator('[data-close="project-dialog"]').click();
+  await page.locator('[data-close="project-dialog"]:not(.dialog-close)').click();
   assert.equal(data.requests.length, 0);
   await page.locator('[data-open="project-dialog"]').click();
   await page.locator('#project-form [name=path]').fill('/projects/new');
@@ -1040,7 +1040,7 @@ test('named configs can be saved, reused, renamed and removed only when unused',
   await page.locator('#save-config-as').click();
   await page.locator('#config-form button.primary').click();
   assert.equal(await page.locator('#config-dialog').isVisible(), true);
-  await page.locator('[data-close=config-dialog]').click();
+  await page.locator('[data-close=config-dialog]:not(.dialog-close)').click();
   assert.equal(data.requests.length, 0);
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '12');
   await page.locator('#save-config-as').click();
@@ -1385,7 +1385,7 @@ test('a project with no enabled harness cannot launch', async () => fixture(asyn
   await page.locator('#launch-project-select').selectOption('2');
   await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('No harnesses are enabled'));
   assert.equal(await page.locator('#launch-form button.primary').isDisabled(), true);
-  await page.locator('[data-close=launch-dialog]').click();
+  await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click();
   assert.equal(data.requests.length, 0);
 }));
 
@@ -1825,7 +1825,7 @@ test('generic crashed turns offer same-model retry and explicit alternative with
   assert.equal(await page.locator('#launch-harness').inputValue(), 'codex');
   assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'Continue the original task');
   assert.equal(data.requests.length, 0, 'opening an alternative does not relaunch or rewrite the original');
-  await page.locator('[data-close=launch-dialog]').click();
+  await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click();
   await crash.locator('[data-action=resume]').click();
   await page.waitForFunction(() => document.querySelector('[data-agent="1"] .pill').textContent === 'working');
   assert.deepEqual(data.requests.at(-1), {url:'/agents/1/resume',method:'POST',body:{}});
@@ -1838,11 +1838,11 @@ test('cancelling member selection preserves a draft only within its project',asy
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('[name=member][value="1"]').check();
   await page.locator('[name=include_user]').uncheck();
-  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('[data-close=thread-dialog]:not(.dialog-close)').click();
   await page.locator('[data-open=thread-dialog]').click();
   assert.equal(await page.locator('[name=member][value="1"]').isChecked(),true);
   assert.equal(await page.locator('[name=include_user]').isChecked(),false);
-  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('[data-close=thread-dialog]:not(.dialog-close)').click();
   await page.locator('#project-select').selectOption('2');
   await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
   await page.locator('[data-open=thread-dialog]').click();
@@ -2058,7 +2058,7 @@ test('background, other pages and dialogs do not clear unread messages', async (
     await refresh();
   });
   assert.equal(data.reads[1], undefined);
-  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('[data-close=thread-dialog]:not(.dialog-close)').click();
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
   assert.equal(data.reads[1], 1);
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
@@ -3028,7 +3028,7 @@ test('late thread creation keeps reopened drafts and cannot open another project
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-form [name=title]').fill('Created in first');
   await page.locator('#thread-form button.primary').click(); await pending.started;
-  await page.locator('[data-close=thread-dialog]').click();
+  await page.locator('[data-close=thread-dialog]:not(.dialog-close)').click();
   await page.locator('#project-select').selectOption('2');
   await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/other');
   await page.locator('[data-open=thread-dialog]').click();
@@ -3048,13 +3048,13 @@ test('late launch completions preserve newer drafts in the same or reopened dial
     await openLaunch(page);
     await page.locator('#launch-form [name=task]').fill('Submitted task');
     await page.locator('#launch-form button.primary').click(); await pending.started;
-    if (reopen) { await page.locator('[data-close=launch-dialog]').click(); await openLaunch(page); }
+    if (reopen) { await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click(); await openLaunch(page); }
     await page.locator('#launch-form [name=task]').fill('New unsent task');
     pending.release(); await pending.remove();
     await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Agent launched');
     assert.equal(await page.locator('#launch-dialog').isVisible(), true);
     assert.equal(await page.locator('#launch-form [name=task]').inputValue(), 'New unsent task');
-    await page.locator('[data-close=launch-dialog]').click();
+    await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click();
   }
   assert.deepEqual(data.requests.filter(r=>r.url === '/agents').map(r=>r.body.task), ['Submitted task','Submitted task']);
 }));
@@ -3066,7 +3066,7 @@ test('a stale launch failure cannot prompt or force a request from a reopened di
   page.on('dialog', dialog => { confirmations++; dialog.accept(); });
   await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Original task');
   await page.locator('#launch-form button.primary').click(); await pending.started;
-  await page.locator('[data-close=launch-dialog]').click(); await openLaunch(page);
+  await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click(); await openLaunch(page);
   await page.locator('#launch-form [name=task]').fill('New task');
   pending.release(); await pending.remove();
   await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('hard limit reached'));
@@ -3081,7 +3081,7 @@ test('late project creation preserves reopened paths and the current project', a
   await page.locator('[data-open=project-dialog]').click();
   await page.locator('#project-form [name=path]').fill('/projects/created');
   await page.locator('#project-form button.primary').click(); await pending.started;
-  await page.locator('[data-close=project-dialog]').click();
+  await page.locator('[data-close=project-dialog]:not(.dialog-close)').click();
   await page.locator('[data-open=project-dialog]').click();
   await page.locator('#project-form [name=path]').fill('/projects/newer-draft');
   pending.release(); await pending.remove();
@@ -3118,7 +3118,7 @@ test('late config and member saves preserve newer dialog input', async () => fix
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
   assert.equal(await page.locator('#config-dialog').isVisible(), true);
   assert.equal(await page.locator('#config-form [name=name]').inputValue(), 'Next copy draft');
-  await page.locator('[data-close=config-dialog]').click();
+  await page.locator('[data-close=config-dialog]:not(.dialog-close)').click();
   data.agents = [1,2].map(id => ({id,project:1,name:`Worker ${id}`,state:'idle'}));
   data.threads = [conversation([], {members:[0]})];
   await page.evaluate(() => refresh()); await page.locator('[data-page=threads]').click();
@@ -3141,7 +3141,7 @@ test('late removal keeps reopened selections and never removes members from a di
   await openThreadDetails(page); await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="1"]').check();
   const pending=await holdRequest(page,'**/threads/1/members/remove');
   await page.locator('#remove-members-form button.danger').click(); await pending.started;
-  await page.locator('[data-close=remove-members-dialog]').click(); await page.locator('[data-thread="2"]').click();
+  await page.locator('[data-close=remove-members-dialog]:not(.dialog-close)').click(); await page.locator('[data-thread="2"]').click();
   await openThreadDetails(page); await page.locator('#remove-thread-members').click(); await page.locator('#remove-member-picker [name=member][value="2"]').check();
   pending.release(); await pending.remove();
   await page.waitForFunction(()=>!document.querySelector('#remove-members-form button.danger').disabled);
@@ -3150,7 +3150,7 @@ test('late removal keeps reopened selections and never removes members from a di
   assert.deepEqual(data.threads[0].members,[0]);
   assert.deepEqual(data.threads[1].members,[0,2]);
   assert.equal(data.requests.filter(r=>r.url.endsWith('/members/remove')).length,1);
-  await page.locator('[data-close=remove-members-dialog]').click();
+  await page.locator('[data-close=remove-members-dialog]:not(.dialog-close)').click();
   await openThreadDetails(page); await page.locator('#remove-thread-members').click();
   await page.evaluate(()=>resetThread());
   assert.equal(await page.locator('#remove-members-dialog').isVisible(),false);
@@ -3173,7 +3173,7 @@ test('late ownership transfers preserve edited or reopened owner drafts and neve
   assert.match(await page.locator('#thread-owner-current').textContent(), /Current owner: #2 Worker 2/);
   const second=await holdRequest(page,'**/threads/1/owner');
   await page.locator('#thread-owner-form button.primary').click(); await second.started;
-  await page.locator('[data-close=thread-owner-dialog]').click(); await page.locator('[data-thread="2"]').click();
+  await page.locator('[data-close=thread-owner-dialog]:not(.dialog-close)').click(); await page.locator('[data-thread="2"]').click();
   await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
   second.release(); await second.remove();
   await page.waitForFunction(()=>!document.querySelector('#thread-owner-form button.primary').disabled);
@@ -3231,7 +3231,7 @@ test('mobile locks can scroll every control into view and dialogs and feedback h
   await page.locator('#launch-custom-model').fill('invalid model'); await page.locator('#launch-form [name=task]').fill('Task');
   await page.locator('#launch-form button.primary').click();
   assert.match(await page.getByRole('dialog',{name:'Launch agent'}).ariaSnapshot(), /status: Enter a full model ID without spaces/);
-  await page.locator('[data-close=launch-dialog]').click();
+  await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click();
   await page.locator('#toast').waitFor({state:'visible'});
   assert.equal(await page.locator('#toast').isVisible(), true);
   assert.match(await page.locator('#toast').textContent(), /Enter a full model ID without spaces/);
@@ -3496,7 +3496,7 @@ test('truncated mutation results expose lossless receipts and receipt failures r
   await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('Warning 99:'));
   const receipt=JSON.parse(await page.locator('#record-content').textContent());
   assert.deepEqual(receipt.details.response.warnings,warnings);
-  await page.locator('#record-dialog button').click();
+  await page.locator('#record-dialog .dialog-actions button').click();
   data.launchResult={id:2,result_truncated:true,counts:{warnings:100},receipt_error:'Action completed, receipt storage unavailable'};
   await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Another explicit launch');
   await page.locator('#launch-form button.primary').click(); await page.waitForFunction(()=>!document.querySelector('#launch-dialog').open);
@@ -3817,7 +3817,7 @@ test('oversized selector previews retain unique ID labels and hydrate only the c
   await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
   assert.match(await page.locator('#thread-member-picker [data-member-row]').textContent(),/Agent #1.*working.*Details exceed the preview budget/);
   assert.doesNotMatch(await page.locator('#thread-member-picker').textContent(),/undefined/);
-  await page.locator('#thread-dialog [data-close=thread-dialog]').click();
+  await page.locator('#thread-dialog [data-close=thread-dialog]:not(.dialog-close)').click();
   page.once('dialog',dialog=>dialog.accept());
   await page.locator('#project-select').selectOption('3');
   await page.waitForFunction(()=>state.selectedProject===3&&refreshPending===0);
@@ -4062,7 +4062,7 @@ test('truncated restart-paused results report full failure counts even when the 
   await page.locator('#result-notice [data-record=receipts]').click();
   await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('Agent 3: disabled model'));
   assert.deepEqual(JSON.parse(await page.locator('#record-content').textContent()).details.response.errors,[error]);
-  await page.locator('#record-dialog').getByRole('button',{name:'Close'}).click();
+  await page.locator('#record-dialog').getByRole('button',{name:'Close',exact:true}).click();
   await page.evaluate(()=>refresh());
   assert.equal(data.requests.filter(r=>r.url==='/resume-restart').length,1,'reading the receipt and polling do not repeat a partially completed action');
   assert.deepEqual(data.agents.map(a=>a.state),['working','working','paused']);
@@ -4525,6 +4525,17 @@ test('coordination warnings remain advisory, escaped and visible in compact card
   await page.locator('[data-action=details]').click(); await page.locator('#agent-coordination-warning').waitFor();
   assert.match(await page.locator('#agent-coordination-warning').textContent(),/Advisory only; no automatic intervention.*Repeated A → B → A <wake> pattern/s);
   assert.equal(await page.locator('#agent-coordination-warning wake').count(),0);
+  assert.equal(await page.locator('#agent-title').textContent(),`${data.agents[0].name} · #1`,'a bounded dialog heading preserves the complete agent name');
+  assert.equal(await page.locator('#agent-title').getAttribute('tabindex'),'0');
+  assert.equal(await page.locator('#agent-title').evaluate(node=>{
+    const dialog=node.closest('dialog').getBoundingClientRect(), header=node.closest('.dialog-header').getBoundingClientRect();
+    return header.height<dialog.height/2&&node.scrollHeight>node.clientHeight;
+  }),true,'very long dialog headings scroll locally instead of covering the remaining controls');
+  await page.locator('#agent-title').focus(); await page.keyboard.press('PageDown');
+  await page.waitForFunction(()=>document.querySelector('#agent-title').scrollTop>0);
+  assert.equal(await page.locator('#agent-dialog .dialog-close').evaluate(node=>{
+    const box=node.getBoundingClientRect();return node.contains(document.elementFromPoint(box.left+box.width/2,box.top+box.height/2));
+  }),true,'the close control remains reachable beside a long heading');
   assert.equal(data.getRequests.filter(url=>url.startsWith('/history?')).length,0);
   await page.locator('#agent-diagnostics summary').click(); await page.waitForFunction(()=>agentDiagnostics?.events.length===30&&!diagnosticsLoading);
   assert.match(await page.locator('#agent-diagnostics-items').textContent(),/#35.*agents: #1, #2.*subscriptions: #3, #4.*events: #5, #6/s);
@@ -5833,4 +5844,208 @@ test('an outgoing receipt cannot replace another project or erase its newer draf
   await page.locator('#project-select').selectOption('1'); await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),'Sent in first project');
   assert.equal(await page.locator('.message').count(),1);
+}));
+
+test('modal scrolling contains wheel gestures at both boundaries without moving the background', async () => fixture(async (page,data) => {
+  data.agents=Array.from({length:35},(_,i)=>({id:i+1,project:1,name:`Worker ${i+1}`,state:'paused',task:i===9?'Detail line\n'.repeat(90):'Review the example'}));
+  data.agentLogs[10]=Array.from({length:80},(_,i)=>`Activity ${i}`);
+  await manualPolling(page); await page.setViewportSize({width:1280,height:720}); await reloadPage(page);
+  await page.locator('[data-agent="10"] [data-action=details]').click(); await page.locator('#agent-field-task').waitFor();
+  const dialog=page.locator('#agent-dialog');
+  assert.ok(await page.evaluate(()=>document.scrollingElement.scrollHeight>innerHeight),'the underlying page must genuinely be scrollable');
+  assert.ok(await dialog.evaluate(node=>node.scrollHeight>node.clientHeight),'the detail modal must genuinely be scrollable');
+  const background=await page.evaluate(()=>scrollY);
+  assert.ok(background>0,'a downward-scrolled background also makes upward scroll leakage observable');
+  const wheel=async (selector,delta)=>{
+    const box=await page.locator(selector).boundingBox();
+    await page.mouse.move(box.x+box.width-24,box.y+Math.min(90,box.height/2)); await page.mouse.wheel(0,delta); await page.waitForTimeout(160);
+  };
+  await dialog.evaluate(node=>{node.scrollTop=0;}); await wheel('#agent-dialog',450);
+  assert.ok(await dialog.evaluate(node=>node.scrollTop>0),'wheel gestures still scroll modal content normally');
+  assert.equal(await page.evaluate(()=>scrollY),background);
+  await dialog.evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await wheel('#agent-dialog',900);
+  assert.equal(await page.evaluate(()=>scrollY),background,'a downward gesture at the modal end cannot scroll the document');
+  await page.locator('#agent-log').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  await wheel('#agent-log',900);
+  assert.equal(await page.evaluate(()=>scrollY),background,'nested output scroll boundaries cannot reach the document');
+  await dialog.evaluate(node=>{node.scrollTop=0;});
+  await wheel('#agent-dialog',-900);
+  assert.equal(await page.evaluate(()=>scrollY),background,'an upward gesture at the modal start cannot scroll the document');
+}));
+
+test('modal dismissal stays accessible after scrolling and preserves native keyboard focus', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Long details',state:'paused',task:'Read this long detail\n'.repeat(90)}];
+  await manualPolling(page); await page.setViewportSize({width:1280,height:720}); await reloadPage(page);
+  const trigger=page.locator('[data-agent="1"] [data-action=details]');
+  await trigger.click(); await page.locator('#agent-field-task').waitFor();
+  const dialog=page.locator('#agent-dialog'), close=dialog.locator('.dialog-close');
+  assert.equal(await close.count(),1,'each modal has one always-accessible close control');
+  assert.match(await close.getAttribute('aria-label'),/^Close\b/);
+  for(const id of ['agent-subscription-items','agent-diagnostics-items','agent-lifecycle-items']) {
+    const region=page.locator(`#${id}`);
+    assert.equal(await region.getAttribute('role'),'region'); assert.equal(await region.getAttribute('tabindex'),'0');
+    assert.ok((await region.getAttribute('aria-label'))?.trim(),'nested activity regions have names for keyboard and screen-reader navigation');
+  }
+  await dialog.evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  const bounds=await dialog.boundingBox(), button=await close.boundingBox();
+  assert.ok(button.y>=bounds.y&&button.y+button.height<=bounds.y+Math.min(bounds.height,70),'Close stays in the modal’s top-right corner while its content scrolls');
+  assert.ok(button.x+button.width>=bounds.x+bounds.width-70);
+  await close.click(); assert.equal(await dialog.isVisible(),false);
+  assert.equal(await trigger.evaluate(node=>document.activeElement===node),true,'closing restores focus to the launching control');
+  await trigger.click(); await page.keyboard.press('Escape'); assert.equal(await dialog.isVisible(),false);
+  assert.equal(await trigger.evaluate(node=>document.activeElement===node),true,'Escape preserves native focus restoration');
+  assert.deepEqual(data.requests,[],'dismissing a detail modal never mutates an agent');
+}));
+
+test('modal backdrop dismissal ignores inside interactions and drags that began in content', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page); await openLaunch(page);
+  const dialog=page.locator('#launch-dialog');
+  await page.locator('#launch-form [name=task]').fill('Keep this unsubmitted task');
+  await page.locator('#launch-title').click(); assert.equal(await dialog.isVisible(),true);
+  const title=await page.locator('#launch-title').boundingBox();
+  await page.mouse.move(title.x+15,title.y+title.height/2); await page.mouse.down(); await page.mouse.move(5,5); await page.mouse.up();
+  assert.equal(await dialog.isVisible(),true,'text selection ending on the backdrop must not dismiss a modal');
+  await page.mouse.click(5,5); assert.equal(await dialog.isVisible(),false,'a complete backdrop click dismisses the modal');
+  assert.deepEqual(data.requests,[],'backdrop dismissal must not submit the form');
+  await openLaunch(page);
+  assert.equal(await page.locator('#launch-form [name=task]').inputValue(),'Keep this unsubmitted task','dismissing and reopening does not erase entered form data');
+}));
+
+test('closing a nested modal restores its parent without unlocking or dismissing it', async () => fixture(async (page,data) => {
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('[data-open=project-dialog]').click();
+  await page.locator('#project-form [name=path]').fill('/projects/unsubmitted');
+  await page.locator('#browse-project').click(); await page.locator('#folder-dialog').waitFor();
+  await page.locator('#folder-dialog .dialog-close').click();
+  assert.equal(await page.locator('#folder-dialog').isVisible(),false);
+  assert.equal(await page.locator('#project-dialog').isVisible(),true);
+  assert.equal(await page.locator('#browse-project').evaluate(node=>document.activeElement===node),true);
+  assert.equal(await page.locator('#project-form [name=path]').inputValue(),'/projects/unsubmitted');
+  await page.locator('#browse-project').click(); await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#folder-dialog').isVisible(),false);
+  assert.equal(await page.locator('#project-dialog').isVisible(),true);
+  await page.mouse.click(5,5); assert.equal(await page.locator('#project-dialog').isVisible(),false);
+  assert.deepEqual(data.requests,[]);
+}));
+
+for(const viewport of [{width:1280,height:900},{width:375,height:760}])test(`long message metadata and raw copy remain reachable while reading at ${viewport.width}px`,async()=>fixture(async(page,data)=>{
+  const source='Review paragraph with **emphasis** and an exact copy.\n\n'.repeat(100);
+  data.threads=[conversation([incoming(1,source),{id:2,sender:0,at:2,text:source}])]; data.reads[1]=2;
+  await manualPolling(page); await page.setViewportSize(viewport); await reloadPage(page);
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  for(const id of [1,2]) {
+    await page.locator(`[data-message="${id}"]`).evaluate(node=>{
+      const messages=node.closest('#messages'), message=node.getBoundingClientRect(), box=messages.getBoundingClientRect();
+      messages.scrollTop+=message.top-box.top+message.height/2-messages.clientHeight/2;
+    });
+    const placement=await page.locator(`[data-message="${id}"] .message-head`).evaluate(node=>{
+      const head=node.getBoundingClientRect(), messages=node.closest('#messages').getBoundingClientRect(), body=node.closest('.message').querySelector('.message-text').getBoundingClientRect();
+      return {inside:head.top>=messages.top&&head.bottom<=messages.bottom&&head.top>=0&&head.bottom<=innerHeight,head:{left:head.left,right:head.right},body:{left:body.left,right:body.right}};
+    });
+    assert.equal(placement.inside,true,`sender, date and copy remain visible midway through message ${id}`);
+    if(viewport.width>=1000)assert.ok(id===1?placement.head.right<=placement.body.left+2:placement.head.left>=placement.body.right-2,'desktop metadata occupies the outer side instead of covering message text');
+    assert.match(await page.locator(`[data-message="${id}"] .message-head`).textContent(),id===1?/agent 1/:/you/);
+    const before=await page.locator('#messages').evaluate(node=>node.scrollTop);
+    await page.locator(`[data-copy-message="${id}"]`).click();
+    assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+    assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),before,'copying midway through a long message does not jump to its top');
+  }
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'metadata does not introduce horizontal page overflow');
+}));
+
+test('new-message divider survives read acknowledgements, earlier paging and polling until a conversation is reopened',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2; data.reads[1]=3;
+  data.threads=[conversation([incoming(1),incoming(2),incoming(3),{id:4,sender:0,at:4,text:'Own reply'}, {...incoming(5),outside_membership:true},incoming(6),incoming(7)])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  const boundary=page.locator('[data-unread-divider]');
+  await boundary.waitFor(); assert.equal(await boundary.count(),1); assert.equal(await boundary.textContent(),'New messages');
+  assert.equal(await boundary.evaluate(node=>node.nextElementSibling?.dataset.message),'6','the marker identifies the first real unread peer message, not earlier own or catch-up messages');
+  await page.waitForFunction(()=>state.thread.unread===0); assert.equal(data.reads[1],7);
+  await page.evaluate(()=>refresh()); assert.equal(await boundary.count(),1,'automatic read ACK does not immediately erase the reading boundary');
+  while(await page.locator('#thread-older').isVisible()) {
+    await page.locator('#thread-older').click();
+    await page.waitForFunction(()=>{const button=document.querySelector('#thread-older');return button.hidden||!button.disabled;});
+  }
+  assert.deepEqual(await page.locator('#messages [data-message]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.message))),[1,2,3,4,5,6,7]);
+  assert.equal(await boundary.evaluate(node=>node.previousElementSibling?.dataset.message),'5');
+  assert.equal(await boundary.evaluate(node=>node.nextElementSibling?.dataset.message),'6');
+  await page.evaluate(()=>{document.hasFocus=()=>false;document.querySelector('#messages').scrollTop=0;});
+  data.threads[0].messages.push(incoming(8)); await page.evaluate(()=>refresh());
+  assert.equal(await boundary.count(),1); assert.equal(await boundary.evaluate(node=>node.nextElementSibling?.dataset.message),'6','new arrivals cannot move an existing session boundary');
+  await page.locator('#close-thread').click(); await page.locator('[data-thread="1"]').click();
+  await boundary.waitFor();
+  assert.equal(await boundary.count(),1); assert.equal(await boundary.evaluate(node=>node.nextElementSibling?.dataset.message),'8','reopening starts a new reading session from the current unread boundary');
+}));
+
+test('new-message divider excludes own, catch-up, pending and agent-only messages',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([{id:1,sender:0,at:1,text:'Own reply'},{...incoming(2),outside_membership:true}]),conversation([incoming(4)],{id:2,title:'Agent-only discussion',members:[1]})];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('[data-message="2"]').waitFor();
+  assert.equal(await page.locator('[data-unread-divider]').count(),0);
+  const receipt=await holdMessageReceipt(page);
+  try {
+    await page.locator('#message-form textarea').fill('Pending own reply'); await page.locator('#message-form button').click(); await receipt.started;
+    assert.equal(await page.locator('[data-unread-divider]').count(),0,'a local outgoing attempt cannot create an unread boundary');
+  } finally {receipt.release();await receipt.remove();}
+  await page.waitForFunction(()=>pendingSends.size===0);
+  await page.evaluate(()=>{document.hasFocus=()=>false;});
+  data.threads[0].messages.push(incoming(6,'First peer reply after opening')); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-unread-divider]').count(),1);
+  assert.equal(await page.locator('[data-unread-divider]').evaluate(node=>node.nextElementSibling?.dataset.message),'6');
+  await page.locator('[data-thread-filter=all]').click(); await page.locator('[data-thread="2"]').click();
+  await page.waitForFunction(()=>state.thread?.id===2&&!state.thread.loadingNew);
+  assert.equal(await page.locator('[data-unread-divider]').count(),0,'reading an agent-only public conversation does not invent user unread state');
+}));
+
+test('expanded thread metadata scrolls without hiding close or disclosure controls',async()=>fixture(async(page,data)=>{
+  data.agents=Array.from({length:70},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
+  data.threads=[conversation(Array.from({length:12},(_,i)=>incoming(i+1,'Read the earlier message\n'.repeat(4))),{members:[0,...data.agents.map(agent=>agent.id)]})]; data.reads[1]=12;
+  await manualPolling(page); await page.setViewportSize({width:640,height:800}); await reloadPage(page);
+  await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('#messages').evaluate(node=>{node.scrollTop=120;});
+  await openThreadDetails(page);
+  const reading=await page.locator('#messages').evaluate(node=>node.scrollTop);
+  const metadata=page.locator('#thread-details');
+  assert.ok(await metadata.evaluate(node=>node.scrollHeight>node.clientHeight),'the large member list must exercise the metadata scroll boundary');
+  await metadata.evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  const reachable=await page.locator('.thread-header').evaluate(header=>{
+    const bounds=header.getBoundingClientRect();
+    return ['#close-thread','#thread-details > summary'].every(selector=>{
+      const node=header.querySelector(selector), box=node.getBoundingClientRect();
+      return box.top>=bounds.top&&box.bottom<=bounds.bottom&&box.top>=0&&box.bottom<=innerHeight;
+    });
+  });
+  assert.equal(reachable,true,'expanded metadata cannot scroll the conversation’s close and Details controls out of view');
+  assert.equal(await page.locator('#thread-events').getAttribute('role'),'region');
+  assert.equal(await page.locator('#thread-events').getAttribute('tabindex'),'0');
+  assert.ok((await page.locator('#thread-events').getAttribute('aria-label'))?.trim());
+  assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),reading);
+  await page.locator('#thread-details > summary').click(); assert.equal(await page.locator('#thread-details').evaluate(node=>node.open),false);
+  assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),reading);
+  await page.locator('#close-thread').click(); assert.equal(await page.locator('#messages').count(),0);
+}));
+
+test('long thread titles cannot clip metadata or its management controls on a small screen',async()=>fixture(async(page,data)=>{
+  const title='A descriptive thread title with enough context to stay understandable. '.repeat(12);
+  data.agents=Array.from({length:20},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1}`,state:'idle'}));
+  data.threads=[conversation([incoming(1)],{title,members:[0,...data.agents.map(agent=>agent.id)]})]; data.reads[1]=1;
+  await manualPolling(page); await page.setViewportSize({width:320,height:568}); await reloadPage(page);
+  await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await openThreadDetails(page);
+  assert.equal(await page.locator('.thread-header h2').textContent(),title,'bounded title presentation retains the entire original title');
+  assert.ok(await page.locator('#thread-details').evaluate(node=>node.clientHeight>0),'the title cannot consume all available Details space');
+  await page.locator('#thread-details').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+  for(const selector of ['#close-thread','#thread-details > summary','#change-thread-owner']) {
+    assert.equal(await page.locator(selector).evaluate(node=>{
+      const box=node.getBoundingClientRect(), x=box.left+box.width/2, y=box.top+box.height/2;
+      return box.width>0&&box.height>0&&x>=0&&x<innerWidth&&y>=0&&y<innerHeight&&node.contains(document.elementFromPoint(x,y));
+    }),true,`${selector} is hit-testable, not merely present behind clipped metadata`);
+  }
+  await page.locator('#change-thread-owner').click(); assert.equal(await page.locator('#thread-owner-dialog').isVisible(),true);
+  await page.locator('#thread-owner-dialog .dialog-close').click();
+  await page.locator('#thread-details > summary').click();
+  assert.equal(await page.locator('#thread-details').evaluate(node=>node.open),false);
+  await page.locator('#close-thread').click(); assert.equal(await page.locator('#messages').count(),0);
 }));
