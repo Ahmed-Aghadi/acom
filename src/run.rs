@@ -653,6 +653,8 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             model: model.clone(),
             effort: std::mem::take(&mut turn.effort),
             failure: None,
+            diagnostic: None,
+            completed: false,
         },
     );
     st.reaped.remove(&id);
@@ -682,7 +684,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             thread::spawn(move || {
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
                 let ended_at = capture_time();
-                cleanup_ended_turn(&app, id, pid, ok);
+                cleanup_ended_turn(&app, id, pid, ok, false);
                 (ok, ended_at)
             })
         };
@@ -697,7 +699,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             .flatten();
         done.store(true, Ordering::SeqCst);
         let _ = side.join();
-        cleanup_ended_turn(&app, id, pid, ok);
+        cleanup_ended_turn(&app, id, pid, ok, true);
         append_entry(
             &log_path(&app, id, "txt"),
             &ended_at,
@@ -720,16 +722,20 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
 }
 
 /// Only unfinished idle success may keep owned background tools.
-fn cleanup_ended_turn(app: &Arc<App>, id: i64, pid: u32, ok: bool) {
+fn cleanup_ended_turn(app: &Arc<App>, id: i64, pid: u32, ok: bool, drained: bool) {
     let mut st = app.lock();
     let current = st.procs.get(&id).is_some_and(|p| p.pid == pid);
     if current {
         st.reaped.insert(id);
     }
-    let kill = st
-        .procs
-        .get(&id)
-        .is_some_and(|p| p.pid == pid && (!ok || p.failure.is_some() || p.stopping));
+    // A completion may still arrive from either stream and resolve diagnostics.
+    let kill = st.procs.get(&id).is_some_and(|p| {
+        p.pid == pid
+            && (!ok
+                || p.failure.is_some()
+                || (drained && p.failure_reason().is_some())
+                || p.stopping)
+    });
     let finishing = current
         && st
             .db
@@ -773,6 +779,16 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event, at: &st
             append_entry(&log_path(app, id, "txt"), at, "error", &reason);
             app.fail_turn(id, &reason)
         }
+        Event::Diagnostic(reason) => {
+            append_entry(
+                &log_path(app, id, "txt"),
+                at,
+                "message",
+                &format!("notice: {reason}"),
+            );
+            app.diagnose_turn(id, &reason)
+        }
+        Event::TurnCompleted => app.complete_turn(id),
         Event::ModelSwitched(reason) => {
             append_entry(&log_path(app, id, "txt"), at, "error", &reason);
             app.fail_and_stop(id, &reason)
@@ -903,7 +919,7 @@ mod tests {
             "[tool] Bash: pwd",
             "[message] shell: also a message",
             "[tool] shell: pwd",
-            "[error] captured failure",
+            "[message] notice: captured failure",
         ];
         assert_eq!(output.lines().count(), expected.len());
         for (line, expected) in output.lines().zip(expected) {
@@ -915,7 +931,7 @@ mod tests {
             assert_eq!(text, expected);
         }
         assert_eq!(
-            app.lock().procs[&1].failure.as_deref(),
+            app.lock().procs[&1].diagnostic.as_deref(),
             Some("captured failure")
         );
         std::fs::remove_dir_all(&app.home).unwrap();
@@ -1050,7 +1066,7 @@ mod tests {
 
     fn test_app(pid: u32) -> Arc<App> {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT,done_req INTEGER DEFAULT 0,rest TEXT DEFAULT 'idle'); INSERT INTO agents(id,state) VALUES(1,'working');
+        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT,done_req INTEGER DEFAULT 0,rest TEXT DEFAULT 'idle',fresh_in INTEGER DEFAULT 0,cache_write INTEGER DEFAULT 0,cache_read INTEGER DEFAULT 0,output INTEGER DEFAULT 0); INSERT INTO agents(id,state) VALUES(1,'working');
             CREATE TABLE view_revisions(name TEXT PRIMARY KEY,value INTEGER); INSERT INTO view_revisions VALUES('agents',0);
             CREATE TABLE agent_handoffs(agent_id INTEGER); CREATE TABLE agent_continuations(agent_id INTEGER);").unwrap();
         Arc::new(App {
@@ -1068,6 +1084,8 @@ mod tests {
                         model: "gpt-6-sol".into(),
                         effort: "medium".into(),
                         failure: None,
+                        diagnostic: None,
+                        completed: false,
                     },
                 )]
                 .into(),
@@ -1083,7 +1101,9 @@ mod tests {
     struct StopWorker(Child);
     impl Drop for StopWorker {
         fn drop(&mut self) {
-            kill_group(self.0.id(), libc::SIGKILL);
+            if matches!(self.0.try_wait(), Ok(None)) {
+                kill_group(self.0.id(), libc::SIGKILL);
+            }
             let _ = self.0.wait();
         }
     }
@@ -1257,6 +1277,8 @@ mod tests {
                     model: "m".into(),
                     effort: "e".into(),
                     failure: None,
+                    diagnostic: None,
+                    completed: false,
                 },
             );
         }
@@ -1351,6 +1373,42 @@ mod tests {
                     .get::<_, String>(0))
                 .unwrap(),
             "working"
+        );
+    }
+
+    #[test]
+    fn recovered_codex_diagnostics_do_not_fail_a_completed_turn_in_either_source_order() {
+        let diagnostic = r#"{"type":"error","message":"temporary transport interruption"}"#;
+        let completed = r#"{"type":"turn.completed"}"#;
+        for lines in [[diagnostic, completed], [completed, diagnostic]] {
+            let app = test_app(0);
+            for line in lines {
+                for ev in harness::parse_line("codex", line) {
+                    apply(&app, 1, "codex", "gpt-6-sol", ev, &capture_time());
+                }
+            }
+            let st = app.lock();
+            let worker = &st.procs[&1];
+            assert!(worker.completed);
+            assert!(worker.diagnostic.is_none());
+            assert!(worker.failure_reason().is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_codex_failure_is_not_masked_by_an_earlier_diagnostic() {
+        let app = test_app(0);
+        for line in [
+            r#"{"type":"error","message":"temporary transport interruption"}"#,
+            r#"{"type":"turn.failed","error":{"message":"terminal synthetic failure"}}"#,
+        ] {
+            for ev in harness::parse_line("codex", line) {
+                apply(&app, 1, "codex", "gpt-6-sol", ev, &capture_time());
+            }
+        }
+        assert_eq!(
+            app.lock().procs[&1].failure.as_deref(),
+            Some("terminal synthetic failure")
         );
     }
 
@@ -1484,9 +1542,9 @@ mod tests {
                 worker.failure = failed.then(|| "turn failed".into());
                 worker.stopping = stopping;
             }
-            cleanup_ended_turn(&app, 1, pid + 1, false);
+            cleanup_ended_turn(&app, 1, pid + 1, false, false);
             let unaffected = child.try_wait().unwrap().is_none();
-            cleanup_ended_turn(&app, 1, pid, ok);
+            cleanup_ended_turn(&app, 1, pid, ok, false);
             let successful_still_running = if ok && !failed && !stopping {
                 let running = child.try_wait().unwrap().is_none();
                 kill_group(pid, libc::SIGKILL);
@@ -1509,6 +1567,53 @@ mod tests {
     }
 
     #[test]
+    fn provisional_diagnostics_only_clean_owned_tools_after_final_drain_without_completion() {
+        for completed in [false, true] {
+            let app = test_app(0);
+            let mut child = StopWorker(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .env("ACOM_ID", "1")
+                    .env("ACOM_URL", &app.url)
+                    .env("ACOM_HOME", &app.home)
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = child.0.id();
+            app.lock().procs.get_mut(&1).unwrap().pid = pid;
+            cleanup_ended_turn(&app, 1, pid, true, false);
+            app.diagnose_turn(1, "pending diagnostic").unwrap();
+            assert!(child.0.try_wait().unwrap().is_none());
+            if completed {
+                app.complete_turn(1).unwrap();
+                app.diagnose_turn(1, "late duplicate diagnostic").unwrap();
+            }
+            cleanup_ended_turn(&app, 1, pid, true, true);
+            if completed {
+                assert!(child.0.try_wait().unwrap().is_none());
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        assert!(!status.success());
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "unresolved failure left owned tools running"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let mut st = app.lock();
+                while st.stopping_agents.contains(&1) {
+                    st = app.cv.wait(st).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn late_failure_cleans_a_reaped_workers_remaining_group() {
         let app = test_app(0);
         let mut child = std::process::Command::new("sleep")
@@ -1521,7 +1626,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         app.lock().procs.get_mut(&1).unwrap().pid = pid;
-        cleanup_ended_turn(&app, 1, pid, true);
+        cleanup_ended_turn(&app, 1, pid, true, false);
         assert!(child.try_wait().unwrap().is_none());
         assert!(app.lock().reaped.contains(&1));
         app.fail_turn(1, "late buffered failure").unwrap();

@@ -10,6 +10,8 @@ The server rejects unknown request fields/query parameters, duplicate keys and m
 
 Request bodies are capped at 16 MiB after transfer decoding. A [narrow local tiny_http patch](../vendor/tiny_http/ACOM_PATCH.md) bounds unread-body discard allocation and rejects truncated chunks; retain its provenance and regressions when updating the dependency. The handler rejects invalid origins/media types before reading, but the library can prebuffer small bodies. Body draining still waits for data/disconnection: this is not general slow-client or denial-of-service protection.
 
+Harness diagnostics are not necessarily terminal failures. Codex's [JSON event interface](https://learn.chatgpt.com/docs/non-interactive-mode) distinguishes `error`, `turn.failed` and `turn.completed`; CLI 0.164.0 observations also establish recoverable generic errors and native `task_complete.error`. Parser regressions use synthetic fixtures, not private sessions. Reconcile both output sources before final classification, keep authoritative failures sticky, and use one reason across details, history and recovery prompts.
+
 ## Licenses and releases
 
 Keep the project's MIT [LICENSE](../LICENSE) unchanged when updating third-party notices. [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt) is generated from the reviewed [Rust inventory](../licenses/rust.json) and existing Markdown notices. It includes build dependencies and bundled native-source notices conservatively, not a claim that every listed source file is linked. `acom licenses` embeds and prints the project's license followed by these notices without using a server, provider or data directory.
@@ -37,6 +39,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-access.cjs tests/wait-watch.cjs tests/subscriptions.cjs
 node --test tests/storage.cjs tests/http-boundaries.cjs tests/process-cleanup.cjs
+node --test tests/failure-reporting.cjs
 node --test tests/licenses.cjs
 cargo audit
 ```

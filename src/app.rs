@@ -513,6 +513,18 @@ pub struct Proc {
     pub model: String,
     pub effort: String,
     pub failure: Option<String>,
+    pub diagnostic: Option<String>,
+    pub completed: bool,
+}
+
+impl Proc {
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure.as_deref().or(if self.completed {
+            None
+        } else {
+            self.diagnostic.as_deref()
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2408,7 +2420,10 @@ impl App {
             self.pause_locked(&mut st, id, "limit", "acom")?;
             a = st.agent(id)?;
         }
-        let failure = st.procs.get(&id).and_then(|p| p.failure.clone());
+        let failure = st
+            .procs
+            .get(&id)
+            .and_then(|p| p.failure_reason().map(str::to_owned));
         let stopping = st.procs.get(&id).is_some_and(|p| p.stopping);
         let failed = (!ok || failure.is_some()) && !stopping && a.state == "working";
         if a.state != "working" {
@@ -4682,6 +4697,24 @@ impl App {
         let mut st = self.lock();
         st.atomic(|st| subscriptions::observe_usage(st, provider, win, used_pct, resets_at))?;
         self.cv.notify_all();
+        Ok(())
+    }
+
+    /// An error frame may describe a recovered attempt, not the turn's final outcome.
+    pub fn diagnose_turn(&self, id: i64, reason: &str) -> R<()> {
+        if let Some(p) = self.lock().procs.get_mut(&id)
+            && !p.completed
+        {
+            p.diagnostic = Some(reason.into());
+        }
+        Ok(())
+    }
+
+    pub fn complete_turn(&self, id: i64) -> R<()> {
+        if let Some(p) = self.lock().procs.get_mut(&id) {
+            p.completed = true;
+            p.diagnostic = None;
+        }
         Ok(())
     }
 
@@ -10886,6 +10919,8 @@ mod tests {
                         model: "claude-opus-5-5".into(),
                         effort: "medium".into(),
                         failure: None,
+                        diagnostic: None,
+                        completed: false,
                     },
                 );
                 st.reaped.insert(1);
@@ -11513,6 +11548,8 @@ mod tests {
                     model: "claude-opus-5-5".into(),
                     effort: "high".into(),
                     failure: Some("network failure".into()),
+                    diagnostic: None,
+                    completed: false,
                 },
             );
         }
@@ -12324,6 +12361,8 @@ mod tests {
                     model: "gpt-6-sol".into(),
                     effort: "ultra".into(),
                     failure: None,
+                    diagnostic: None,
+                    completed: false,
                 },
             );
         }
@@ -12340,6 +12379,107 @@ mod tests {
         assert!(view["retry"]["eligible_at"].as_i64().unwrap() > now());
         app.tick().unwrap();
         assert!(app.lock().procs.is_empty()); // No rule, no automatic launch.
+    }
+
+    #[test]
+    fn turn_outcomes_prioritize_terminal_failures_and_only_unresolved_diagnostics() {
+        for (completed, terminal, ok, expected) in [
+            (false, false, true, Some("latest diagnostic")),
+            (false, false, false, Some("latest diagnostic")),
+            (true, false, true, None),
+            (true, false, false, Some("native exit failure")),
+            (false, true, true, Some("terminal failure")),
+            (true, true, true, Some("terminal failure")),
+        ] {
+            let app = app_with_two_projects();
+            {
+                let mut st = app.lock();
+                st.db.execute("UPDATE agents SET state='working',harness='codex',model='gpt-6-sol',effort='high' WHERE id=1", []).unwrap();
+                st.procs.insert(
+                    1,
+                    Proc {
+                        pid: 0,
+                        stopping: false,
+                        model: "gpt-6-sol".into(),
+                        effort: "high".into(),
+                        failure: None,
+                        diagnostic: None,
+                        completed: false,
+                    },
+                );
+            }
+            app.diagnose_turn(1, "earlier diagnostic").unwrap();
+            app.diagnose_turn(1, "latest diagnostic").unwrap();
+            if terminal {
+                app.fail_turn(1, "terminal failure").unwrap();
+                app.fail_turn(1, "duplicate terminal failure").unwrap();
+            }
+            if completed {
+                app.complete_turn(1).unwrap();
+                app.diagnose_turn(1, "delayed duplicate diagnostic")
+                    .unwrap();
+            }
+            app.turn_ended(1, 0, ok, Some("native exit failure"))
+                .unwrap();
+            let view = app.agent_view(1).unwrap();
+            assert_eq!(
+                view["state"],
+                if expected.is_some() {
+                    "crashed"
+                } else {
+                    "idle"
+                }
+            );
+            assert_eq!(view["problem"].as_str(), expected);
+            let events = rows(&app.lock().db, "SELECT json_extract(details,'$.reason') AS reason FROM events WHERE agent=1 AND kind='agent.failed'", []).unwrap();
+            assert_eq!(events.len(), usize::from(expected.is_some()));
+            if let Some(reason) = expected {
+                assert_eq!(events[0]["reason"], reason);
+            }
+        }
+    }
+
+    #[test]
+    fn done_request_never_overrides_an_authoritative_failure_or_native_failed_exit() {
+        for done_closes in [false, true] {
+            for terminal in [false, true] {
+                let app = app_with_two_projects();
+                custom(&app, 1, |s| s.done_closes = done_closes);
+                {
+                    let mut st = app.lock();
+                    st.db.execute("UPDATE agents SET state='working',done_req=1,harness='codex',model='gpt-6-sol',effort='high' WHERE id=1", []).unwrap();
+                    st.procs.insert(
+                        1,
+                        Proc {
+                            pid: 0,
+                            stopping: false,
+                            model: "gpt-6-sol".into(),
+                            effort: "high".into(),
+                            failure: None,
+                            diagnostic: None,
+                            completed: false,
+                        },
+                    );
+                }
+                app.diagnose_turn(1, "temporary diagnostic").unwrap();
+                app.complete_turn(1).unwrap();
+                if terminal {
+                    app.fail_turn(1, "terminal failure").unwrap();
+                }
+                app.turn_ended(1, 0, terminal, Some("native exit failure"))
+                    .unwrap();
+                let view = app.agent_view(1).unwrap();
+                assert_eq!(view["state"], "crashed");
+                assert_eq!(
+                    view["problem"],
+                    if terminal {
+                        "terminal failure"
+                    } else {
+                        "native exit failure"
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -12776,6 +12916,8 @@ mod tests {
                     model: "gpt-6-sol".into(),
                     effort: "high".into(),
                     failure: None,
+                    diagnostic: None,
+                    completed: false,
                 },
             );
             st.remember_crash(1, &st.agent(1).unwrap()).unwrap();
@@ -12942,6 +13084,8 @@ mod tests {
                     model: "claude-fable-5-1".into(),
                     effort: "medium".into(),
                     failure: None,
+                    diagnostic: None,
+                    completed: false,
                 },
             );
             st.procs.insert(
@@ -12952,6 +13096,8 @@ mod tests {
                     model: "claude-opus-5-5".into(),
                     effort: "medium".into(),
                     failure: None,
+                    diagnostic: None,
+                    completed: false,
                 },
             );
         }
@@ -13330,6 +13476,8 @@ mod tests {
                     model: "running-model".into(),
                     effort: "high".into(),
                     failure: Some("failed turn".into()),
+                    diagnostic: None,
+                    completed: false,
                 },
             );
             st.db

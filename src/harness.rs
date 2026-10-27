@@ -36,6 +36,10 @@ pub enum Event {
     Text(String),
     /// A tool action, separate from ordinary assistant text.
     Tool(String),
+    /// A provisional harness error; completion can resolve it without a crash.
+    Diagnostic(String),
+    /// An explicit successful native turn completion, not merely a process exit.
+    TurnCompleted,
     /// A structured harness failure. The supervisor decides recovery after exit.
     Failed(String),
     /// An unexpected model switch; stop the process before it can do more work.
@@ -498,7 +502,10 @@ fn codex_events(v: &Value) -> Vec<Event> {
             300,
         ))];
     }
-    if kind == "error" || v["type"] == "turn.failed" {
+    let completion =
+        v["type"] == "turn.completed" || (v["type"] == "event_msg" && kind == "task_complete");
+    let failed = v["type"] == "turn.failed" || (completion && !event["error"].is_null());
+    if kind == "error" || failed {
         let error = if event["error"].is_object() {
             &event["error"]
         } else {
@@ -518,14 +525,15 @@ fn codex_events(v: &Value) -> Vec<Event> {
         let code = error["code"]
             .as_str()
             .or(event["codex_error_info"].as_str())
+            .or(error["codex_error_info"].as_str())
             .or(error["codexErrorInfo"].as_str())
             .or(nested
                 .as_ref()
                 .and_then(|v| v.pointer("/error/code"))
                 .and_then(Value::as_str))
             .unwrap_or("");
-        // Errors are failures regardless of their wording. Only quota errors
-        // have a distinct recovery path; ordinary assistant/tool text is ignored.
+        // Generic error frames can describe retried requests. Failed completion
+        // is authoritative; the supervisor reconciles other errors at exit.
         let lower = message.to_ascii_lowercase();
         if matches!(
             code,
@@ -540,7 +548,14 @@ fn codex_events(v: &Value) -> Vec<Event> {
         {
             return vec![Event::LimitHit(short(message, 200))];
         }
-        return vec![Event::Failed(short(message, 300))];
+        return vec![if failed {
+            Event::Failed(short(message, 300))
+        } else {
+            Event::Diagnostic(short(message, 300))
+        }];
+    }
+    if completion && v["type"] == "event_msg" {
+        return vec![Event::TurnCompleted];
     }
     if matches!(
         v["type"].as_str(),
@@ -571,7 +586,7 @@ fn codex_events(v: &Value) -> Vec<Event> {
             .as_str()
             .map(|s| vec![Event::Session(s.to_string())])
             .unwrap_or_default(),
-        "turn.completed" => vec![tokens(&v["usage"], false)],
+        "turn.completed" => vec![tokens(&v["usage"], false), Event::TurnCompleted],
         "item.completed" => {
             let item = &v["item"];
             let event = match item["type"].as_str().unwrap_or("") {
@@ -586,9 +601,8 @@ fn codex_events(v: &Value) -> Vec<Event> {
                     .as_str()
                     .map(|s| Event::Tool(format!("search: {}", short(s, 200)))),
                 "file_change" => Some(Event::Tool("changed files".to_string())),
-                // Codex also uses error items for nonfatal startup diagnostics,
-                // including the hook-trust warning. Only turn/core errors (above)
-                // or an unsuccessful process exit establish a failed turn.
+                // Item-level warnings (including hook trust) are notices, not
+                // provisional turn errors or terminal failures.
                 "error" => item["message"]
                     .as_str()
                     .map(|s| Event::Text(format!("notice: {}", short(s, 300)))),
@@ -1237,7 +1251,10 @@ mod tests {
             assert!(
                 parse_line("codex", line).iter().all(|e| !matches!(
                     e,
-                    Event::Failed(_) | Event::ModelSwitched(_) | Event::Model(_)
+                    Event::Diagnostic(_)
+                        | Event::Failed(_)
+                        | Event::ModelSwitched(_)
+                        | Event::Model(_)
                 )),
                 "{line}"
             );
@@ -1276,11 +1293,54 @@ mod tests {
     }
 
     #[test]
-    fn codex_generic_error_frames_fail_independently_of_message_words() {
+    fn codex_generic_error_notices_are_provisional() {
+        for line in [
+            r#"{"type":"error","message":"Temporary transport interruption"}"#,
+            r#"{"type":"error","message":"invalid credentials"}"#,
+            r#"{"type":"event_msg","payload":{"type":"error","message":"Temporary upstream interruption"}}"#,
+        ] {
+            let events = parse_line("codex", line);
+            assert!(
+                matches!(events.as_slice(), [Event::Diagnostic(text)] if !text.is_empty()),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_explicit_success_is_reported_separately_from_usage() {
+        for line in [
+            r#"{"type":"turn.completed","usage":{}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","error":null}}"#,
+        ] {
+            assert!(
+                parse_line("codex", line)
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnCompleted)),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_failed_completion_cannot_resolve_an_error() {
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"task_complete","error":{"message":"Synthetic terminal failure"}}}"#,
+            r#"{"type":"turn.completed","error":{"message":"Synthetic terminal failure"}}"#,
+        ] {
+            let events = parse_line("codex", line);
+            assert!(
+                matches!(events.as_slice(), [Event::Failed(text)] if text == "Synthetic terminal failure"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_terminal_error_frames_fail_independently_of_message_words() {
         for line in [
             r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#,
-            r#"{"type":"error","message":"invalid credentials"}"#,
-            r#"{"type":"event_msg","payload":{"type":"error","message":"server unavailable"}}"#,
             r#"{"type":"turn.failed","error":"unexpected harness failure"}"#,
             r#"{"type":"turn.failed"}"#,
         ] {
@@ -1316,6 +1376,11 @@ mod tests {
         );
         assert!(events.iter().any(|e| matches!(e, Event::LimitHit(_))));
         assert!(!events.iter().any(|e| matches!(e, Event::Failed(_))));
+        let events = parse_line(
+            "codex",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","error":{"codex_error_info":"UsageLimitExceeded","message":"Account blocked"}}}"#,
+        );
+        assert!(matches!(events.as_slice(), [Event::LimitHit(_)]));
         let events = parse_line(
             "codex",
             r#"{"type":"response.completed","response":{"model":"gpt-6-sol"}}"#,
