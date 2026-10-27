@@ -5929,28 +5929,40 @@ test('closing a nested modal restores its parent without unlocking or dismissing
   assert.deepEqual(data.requests,[]);
 }));
 
-for(const viewport of [{width:1280,height:900},{width:375,height:760}])test(`long message metadata and raw copy remain reachable while reading at ${viewport.width}px`,async()=>fixture(async(page,data)=>{
+for(const viewport of [{width:1280,height:900},{width:375,height:760}])test(`message metadata floats outside the correct side of short, medium and long bubbles at ${viewport.width}px`,async()=>fixture(async(page,data)=>{
   const source='Review paragraph with **emphasis** and an exact copy.\n\n'.repeat(100);
-  data.threads=[conversation([incoming(1,source),{id:2,sender:0,at:2,text:source}])]; data.reads[1]=2;
+  const medium=Array.from({length:6},(_,index)=>`Medium line ${index+1}`).join('\n');
+  data.threads=[conversation([incoming(1,source),{id:2,sender:0,at:2,text:source},incoming(3,'Short agent reply'),{id:4,sender:0,at:4,text:'Short user reply'},incoming(5,medium),{id:6,sender:0,at:6,text:medium},incoming(7,'Keep space after the medium replies.\n'.repeat(30))])]; data.reads[1]=7;
   await manualPolling(page); await page.setViewportSize(viewport); await reloadPage(page);
   await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  for(const id of [1,2]) {
-    await page.locator(`[data-message="${id}"]`).evaluate(node=>{
-      const messages=node.closest('#messages'), message=node.getBoundingClientRect(), box=messages.getBoundingClientRect();
-      messages.scrollTop+=message.top-box.top+message.height/2-messages.clientHeight/2;
-    });
-    const placement=await page.locator(`[data-message="${id}"] .message-head`).evaluate(node=>{
-      const head=node.getBoundingClientRect(), messages=node.closest('#messages').getBoundingClientRect(), body=node.closest('.message').querySelector('.message-text').getBoundingClientRect();
-      return {inside:head.top>=messages.top&&head.bottom<=messages.bottom&&head.top>=0&&head.bottom<=innerHeight,head:{left:head.left,right:head.right},body:{left:body.left,right:body.right}};
-    });
-    assert.equal(placement.inside,true,`sender, date and copy remain visible midway through message ${id}`);
-    if(viewport.width>=1000)assert.ok(id===1?placement.head.right<=placement.body.left+2:placement.head.left>=placement.body.right-2,'desktop metadata occupies the outer side instead of covering message text');
-    assert.match(await page.locator(`[data-message="${id}"] .message-head`).textContent(),id===1?/agent 1/:/you/);
-    const before=await page.locator('#messages').evaluate(node=>node.scrollTop);
-    await page.locator(`[data-copy-message="${id}"]`).click();
-    assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
-    assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),before,'copying midway through a long message does not jump to its top');
+  for(const id of [1,2,3,4,5,6]) {
+    for(const progress of id<=2?[.25,.5,.75]:[.5]) {
+      await page.locator(`[data-message="${id}"]`).evaluate((node,{progress,topAligned})=>{
+        const messages=node.closest('#messages'), message=node.getBoundingClientRect(), box=messages.getBoundingClientRect();
+        messages.scrollTop+=message.top-box.top+(topAligned?-12:message.height*progress-messages.clientHeight/2);
+      },{progress,topAligned:id>=5});
+      await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+      const placement=await page.locator(`[data-message="${id}"] .message-head`).evaluate(node=>{
+        const head=node.getBoundingClientRect(), messages=node.closest('#messages').getBoundingClientRect(), bubble=node.closest('.message').querySelector('.message-bubble');
+        if(!bubble)return {external:false};
+        const body=bubble.getBoundingClientRect(), visibleTop=Math.max(body.top,messages.top), visibleBottom=Math.min(body.bottom,messages.bottom);
+        return {external:node.parentElement===bubble.parentElement&&!bubble.contains(node),background:getComputedStyle(node.parentElement).backgroundColor,bubbleBackground:getComputedStyle(bubble).backgroundColor,inside:head.top>=messages.top&&head.bottom<=messages.bottom&&head.top>=0&&head.bottom<=innerHeight,center:(head.top+head.bottom)/2,visibleCenter:(visibleTop+visibleBottom)/2,head:{left:head.left,right:head.right},body:{left:body.left,right:body.right}};
+      });
+      assert.equal(placement.external,true,'sender, date and copy are outside the message bubble, not inside its border/background');
+      assert.equal(placement.background,'rgba(0, 0, 0, 0)','the layout row must not extend the bubble background behind metadata');
+      assert.notEqual(placement.bubbleBackground,'rgba(0, 0, 0, 0)','only the separate bubble has the message background');
+      assert.equal(placement.inside,true,`metadata stays visible while reading message ${id} at ${progress}`);
+      assert.ok(id%2===1?placement.head.left>=placement.body.right+4:placement.head.right<=placement.body.left-4,`agent metadata belongs to the right and user metadata to the left of message ${id}`);
+      assert.ok(Math.abs(placement.center-placement.visibleCenter)<=4,`metadata floats at the visible bubble midpoint for message ${id} at ${progress}, not pinned to its top: ${JSON.stringify(placement)}`);
+      assert.match(await page.locator(`[data-message="${id}"] .message-head`).textContent(),id%2===1?/agent 1/:/you/);
+      if(id<=2&&progress===.5) {
+        const before=await page.locator('#messages').evaluate(node=>node.scrollTop);
+        await page.locator(`[data-copy-message="${id}"]`).click();
+        assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source);
+        assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),before,'copying midway through a long message does not jump to its top');
+      }
+    }
   }
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'metadata does not introduce horizontal page overflow');
 }));
