@@ -20,6 +20,10 @@ Settings have section links and a persistent save-state indicator. The theme fol
 
 The header toggle hides or shows the sidebar and saves your preference in this browser. Mobile defaults to hidden navigation. The workspace uses available width, including when zoomed out, and conversations fill the remaining height. Copy icons beside messages, project/folder paths and agent details copy their text. Manual selection still works. Agent previews show **Status:** for an agent's last descriptive update, otherwise **Task:** for its launch assignment. Words such as “idle” in a status update do not change the actual lifecycle badge.
 
+Agent token counts update as provider reports arrive. **In progress (provisional)** is not a final total; **Finalised** means accounting was reported, not that the task succeeded. **Partial (incomplete)** retains available observations but may omit earlier unreported work; these are not complete lifetime totals. **Not reported** and `—` mean unavailable, never measured zero. Details and `acom agent <ID>` show the total and input/cache/output breakdown. Some providers report a total without every breakdown, so those fields need not sum to it. Claude's counts cover this agent's main loop, not native subagents. Counts are separate from context size, account subscription usage and billing; existing records without coverage metadata are not retroactively declared complete.
+
+Claude's live accounting enables its partial-event stream. Raw stdout capture retains those events too, so new Claude output logs can be larger; storage/retention behaviour is otherwise unchanged.
+
 ## Threads and messages
 
 Threads have title/ID search and a mobile conversation view with **All threads** to return to the list while keeping the draft. **Ctrl/Cmd + Enter** sends; Enter adds a line.

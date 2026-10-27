@@ -149,6 +149,8 @@ fn stub(item: &Value) -> Value {
         "joinable",
         "owner",
         "created_by",
+        "total_tokens",
+        "token_usage_state",
     ] {
         if let Some(value) = item.get(key).filter(|v| !v.is_null()) {
             result[key] = value.clone();

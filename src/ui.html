@@ -689,6 +689,9 @@
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
+    const tokenCount = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? fmt(value) : '—';
+    const tokenUsageState = agent => ({unknown:'Not reported', provisional:'In progress (provisional)', final:'Finalised', partial:'Partial (incomplete)'})[agent.token_usage_state] || 'Not reported';
+    const agentTokenSummary = agent => `<div class="meta">Total tokens: ${tokenCount(agent.total_tokens)} · ${tokenUsageState(agent)}</div>`;
     const when = n => n ? new Date(n * 1000).toLocaleString() : '—';
     function confirmAgentAction(message) { return !state.confirmAgentActions || confirm(message); }
     const who = id => Number(id) === 0 ? 'user' : `agent ${id}`;
@@ -1371,8 +1374,7 @@
       const diagnostics = a.has_diagnostics ? '<span class="pill waiting" title="A suspected coordination loop was recorded; inspect Details. No automatic intervention.">Coordination warning recorded</span>' : '';
       const waiting = a.waiting ? `<div class="meta agent-wait">${waitingDescription(a)}</div>` : a.is_waiting ? '<div class="meta agent-wait">Waiting for notifications · See Details for the watch and timeout.</div>' : '';
       const disabled = a.stopping || agentTransitions.has(a.id) ? ' disabled' : '';
-      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}${waiting}${diagnostics}<div class="meta">Details exceed the preview budget.${replacement}</div><div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
-      const total = Number(a.fresh_in || 0) + Number(a.cache_write || 0) + Number(a.cache_read || 0) + Number(a.output || 0);
+      if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}${waiting}${diagnostics}<div class="meta">Details exceed the preview budget.${replacement}</div>${a.token_usage_state ? agentTokenSummary(a) : ''}<div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
       const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
       const buttons = ['working', 'idle', 'done'].includes(a.state)
@@ -1386,7 +1388,7 @@
       const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta wait-reason">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
         <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${queued}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta agent-task" title="${esc(`${a.status ? 'Status' : 'Task'}: ${a.status || task}`)}"><span class="agent-task-label">${a.status ? 'Status' : 'Task'}: </span>${esc(a.status || task)}</div>${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${fmt(a.context)} · ${fmt(total)} tokens · ${fmt(a.turns)} turns</div><div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div><div class="meta agent-task" title="${esc(`${a.status ? 'Status' : 'Task'}: ${a.status || task}`)}"><span class="agent-task-label">${a.status ? 'Status' : 'Task'}: </span>${esc(a.status || task)}</div>${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${tokenCount(a.context)} · ${fmt(a.turns)} turns</div>${agentTokenSummary(a)}<div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
         <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
@@ -1730,7 +1732,8 @@
         }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting','has_diagnostics','subscriptions','diagnostics'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting','has_diagnostics','subscriptions','diagnostics','total_tokens','fresh_in','cache_write','cache_read','output','token_usage_state','token_usage_updated_at'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        fields.push({key:'token_usage',label:'Token usage',content:tokenUsageState(a)}, ...[['total_tokens','Total tokens'],['fresh_in','Fresh input'],['cache_write','Cache writes'],['cache_read','Cache reads'],['output','Output']].map(([key,label]) => ({key,label,content:tokenCount(a[key])})));
         if (a.waiting) fields.push({key:'waiting',label:'waiting',content:waitingDescription(a)});
         const subscriptions = a.subscriptions || {active:0,pending:0};
         setText($('#agent-subscription-count'), `(${fmt(subscriptions.active)} active · ${fmt(subscriptions.pending)} pending events)`);

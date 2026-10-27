@@ -1707,9 +1707,26 @@ fn print_agent(a: &Value) {
         sender(&a["launched_by"]),
         t(&a["launched_at"])
     );
+    let count = |key: &str| {
+        a[key]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "not reported".into())
+    };
+    let reporting = match a["token_usage_state"].as_str() {
+        Some("provisional") => "in progress (provisional)",
+        Some("final") => "finalised",
+        Some("partial") => "partial (incomplete)",
+        _ => "not reported",
+    };
     println!(
-        "Context: {} tokens. Tokens so far: fresh input {}, cache writes {}, cache reads {}, output {}",
-        a["context"], a["fresh_in"], a["cache_write"], a["cache_read"], a["output"]
+        "Context: {} tokens. Tokens so far ({reporting}): total {}, fresh input {}, cache writes {}, cache reads {}, output {}",
+        a["context"],
+        count("total_tokens"),
+        count("fresh_in"),
+        count("cache_write"),
+        count("cache_read"),
+        count("output")
     );
     let locks: Vec<&str> = a["locks"]
         .as_array()

@@ -389,6 +389,7 @@ pub(crate) struct PreparedTurn {
     harness: String,
     model: String,
     effort: String,
+    session: Option<String>,
     side_file: Option<(PathBuf, u64)>,
     turns: i64,
     err_from: u64,
@@ -580,6 +581,7 @@ pub(crate) fn prepare_turn(
     // failure after spawn must stop and reap the child, not leave it unattended.
     let saved = (|| -> R<()> {
         st.db.execute_batch("SAVEPOINT turn_start")?;
+        crate::app::tokens::begin(st, id, a.session.as_deref())?;
         st.db.execute(
             "UPDATE agents SET seen_model=NULL,state='working',pid=?2,turns=turns+1,ended_at=NULL WHERE id=?1",
             params![id, pid])?;
@@ -629,6 +631,7 @@ pub(crate) fn prepare_turn(
         harness: a.harness,
         model: a.model,
         effort: a.effort,
+        session: a.session,
         side_file,
         turns,
         err_from,
@@ -643,6 +646,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
     let model = std::mem::take(&mut turn.model);
     let harness = std::mem::take(&mut turn.harness);
     let side_file = turn.side_file.take();
+    let session = turn.session.take();
     let turns = turn.turns;
     let err_from = turn.err_from;
     st.procs.insert(
@@ -672,9 +676,13 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
     let app = app.clone();
     thread::spawn(move || {
         let done = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(std::sync::Mutex::new(()));
         let side = {
-            let (app, harness, done) = (app.clone(), harness.clone(), done.clone());
-            thread::spawn(move || follow_side_file(&app, id, &harness, side_file, &done))
+            let (app, harness, done, events) =
+                (app.clone(), harness.clone(), done.clone(), events.clone());
+            thread::spawn(move || {
+                follow_side_file(&app, id, &harness, session, side_file, &done, &events)
+            })
         };
         let out = child.stdout.take();
         // Reap independently of stdout: a descendant can otherwise keep its
@@ -690,6 +698,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
         };
         if let Some(out) = out {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _events = events.lock().unwrap_or_else(|error| error.into_inner());
                 stdout_line(&app, id, &harness, &model, &line);
             }
         }
@@ -768,7 +777,7 @@ fn last_line(path: &PathBuf, from: u64) -> Option<String> {
 fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event, at: &str) {
     let r = match ev {
         Event::Session(s) => app.set_session(id, &s),
-        Event::Tokens { t, add } => app.record_tokens(id, t, add),
+        Event::Tokens(usage) => app.record_tokens(id, usage),
         Event::Context(n) => app.record_context(id, n),
         Event::Usage {
             win,
@@ -816,16 +825,36 @@ fn follow_side_file(
     app: &Arc<App>,
     id: i64,
     harness: &str,
+    mut session: Option<String>,
     initial: Option<(PathBuf, u64)>,
     done: &AtomicBool,
+    events: &std::sync::Mutex<()>,
 ) {
     let (mut path, mut pos) = initial.map_or((None, 0), |(p, pos)| (Some(p), pos));
     let mut partial = Vec::new();
-    loop {
+    'follow: loop {
         let finished = done.load(Ordering::SeqCst);
+        let current = match current_session(app, id) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("agent {id}: couldn't check native session: {}", error.1);
+                if finished {
+                    return;
+                }
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        if session != current {
+            session = current;
+            path = None;
+            pos = 0;
+            partial.clear();
+        }
         if path.is_none() {
-            let session = app.lock().agent(id).ok().and_then(|a| a.session);
-            path = session.and_then(|s| harness::side_file(harness, &s));
+            path = session
+                .as_deref()
+                .and_then(|s| harness::side_file(harness, s));
         }
         if let Some(p) = &path
             && let Ok(mut f) = File::open(p)
@@ -836,21 +865,32 @@ fn follow_side_file(
                 pos += n as u64;
                 partial.extend_from_slice(&buf);
                 while let Some(i) = partial.iter().position(|&c| c == b'\n') {
-                    let line: Vec<u8> = partial.drain(..=i).collect();
-                    let at = capture_time();
-                    for ev in
-                        harness::parse_line(harness, String::from_utf8_lossy(&line).trim_end())
-                    {
-                        if !matches!(ev, Event::Text(_) | Event::Tool(_)) {
-                            // The running process keeps its original requested model even
-                            // if the user/agent has changed the next-turn configuration.
-                            let asked = app
-                                .lock()
-                                .procs
-                                .get(&id)
-                                .map(|p| p.model.clone())
-                                .unwrap_or_default();
-                            apply(app, id, harness, &asked, ev, &at);
+                    let applied = match session.as_deref() {
+                        Some(session) => apply_side_line(
+                            app,
+                            id,
+                            harness,
+                            session,
+                            String::from_utf8_lossy(&partial[..=i]).trim_end(),
+                            events,
+                        ),
+                        None => Ok(false),
+                    };
+                    match applied {
+                        Ok(true) => {
+                            partial.drain(..=i);
+                        }
+                        Ok(false) => {
+                            partial.clear();
+                            continue 'follow;
+                        }
+                        Err(error) => {
+                            eprintln!("agent {id}: couldn't check native session: {}", error.1);
+                            if finished {
+                                return;
+                            }
+                            thread::sleep(Duration::from_secs(1));
+                            continue 'follow;
                         }
                     }
                 }
@@ -861,6 +901,44 @@ fn follow_side_file(
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn current_session(app: &App, id: i64) -> R<Option<String>> {
+    Ok(app
+        .lock()
+        .db
+        .query_row("SELECT session_id FROM agents WHERE id=?1", [id], |row| {
+            row.get(0)
+        })?)
+}
+
+fn apply_side_line(
+    app: &Arc<App>,
+    id: i64,
+    harness: &str,
+    session: &str,
+    line: &str,
+    events: &std::sync::Mutex<()>,
+) -> R<bool> {
+    // Match stdout's gate->application lock order: a confirmed session change
+    // cannot interleave with an already-read old session's state mutations.
+    let _events = events.lock().unwrap_or_else(|error| error.into_inner());
+    if current_session(app, id)?.as_deref() != Some(session) {
+        return Ok(false);
+    }
+    let at = capture_time();
+    for ev in harness::parse_line(harness, line) {
+        if !matches!(ev, Event::Text(_) | Event::Tool(_) | Event::Session(_)) {
+            let asked = app
+                .lock()
+                .procs
+                .get(&id)
+                .map(|p| p.model.clone())
+                .unwrap_or_default();
+            apply(app, id, harness, &asked, ev, &at);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1066,7 +1144,8 @@ mod tests {
 
     fn test_app(pid: u32) -> Arc<App> {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT,done_req INTEGER DEFAULT 0,rest TEXT DEFAULT 'idle',fresh_in INTEGER DEFAULT 0,cache_write INTEGER DEFAULT 0,cache_read INTEGER DEFAULT 0,output INTEGER DEFAULT 0); INSERT INTO agents(id,state) VALUES(1,'working');
+        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT,done_req INTEGER DEFAULT 0,rest TEXT DEFAULT 'idle',fresh_in INTEGER DEFAULT 0,cache_write INTEGER DEFAULT 0,cache_read INTEGER DEFAULT 0,output INTEGER DEFAULT 0,harness TEXT DEFAULT 'codex',session_id TEXT,session_started INTEGER DEFAULT 0,turns INTEGER DEFAULT 0); INSERT INTO agents(id,state) VALUES(1,'working');
+            CREATE TABLE agent_token_usage(agent_id INTEGER PRIMARY KEY,ledger TEXT NOT NULL);
             CREATE TABLE view_revisions(name TEXT PRIMARY KEY,value INTEGER); INSERT INTO view_revisions VALUES('agents',0);
             CREATE TABLE agent_handoffs(agent_id INTEGER); CREATE TABLE agent_continuations(agent_id INTEGER);").unwrap();
         Arc::new(App {
@@ -1096,6 +1175,178 @@ mod tests {
             url: String::new(),
             exe: PathBuf::new(),
         })
+    }
+
+    #[test]
+    fn old_session_events_are_fenced_by_the_same_gate_as_confirmed_stdout_sessions() {
+        let app = test_app(0);
+        app.set_session(1, "old-session").unwrap();
+        app.record_tokens(
+            1,
+            crate::harness::TokenUsage {
+                source: crate::harness::TokenSource::CodexSession { finalized: false },
+                counts: [Some(10), Some(0), Some(0), Some(0)],
+                total: Some(10),
+            },
+        )
+        .unwrap();
+        let events = Arc::new(Mutex::new(()));
+        let changing = events.lock().unwrap();
+        let stale = {
+            let (app, events) = (app.clone(), events.clone());
+            thread::spawn(move || {
+                for line in [
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}}"#,
+                    r#"{"type":"event_msg","payload":{"type":"task_complete","error":{"message":"Synthetic old-session failure"}}}"#,
+                ] {
+                    assert!(
+                        !apply_side_line(&app, 1, "codex", "old-session", line, &events).unwrap()
+                    );
+                }
+            })
+        };
+        app.set_session(1, "new-session").unwrap();
+        app.record_tokens(
+            1,
+            crate::harness::TokenUsage {
+                source: crate::harness::TokenSource::CodexSession { finalized: false },
+                counts: [Some(2), Some(0), Some(0), Some(0)],
+                total: Some(2),
+            },
+        )
+        .unwrap();
+        drop(changing);
+        stale.join().unwrap();
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT fresh_in FROM agents WHERE id=1", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            12
+        );
+        assert!(app.lock().procs[&1].failure.is_none());
+        assert!(
+            apply_side_line(
+                &app,
+                1,
+                "codex",
+                "new-session",
+                r#"{"type":"thread.started","thread_id":"history-must-not-change-session"}"#,
+                &events
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            current_session(&app, 1).unwrap().as_deref(),
+            Some("new-session")
+        );
+    }
+
+    #[test]
+    fn native_follower_retargets_new_sessions_and_discards_old_partial_lines() {
+        const FIXTURE: &str = "ACOM_NATIVE_RETARGET_TEST_DIR";
+        let Some(home) = std::env::var_os(FIXTURE).map(PathBuf::from) else {
+            let home =
+                std::env::temp_dir().join(format!("acom-native-retarget-{}", harness::new_uuid()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","run::tests::native_follower_retargets_new_sessions_and_discards_old_partial_lines","--nocapture"])
+                .env(FIXTURE,&home).env("CODEX_HOME",home.join("codex")).env("ACOM_HOME",home.join("state"))
+                .output().unwrap();
+            let _ = std::fs::remove_dir_all(home);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let sessions = home.join("codex/sessions/2026/01/01");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let usage = |input| {
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}}).to_string()
+        };
+        let a = sessions.join("rollout-synthetic-native-a.jsonl");
+        let b = sessions.join("rollout-synthetic-native-b.jsonl");
+        std::fs::write(&a, format!("{}\n{{\"type\":\"", usage(10))).unwrap();
+        std::fs::write(&b, format!("{}\n", usage(2))).unwrap();
+        let app = test_app(0);
+        app.set_session(1, "synthetic-native-a").unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(()));
+        let follower = {
+            let (app, done, events) = (app.clone(), done.clone(), events.clone());
+            thread::spawn(move || {
+                follow_side_file(
+                    &app,
+                    1,
+                    "codex",
+                    Some("synthetic-native-a".into()),
+                    Some((a, 0)),
+                    &done,
+                    &events,
+                )
+            })
+        };
+        let wait = |expected| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let actual: i64 = app
+                    .lock()
+                    .db
+                    .query_row("SELECT fresh_in FROM agents WHERE id=1", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                if actual == expected {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "expected {expected} tokens, observed {actual}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(10);
+        {
+            let _events = events.lock().unwrap();
+            app.set_session(1, "synthetic-native-b").unwrap();
+        }
+        wait(12);
+        done.store(true, Ordering::SeqCst);
+        follower.join().unwrap();
+        assert_eq!(
+            current_session(&app, 1).unwrap().as_deref(),
+            Some("synthetic-native-b")
+        );
+    }
+
+    #[test]
+    fn a_failed_session_lookup_is_not_an_absent_or_changed_session() {
+        let app = test_app(0);
+        assert_eq!(current_session(&app, 1).unwrap(), None);
+        app.lock()
+            .db
+            .execute(
+                "ALTER TABLE agents RENAME COLUMN session_id TO hidden_session",
+                [],
+            )
+            .unwrap();
+        assert!(current_session(&app, 1).is_err());
+        assert!(
+            apply_side_line(
+                &app,
+                1,
+                "codex",
+                "old-session",
+                r#"{"type":"turn.failed","error":{"message":"Synthetic failure"}}"#,
+                &Mutex::new(())
+            )
+            .is_err()
+        );
+        assert!(app.lock().procs[&1].failure.is_none());
     }
 
     struct StopWorker(Child);

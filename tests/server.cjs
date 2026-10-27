@@ -1825,7 +1825,10 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
   await until(()=>captures(warned.id).length===4,'own history survives successful turns and explicit reopen');
   await configure(warned.id,{model:'gpt-6-sol'},409);
   await api('POST','/agent-config',{id:warned.id,model:'gpt-6-sol',effort:'medium'}); // User override is never gated.
-  for(const id of [helper.id,cliHelperId,otherProvider.id]) await api('POST',`/agents/${id}/close`,{});
+  for(const [id,state] of [[helper.id,'idle'],[cliHelperId,'done'],[otherProvider.id,'done']]) {
+    await until(async()=>{const agent=await view(id);return agent.state===state && !agent.stopping;},`helper ${id} finishes before close`);
+    await api('POST',`/agents/${id}/close`,{});
+  }
 
   const lineageRequest={harness:'claude',model:'claude-sonnet-5-5',effort:'high',task:'Continue this identity through another provider'};
   await api('POST',`/agents/${warned.id}/replacement`,lineageRequest);

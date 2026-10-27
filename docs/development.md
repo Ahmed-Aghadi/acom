@@ -12,6 +12,8 @@ Request bodies are capped at 16 MiB after transfer decoding. A [narrow local tin
 
 Harness diagnostics are not necessarily terminal failures. Codex's [JSON event interface](https://learn.chatgpt.com/docs/non-interactive-mode) distinguishes `error`, `turn.failed` and `turn.completed`; CLI 0.164.0 observations also establish recoverable generic errors and native `task_complete.error`. Parser regressions use synthetic fixtures, not private sessions. Reconcile both output sources before final classification, keep authoritative failures sticky, and use one reason across details, history and recovery prompts.
 
+Token reports have different scopes. Claude's [accounting contract](https://code.claude.com/docs/en/agent-sdk/cost-tracking) requires message-ID deduplication and cumulative stream deltas for output; `result.usage` is per invocation, unlike session-wide `modelUsage`. Codex CLI 0.164.0 observations establish that stdout and native usage snapshots share cumulative session scope. Preserve missing values, partial coverage and interruptions; test repeated reports, final reconciliation, resumes and source ordering without using private transcripts as fixtures.
+
 ## Licenses and releases
 
 Keep the project's MIT [LICENSE](../LICENSE) unchanged when updating third-party notices. [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt) is generated from the reviewed [Rust inventory](../licenses/rust.json) and existing Markdown notices. It includes build dependencies and bundled native-source notices conservatively, not a claim that every listed source file is linked. `acom licenses` embeds and prints the project's license followed by these notices without using a server, provider or data directory.
@@ -40,6 +42,7 @@ cargo fmt --check
 cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-access.cjs tests/wait-watch.cjs tests/subscriptions.cjs
 node --test tests/storage.cjs tests/http-boundaries.cjs tests/process-cleanup.cjs
 node --test tests/failure-reporting.cjs
+node --test tests/token-usage.cjs
 node --test tests/licenses.cjs
 cargo audit
 ```

@@ -19,11 +19,28 @@ pub struct Launch<'a> {
     pub acom: &'a Path,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenSource {
+    ClaudeMessage(String),
+    ClaudeStreamStart(String),
+    ClaudeStreamDelta,
+    ClaudeStreamEnd,
+    ClaudeResult { trusted: bool },
+    CodexSession { finalized: bool },
+}
+
+#[derive(Clone, Debug)]
+pub struct TokenUsage {
+    /// Fresh input, cache writes, cache reads, output. None means unreported.
+    pub counts: [Option<u64>; 4],
+    pub total: Option<u64>,
+    pub source: TokenSource,
+}
+
 pub enum Event {
     /// The harness's session ID, needed to resume it.
     Session(String),
-    /// Tokens: fresh input, cache writes, cache reads, output. `add` adds them to the totals, otherwise they replace them.
-    Tokens { t: [u64; 4], add: bool },
+    Tokens(TokenUsage),
     /// How big the context is now.
     Context(u64),
     /// Subscription usage for one window, in percent.
@@ -47,7 +64,10 @@ pub enum Event {
     /// The subscription's usage limit was hit mid-turn. acom pauses the agent until the window resets.
     LimitHit(String),
     /// A model-scoped window exhausted; do not mark the whole provider exhausted.
-    WindowLimitHit { win: String, text: String },
+    WindowLimitHit {
+        win: String,
+        text: String,
+    },
     /// The model that actually answered.
     Model(String),
 }
@@ -144,6 +164,72 @@ fn quote(p: &Path) -> String {
     format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
 }
 
+fn token_number(v: &Value) -> Option<u64> {
+    v.as_u64().filter(|n| *n <= i64::MAX as u64)
+}
+
+fn claude_tokens(u: &Value, source: TokenSource, include_output: bool) -> Option<Event> {
+    let counts = [
+        token_number(&u["input_tokens"]),
+        token_number(&u["cache_creation_input_tokens"]),
+        token_number(&u["cache_read_input_tokens"]),
+        include_output
+            .then(|| token_number(&u["output_tokens"]))
+            .flatten(),
+    ];
+    if counts.iter().all(Option::is_none)
+        && !matches!(
+            source,
+            TokenSource::ClaudeStreamStart(_) | TokenSource::ClaudeStreamEnd
+        )
+    {
+        return None;
+    }
+    let total = counts
+        .into_iter()
+        .try_fold(0_u64, |sum, count| sum.checked_add(count?));
+    Some(Event::Tokens(TokenUsage {
+        counts,
+        total,
+        source,
+    }))
+}
+
+fn codex_tokens(u: &Value, finalized: bool) -> Option<Event> {
+    let input = token_number(&u["input_tokens"]);
+    let read = token_number(&u["cached_input_tokens"]);
+    let write = token_number(&u["cache_write_input_tokens"]);
+    let output = token_number(&u["output_tokens"]);
+    if input.is_some_and(|input| {
+        read.is_some_and(|read| read > input)
+            || write.is_some_and(|write| write > input)
+            || read.zip(write).is_some_and(|(read, write)| {
+                read.checked_add(write).is_none_or(|cached| cached > input)
+            })
+    }) {
+        return None;
+    }
+    let counts = [
+        input
+            .zip(read)
+            .zip(write)
+            .and_then(|((input, read), write)| input.checked_sub(read)?.checked_sub(write)),
+        write,
+        read,
+        output,
+    ];
+    if input.is_none() && counts.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(Event::Tokens(TokenUsage {
+        counts,
+        total: input
+            .zip(output)
+            .and_then(|(input, output)| input.checked_add(output)),
+        source: TokenSource::CodexSession { finalized },
+    }))
+}
+
 // ---------- Claude Code ----------
 
 pub fn claude_catalog() -> Vec<Model> {
@@ -181,7 +267,7 @@ fn claude_command(l: &Launch) -> (Command, Option<String>) {
     c.args(l.flags);
     // Keep session, model, compaction, hook and subagent controls after the
     // configurable flags so project settings cannot replace these invariants.
-    c.args(["--model", l.model]);
+    c.args(["--include-partial-messages", "--model", l.model]);
     // Haiku 4.5 has fixed effort; medium is its catalog placeholder, not a knob.
     if !crate::app::same_model("claude-haiku-4-5", l.model) {
         c.args(["--effort", l.effort]);
@@ -231,7 +317,7 @@ fn claude_events(v: &Value) -> Vec<Event> {
     match v["type"].as_str().unwrap_or("") {
         "system" => match v["subtype"].as_str().unwrap_or("") {
             "init" => {
-                if let Some(s) = v["session_id"].as_str() {
+                if let Some(s) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
                     out.push(Event::Session(s.to_string()));
                 }
             }
@@ -244,7 +330,30 @@ fn claude_events(v: &Value) -> Vec<Event> {
             }
             _ => {}
         },
-        "assistant" => {
+        "stream_event" if v["parent_tool_use_id"].is_null() => {
+            let event = &v["event"];
+            let usage = match event["type"].as_str() {
+                Some("message_start") => event["message"]["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| {
+                        claude_tokens(
+                            &event["message"]["usage"],
+                            TokenSource::ClaudeStreamStart(id.into()),
+                            false,
+                        )
+                    }),
+                Some("message_delta") => {
+                    claude_tokens(&event["usage"], TokenSource::ClaudeStreamDelta, true)
+                }
+                Some("message_stop") => {
+                    claude_tokens(&Value::Null, TokenSource::ClaudeStreamEnd, false)
+                }
+                _ => None,
+            };
+            out.extend(usage);
+        }
+        "assistant" if v["parent_tool_use_id"].is_null() => {
             let m = &v["message"];
             if let Some(model) = m["model"].as_str().filter(|x| !x.starts_with('<')) {
                 out.push(Event::Model(model.to_string()));
@@ -262,6 +371,15 @@ fn claude_events(v: &Value) -> Vec<Event> {
                 + n(&u["cache_read_input_tokens"]);
             if ctx > 0 {
                 out.push(Event::Context(ctx));
+            }
+            // Blocks repeat by message ID; their output count is a placeholder.
+            // Stream message_delta supplies cumulative output instead.
+            if let Some(id) = m["id"].as_str().filter(|id| !id.is_empty()) {
+                out.extend(claude_tokens(
+                    u,
+                    TokenSource::ClaudeMessage(id.into()),
+                    false,
+                ));
             }
             for b in v["message"]["content"].as_array().into_iter().flatten() {
                 match b["type"].as_str() {
@@ -284,18 +402,16 @@ fn claude_events(v: &Value) -> Vec<Event> {
                 }
             }
         }
-        // The turn's totals. Per-message usage repeats and undercounts output, so only this is counted.
+        // Reconcile this invocation, never add its totals to its live snapshots.
         "result" => {
             let u = &v["usage"];
-            out.push(Event::Tokens {
-                t: [
-                    n(&u["input_tokens"]),
-                    n(&u["cache_creation_input_tokens"]),
-                    n(&u["cache_read_input_tokens"]),
-                    n(&u["output_tokens"]),
-                ],
-                add: true,
-            });
+            // Error totals can omit work or be synthesized as zeros.
+            let trusted = v["is_error"] == false;
+            out.extend(claude_tokens(
+                u,
+                TokenSource::ClaudeResult { trusted },
+                true,
+            ));
             if v["is_error"] == true {
                 let errors = v["errors"]
                     .as_array()
@@ -565,28 +681,18 @@ fn codex_events(v: &Value) -> Vec<Event> {
         return vec![Event::Model(model.to_string())];
     }
     let n = |x: &Value| x.as_u64().unwrap_or(0);
-    let tokens = |u: &Value, add| {
-        let input = n(&u["input_tokens"]);
-        let read = n(&u["cached_input_tokens"]);
-        let write = n(&u["cache_write_input_tokens"]);
-        Event::Tokens {
-            t: [
-                input.saturating_sub(read).saturating_sub(write),
-                write,
-                read,
-                n(&u["output_tokens"]),
-            ],
-            add,
-        }
-    };
 
     // `codex exec --json` events.
     match v["type"].as_str().unwrap_or("") {
         "thread.started" => v["thread_id"]
             .as_str()
+            .filter(|s| !s.is_empty())
             .map(|s| vec![Event::Session(s.to_string())])
             .unwrap_or_default(),
-        "turn.completed" => vec![tokens(&v["usage"], false), Event::TurnCompleted],
+        "turn.completed" => codex_tokens(&v["usage"], true)
+            .into_iter()
+            .chain([Event::TurnCompleted])
+            .collect(),
         "item.completed" => {
             let item = &v["item"];
             let event = match item["type"].as_str().unwrap_or("") {
@@ -615,7 +721,9 @@ fn codex_events(v: &Value) -> Vec<Event> {
         "event_msg" if v["payload"]["type"] == "token_count" => {
             let payload = &v["payload"];
             let info = &payload["info"];
-            let mut out = vec![tokens(&info["total_token_usage"], false)];
+            let mut out: Vec<_> = codex_tokens(&info["total_token_usage"], false)
+                .into_iter()
+                .collect();
             let context = n(&info["last_token_usage"]["total_tokens"]);
             if context > 0 {
                 out.push(Event::Context(context));
@@ -944,15 +1052,184 @@ mod tests {
     }
 
     #[test]
-    fn claude_result_adds_tokens() {
-        let line = r#"{"type":"result","usage":{"input_tokens":17,"cache_creation_input_tokens":28668,"cache_read_input_tokens":27308,"output_tokens":544}}"#;
+    fn empty_native_session_ids_are_not_confirmed() {
+        for (provider, line) in [
+            (
+                "claude",
+                r#"{"type":"system","subtype":"init","session_id":""}"#,
+            ),
+            ("codex", r#"{"type":"thread.started","thread_id":""}"#),
+        ] {
+            assert!(
+                !parse_line(provider, line)
+                    .iter()
+                    .any(|event| matches!(event, Event::Session(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_result_reports_invocation_totals() {
+        let line = r#"{"type":"result","is_error":false,"usage":{"input_tokens":17,"cache_creation_input_tokens":28668,"cache_read_input_tokens":27308,"output_tokens":544}}"#;
         let ev = parse_line("claude", line);
         assert!(matches!(
             &ev[0],
-            Event::Tokens {
-                t: [17, 28668, 27308, 544],
-                add: true
-            }
+            Event::Tokens(TokenUsage {
+                counts: [Some(17), Some(28668), Some(27308), Some(544)],
+                total: Some(56537),
+                source: TokenSource::ClaudeResult { trusted: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn claude_assistant_usage_has_stable_identity_but_no_placeholder_output() {
+        let events = parse_line(
+            "claude",
+            r#"{"type":"assistant","uuid":"block-id","message":{"id":"message-id","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":1}}}"#,
+        );
+        assert!(events.iter().any(|event| matches!(event, Event::Tokens(TokenUsage { counts:[Some(10),Some(20),Some(30),None], total:None, source:TokenSource::ClaudeMessage(id) }) if id == "message-id")));
+        let missing_id = parse_line(
+            "claude",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10}}}"#,
+        );
+        assert!(
+            !missing_id
+                .iter()
+                .any(|event| matches!(event, Event::Tokens(_)))
+        );
+    }
+
+    #[test]
+    fn claude_stream_usage_keeps_cumulative_output_and_message_boundaries() {
+        for (line, expected) in [
+            (
+                r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"message-id","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":20,"output_tokens":0}}}}"#,
+                TokenSource::ClaudeStreamStart("message-id".into()),
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":15}}}"#,
+                TokenSource::ClaudeStreamDelta,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+                TokenSource::ClaudeStreamEnd,
+            ),
+        ] {
+            let events = parse_line("claude", line);
+            assert!(
+                matches!(events.as_slice(), [Event::Tokens(sample)] if sample.source == expected)
+            );
+        }
+        assert!(parse_line("claude", r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"not a usage report"}}}"#).is_empty());
+    }
+
+    #[test]
+    fn claude_child_messages_do_not_inflate_main_loop_usage_or_context() {
+        for line in [
+            r#"{"type":"assistant","parent_tool_use_id":"child","message":{"id":"message-id","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":"child","event":{"type":"message_delta","usage":{"output_tokens":100}}}"#,
+        ] {
+            assert!(parse_line("claude", line).is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_and_invalid_usage_is_not_an_observed_zero() {
+        for (provider, line) in [
+            ("claude", r#"{"type":"result"}"#),
+            (
+                "claude",
+                r#"{"type":"result","usage":{"input_tokens":null,"output_tokens":-2}}"#,
+            ),
+            ("codex", r#"{"type":"turn.completed"}"#),
+            ("codex", r#"{"type":"turn.completed","usage":{}}"#),
+            (
+                "codex",
+                r#"{"type":"turn.completed","usage":{"input_tokens":1.5,"output_tokens":"2"}}"#,
+            ),
+            (
+                "codex",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":60}}}}"#,
+            ),
+        ] {
+            assert!(
+                !parse_line(provider, line)
+                    .iter()
+                    .any(|event| matches!(event, Event::Tokens(_))),
+                "{line}"
+            );
+        }
+        let events = parse_line(
+            "codex",
+            r#"{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}"#,
+        );
+        assert!(matches!(
+            &events[0],
+            Event::Tokens(TokenUsage {
+                counts: [Some(0), Some(0), Some(0), Some(0)],
+                total: Some(0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn codex_total_does_not_require_an_unreported_cache_write_breakdown() {
+        let events = parse_line(
+            "codex",
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":7}}"#,
+        );
+        assert!(matches!(
+            &events[0],
+            Event::Tokens(TokenUsage {
+                counts: [None, None, Some(60), Some(7)],
+                total: Some(107),
+                ..
+            })
+        ));
+        let events = parse_line(
+            "codex",
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":7}}"#,
+        );
+        assert!(!events.iter().any(|event| matches!(event, Event::Tokens(_))));
+    }
+
+    #[test]
+    fn claude_error_totals_do_not_establish_complete_accounting() {
+        let events = parse_line(
+            "claude",
+            r#"{"type":"result","is_error":true,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}"#,
+        );
+        assert!(matches!(
+            &events[0],
+            Event::Tokens(TokenUsage {
+                source: TokenSource::ClaudeResult { trusted: false },
+                ..
+            })
+        ));
+        let events = parse_line(
+            "claude",
+            r#"{"type":"result","is_error":true,"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4}}"#,
+        );
+        assert!(matches!(
+            &events[0],
+            Event::Tokens(TokenUsage {
+                source: TokenSource::ClaudeResult { trusted: false },
+                ..
+            })
+        ));
+        let events = parse_line(
+            "claude",
+            r#"{"type":"result","is_error":false,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}"#,
+        );
+        assert!(matches!(
+            &events[0],
+            Event::Tokens(TokenUsage {
+                source: TokenSource::ClaudeResult { trusted: true },
+                total: Some(0),
+                ..
+            })
         ));
     }
 
@@ -984,6 +1261,12 @@ mod tests {
             .collect();
         let last_model = args.iter().rposition(|x| x == "--model").unwrap();
         assert_eq!(args[last_model + 1], "right-model");
+        assert!(
+            args.iter()
+                .rposition(|x| x == "--include-partial-messages")
+                .unwrap()
+                > 3
+        );
         let last_settings = args.iter().rposition(|x| x == "--settings").unwrap();
         assert!(args[last_settings + 1].contains("PostToolUse"));
         let denied = args.iter().rposition(|x| x == "--disallowedTools").unwrap();
@@ -1004,10 +1287,11 @@ mod tests {
         );
         assert!(matches!(
             &ev[0],
-            Event::Tokens {
-                t: [35, 5, 60, 7],
-                add: false
-            }
+            Event::Tokens(TokenUsage {
+                counts: [Some(35), Some(5), Some(60), Some(7)],
+                total: Some(107),
+                source: TokenSource::CodexSession { finalized: true }
+            })
         ));
     }
 
@@ -1063,10 +1347,11 @@ mod tests {
         let ev = parse_line("codex", line);
         assert!(matches!(
             &ev[0],
-            Event::Tokens {
-                t: [60, 0, 40, 9],
-                add: false
-            }
+            Event::Tokens(TokenUsage {
+                counts: [Some(60), Some(0), Some(40), Some(9)],
+                total: Some(109),
+                source: TokenSource::CodexSession { finalized: false }
+            })
         ));
         assert!(matches!(&ev[1], Event::Context(71)));
         assert!(

@@ -16,6 +16,7 @@ mod agent_query;
 mod diagnostics;
 mod storage;
 mod subscriptions;
+pub(crate) mod tokens;
 pub use agent_query::ParsedAgentQuery;
 pub use subscriptions::UsageWatch;
 
@@ -772,6 +773,7 @@ INSERT OR IGNORE INTO view_ids SELECT 'notices',coalesce(max(id),0) FROM notices
 fn initialize_views(db: &Connection) -> R<()> {
     db.execute_batch(subscriptions::SCHEMA)?;
     db.execute_batch(diagnostics::SCHEMA)?;
+    db.execute_batch(tokens::SCHEMA)?;
     db.create_scalar_function(
         "acom_lower",
         1,
@@ -783,6 +785,7 @@ fn initialize_views(db: &Connection) -> R<()> {
         "projects",
         "configs",
         "agents",
+        "agent_token_usage",
         "threads",
         "messages",
         "members",
@@ -1923,6 +1926,7 @@ impl App {
                     "UPDATE agents SET state='paused', pause_reason='restart', pause_from='working', paused_at=?2 WHERE id=?1",
                     params![id, now()],
                 )?;
+                tokens::finish(st, id)?;
                 Ok(())
             })?;
             st.log_for(
@@ -2402,6 +2406,7 @@ impl App {
             st.atomic(|st| {
                 Self::cancel_followups(st, id, "the server stopped during the turn")?;
                 st.db.execute("UPDATE agents SET state='paused',pause_reason='restart',pause_from='working',paused_at=?2,pid=NULL WHERE id=?1",params![id,now()])?;
+                tokens::finish(st, id)?;
                 st.log_for(id,"acom",&format!("paused agent {id}: the server stopped during its turn"))?;
                 Ok(())
             })?;
@@ -2428,10 +2433,14 @@ impl App {
         let failed = (!ok || failure.is_some()) && !stopping && a.state == "working";
         if a.state != "working" {
             // Paused or closed by someone: they already set the state.
-            st.db.execute(
-                "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
-                params![id, pid],
-            )?;
+            st.atomic(|st| {
+                tokens::finish(st, id)?;
+                st.db.execute(
+                    "UPDATE agents SET pid=NULL WHERE id=?1 AND pid=?2",
+                    params![id, pid],
+                )?;
+                Ok(())
+            })?;
             st.procs.remove(&id);
             st.reaped.remove(&id);
             if let Err(e) = self.maybe_wake(&mut st, id) {
@@ -2457,6 +2466,7 @@ impl App {
             a.rest.as_str()
         };
         st.atomic(|st| {
+            tokens::finish(st, id)?;
             if failed {
                 // Retain the actual running model/effort until all exit writes
                 // commit. A transient database failure can safely be retried.
@@ -4644,17 +4654,9 @@ impl App {
 
     // ---------- usage and limits ----------
 
-    pub fn record_tokens(&self, id: i64, t: [u64; 4], add: bool) -> R<()> {
-        let st = self.lock();
-        let sql = if add {
-            "UPDATE agents SET fresh_in=fresh_in+?2, cache_write=cache_write+?3, cache_read=cache_read+?4, output=output+?5 WHERE id=?1"
-        } else {
-            "UPDATE agents SET fresh_in=?2, cache_write=?3, cache_read=?4, output=?5 WHERE id=?1"
-        };
-        st.db.execute(
-            sql,
-            params![id, t[0] as i64, t[1] as i64, t[2] as i64, t[3] as i64],
-        )?;
+    pub fn record_tokens(&self, id: i64, sample: crate::harness::TokenUsage) -> R<()> {
+        let mut st = self.lock();
+        st.atomic(|st| tokens::record(st, id, sample))?;
         Ok(())
     }
 
@@ -4840,12 +4842,15 @@ impl App {
     }
 
     pub fn set_session(&self, id: i64, session: &str) -> R<()> {
-        let st = self.lock();
-        st.db.execute(
-            "UPDATE agents SET session_id=coalesce(session_id, ?2), session_started=1 WHERE id=?1",
-            params![id, session],
-        )?;
-        Ok(())
+        let mut st = self.lock();
+        st.atomic(|st| {
+            tokens::session(st, id, session)?;
+            st.db.execute(
+                "UPDATE agents SET session_id=?2, session_started=1 WHERE id=?1",
+                params![id, session],
+            )?;
+            Ok(())
+        })
     }
 
     /// Retry only explicit rules, after the failed process exits. Keep a durable
@@ -5778,6 +5783,7 @@ impl App {
             &q,
             &[
                 "agents",
+                "agent_token_usage",
                 "locks",
                 "agent_handoffs",
                 "agent_starts",
@@ -5789,6 +5795,7 @@ impl App {
             true,
         )?;
         for item in &mut page.items {
+            tokens::attach(st, item)?;
             item["locks"] = json!(st.held_by(item["id"].as_i64().unwrap())?);
             Self::replacement_fields(st, item)?;
             let waiting = st.waiting_updates.get(&item["id"].as_i64().unwrap());
@@ -6150,6 +6157,7 @@ impl App {
                 "agents",
                 vec![
                     "agents",
+                    "agent_token_usage",
                     "locks",
                     "agent_handoffs",
                     "agent_starts",
@@ -6192,6 +6200,7 @@ impl App {
                 "projects",
                 "configs",
                 "agents",
+                "agent_token_usage",
                 "threads",
                 "messages",
                 "members",
@@ -6502,6 +6511,7 @@ impl App {
         )?;
         for a in &mut v {
             let id = a["id"].as_i64().unwrap();
+            tokens::attach(st, a)?;
             a["locks"] = json!(st.held_by(id)?);
         }
         Ok(v)
@@ -6523,6 +6533,7 @@ impl App {
         let mut a = rows(&st.db,"SELECT id,project,name,grp \"group\",task,harness,model,effort,state,status_text status,
             session_id session,launched_by,launched_at,pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,
             turns,ended_at,wake_queued_at,wake_why wake_reason,problem FROM agents WHERE id=?1",[id])?.remove(0);
+        tokens::attach(&st, &mut a)?;
         a["locks"] = json!(st.held_by(id)?);
         let (name, path) = st.project(project)?;
         a["project_name"] = json!(name);
@@ -7864,6 +7875,88 @@ mod tests {
                 .unwrap();
         }
         app
+    }
+
+    #[test]
+    fn overview_invalidates_when_only_token_reporting_state_changes() {
+        let app = app_with_two_projects();
+        {
+            let st = app.lock();
+            st.db
+                .execute(
+                    "UPDATE agents SET harness='codex',state='working' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            tokens::begin(&st, 1, None).unwrap();
+        }
+        for finalized in [false, true] {
+            let before = app.overview(Some(1), None).unwrap();
+            let agent_revision: i64 = app
+                .lock()
+                .db
+                .query_row(
+                    "SELECT value FROM view_revisions WHERE name='agents'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            app.record_tokens(
+                1,
+                crate::harness::TokenUsage {
+                    source: crate::harness::TokenSource::CodexSession { finalized },
+                    counts: [Some(0); 4],
+                    total: Some(0),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                app.lock()
+                    .db
+                    .query_row(
+                        "SELECT value FROM view_revisions WHERE name='agents'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                agent_revision
+            );
+            let after = app.overview(Some(1), before["revision"].as_str()).unwrap();
+            assert_ne!(
+                after["unchanged"], true,
+                "ledger-only change must reach the normal UI polling path"
+            );
+            assert_ne!(after["revisions"]["agents"], before["revisions"]["agents"]);
+        }
+    }
+
+    #[test]
+    fn confirmed_native_sessions_drive_resume_and_do_not_duplicate_accounting_prefixes() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute(
+                "UPDATE agents SET harness='codex',session_id='a' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        for (reported, total) in [("a", 10), ("b", 2), ("b", 3)] {
+            let session = app.lock().agent(1).unwrap().session;
+            tokens::begin(&app.lock(), 1, session.as_deref()).unwrap();
+            app.set_session(1, reported).unwrap();
+            app.record_tokens(
+                1,
+                crate::harness::TokenUsage {
+                    source: crate::harness::TokenSource::CodexSession { finalized: true },
+                    counts: [Some(total), Some(0), Some(0), Some(0)],
+                    total: Some(total),
+                },
+            )
+            .unwrap();
+            tokens::finish(&app.lock(), 1).unwrap();
+        }
+        assert_eq!(app.lock().agent(1).unwrap().session.as_deref(), Some("b"));
+        assert_eq!(app.agent_view(1).unwrap()["total_tokens"], 13);
     }
 
     #[test]

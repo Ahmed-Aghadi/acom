@@ -148,7 +148,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline','total_tokens','token_usage_state'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -2117,6 +2117,68 @@ test('a delayed read acknowledgement cannot clear a reply absent from its snapsh
   assert.equal(data.reads[1], 2);
 }));
 
+test('agent tokens distinguish unreported counts from measured zero in Overview and Details', async () => fixture(async (page,data) => {
+  data.agents=[
+    {id:1,project:1,name:'Starting worker',state:'working',token_usage_state:'unknown',total_tokens:null,fresh_in:null,cache_write:null,cache_read:null,output:null,token_usage_updated_at:null},
+    {id:2,project:1,name:'Zero usage',state:'idle',token_usage_state:'final',total_tokens:0,fresh_in:0,cache_write:0,cache_read:0,output:0,token_usage_updated_at:1720000000},
+  ];
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: —.*Not reported/);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/context —/,'an absent context count is not measured zero');
+  assert.match(await page.locator('[data-agent="2"]').textContent(),/Total tokens: 0.*Finalised/);
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-field-total_tokens').waitFor();
+  assert.equal(await page.locator('dt[data-key="total_tokens"]').textContent(),'Total tokens');
+  assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Not reported');
+  for(const key of ['total_tokens','fresh_in','cache_write','cache_read','output'])assert.equal(await page.locator(`#agent-field-${key}`).textContent(),'—',`${key} remains unavailable`);
+  assert.equal(await page.locator('dt[data-key="token_usage_state"], dt[data-key="token_usage_updated_at"]').count(),0,'raw reporting metadata is not duplicated');
+  await page.locator('#agent-dialog button[value=cancel]').click();
+  await page.locator('[data-agent="2"] [data-action=details]').click();
+  await page.locator('#agent-field-total_tokens').waitFor();
+  assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Finalised');
+  for(const key of ['total_tokens','fresh_in','cache_write','cache_read','output'])assert.equal(await page.locator(`#agent-field-${key}`).textContent(),'0',`${key} can be an explicitly reported zero`);
+}));
+
+test('live token counts reconcile to reported totals and retain partial status without resetting selections', async () => fixture(async (page,data) => {
+  const task='Review the synthetic example without replacing this selected task.';
+  data.agents=[{id:1,project:1,name:'Worker',state:'working',task,token_usage_state:'provisional',total_tokens:null,fresh_in:1000,cache_write:2000,cache_read:3000,output:null,token_usage_updated_at:1720000000}];
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: —.*In progress \(provisional\)/,'known input alone does not invent a total');
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-field-fresh_in').waitFor();
+  assert.equal(await page.locator('#agent-field-fresh_in').textContent(),'1,000');
+  assert.equal(await page.locator('#agent-field-output').textContent(),'—');
+  const selected=await selectText(page,'#agent-field-task');
+  Object.assign(data.agents[0],{output:4,total_tokens:6004}); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'6,004');
+  assert.equal(await page.locator('#agent-field-output').textContent(),'4');
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>document.querySelector('#agent-field-task')===window.selectedNode),true);
+  Object.assign(data.agents[0],{state:'idle',token_usage_state:'final',fresh_in:800,cache_write:1800,cache_read:2800,total_tokens:5404}); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'5,404','an authoritative total replaces the provisional value rather than accumulating it');
+  assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Finalised');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 5,404.*Finalised/);
+  Object.assign(data.agents[0],{state:'crashed',token_usage_state:'partial',fresh_in:900,total_tokens:5504}); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'5,504');
+  assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Partial (incomplete)');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 5,504.*Partial \(incomplete\)/);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),task);
+  assert.equal(await page.locator('dt[data-key="fresh_in"]').textContent(),'Fresh input');
+  assert.equal(await page.locator('dt[data-key="cache_write"]').textContent(),'Cache writes');
+  assert.equal(await page.locator('dt[data-key="cache_read"]').textContent(),'Cache reads');
+}));
+
+test('absent token metadata never invents a total from an incomplete breakdown', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Incomplete worker',state:'paused',fresh_in:7,cache_write:0,output:3}];
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: —.*Not reported/);
+  await page.locator('[data-agent="1"] [data-action=details]').click(); await page.locator('#agent-field-total_tokens').waitFor();
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'—');
+  assert.equal(await page.locator('#agent-field-fresh_in').textContent(),'7');
+  assert.equal(await page.locator('#agent-field-cache_write').textContent(),'0');
+  assert.equal(await page.locator('#agent-field-cache_read').textContent(),'—');
+}));
+
 test('open details update status and logs, preserve history scroll and recover from errors', async () => fixture(async (page, data) => {
   data.agents = [{ id: 1, project: 1, name: 'Worker', state: 'working', status: 'Starting', locks: [], lost_locks: [] }];
   data.agentLogs[1] = Array.from({ length: 80 }, (_, i) => `Line ${i}`);
@@ -3721,12 +3783,16 @@ test('bounded stopping previews keep cleanup visible and Details available witho
 }));
 
 test('explicit Details hydration restores the action controls of an oversized agent preview without replacing config drafts', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Large agent name ☃ '.repeat(1500),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',task:'Full task',locks:[]}];
+  data.agents=[{id:1,project:1,name:'Large agent name ☃ '.repeat(1500),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',task:'Full task',locks:[],token_usage_state:'partial',total_tokens:123,fresh_in:100,cache_write:0,cache_read:20,output:3}];
   await manualPolling(page); await reloadPage(page);
   assert.equal(await page.locator('[data-action=pause]').count(),0);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 123.*Partial \(incomplete\)/,'a bounded stub uses its explicit total and completeness status');
+  assert.equal(data.detailRequests.length,0,'the token preview does not eagerly hydrate the record');
   await page.locator('[data-action=details]').click();
   await page.waitForFunction(()=>document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
   assert.equal(await page.locator('[data-action=pause]').count(),1);
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'123','chunked Details retain the reported total');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 123.*Partial \(incomplete\)/);
   const model=page.locator('#agent-config [name=agent_model]');
   await model.selectOption('gpt-6-luna');
   await page.evaluate(()=>refresh());
@@ -5668,8 +5734,10 @@ test('sending messages appear immediately, remain copyable, and confirm without 
 test('post confirmations cannot skip intervening peer messages or duplicate paged results', async () => fixture(async (page,data) => {
   data.threads=[conversation([incoming(10)])]; data.reads={1:10}; data.pageLimit=1;
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
-  const poll=await holdRequest(page,/\/threads\/1\/messages\?after=10(?:&|$)/,'GET');
-  await page.evaluate(()=>{window.heldMessagePoll=refreshThread();}); await poll.started;
+  await page.waitForFunction(()=>state.thread?.messages.at(-1)?.id===10&&!threadLoading);
+  const pattern=/\/threads\/1\/messages\?after=10(?:&|$)/, poll=await holdRequest(page,pattern,'GET');
+  const started=page.waitForRequest(request=>request.method()==='GET'&&pattern.test(request.url()),{timeout:5000});
+  await page.evaluate(()=>{window.heldMessagePoll=refreshThread();}); await started;
   data.threads[0].messages.push(incoming(11,'Intervening peer message'));
   await page.locator('#message-form textarea').fill('Confirmed outgoing'); await page.locator('#message-form button').click();
   await page.waitForFunction(()=>document.querySelector('#message-form textarea').value==='');
