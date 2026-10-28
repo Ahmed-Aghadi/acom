@@ -24,6 +24,8 @@ Dialogs keep their top-right **×** visible while scrolling; long titles scroll 
 
 Agent token counts update as provider reports arrive. **In progress (provisional)** is not a final total; **Finalised** means accounting was reported, not that the task succeeded. **Partial (incomplete)** retains available observations but may omit earlier unreported work; these are not complete lifetime totals. **Not reported** and `—` mean unavailable, never measured zero. Details and `acom agent <ID>` show the total and input/cache/output breakdown. Some providers report a total without every breakdown, so those fields need not sum to it. Claude's counts cover this agent's main loop, not native subagents. Counts are separate from context size, account subscription usage and billing; existing records without coverage metadata are not retroactively declared complete.
 
+While a newer report is incomplete, the UI keeps the last known total with **Last known** and, while working, **Awaiting update**. Hover the label for its observation time when available. This survives reopening and server restarts; it does not fill missing input/cache/output counts. Agents without any known total still show `—`.
+
 Claude's live accounting enables its partial-event stream. Raw stdout capture retains those events too, so new Claude output logs can be larger; storage/retention behaviour is otherwise unchanged.
 
 ## Threads and messages

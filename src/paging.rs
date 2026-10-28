@@ -151,6 +151,7 @@ fn stub(item: &Value) -> Value {
         "created_by",
         "total_tokens",
         "token_usage_state",
+        "token_usage_last_total",
     ] {
         if let Some(value) = item.get(key).filter(|v| !v.is_null()) {
             result[key] = value.clone();
@@ -239,6 +240,27 @@ pub fn bounded_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_agent_stubs_preserve_last_known_totals_including_zero() {
+        let last = json!({"tokens":0,"at":42});
+        let page = PageQuery {
+            max_bytes: 512,
+            ..Default::default()
+        }
+        .finish(
+            vec![json!({"id":1,"task":"x".repeat(2000),"total_tokens":null,
+                "token_usage_state":"provisional","token_usage_last_total":last})],
+            1,
+            1,
+            "r",
+        )
+        .unwrap();
+        assert!(page.to_string().len() <= 512);
+        assert_eq!(page["items"][0]["truncated"], true);
+        assert_eq!(page["items"][0]["total_tokens"], Value::Null);
+        assert_eq!(page["items"][0]["token_usage_last_total"], last);
+    }
 
     #[test]
     fn pages_advance_past_oversize_items_without_skipping_the_next() {

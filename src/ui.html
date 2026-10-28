@@ -188,7 +188,7 @@
     .pill.unread { background: #365ce5; color: #fff; }
     .pill.waiting { background: #b6791315; color: var(--warn); }
     .meta { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-    .meta.launch-project, .launch-project { white-space: normal; overflow-wrap: anywhere; }
+    .meta.launch-project, .launch-project, .meta.token-summary { white-space: normal; overflow-wrap: anywhere; }
     .problem { margin-top: 6px; padding: 7px 9px; border-left: 2px solid var(--danger); background: #bd354908; color: var(--danger); font-size: 11px; overflow-wrap: anywhere; white-space: normal; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -707,9 +707,16 @@
     const $ = (s, root = document) => root.querySelector(s);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = n => Number(n || 0).toLocaleString();
-    const tokenCount = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? fmt(value) : '—';
+    const hasTokenCount = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    const tokenCount = value => hasTokenCount(value) ? fmt(value) : '—';
     const tokenUsageState = agent => ({unknown:'Not reported', provisional:'In progress (provisional)', final:'Finalised', partial:'Partial (incomplete)'})[agent.token_usage_state] || 'Not reported';
-    const agentTokenSummary = agent => `<div class="meta">Total tokens: ${tokenCount(agent.total_tokens)} · ${tokenUsageState(agent)}</div>`;
+    function tokenTotal(agent) {
+      const last = agent.token_usage_last_total;
+      if (!hasTokenCount(last?.tokens) || last.tokens === agent.total_tokens) return tokenCount(agent.total_tokens);
+      const note = `Last known total${last.at ? ` at ${when(last.at)}` : ''}; current accounting is incomplete.`;
+      return `${tokenCount(last.tokens)} <span class="pill" title="${esc(note)}">Last known${agent.state === 'working' ? ' · Awaiting update' : ''}</span>`;
+    }
+    const agentTokenSummary = agent => `<div class="meta token-summary">Total tokens: ${tokenTotal(agent)} · ${tokenUsageState(agent)}</div>`;
     const when = n => n ? new Date(n * 1000).toLocaleString() : '—';
     function confirmAgentAction(message) { return !state.confirmAgentActions || confirm(message); }
     const who = id => Number(id) === 0 ? 'user' : `agent ${id}`;
@@ -1781,8 +1788,8 @@
         }
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
-        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting','has_diagnostics','subscriptions','diagnostics','total_tokens','fresh_in','cache_write','cache_read','output','token_usage_state','token_usage_updated_at'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
-        fields.push({key:'token_usage',label:'Token usage',content:tokenUsageState(a)}, ...[['total_tokens','Total tokens'],['fresh_in','Fresh input'],['cache_write','Cache writes'],['cache_read','Cache reads'],['output','Output']].map(([key,label]) => ({key,label,content:tokenCount(a[key])})));
+        const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting','has_diagnostics','subscriptions','diagnostics','total_tokens','fresh_in','cache_write','cache_read','output','token_usage_state','token_usage_updated_at','token_usage_last_total'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
+        fields.push({key:'token_usage',label:'Token usage',content:tokenUsageState(a)}, {key:'total_tokens',label:'Total tokens',content:tokenTotal(a)}, ...[['fresh_in','Fresh input'],['cache_write','Cache writes'],['cache_read','Cache reads'],['output','Output']].map(([key,label]) => ({key,label,content:tokenCount(a[key])})));
         if (a.waiting) fields.push({key:'waiting',label:'waiting',content:waitingDescription(a)});
         const subscriptions = a.subscriptions || {active:0,pending:0};
         setText($('#agent-subscription-count'), `(${fmt(subscriptions.active)} active · ${fmt(subscriptions.pending)} pending events)`);

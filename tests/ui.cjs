@@ -148,7 +148,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline','total_tokens','token_usage_state'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline','total_tokens','token_usage_state','token_usage_last_total'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -2177,6 +2177,79 @@ test('absent token metadata never invents a total from an incomplete breakdown',
   assert.equal(await page.locator('#agent-field-fresh_in').textContent(),'7');
   assert.equal(await page.locator('#agent-field-cache_write').textContent(),'0');
   assert.equal(await page.locator('#agent-field-cache_read').textContent(),'—');
+}));
+
+test('last known token totals remain visible while a newer report is incomplete', async () => fixture(async (page,data) => {
+  const task='Keep this synthetic task selected while token reports update.';
+  data.agents=[{id:1,project:1,name:'Worker',state:'idle',task,token_usage_state:'final',total_tokens:1000,fresh_in:900,cache_write:0,cache_read:0,output:100,token_usage_last_total:{tokens:1000,at:1720000000}}];
+  await manualPolling(page); await reloadPage(page);
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-field-total_tokens').waitFor();
+  const selected=await selectText(page,'#agent-field-task');
+  Object.assign(data.agents[0],{state:'working',token_usage_state:'provisional',total_tokens:null,fresh_in:1100,output:null});
+  await page.evaluate(()=>refresh());
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 1,000.*Last known.*Awaiting update/,'a missing current total does not erase the latest observed total');
+  assert.match(await page.locator('#agent-field-total_tokens').textContent(),/1,000.*Last known.*Awaiting update/);
+  assert.equal(await page.locator('#agent-field-output').textContent(),'—','fallback applies to the total, not unreported breakdowns');
+  assert.equal(await page.locator('#agent-field-fresh_in').textContent(),'1,100');
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.evaluate(()=>document.querySelector('#agent-field-task')===window.selectedNode),true);
+  await reloadPage(page);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 1,000.*Last known.*Awaiting update/,'the snapshot comes from the API, not an ephemeral page cache');
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-field-total_tokens').waitFor();
+  await selectText(page,'#agent-field-task');
+  Object.assign(data.agents[0],{total_tokens:1204,output:104,token_usage_last_total:{tokens:1204,at:1720000010}});
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'1,204');
+  assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Last known|Awaiting update/,'a live numeric report replaces the fallback');
+  Object.assign(data.agents[0],{state:'idle',token_usage_state:'final',total_tokens:900,fresh_in:800,output:100,token_usage_last_total:{tokens:900,at:1720000020}});
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'900','a lower authoritative total is not clamped to an earlier provisional snapshot');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 900.*Finalised/);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),task);
+}));
+
+test('last known zero totals survive compact previews without implying paused agents are loading', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Large synthetic worker '.repeat(1500),state:'working',task:'Synthetic task',token_usage_state:'partial',total_tokens:null,fresh_in:50,cache_write:null,cache_read:null,output:null,token_usage_last_total:{tokens:0,at:null}}];
+  await manualPolling(page); await reloadPage(page);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 0.*Last known.*Awaiting update/,'the bounded preview retains an explicitly observed zero snapshot');
+  assert.equal(data.detailRequests.length,0,'showing the snapshot does not hydrate the full record');
+  await page.locator('[data-agent="1"] [data-action=details]').click();
+  await page.locator('#agent-field-total_tokens').waitFor();
+  assert.match(await page.locator('#agent-field-total_tokens').textContent(),/0.*Last known.*Awaiting update/);
+  assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Partial (incomplete)','last known is not a claim of complete accounting');
+  for(const key of ['cache_write','cache_read','output'])assert.equal(await page.locator(`#agent-field-${key}`).textContent(),'—',`${key} is not fabricated from the snapshot`);
+  Object.assign(data.agents[0],{total_tokens:10,token_usage_last_total:{tokens:30,at:1720000010}});
+  for(const state of ['paused','crashed','idle']) {
+    data.agents[0].state=state; await page.evaluate(()=>refresh());
+    assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 30.*Last known/,'a folded partial count does not erase a more recent observed total');
+    assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Awaiting update/,`${state} is not shown as actively awaiting a report`);
+    assert.match(await page.locator('#agent-field-total_tokens').textContent(),/30.*Last known/);
+    assert.doesNotMatch(await page.locator('#agent-field-total_tokens').textContent(),/Awaiting update/);
+  }
+  Object.assign(data.agents[0],{state:'working',total_tokens:0,token_usage_last_total:{tokens:0,at:1720000020}}); await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'0','an actual zero takes precedence over a fallback snapshot');
+  assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Last known|Awaiting update/);
+}));
+
+for(const width of [375,320])test(`last known token totals and their update cue stay visible at ${width}px`, async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:1,name:'Worker',state:'working',task:'Synthetic task',token_usage_state:'provisional',total_tokens:null,token_usage_last_total:{tokens:1000,at:1720000000}}];
+  await manualPolling(page); await page.setViewportSize({width,height:812}); await reloadPage(page);
+  const row=page.locator('[data-agent="1"]'); await row.scrollIntoViewIfNeeded();
+  const geometry=await row.evaluate(row=>{
+    const meta=[...row.querySelectorAll('.meta')].find(el=>el.textContent.startsWith('Total tokens:'));
+    const note=meta.querySelector('.pill'),number=document.createRange(); number.selectNode(meta.firstChild);
+    const rect=el=>{const r=el.getBoundingClientRect(); return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};};
+    return {meta:rect(meta),number:rect(number),note:rect(note),text:meta.textContent,title:note.title,pageWidth:document.documentElement.scrollWidth};
+  });
+  assert.match(geometry.text,/Total tokens: 1,000.*Last known.*Awaiting update/);
+  assert.match(geometry.title,/Last known total at/,'the observed timestamp is available without widening the card');
+  for(const key of ['number','note']) {
+    assert.ok(geometry[key].left>=geometry.meta.left-1&&geometry[key].right<=geometry.meta.right+1,`${key} is not horizontally clipped`);
+    assert.ok(geometry[key].top>=geometry.meta.top-1&&geometry[key].bottom<=geometry.meta.bottom+1,`${key} is not vertically clipped`);
+  }
+  assert.ok(geometry.pageWidth<=width,'the total and cue do not widen the page');
 }));
 
 test('open details update status and logs, preserve history scroll and recover from errors', async () => fixture(async (page, data) => {

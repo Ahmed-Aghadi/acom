@@ -82,6 +82,12 @@ impl Turn {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct LastTotal {
+    tokens: u64,
+    at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Ledger {
     previous: Counts,
     previous_partial: bool,
@@ -90,9 +96,20 @@ struct Ledger {
     codex_complete: bool,
     turn: Option<Turn>,
     updated_at: Option<i64>,
+    #[serde(default)]
+    last_total: Option<LastTotal>,
 }
 
 impl Ledger {
+    fn remember_total(&mut self, harness: &str) {
+        if let Some(tokens) = self.counts(harness).total {
+            self.last_total = Some(LastTotal {
+                tokens,
+                at: self.updated_at,
+            });
+        }
+    }
+
     fn session(&mut self, session: Option<&str>) {
         let Some(session) = session else { return };
         if self.session.as_deref().is_some_and(|old| old != session) {
@@ -277,7 +294,7 @@ fn load(st: &St, id: i64) -> R<(Ledger, String)> {
             |row| row.get(0),
         )
         .optional()?;
-    let ledger = if let Some(saved) = saved {
+    let mut ledger: Ledger = if let Some(saved) = saved {
         serde_json::from_str(&saved)
             .map_err(|error| Fail(500, format!("invalid token accounting: {error}")))?
     } else {
@@ -303,6 +320,9 @@ fn load(st: &St, id: i64) -> R<(Ledger, String)> {
             }
         }
     };
+    if ledger.last_total.is_none() {
+        ledger.remember_total(&harness);
+    }
     Ok((ledger, harness))
 }
 
@@ -345,7 +365,18 @@ pub(super) fn session(st: &St, id: i64, session: &str) -> R<()> {
 
 pub(super) fn record(st: &St, id: i64, sample: TokenUsage) -> R<()> {
     let (mut ledger, harness) = load(st, id)?;
+    let reports_total = match &sample.source {
+        TokenSource::CodexSession { .. } => sample.total.is_some(),
+        TokenSource::ClaudeResult { trusted: false } => {
+            sample.total.is_some_and(|value| value > 0)
+                || sample.counts.iter().flatten().any(|value| *value > 0)
+        }
+        _ => sample.total.is_some() || sample.counts.iter().any(Option::is_some),
+    };
     if ledger.observe(sample) {
+        if reports_total {
+            ledger.remember_total(&harness);
+        }
         save(st, id, &harness, &ledger)?;
     }
     Ok(())
@@ -362,6 +393,7 @@ pub(super) fn attach(st: &St, agent: &mut Value) -> R<()> {
         agent[name] = json!(value);
     }
     agent["total_tokens"] = json!(counts.total);
+    agent["token_usage_last_total"] = json!(ledger.last_total);
     agent["token_usage_state"] = json!(ledger.state(&harness, agent["state"] == "working"));
     agent["token_usage_updated_at"] = json!(ledger.updated_at);
     Ok(())

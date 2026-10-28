@@ -203,6 +203,89 @@ test('Claude ignores subagent usage and adds only each resumed invocation result
   assert.ok(f.runs(id)[1].args.includes('--resume'));
 }));
 
+test('last reported totals survive Claude reporting gaps without inventing current totals', async () => fixture(async f => {
+  const id = await f.launch();
+  assert.equal((await f.view(id)).token_usage_last_total, null);
+  let agent = await f.finish(id, [result(counts(1, 2, 3, 4))]);
+  const first = agent.token_usage_last_total;
+  assert.equal(first.tokens, 10); assert.ok(first.at > 0);
+  await pause(1100);
+  agent = await f.next(id);
+  assert.deepEqual(agent.token_usage_last_total, first);
+  agent = await f.emit(id, [start('next-turn-input', counts(5, 6, 7, 1))]);
+  assert.equal(agent.total_tokens, null);
+  assert.deepEqual(agent.token_usage_last_total, first, 'input-only updates do not refresh the total timestamp');
+  agent = await f.emit(id, [delta(2)]);
+  assert.equal(agent.total_tokens, 30);
+  const live = agent.token_usage_last_total;
+  assert.equal(live.tokens, 30); assert.ok(live.at > first.at);
+  agent = await f.emit(id, [start('later-message-input', counts(1, 1, 1, 1))]);
+  assert.equal(agent.total_tokens, null);
+  assert.deepEqual(agent.token_usage_last_total, live, 'another message cannot hide the previously reported total');
+  const listed = (await f.api('GET', `/agents?project=${f.project}`)).items.find(a => a.id === id);
+  assert.equal(listed.total_tokens, null);
+  assert.deepEqual(listed.token_usage_last_total, live);
+  const compact = await f.api('GET', `/agents?project=${f.project}&limit=1&max_bytes=512`);
+  assert.ok(Buffer.byteLength(JSON.stringify(compact)) <= 512, 'the complete response fits the minimum page budget');
+  assert.equal(compact.items[0].id, id);
+  assert.equal(compact.items[0].truncated, true);
+  assert.deepEqual(compact.items[0].token_usage_last_total, live);
+  await f.api('POST', `/agents/${id}/pause`, {});
+  await until(async () => !(await f.view(id)).stopping, 'last-total prefix cleanup');
+  agent = await f.view(id);
+  assert.equal(agent.total_tokens, 10, 'interrupted accounting retains only the previously covered total');
+  assert.deepEqual(agent.token_usage_last_total, live, 'a lifecycle fold is not a new usage report');
+  await f.restart();
+  assert.deepEqual((await f.view(id)).token_usage_last_total, live);
+  await f.next(id);
+  agent = await f.emit(id, [start('identity-without-counts', {})]);
+  assert.deepEqual(agent.token_usage_last_total, live, 'a new identity without counts cannot refresh an older partial prefix');
+  agent = await f.finish(id, [result(counts(2, 2, 2, 2))]);
+  assert.equal(agent.total_tokens, 18);
+  assert.equal(agent.token_usage_last_total.tokens, 18, 'an authoritative downward correction replaces a larger provisional total');
+}));
+
+test('last reported totals distinguish measured zero from unknown and remain agent-local', async () => fixture(async f => {
+  const id = await f.launch();
+  let agent = await f.emit(id, [start('first-input-only', counts(1, 2, 3, 1))]);
+  assert.equal(agent.total_tokens, null);
+  assert.equal(agent.token_usage_last_total, null, 'an incomplete first report does not establish a total');
+  agent = await f.finish(id, [result(counts(0, 0, 0, 0))]);
+  const zero = agent.token_usage_last_total;
+  assert.equal(zero.tokens, 0); assert.ok(zero.at > 0);
+  await f.next(id);
+  agent = await f.emit(id, [start('after-zero', counts(1, 2, 3, 1))]);
+  assert.equal(agent.total_tokens, null);
+  assert.deepEqual(agent.token_usage_last_total, zero, 'zero is a real previous total, not a missing fallback');
+  for (const harness of ['claude', 'codex']) {
+    const other = await f.launch(harness);
+    assert.equal((await f.view(other)).token_usage_last_total, null, 'another agent never inherits the previous total');
+  }
+}));
+
+test('last reported total and its timestamp survive interruption and server restart', async () => fixture(async f => {
+  const id = await f.launch();
+  let agent = await f.emit(id, [start('observed-message', counts(10, 20, 30, 1)), delta(5)]);
+  const observed = agent.token_usage_last_total;
+  assert.equal(observed.tokens, 65); assert.ok(observed.at > 0);
+  agent = await f.emit(id, [start('interrupted-message', counts(40, 0, 10, 1))]);
+  assert.equal(agent.total_tokens, null);
+  assert.deepEqual(agent.token_usage_last_total, observed);
+  await f.api('POST', `/agents/${id}/pause`, {});
+  await until(async () => !(await f.view(id)).stopping, 'interrupted total cleanup');
+  agent = await f.view(id);
+  assert.equal(agent.total_tokens, null);
+  assert.deepEqual(agent.token_usage_last_total, observed);
+  await f.restart();
+  agent = await f.view(id);
+  assert.equal(agent.token_usage_state, 'partial');
+  assert.equal(agent.total_tokens, null);
+  assert.deepEqual(agent.token_usage_last_total, observed);
+  await f.next(id);
+  agent = await f.finish(id, [result(counts(1, 2, 3, 4))]);
+  assert.equal(agent.token_usage_last_total.tokens, agent.total_tokens);
+}));
+
 test('missing Claude usage preserves known values without claiming a complete total', async () => fixture(async f => {
   const id = await f.launch();
   await f.emit(id, [assistant('incomplete', { input_tokens: 12, cache_read_input_tokens: 7 })]);
@@ -272,6 +355,22 @@ test('Codex absent usage never overwrites known counters and explicitly reported
   const zero = await f.launch('codex');
   agent = await f.finish(zero, [{ type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0 } }]);
   usage(agent, 'final', [0, 0, 0, 0], 0);
+}));
+
+test('Codex breakdown-only reports do not refresh the last total and an authoritative zero replaces it', async () => fixture(async f => {
+  const id = await f.launch('codex');
+  let agent = await f.emit(id, [native({ input_tokens: 100, cached_input_tokens: 40, cache_write_input_tokens: 5, output_tokens: 9 })]);
+  const observed = agent.token_usage_last_total;
+  assert.equal(observed.tokens, 109); assert.ok(observed.at > 0);
+  await pause(1100);
+  agent = await f.emit(id, [native({ output_tokens: 12 })]);
+  usage(agent, 'provisional', [55, 5, 40, 12], 109);
+  assert.ok(agent.token_usage_updated_at > observed.at, 'the output counter has a newer observation');
+  assert.deepEqual(agent.token_usage_last_total, observed, 'an omitted total cannot acquire the breakdown timestamp');
+  agent = await f.finish(id, [{ type: 'turn.completed', usage: { input_tokens: 0, output_tokens: 0 } }]);
+  usage(agent, 'final', [null, null, null, 0], 0);
+  assert.equal(agent.token_usage_last_total.tokens, 0);
+  assert.ok(agent.token_usage_last_total.at > observed.at);
 }));
 
 test('Codex final session totals supersede duplicate live observations and reject late stale native snapshots', async () => fixture(async f => {
