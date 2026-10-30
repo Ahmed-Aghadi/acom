@@ -9,8 +9,9 @@ Runtime changes:
 
 - `src/util/equal_reader.rs` discards unread request bodies through an 8 KiB scratch buffer instead of allocating the client-controlled remaining Content-Length.
 - `src/request.rs` rejects EOF inside a nonzero chunk instead of accepting a truncated chunked body as complete. Its decoder wrapper preserves empty-buffer reads.
+- `src/util/task_pool.rs` counts queued tasks as reservations of sleeping workers. New connections spawn a worker when all sleepers are already reserved, rather than waiting behind persistent connections that keep their workers busy.
 
-Discard still waits for unread bytes or disconnection; these changes are not request timeouts or general denial-of-service protection. Regressions cover bounded discard, exact body consumption, truncated/complete chunked bodies and empty-buffer reads:
+Discard still waits for unread bytes or disconnection; these changes are not request timeouts, connection limits or general denial-of-service protection. Regressions cover bounded discard, exact body consumption, truncated/complete chunked bodies, empty-buffer reads and queued-worker reservations:
 
 ```sh
 cargo test --locked --offline -p tiny_http --lib
@@ -25,5 +26,10 @@ SHA-256 for `src/request.rs`:
 
 - Upstream: `ef8fcf8d36706a0e1a146f3262917b4631ecf8db925408d4b6959a0d7423695a`
 - Patched, including regressions: `76e4b5c4c4ba73fb3331133b98457281fd707ab6e4ea7a1f56aea353d1667c10`
+
+SHA-256 for `src/util/task_pool.rs`:
+
+- Upstream: `08e3cc8139d1512bb751f828e9838579d8848607e7172ae41b4033d8ecc46fdb`
+- Patched, including regression: `7ba275b011245593639a0c4c0026c1e82969f344f9c3b3b30c2f441905441679`
 
 Upstream MIT/Apache-2.0 licensing is unchanged; acom's notices select MIT.

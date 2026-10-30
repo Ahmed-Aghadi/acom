@@ -69,7 +69,8 @@ impl TaskPool {
     pub fn spawn(&self, code: Box<dyn FnMut() + Send>) {
         let mut queue = self.sharing.todo.lock().unwrap();
 
-        if self.sharing.waiting_tasks.load(Ordering::Acquire) == 0 {
+        // Queued tasks already reserve workers that have not woken up yet.
+        if self.sharing.waiting_tasks.load(Ordering::Acquire) <= queue.len() {
             self.add_thread(Some(code));
         } else {
             queue.push_back(code);
@@ -133,5 +134,52 @@ impl Drop for TaskPool {
             .active_tasks
             .store(999_999_999, Ordering::Release);
         self.sharing.condvar.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    #[test]
+    fn queued_tasks_reserve_waiting_workers_before_they_wake() {
+        let pool = TaskPool::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pool.sharing.waiting_tasks.load(Ordering::Acquire) != MIN_THREADS {
+            assert!(
+                Instant::now() < deadline,
+                "initial workers did not become idle"
+            );
+            thread::yield_now();
+        }
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        {
+            let mut queue = pool.sharing.todo.lock().unwrap();
+            // Hold queued reservations before their sleeping workers can run.
+            for _ in 0..MIN_THREADS {
+                let release = release.clone();
+                queue.push_back(Box::new(move || {
+                    let (lock, ready) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }));
+            }
+        }
+        let (started, received) = mpsc::channel();
+        pool.spawn(Box::new(move || {
+            let _ = started.send(());
+        }));
+        let result = received.recv_timeout(Duration::from_secs(1));
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        pool.sharing.condvar.notify_all();
+        assert!(
+            result.is_ok(),
+            "a new task waited behind already-reserved workers"
+        );
     }
 }
