@@ -28,5 +28,6 @@ Contributor instructions for editing this repository. These are separate from th
 ## Verification and handoff
 
 - For behavior changes, add a regression that fails before the fix. Cover valid input and rejection/no-side-effects, direct API bypass of client checks, and affected failure/restart/concurrency paths. Test shared behavior through each affected entry point.
+- For UI layout changes, inspect rendered desktop and narrow-screen screenshots, including empty and populated states. Functional tests alone do not establish a usable layout.
 - Use the [README test instructions](README.md#test). Isolate data, ports, credentials, fake clients and builds from running instances. Never alter live data or replace a live executable as a test. Real-provider tests spend usage and require explicit user approval.
 - Report what changed, evidence, tests run/skipped and remaining gaps. Documentation alone is not a fix or a guarantee: enforce contracts in code and tests, and extend these rules when a new general failure pattern is confirmed.

@@ -6360,6 +6360,51 @@ test('field-specific identity and task filters share visual and typed semantics 
   await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===1);
 }));
 
+for (const width of [1600,1024,390,320]) for (const scenario of ['empty','populated','large-counts']) test(`agent quick filters align and wrap at ${width}px with ${scenario}`,async()=>fixture(async(page,data)=>{
+  data.agents=scenario==='empty'?[]:['working','idle','paused','crashed','done','closed','replaced'].map((state,index)=>({id:index+1,project:projectId(1),name:`Worker ${state}`,state}));
+  await manualPolling(page);await page.setViewportSize({width,height:900});await reloadPage(page);
+  if(scenario==='large-counts')await page.locator('[data-agent-count]').evaluateAll(nodes=>nodes.forEach(node=>node.textContent='1,000,000'));
+  await page.evaluate(()=>document.fonts.ready);
+  const toolbar=page.locator('.agent-toolbar'),more=page.locator('.state-shortcuts > details > summary');
+  if(process.env.ACOM_UI_SCREENSHOT_DIR){fs.mkdirSync(process.env.ACOM_UI_SCREENSHOT_DIR,{recursive:true});await toolbar.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,`agent-quick-filters-${scenario}-${width}.png`)});}
+  const check=async()=>toolbar.evaluate(root=>{
+    const rect=node=>{const r=node.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,height:r.height};};
+    const controls=[...root.querySelectorAll('[data-agent-filter],.state-shortcuts > details > summary')].filter(node=>node.getClientRects().length&&getComputedStyle(node).visibility!=='hidden');
+    const boxes=controls.map(rect),bounds=rect(root);
+    const groups=[root.querySelector(':scope > .filter-actions'),root.querySelector('.state-shortcuts > .filter-actions')].map(group=>[...group.children].map(rect));
+    const counts=[...root.querySelectorAll('[data-agent-count]')].filter(node=>node.getClientRects().length);
+    return {overflow:document.documentElement.scrollWidth>innerWidth||root.scrollWidth>root.clientWidth,
+      outside:boxes.some(box=>box.left<bounds.left-1||box.right>bounds.right+1),
+      overlaps:boxes.some((a,index)=>boxes.slice(index+1).some(b=>a.left<b.right-1&&a.right>b.left+1&&a.top<b.bottom-1&&a.bottom>b.top+1)),
+      countOverflow:counts.some(node=>{const box=rect(node),button=rect(node.parentElement);return box.left<button.left||box.right>button.right||box.bottom>button.bottom;}),
+      counts:counts.map(node=>node.textContent),groups,heights:boxes.map(box=>box.height),first:rect(root.querySelector('[data-agent-filter=working]')),more:rect(root.querySelector('.state-shortcuts > details > summary'))};
+  });
+  const closed=await check();
+  assert.equal(closed.overflow,false,'quick filters must not widen the viewport or toolbar');
+  assert.equal(closed.outside,false,'quick filters stay within their container');
+  assert.equal(closed.overlaps,false,'controls never overlap');
+  assert.equal(closed.countOverflow,false,'full counts stay within their buttons');
+  assert.ok(closed.heights.every(height=>height>=32),'every quick-filter control has a usable height');
+  if(width>=1024||scenario!=='large-counts')assert.ok(closed.heights.every(height=>Math.abs(height-32)<1),'buttons and More states share the same compact height');
+  if(scenario==='large-counts')assert.ok(closed.counts.every(count=>count==='1,000,000'),'large counts remain exact, not truncated or abbreviated');
+  if(width<=480)for(const group of closed.groups){
+    assert.ok(Math.abs(group[0].top-group[1].top)<1&&Math.abs(group[2].top-group[3].top)<1,'mobile shortcuts form two intentional rows');
+    assert.ok(Math.abs(group[0].left-group[2].left)<1&&Math.abs(group[1].left-group[3].left)<1,'mobile shortcut columns align');
+    assert.ok(Math.abs(group[0].height-group[1].height)<1&&Math.abs(group[2].height-group[3].height)<1,'wrapped counts preserve equal row heights');
+  }
+  if(width>=1024&&scenario!=='large-counts')assert.ok(Math.abs(closed.more.top-closed.first.top)<1,'More states aligns with the exact-state row, not above it');
+  await more.focus();await more.press('Enter');assert.equal(await page.locator('.state-shortcuts > details').evaluate(node=>node.open),true);
+  const expanded=await check();assert.equal(expanded.overflow,false);assert.equal(expanded.outside,false);assert.equal(expanded.overlaps,false);assert.equal(expanded.countOverflow,false);
+  const terminals=await page.locator('[aria-label="Additional agent states"]').boundingBox();
+  assert.ok(terminals.y>=expanded.more.bottom-1,'expanded states appear below the disclosure');
+  assert.ok(Math.abs(terminals.x-expanded.first.left)<1,'expanded states start at the row edge, not in a floating right column');
+  if(process.env.ACOM_UI_SCREENSHOT_DIR)await toolbar.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,`agent-quick-filters-${scenario}-${width}-expanded.png`)});
+  await page.locator('[data-agent-filter=closed]').click();await page.waitForFunction(()=>state.agentFilter==='closed'&&!state.pages.agentBrowser.pending);
+  assert.equal(await page.locator('[data-agent-filter][aria-pressed=true]').count(),1);
+  await more.focus();await more.press('Space');assert.equal(await page.locator('.state-shortcuts > details').evaluate(node=>node.open),false);
+  assert.match(await page.locator('#agent-filter-chips').textContent(),/closed/i,'the selected terminal state remains visible when collapsed');
+}));
+
 test('state shortcuts replace summary views rather than stacking incompatible categories and keep whole-project counts',async()=>fixture(async(page,data)=>{
   data.pageLimit=2;
   data.agents=['working','idle','paused','crashed','done','closed','replaced'].map((state,index)=>({id:index+1,project:projectId(1),name:`Worker ${state}`,state,group:'Team'}));
