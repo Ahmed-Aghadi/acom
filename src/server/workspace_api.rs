@@ -53,6 +53,7 @@ fn local_input(
             path,
             ["agents"]
                 | ["threads"]
+                | ["messages", "search"]
                 | ["locks"]
                 | ["locks", _]
                 | ["activity", ..]
@@ -333,9 +334,14 @@ fn route_inner(ws: &Arc<Workspace>, method: &str, p: &[&str], q: &Query, b: &Val
         return Err(bad("GET requests do not accept body fields"));
     }
     if method == "GET" && p.is_empty() {
-        allowed_query(q, "project")?;
+        allowed_query(q, "project thread message")?;
         if let Some(project) = q.get("project") {
             crate::workspace::validate_uuid(&project)?;
+        }
+        for key in ["thread", "message"] {
+            if let Some(value) = q.get(key) {
+                id(&value)?;
+            }
         }
         return Ok(Reply::Html(UI));
     }
@@ -635,6 +641,161 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn shell_links_accept_stale_project_and_validated_thread_message_hints() {
+        let f = Fixture::new();
+        let engine = f.ws.lookup(&f.ids[0]).unwrap();
+        let before = engine.lock().db.total_changes();
+        for query in [
+            format!("project={}&thread=1&message=1", f.ids[0]),
+            format!(
+                "project={}&thread=999&message=999",
+                crate::harness::new_uuid()
+            ),
+            "thread=1".into(),
+        ] {
+            assert!(matches!(
+                route_workspace(&f.ws, "GET", &[], &Query(&query), &json!({})).unwrap(),
+                Reply::Html(_)
+            ));
+        }
+        for query in [
+            "thread=0",
+            "thread=-1",
+            "thread=wrong",
+            "message=0",
+            "message=-1",
+            "message=wrong",
+            "thread=1&thread=2",
+            "message=1&message=2",
+            "project=invalid&thread=1",
+            "thread=1&extra=1",
+            "thread=%XX",
+        ] {
+            assert_eq!(
+                route_workspace(&f.ws, "GET", &[], &Query(query), &json!({}))
+                    .err()
+                    .unwrap()
+                    .0,
+                400,
+                "{query}"
+            );
+        }
+        assert_eq!(engine.lock().db.total_changes(), before);
+    }
+
+    #[test]
+    fn message_search_context_and_thread_filters_stay_in_scoped_project() {
+        let f = Fixture::new();
+        for (index, id) in f.ids.iter().enumerate() {
+            let engine = f.ws.lookup(id).unwrap();
+            engine
+                .lock()
+                .db
+                .execute(
+                    "UPDATE messages SET text=?1 WHERE id=1",
+                    [format!("unique-{index} message")],
+                )
+                .unwrap();
+            let before = engine.lock().db.total_changes();
+            let search = f
+                .request(
+                    "GET",
+                    &format!("/p/{id}/messages/search"),
+                    "text=message&viewer=1",
+                    json!({}),
+                )
+                .unwrap();
+            assert_eq!(search["total"], 1);
+            assert_eq!(
+                search["items"][0]["snippet"],
+                format!("unique-{index} message")
+            );
+            assert_eq!(
+                f.request(
+                    "GET",
+                    &format!("/p/{id}/messages/search"),
+                    &format!("text=unique-{}", 1 - index),
+                    json!({})
+                )
+                .unwrap()["total"],
+                0
+            );
+            let context = f
+                .request(
+                    "GET",
+                    &format!("/p/{id}/threads/1/messages/context"),
+                    "message=1&agent=1&limit=1&max_bytes=512",
+                    json!({}),
+                )
+                .unwrap();
+            assert_eq!(
+                context["items"][0]["text"],
+                format!("unique-{index} message")
+            );
+            assert_eq!(context["target"], 1);
+            assert_eq!(context["has_older"], false);
+            assert_eq!(context["has_newer"], false);
+            let threads = f
+                .request(
+                    "GET",
+                    &format!("/p/{id}/threads"),
+                    "id=1&members=0&member_match=all&category=mine",
+                    json!({}),
+                )
+                .unwrap();
+            assert_eq!(threads["total"], 1);
+            assert_eq!(threads["items"][0]["project"], *id);
+            for (suffix, query) in [
+                ("messages/search", "text=message&text=other"),
+                ("messages/search", "text=%XX"),
+                ("messages/search", "text=message&unknown=1"),
+                ("messages/search", "text=message&id=1"),
+                ("messages/search", "text="),
+                ("messages/search", "text=message&from=bad"),
+                ("messages/search", "text=message&threads=1,,2"),
+                ("messages/search", "text=message&sender=-1"),
+                ("messages/search", "text=message&agent=1"),
+                ("messages/search", "text=message&thread=1&threads=1"),
+                ("threads", "search=Notes&id=1"),
+                ("threads", "members=0&agent=0"),
+                ("threads", "member_match=any"),
+                ("threads", "members=0&member_match=ALL"),
+                ("threads", "category=idle"),
+                ("threads/1/messages/context", "message=0"),
+                ("threads/1/messages/context", "message=1&before=2"),
+                ("threads/1/messages/context", "message=1&limit=0"),
+                ("threads/1/messages/context", "message=1&max_bytes=511"),
+            ] {
+                assert_eq!(
+                    f.request("GET", &format!("/p/{id}/{suffix}"), query, json!({}))
+                        .unwrap_err()
+                        .0,
+                    400,
+                    "{suffix}?{query}"
+                );
+            }
+            assert_eq!(
+                f.request(
+                    "GET",
+                    &format!("/p/{id}/messages/search"),
+                    &format!("text=message&project={}", f.ids[1 - index]),
+                    json!({})
+                )
+                .unwrap_err()
+                .0,
+                400
+            );
+            assert_eq!(engine.lock().db.total_changes(), before);
+        }
+        assert_eq!(
+            f.request("GET", "/messages/search", "text=message", json!({}))
+                .unwrap_err()
+                .0,
+            400
+        );
     }
 
     #[test]

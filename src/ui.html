@@ -234,6 +234,26 @@
     .thread-sort select { width: auto; flex: 1; padding: 6px 8px; font-size: 11px; }
     #thread-sort-status { min-height: 1.6em; margin: 4px 0 0; font-size: 10px; }
     .thread-tools .filter-actions { gap: 1px; }
+    .thread-search-filters { margin-top: 10px; font-size: 11px; }
+    .thread-search-filters label { margin-top: 10px; }
+    .thread-search-filters summary { cursor: pointer; color: var(--muted); }
+    #thread-filter-members-picker { max-height: 180px; overflow: auto; overscroll-behavior: contain; }
+    #thread-filter-members-picker label { display: flex; align-items: center; gap: 7px; margin: 0; padding: 6px 0; }
+    #thread-filter-members-picker input { width: auto; }
+    .message-reference { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+    .message-reference button { min-height: 24px; padding: 2px 3px; border-color: transparent; background: transparent; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+    .message-target .message-bubble { box-shadow: 0 0 0 2px var(--accent); }
+    #message-search-dialog { --search-gutter: 26px; }
+    #message-search-form { padding-bottom: 0; }
+    #message-search-results { max-height: 46dvh; overflow: auto; overscroll-behavior: contain; margin: 12px var(--search-gutter) 0; }
+    #message-search-dialog > .actions:has(> button:not([hidden])) { padding: 12px var(--search-gutter) 20px; }
+    #message-search-form > details { margin-top: 14px; }
+    .message-search-result { display: block; width: 100%; text-align: left; margin: 0 0 8px; padding: 12px; }
+    .message-search-result strong, .message-search-result .meta { display: block; white-space: normal; overflow-wrap: anywhere; }
+    .message-search-snippet { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; font-weight: 400; line-height: 1.6; margin-top: 8px; }
+    mark { background: #ffdf84; color: #172038; }
+    #agent-threads-items { max-height: 240px; overflow: auto; overscroll-behavior: contain; }
+    #agent-threads-items button { display: block; margin: 6px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: left; }
     .thread-row { display: block; width: 100%; min-height: 0; padding: 16px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; text-align: left; }
     .thread-row:hover { background: var(--panel); }
     .thread-row.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
@@ -445,6 +465,7 @@
       .limit-row { grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; } .limit-row strong { grid-column: 1/-1; }
       .model-options label { flex-wrap: wrap; } .model-options code { margin-left: 0; overflow-wrap: anywhere; }
       dialog form { padding: 20px; } .dialog-header { margin: -20px -20px 16px; padding: 12px 20px; } .details { grid-template-columns: 100px minmax(0,1fr); gap: 0 10px; font-size: 11px; }
+      #message-search-dialog { --search-gutter: 20px; }
       .composer { padding: 12px; gap: 8px; } .message { grid-template-columns: minmax(0,1fr) 72px; column-gap: 10px; } .message.user { grid-template-columns: 72px minmax(0,1fr); } .message-bubble { padding: 11px 12px; } .message-head { gap: 3px; }
       .settings-save-state { max-width: 125px; text-align: right; font-size: 10px; } .settings-jump { gap: 8px 15px; }
       .connection-banner { align-items: start; padding: 12px; }
@@ -534,7 +555,7 @@
       <section class="panel thread-layout">
         <div class="thread-list">
           <div class="panel-head"><h2>Threads</h2><span class="count" id="thread-count"></span><button class="small" data-open="thread-dialog">New</button></div>
-          <div class="thread-tools"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="thread-search" aria-label="Search threads" placeholder="Find a conversation…"></label><div class="filter-actions"><button class="small" data-thread-filter="mine">Mine</button><button class="small" data-thread-filter="unread">Unread</button><button class="small" data-thread-filter="all">All</button><button class="small" data-thread-filter="agents">Agent-only</button></div></div>
+          <div class="thread-tools"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input type="search" id="thread-search" aria-label="Search thread titles" placeholder="Search thread titles…" maxlength="4096"></label><div class="filter-actions"><button class="small" data-thread-filter="mine">Mine</button><button class="small" data-thread-filter="unread">Unread</button><button class="small" data-thread-filter="all">All</button><button class="small" data-thread-filter="agents">Agent-only</button></div><details class="thread-search-filters" id="thread-search-filters"><summary>Thread filters</summary><label>Exact thread ID<input type="number" id="thread-search-id" min="1" step="1" placeholder="Any thread ID"></label><label>Current member IDs<input id="thread-member-filter" placeholder="e.g. 2,7 (0 is you)" aria-describedby="thread-members-help"></label><span class="meta launch-project" id="thread-members-help">Current membership, not earlier participation.</span><label>Selected members<select id="thread-member-match"><option value="all">Must include all</option><option value="any">Must include any</option></select></label><label>Find members<input type="search" id="thread-filter-member-search" placeholder="Agent name or ID"></label><div id="thread-filter-members-picker" role="region" aria-label="Filter by thread members" tabindex="0"></div><button type="button" class="small" id="thread-filter-members-more" hidden>More agents</button><button type="button" class="small" id="thread-filters-clear">Clear thread filters</button></details><button type="button" class="small" id="open-message-search" style="margin-top:10px">Search messages</button></div>
           <div id="thread-list"></div>
           <button class="small" data-more="threads" hidden>Load more threads</button>
         </div>
@@ -647,6 +668,7 @@
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
+  <dialog id="message-search-dialog" aria-labelledby="message-search-title"><form id="message-search-form"><h2 id="message-search-title">Search messages</h2><div class="form-grid"><label>Find<select name="mode"><option value="text">Text</option><option value="id">Exact message ID</option></select></label><label>Scope<select name="scope"><option value="all">All threads in this project</option><option value="thread">Current thread</option></select></label><label class="wide">Search<input type="search" name="query" required maxlength="4096" placeholder="Literal text, including code"></label></div><details><summary>More search filters</summary><div class="form-grid"><label>Sender ID<input type="number" name="sender" min="0" step="1" placeholder="Any sender (0 is you)"></label><label>Thread IDs<input name="threads" placeholder="All threads, or IDs like 2,7"></label><label>From (local time)<input type="datetime-local" name="from" step="1"></label><label>To (local time)<input type="datetime-local" name="to" step="1"></label></div></details><div class="actions" style="margin-top:12px"><button type="submit" class="primary">Search</button><button type="button" data-close-search>Close</button></div><p class="meta launch-project" id="message-search-status" role="status">Search complete stored history. Previews do not mark messages read.</p></form><div id="message-search-results" role="region" aria-label="Message search results" tabindex="0"></div><div class="actions"><button type="button" id="message-search-previous" hidden>Newer results</button><button type="button" id="message-search-more" hidden>Older results</button></div></dialog>
   <script src="/assets/markdown-it-15.0.3.min.js" integrity="sha384-ARStLecQmtLYjBgfD3+w+irhiSoLTnFk/ne6c0gRWQKQtC9791ZLMQ9D3OaBISt3"></script>
   <script src="/assets/charts.js"></script>
   <script src="/assets/project-data.js"></script>
@@ -785,14 +807,20 @@
     const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, configLoading: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: new URL(location.href).searchParams.get('project') || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
     const icons = {"overview": "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>", "chat": "<path d=\"M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z\"/>", "settings": "<path d=\"m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>", "search": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/>", "agents": "<rect x=\"4\" y=\"7\" width=\"16\" height=\"13\" rx=\"3\"/><path d=\"M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4\"/>", "warning": "<path d=\"m12 3 10 18H2zM12 9v4M12 17h.01\"/>", "lock": "<rect x=\"4\" y=\"10\" width=\"16\" height=\"11\" rx=\"2\"/><path d=\"M8 10V7a4 4 0 0 1 8 0v3M12 14v3\"/>", "moon": "<path d=\"M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z\"/>", "sun": "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5\"/>", "check": "<path d=\"m5 12 4 4L19 6\"/>"};
     icons.copy = '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/>';
+    icons.link = '<path d="m10 13 4-4M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 1 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"/>';
     const svgIcon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || ''}</svg>`;
     const copyButton = (target, label) => `<button type="button" class="copy-button" data-copy-target="${esc(target)}" data-copy-label="${esc(label)}" aria-label="Copy ${esc(label.toLowerCase())}" title="Copy ${esc(label.toLowerCase())}">${svgIcon('copy')}</button>`;
-    async function copyText(text, label = 'Text') {
+    async function copyText(text, label = 'Text', reference = false) {
       try { await navigator.clipboard.writeText(text); toast(`${label} copied`); }
-      catch (_) { toast(`Couldn't copy ${label.toLowerCase()}. Select the text and copy it manually.`, true); }
+      catch (_) { if(reference)window.prompt(`Clipboard unavailable. Copy this ${label.toLowerCase()}:`,text);else toast(`Couldn't copy ${label.toLowerCase()}. Select the text and copy it manually.`, true); }
     }
     const emptyState = (icon, title, description = '') => `<div class="empty"><div class="empty-symbol">${svgIcon(icon)}</div><strong>${esc(title)}</strong>${description ? `<p>${esc(description)}</p>` : ''}</div>`;
     state.agentFilter = 'all'; state.agentSearch = ''; state.agentQuery = null; state.agentFilterDraft = null; state.agentBrowser = [];
+    state.threadListFilter = {}; state.threadFilterError = null;
+    const messageSearch = {sequence:0, page:null, history:[], pending:false};
+    let threadSearchTimer = null, memberSearchTimer = null, threadMemberPage = null, agentThreads = null, messageTarget = null;
+    const initialReference = new URL(location.href).searchParams;
+    let initialThreadReference = {project:initialReference.get('project'),thread:initialReference.get('thread'),message:initialReference.get('message')};
     state.confirmAgentActions = stored('acom:confirm-agent-actions') !== 'false';
     const storage = { scope: null, revision: 0, pending: null, reports: new Map(), errors: new Map() };
     const serverSettings = {value:null,revision:null,loading:null,saving:false,dirty:false,conflict:false,error:null};
@@ -895,7 +923,7 @@
       deferredContent.delete(node);
       if (html) {
         const focused = node.contains(document.activeElement) ? document.activeElement : null;
-        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage','data-record','data-record-id','data-record-path','data-cancel-subscription'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
+        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-thread-member','data-usage','data-window','data-check-usage','data-record','data-record-id','data-record-path','data-cancel-subscription'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
         const agent = focused?.closest('[data-agent]');
         if (selector && agent && node.contains(agent)) selector = `[data-agent="${CSS.escape(agent.dataset.agent)}"] ${selector}`;
         node.innerHTML = value; node._renderedHTML = value;
@@ -906,6 +934,9 @@
     }
     const setText = (node, value) => setContent(node, value);
     const setHTML = (node, value) => setContent(node, value, true);
+    function clearContent(node) {
+      deferredContent.delete(node);delete node._renderedHTML;node.replaceChildren();
+    }
     const viewKey = node => node.nodeType === Node.ELEMENT_NODE ? node.dataset.part || (node.dataset.action && `action:${node.dataset.action}:${node.dataset.id}`) : null;
     function patchView(node, next) {
       for (const attr of [...node.attributes]) if (!next.hasAttribute(attr.name)) node.removeAttribute(attr.name);
@@ -1056,7 +1087,7 @@
       }
     }
     function collectionPath(key, project = state.selectedProject) {
-      const path=key==='agentBrowser' ? query('/agents',{category:state.agentFilter,search:state.agentSearch}) : key==='threads' ? query('/threads',{sort:state.threadSort}) : `/${key}`;
+      const path=key==='agentBrowser' ? query('/agents',{category:state.agentFilter,search:state.agentSearch}) : key==='threads' ? query('/threads',{sort:state.threadSort,category:state.threadFilter,...state.threadListFilter}) : `/${key}`;
       return ['agents','agentBrowser','threads','locks','activity'].includes(key)&&project ? projectPath(path,project) : path;
     }
     async function loadCollection(key, more = false) {
@@ -1139,6 +1170,7 @@
       catch (error) {
         if (!current()) return;
         if (error.status === 409) page.retrying = true;
+        else if(key==='threads'&&error.status===400) {page.error=error.message;state.threadFilterError=error.message;}
         else { page.error = error.message; throw error; }
       }
       finally { page.pending = null; updatePaging(); }
@@ -1391,6 +1423,8 @@
       closeThreadDialogs();
       messageSizes.disconnect();
       state.selectedThread = null; state.thread = null; state.threadRequest++;
+      messageTarget=null;
+      const url=new URL(location.href);url.searchParams.delete('thread');url.searchParams.delete('message');history.replaceState(null,'',url);
       $('.thread-layout').classList.remove('conversation-open');
       $('#thread-main').innerHTML = emptyState('chat', 'Select a thread', 'Open a conversation on the left, or create a new thread to bring your team together.');
     }
@@ -1737,15 +1771,17 @@
     function renderThreads() {
       const threadPage=state.pages.threads, current=threadPage?.scope===collectionPath('threads');
       $('#thread-list').setAttribute('aria-busy',String(!current||!!threadPage?.pending));
-      setText($('#thread-sort-status'),!current||threadPage?.pending ? 'Updating order…' : threadPage?.retrying ? 'Keeping the last consistent order; refreshing…' : threadPage?.error ? `Last available list. ${threadPage.error}` : '');
+      setText($('#thread-sort-status'),state.threadFilterError || (!current||threadPage?.pending ? 'Updating results…' : threadPage?.retrying ? 'Keeping the last consistent order; refreshing…' : threadPage?.error ? `Last available list. ${threadPage.error}` : ''));
       setText($('#thread-count'), `${state.pages.threads?.total ?? state.threads.length}`);
+      const filterCount=Number(state.threadListFilter.id!=null)+Number(state.threadListFilter.members!=null);
+      setText($('#thread-search-filters > summary'),`Thread filters${filterCount?` (${filterCount} active)`:''}`);
       document.querySelectorAll('[data-thread-filter]').forEach(b => {
         const active = b.dataset.threadFilter === state.threadFilter;
         b.classList.toggle('active', active); b.setAttribute('aria-pressed', String(active));
       });
       const joined = t => typeof t.user_member === 'boolean' ? t.user_member : Array.isArray(t.members) ? t.members.includes(0) : null;
-      const search = $('#thread-search').value.trim().toLowerCase();
-      const threads = state.threads.filter(t => !search || `${t.title || ''} ${t.id}`.toLowerCase().includes(search)).filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
+      const search = state.threadListFilter.search || state.threadListFilter.id;
+      const threads = state.threads;
       if (threads.length) keepThreadListReading(()=>syncViews($('#thread-list'),threads.map(t=>[`thread:${localKey(t.id,t.project)}`,`<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"${state.selectedThread === t.id ? ' aria-current="true"' : ''}><strong data-part="title">${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span data-part="unread" class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span data-part="participation" class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div data-part="summary" class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} message${t.messages === 1 ? '' : 's'}`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div><div data-part="last-message" class="meta">${t.last_at ? `Last message ${esc(when(t.last_at))}` : 'No messages yet'}</div></button>`])));
       else setHTML($('#thread-list'),`<div class="empty">${search ? 'No threads match your search. Try another title or thread ID.' : state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
@@ -1762,6 +1798,136 @@
     }
     function memberNames(ids) { return (ids || []).map(id=>id===0 ? 'you' : `#${id} ${esc(state.agents.find(a=>a.id===id)?.name || '')}`).join(', ') || 'no members'; }
 
+    function entityId(value, zero = false) {
+      if(!/^\d+$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value)<(zero?0:1))throw new Error(`Enter a whole ${zero?'nonnegative':'positive'} ID.`);
+      return Number(value);
+    }
+    function idList(value) {
+      if(!value.trim())return null;
+      const ids=[...new Set(value.split(',').map(id=>entityId(id.trim(),true)))];
+      if(ids.length>64)throw new Error('Select at most 64 IDs.');
+      return ids.sort((a,b)=>a-b).join(',');
+    }
+    async function applyThreadFilters() {
+      try {
+        if(!$('#thread-search-id').checkValidity())throw new Error('Enter a positive whole thread ID.');
+        const members=idList($('#thread-member-filter').value),id=$('#thread-search-id').value,search=$('#thread-search').value;
+        state.threadListFilter={...(id?{id:entityId(id)}:search?{search}:{}),...(members?{members,member_match:$('#thread-member-match').value}:{})};
+        state.threadFilterError=null;
+        const loading=loadCollection('threads');renderThreads();await loading;renderThreads();
+      }catch(error){state.threadFilterError=error.message;renderThreads();}
+    }
+    function renderThreadMemberPicker() {
+      let selected;try{selected=new Set((idList($('#thread-member-filter').value)||'').split(',').filter(Boolean).map(Number));}catch(_){selected=new Set();}
+      const agents=threadMemberPage?.project===state.selectedProject?threadMemberPage.items:[];
+      setHTML($('#thread-filter-members-picker'),[{id:0,name:'You'},...agents].map(agent=>`<label><input type="checkbox" data-thread-member="${agent.id}"${selected.has(agent.id)?' checked':''}>${esc(agent.name)} · #${agent.id}</label>`).join(''));
+      $('#thread-filter-members-more').hidden=!threadMemberPage?.has_more;
+    }
+    async function loadThreadMemberPicker(more=false) {
+      const project=state.selectedProject,search=$('#thread-filter-member-search').value;
+      if(!project)return;
+      const page=more&&threadMemberPage?.project===project&&threadMemberPage.search===search?threadMemberPage:{project,search,items:[]};
+      threadMemberPage=page;if(page.pending)return;
+      page.pending=true;
+      try{
+        const result=await api(query('/agents',{search:search?`"${search.replaceAll('\\','\\\\').replaceAll('"','\\"')}"`:null,limit:pageSize,max_bytes:pageBytes,...(more?{before:page.next_before,through:page.through,revision:page.revision}:{})}),{project});
+        if(threadMemberPage!==page||project!==state.selectedProject||search!==$('#thread-filter-member-search').value)return;
+        Object.assign(page,result,{items:more?[...page.items,...result.items]:result.items});renderThreadMemberPicker();
+      }catch(error){if(threadMemberPage===page){if(error.status===409){threadMemberPage=null;void loadThreadMemberPicker();}else toast(error.message,true);}}
+      finally{page.pending=false;}
+    }
+    function referenceLink(thread,message,project=state.selectedProject) {
+      const url=new URL('/',location.href);url.searchParams.set('project',project);url.searchParams.set('thread',thread);
+      if(message!=null)url.searchParams.set('message',message);
+      return url.href;
+    }
+    function highlightSnippet(text,term) {
+      if(!term)return esc(text);
+      const source=String(text),lower=source.toLowerCase(),needle=term.toLowerCase(),starts=[],ends=[];let position=0;
+      for(const char of source){const folded=char.toLowerCase();for(let i=0;i<folded.length;i++){starts.push(position);ends.push(position+char.length);}position+=char.length;}
+      let offset=0,foldedOffset=0,html='',index;
+      while((index=lower.indexOf(needle,foldedOffset))>=0){const start=starts[index],end=ends[index+needle.length-1];if(start>=offset){html+=esc(source.slice(offset,start))+`<mark>${esc(source.slice(start,end))}</mark>`;offset=end;}foldedOffset=index+needle.length;}
+      return html+esc(source.slice(offset));
+    }
+    function openMessageSearch(scope='all') {
+      if(!state.selectedProject){toast('Select a project first.',true);return;}
+      const form=$('#message-search-form');
+      form.elements.scope.querySelector('[value=thread]').disabled=!state.selectedThread;
+      form.elements.scope.value=scope==='thread'&&state.selectedThread?'thread':'all';
+      messageSearch.sequence++;messageSearch.pending=false;messageSearch.page=null;messageSearch.history=[];
+      clearContent($('#message-search-results'));$('#message-search-more').hidden=true;$('#message-search-previous').hidden=true;
+      $('#message-search-results').setAttribute('aria-busy','false');setText($('#message-search-status'),'Search complete stored history. Previews do not mark messages read.');
+      syncMessageSearchScope();openDialog($('#message-search-dialog'));form.elements.query.focus();
+    }
+    function syncMessageSearchScope() {
+      const form=$('#message-search-form');form.elements.threads.disabled=form.elements.scope.value==='thread';
+      form.elements.query.placeholder=form.elements.mode.value==='id'?'Exact message ID':'Literal text, including code';
+      const count=['sender','threads','from','to'].filter(key=>!form.elements[key].disabled&&form.elements[key].value!=='').length;
+      setText($('#message-search-form > details > summary'),`More search filters${count?` (${count} set)`:''}`);
+    }
+    async function searchMessages(direction='new') {
+      const form=$('#message-search-form'),project=state.selectedProject;
+      if(!project||!form.reportValidity())return;
+      let filters;
+      try {
+        const data=new FormData(form),mode=data.get('mode'),value=data.get('query');
+        filters=mode==='id'?{id:entityId(value)}:{text:value};
+        if(data.get('scope')==='thread'){if(!state.selectedThread)throw new Error('Open a thread first.');filters.thread=state.selectedThread;}
+        else if(data.get('threads')?.trim()){filters.threads=idList(data.get('threads'));if(filters.threads.split(',').includes('0'))throw new Error('Thread IDs must be positive.');}
+        if(data.get('sender')!=='')filters.sender=entityId(data.get('sender'),true);
+        for(const key of ['from','to'])if(data.get(key)){const stamp=new Date(data.get(key)).getTime()/1000;if(!Number.isSafeInteger(stamp)||stamp<0)throw new Error('Enter a valid date.');filters[key]=stamp;}
+        if(filters.from!=null&&filters.to!=null&&filters.from>filters.to)throw new Error('From must not be later than To.');
+      }catch(error){setText($('#message-search-status'),error.message);return;}
+      const scope=JSON.stringify([project,filters]),previous=messageSearch.page;
+      if(direction!=='new'&&scope!==messageSearch.scope)return searchMessages();
+      let bounds={};
+      if(direction==='more'){if(!previous?.has_more||messageSearch.pending)return;messageSearch.history.push(messageSearch.bounds||{});bounds={before:previous.next_before,through:previous.through,revision:previous.revision};}
+      else if(direction==='previous'){if(!messageSearch.history.length||messageSearch.pending)return;bounds=messageSearch.history.pop();}
+      else messageSearch.history=[];
+      const sequence=++messageSearch.sequence;Object.assign(messageSearch,{scope,project,filters,bounds,pending:true});
+      const current=()=>sequence===messageSearch.sequence&&project===state.selectedProject&&$('#message-search-dialog').open;
+      $('#message-search-results').setAttribute('aria-busy','true');setText($('#message-search-status'),'Searching complete stored history…');
+      try {
+        const result=await api(query('/messages/search',{...filters,...bounds,viewer:0,limit:pageSize,max_bytes:pageBytes}),{project});
+        if(!current())return;
+        messageSearch.page=result;
+        messageSearch.bounds={...bounds,through:result.through,revision:result.revision};
+        setHTML($('#message-search-results'),result.items.map(message=>`<button type="button" class="message-search-result" data-message-result="${message.id}" data-result-thread="${message.thread}"><strong>${esc(message.title)} · Thread #${message.thread} · Message #${message.id}</strong><span class="meta">${esc(who(message.sender))} · ${esc(when(message.at))}</span><div class="message-search-snippet">${highlightSnippet(message.snippet||'',filters.text)}</div></button>`).join('')||`<div class="empty">No messages match this search.${filters.id&&filters.thread?'<p><button type="button" id="message-search-all">Search all threads for this ID</button></p>':''}</div>`);
+        $('#message-search-results').scrollTop=0;setText($('#message-search-status'),`${fmt(result.total)} matching message${result.total===1?'':'s'} · Previews do not mark messages read.`);
+        $('#message-search-more').hidden=!result.has_more;$('#message-search-previous').hidden=!messageSearch.history.length;
+      }catch(error){if(current()){setText($('#message-search-status'),`${error.message}${error.status===409?' Search again for current results.':''}`);$('#message-search-more').hidden=true;$('#message-search-previous').hidden=true;}}
+      finally{if(sequence===messageSearch.sequence){messageSearch.pending=false;$('#message-search-results').setAttribute('aria-busy','false');}}
+    }
+    async function openThreadReference(thread,message=null) {
+      try{thread=entityId(thread);if(message!=null)message=entityId(message);}catch(error){toast(error.message,true);return;}
+      const project=state.selectedProject;
+      if(!project)return;
+      saveVisibleDraft();resetThread();state.selectedThread=thread;
+      messageTarget=message==null?null:{thread,message,project};
+      $('#thread-main').innerHTML='<div class="thread-header"><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button></div><div class="empty" role="status">Loading conversation…</div>';
+      $('[data-page=threads]').click();await refreshThread();
+      if(project!==state.selectedProject||thread!==state.selectedThread)return;
+      const url=new URL(location.href);url.searchParams.set('thread',thread);if(message!=null)url.searchParams.set('message',message);else url.searchParams.delete('message');history.replaceState(null,'',url);
+      renderThreads();
+    }
+    async function loadAgentThreads(more=false) {
+      const id=selectedAgent,request=agentRequest,project=state.selectedProject;
+      if(id==null||!$('#agent-threads').open)return;
+      const same=agentThreads?.id===id&&agentThreads.project===project;
+      if(same&&agentThreads.pending)return;
+      if(!more&&same&&agentThreads.source===state.revisions?.threads)return;
+      const page=more&&same?agentThreads:{id,project,items:[]};agentThreads=page;page.pending=true;
+      const sourceRevision=state.revisions?.threads;
+      try{
+        const result=await api(query('/threads',{members:id,sort:'latest_message',...(more?{cursor:page.next_cursor,revision:page.revision}:{}),limit:pageSize,max_bytes:pageBytes}),{project});
+        if(agentThreads!==page||id!==selectedAgent||request!==agentRequest||project!==state.selectedProject)return;
+        Object.assign(page,result,{items:more?[...page.items,...result.items]:result.items,source:sourceRevision});
+        setText($('#agent-threads-count'),`(${fmt(result.total)})`);
+        setHTML($('#agent-threads-items'),page.items.map(thread=>`<button type="button" class="small" data-agent-thread="${thread.id}">Thread #${thread.id} · ${esc(thread.title||'Title unavailable')}</button>`).join('')||'<p class="meta">Not currently a member of any threads.</p>');
+        $('#agent-threads-more').hidden=!result.has_more;$('#agent-threads-error').hidden=true;
+      }catch(error){if(agentThreads===page){if(error.status===409){agentThreads=null;void loadAgentThreads();}else{setText($('#agent-threads-error'),error.message);$('#agent-threads-error').hidden=false;}}}
+      finally{page.pending=false;}
+    }
     const messageMarkdown = (() => {
       try {
         const md = window.markdownit({html:false, breaks:true, linkify:false, typographer:false, maxNesting:20});
@@ -1796,7 +1962,8 @@
     function messageHtml(m, includeText = true) {
       const local = typeof m.id === 'string';
       const delivery = {sending:'Sending…',failed:'Failed · Not sent. Your text is kept here for retry.',unconfirmed:'Delivery unconfirmed · Check the conversation before retrying.'}[m.delivery] || '';
-      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span><button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-bubble"><div class="message-text">${includeText ? renderMessageText(m.text) : ''}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div></div>`;
+      const reference=local?'':`<span class="message-reference" data-message-id="${esc(m.id)}"><button type="button" data-copy-message-reference="${esc(m.id)}" title="Copy message reference">Message #${esc(m.id)}</button><button type="button" data-copy-message-link="${esc(m.id)}" aria-label="Copy message link" title="Copy message link">${svgIcon('link')}</button></span>`;
+      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span>${reference}<button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-bubble"><div class="message-text">${includeText ? renderMessageText(m.text) : ''}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div></div>`;
     }
     function messageText(id) {
       return state.thread?.messages.find(message => String(message.id) === id)?.text ?? [...outgoingMessages.values()].find(message => message.project===state.selectedProject&&message.thread===state.selectedThread&&(message.id === id || String(message.serverId) === id))?.text;
@@ -1903,10 +2070,11 @@
           metadata = await record(projectPath(`/threads/${selected}/metadata`,project), undefined, current);
           if (!current()) return;
         }
-        const missingUnread = existing && metadata.first_unread != null && metadata.first_unread <= (existing.messages.at(-1)?.id || 0) && !existing.messages.some(m => m.id === metadata.first_unread);
+        const target=messageTarget?.project===project&&messageTarget.thread===selected?messageTarget:null;
+        const missingUnread = existing && !existing.messageWindow && metadata.first_unread != null && metadata.first_unread <= (existing.messages.at(-1)?.id || 0) && !existing.messages.some(m => m.id === metadata.first_unread);
         let cursor = missingUnread ? {after:metadata.first_unread-1, through:metadata.latest_message} : existing ? existing.resume || {after:existing.messages.at(-1)?.id || 0} : metadata.first_unread != null ? {after:metadata.first_unread-1, through:metadata.latest_message} : {through:metadata.latest_message};
         while (current()) {
-        const page = await api(query(`/threads/${selected}/messages`, {...cursor, limit:pageSize, max_bytes:pageBytes}),{project});
+        const page = target?await api(query(`/threads/${selected}/messages/context`,{message:target.message,agent:0,limit:pageSize,max_bytes:pageBytes}),{project}):existing?.messageWindow?{items:[],total:metadata.messages,has_more:false}:await api(query(`/threads/${selected}/messages`, {...cursor, limit:pageSize, max_bytes:pageBytes}),{project});
         if (!current()) return;
         const t = {...metadata, metadataRevision};
         const incoming = [];
@@ -1923,10 +2091,14 @@
         incoming.forEach(m => messagesById.set(m.id, m));
         t.messages = [...messagesById.values()].sort((a,b) => a.id - b.id);
         const forward = cursor.after != null;
-        t.resume = forward && page.has_more ? {after:page.next_after, through:page.through} : null;
+        t.messageWindow=!!target||!!previous?.messageWindow;
+        t.windowNewer=target?page.has_newer:previous?.windowNewer;
+        t.windowThrough=target?page.through:previous?.windowThrough;
+        t.targetMessage=target?.message||previous?.targetMessage;
+        t.resume = !t.messageWindow && forward && page.has_more ? {after:page.next_after, through:page.through} : null;
         if (t.resume && !(t.resume.after > (cursor.after || 0))) throw new Error('Message cursor did not advance');
         t.loadingNew = true;
-        t.oldestReached = previous?.oldestReached || (!forward && !page.has_more);
+        t.oldestReached = target?!page.has_older:previous?.oldestReached || (!forward && !page.has_more);
         t.total = page.total;
         t.unread = (metadata.unread || 0) + t.messages.filter(m => m.id > metadata.latest_message && m.sender !== 0 && !m.outside_membership && t.members?.includes(0)).length;
         if (previous && (t.last_read || 0) < (previous.last_read || 0)) {
@@ -1937,7 +2109,7 @@
           saveVisibleDraft();
           messageSizes.disconnect();
           $('#thread-main').innerHTML = `<div class="thread-header"><div class="thread-title-row"><button type="button" id="back-to-threads" aria-label="All threads" title="All threads">←</button><h2>${esc(t.title)}</h2></div><p class="meta" id="thread-summary"></p><details id="thread-details"><summary aria-label="Thread details">Details</summary><div class="thread-details-content"><div class="meta" id="thread-metadata"></div><p class="meta launch-project" id="thread-watch" hidden></p><div class="actions"><button type="button" id="copy-thread">Copy reference</button><button type="button" id="thread-membership"></button><button type="button" id="add-thread-members">Add members</button><button type="button" id="remove-thread-members">Remove members</button><button type="button" id="change-thread-owner">Change owner</button></div><details id="thread-history" hidden><summary>Thread history</summary><div id="thread-events" role="region" aria-label="Thread history" tabindex="0"></div></details></div></details><button type="button" id="close-thread" aria-label="Close conversation" title="Close conversation; keep draft">×</button><p class="inline-error" id="thread-read-error" role="status" hidden></p></div>
-            <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><span class="meta" id="thread-catchup" role="status"></span><button type="button" class="small" id="thread-unread" hidden></button></div>
+            <div class="actions"><button type="button" class="small" id="thread-older">Load older messages</button><button type="button" class="small" id="thread-newer" hidden>Load newer messages</button><span class="meta launch-project" id="thread-catchup" role="status"></span><button type="button" class="small" id="thread-live" hidden>Jump to latest</button><button type="button" class="small" id="thread-unread" hidden></button></div>
             <div class="messages" id="messages" role="region" aria-label="Conversation messages" tabindex="0"><div class="empty">No messages yet</div></div>
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary"${pendingSends.has(draftKey(t.project, t.id)) ? ' disabled' : ''}>Send</button><span class="composer-hint">Enter for a new line · Ctrl / ⌘ + Enter to send</span></form>`;
           $('.thread-layout').classList.add('conversation-open');
@@ -1968,6 +2140,8 @@
         }
         $('.thread-header h2', $('#thread-main')).title = t.title;
         $('.thread-header h2', $('#thread-main')).tabIndex = 0;
+        if(!$('#thread-message-search'))$('.thread-title-row').insertAdjacentHTML('beforeend','<button type="button" class="small" id="thread-message-search">Find</button>');
+        if(!$('#copy-thread-link'))$('#copy-thread').insertAdjacentHTML('afterend','<button type="button" id="copy-thread-link">Copy link</button>');
         const membership = Array.isArray(t.members) ? t.members.includes(0) ? 'You’re a member' : 'You’re viewing an agent-only thread' : 'Membership unavailable';
         const summary = `Thread #${t.id} · ${threadAccess(t)}${t.watch?.length ? ' · Live' : ''} · ${Array.isArray(t.members) ? `${fmt(t.members.length)} member${t.members.length === 1 ? '' : 's'}` : 'Member count unavailable'} · ${membership}`;
         setText($('#thread-summary'), summary);
@@ -1990,7 +2164,13 @@
         syncMessageBubbles(t);
         updateUnread(t.id, t.project, t.unread, previous?.unread);
         $('#thread-older').hidden = t.oldestReached || t.total <= t.messages.length;
-        setText($('#thread-catchup'), t.resume ? 'Loading new messages…' : '');
+        $('#thread-newer').hidden=!t.messageWindow||!t.windowNewer;
+        $('#thread-live').hidden=!t.messageWindow;
+        setText($('#thread-catchup'),t.messageWindow?'History view · Read status unchanged.':t.resume ? 'Loading new messages…' : '');
+        if(target){
+          const node=$(`[data-message="${target.message}"]`,$('#messages'));
+          if(node){node.classList.add('message-target');const box=$('#messages');box.scrollTop+=node.getBoundingClientRect().top-box.getBoundingClientRect().top-(box.clientHeight-node.clientHeight)/2;box._followLatest=false;messageTarget=null;}
+        }
         if (!t.resume) break;
         cursor = t.resume;
         }
@@ -2039,6 +2219,23 @@
       finally { if (current()) button.disabled = false; }
     }
 
+    async function newerMessages() {
+      const t=state.thread,messages=$('#messages'),button=$('#thread-newer');
+      if(!t?.messageWindow||!messages||button.disabled)return;
+      const current=()=>state.thread?.id===t.id&&state.thread.messageWindow&&messages===$('#messages')&&t.project===state.selectedProject;
+      button.disabled=true;
+      try{
+        const page=await api(query(`/threads/${t.id}/messages`,{after:t.messages.at(-1)?.id||0,through:t.windowThrough,limit:pageSize,max_bytes:pageBytes}),{project:t.project});
+        if(!current())return;
+        const incoming=[];
+        for(const item of page.items){incoming.push(item.truncated?await record(projectPath(`/messages/${item.id}?agent=0`,t.project),item,current):item);if(!current())return;}
+        const latest=state.thread;
+        latest.messages=[...new Map([...latest.messages,...incoming].map(item=>[item.id,item])).values()].sort((a,b)=>a.id-b.id);
+        latest.windowNewer=page.has_more;
+        messages._followLatest=false;syncMessageBubbles(latest);button.hidden=!latest.windowNewer;
+      }catch(error){if(current())toast(error.message,true);}finally{if(current())button.disabled=false;}
+    }
+
     function updateUnread(id, project, unread, previous) {
       const summary = state.threads.find(t => t.id === id);
       const p = state.projects.find(p => p.id === project);
@@ -2046,6 +2243,11 @@
       if (p) p.unread = Math.max(0, (p.unread || 0) + delta);
       if (state.unreadTotal != null) state.unreadTotal = Math.max(0, state.unreadTotal + delta);
       if (summary) summary.unread = unread;
+      if(summary&&state.threadFilter==='unread'&&unread===0){
+        const previousPage=state.pages.threads,items=state.threads.filter(thread=>thread.id!==id);
+        state.threads=items;
+        if(previousPage){state.pages.threads={...previousPage,items,loaded:items.length,total:Math.max(0,(previousPage.total||0)-1),revision:null,sourceRevision:null,pending:null,next_cursor:null};const scope=collectionPath('threads');void loadCollection('threads').then(renderThreads).catch(error=>{if(collectionPath('threads')===scope){state.threadFilterError=error.message;renderThreads();}});}
+      }
       if (state.thread?.id === id && state.thread.project===project && $('#thread-unread')) {
         $('#thread-unread').hidden = !unread;
         setText($('#thread-unread'), `${fmt(unread)} unread · Jump to latest`);
@@ -2056,7 +2258,7 @@
     async function markThreadRead() {
       const t = state.thread, messages = $('#messages');
       const through = t?.messages?.at(-1)?.id || 0;
-      if (!t?.unread || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(localKey(t.id,t.project)) || !messages || !messages.getClientRects().length ||
+      if (!t?.unread || t.messageWindow || messageTarget || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(localKey(t.id,t.project)) || !messages || !messages.getClientRects().length ||
           !$('#page-threads').classList.contains('active') || document.visibilityState !== 'visible' ||
           !document.hasFocus() || $('dialog[open]') || messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 36) return;
       reading.add(localKey(t.id,t.project));
@@ -2099,6 +2301,7 @@
         fields.push({key:'token_usage',label:'Token usage',content:tokenUsageState(a)}, {key:'total_tokens',label:'Total tokens',content:tokenTotal(a)}, ...[['fresh_in','Fresh input'],['cache_write','Cache writes'],['cache_read','Cache reads'],['output','Output']].map(([key,label]) => ({key,label,content:tokenField(a,key,label)})));
         if (a.waiting) fields.push({key:'waiting',label:'waiting',content:waitingDescription(a)});
         const subscriptions = a.subscriptions || {active:0,pending:0};
+        if(Array.isArray(a.threads))setText($('#agent-threads-count'),`(${fmt(a.threads.length)})`);
         setText($('#agent-subscription-count'), `(${fmt(subscriptions.active)} active · ${fmt(subscriptions.pending)} pending events)`);
         const warning = $('#agent-coordination-warning'); warning.hidden = !a.diagnostics?.suspected_loop;
         if (!warning.hidden) setHTML(warning, `<strong>Suspected coordination loop reported</strong><div class="meta">Advisory only; no automatic intervention.</div>${(a.diagnostics.items || []).map(item=>`<div class="meta">#${esc(item.id)} · ${esc(when(item.at))} · ${esc(item.details?.summary || 'Inspect coordination history for the observed pattern.')}</div>`).join('')}`);
@@ -2150,7 +2353,7 @@
           el.scrollTop = atBottom ? el.scrollHeight : top;
         }
         setText($('#agent-detail-status'), `Live · refreshed ${new Date().toLocaleTimeString()}`);
-        await Promise.all([$('#agent-lifecycle').open ? loadAgentLifecycle(id, request) : null, $('#agent-diagnostics').open ? loadAgentDiagnostics(id, request) : null, $('#agent-subscriptions').open ? loadAgentSubscriptions(id, request) : null, $('#agent-permissions').open ? loadPermissions(id,request) : null]);
+        await Promise.all([$('#agent-lifecycle').open ? loadAgentLifecycle(id, request) : null, $('#agent-diagnostics').open ? loadAgentDiagnostics(id, request) : null, $('#agent-subscriptions').open ? loadAgentSubscriptions(id, request) : null, $('#agent-permissions').open ? loadPermissions(id,request) : null,$('#agent-threads').open?loadAgentThreads():null]);
       } catch (error) {
         if (request === agentRequest && $('#agent-dialog').open) setText($('#agent-detail-status'), `Updates unavailable: ${error.message}. Retrying automatically.`);
       } finally { if (agentLoading === request) agentLoading = null; }
@@ -2875,6 +3078,31 @@
         return;
       }
       if (event.target.closest('#thread-older')) { await olderMessages(); return; }
+      if(event.target.closest('#thread-newer')){await newerMessages();return;}
+      if(event.target.closest('#thread-live')){await openThreadReference(state.selectedThread);return;}
+      if(event.target.closest('#open-message-search')){openMessageSearch('all');return;}
+      if(event.target.closest('#thread-message-search')){openMessageSearch('thread');return;}
+      if(event.target.closest('[data-close-search]')){$('#message-search-dialog').close();return;}
+      if(event.target.closest('#message-search-more')){await searchMessages('more');return;}
+      if(event.target.closest('#message-search-previous')){await searchMessages('previous');return;}
+      if(event.target.closest('#message-search-all')){const form=$('#message-search-form');form.elements.scope.value='all';form.elements.threads.value='';syncMessageSearchScope();await searchMessages();return;}
+      if(event.target.closest('#message-search-clear-filters')){const form=$('#message-search-form');for(const key of ['sender','threads','from','to'])form.elements[key].value='';form.dispatchEvent(new Event('input',{bubbles:true}));return;}
+      const searchResult=event.target.closest('[data-message-result]');
+      if(searchResult){$('#message-search-dialog').close();await openThreadReference(Number(searchResult.dataset.resultThread),Number(searchResult.dataset.messageResult));return;}
+      const reference=event.target.closest('[data-copy-message-reference], [data-copy-message-link]');
+      if(reference){
+        const id=Number(reference.dataset.copyMessageReference||reference.dataset.copyMessageLink);
+        const link=reference.hasAttribute('data-copy-message-link');await copyText(link?referenceLink(state.selectedThread,id):`thread #${state.selectedThread}, message #${id}`,link?'Message link':'Message reference',true);return;
+      }
+      if(event.target.closest('#copy-thread-link')){await copyText(referenceLink(state.selectedThread),'Thread link',true);return;}
+      if(event.target.closest('#thread-filter-members-more')){await loadThreadMemberPicker(true);return;}
+      if(event.target.closest('#thread-filters-clear')){$('#thread-search').value='';$('#thread-search-id').value='';$('#thread-member-filter').value='';$('#thread-member-match').value='all';renderThreadMemberPicker();await applyThreadFilters();return;}
+      if(event.target.closest('#agent-threads-more')){await loadAgentThreads(true);return;}
+      const agentThread=event.target.closest('[data-agent-thread]');
+      if(agentThread){$('#agent-dialog').close();await openThreadReference(Number(agentThread.dataset.agentThread));return;}
+      if(event.target.closest('#agent-threads-view-all')){
+        const id=selectedAgent;$('#agent-dialog').close();$('#thread-search').value='';$('#thread-search-id').value='';$('#thread-member-filter').value=String(id);$('#thread-member-match').value='all';state.threadFilter='all';storeValue('thread-filter','all');$('#thread-search-filters').open=true;renderThreadMemberPicker();$('[data-page=threads]').click();await applyThreadFilters();return;
+      }
       const copyMessage = event.target.closest('[data-copy-message]');
       if (copyMessage) {
         const text = messageText(copyMessage.dataset.copyMessage);
@@ -2949,7 +3177,7 @@
         finally { pendingUsage.delete(provider); renderUsage(); } return;
       }
       const threadFilter = event.target.closest('[data-thread-filter]');
-      if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; storeValue('thread-filter',state.threadFilter); renderThreads(); return; }
+      if(threadFilter) { state.threadFilter=threadFilter.dataset.threadFilter; storeValue('thread-filter',state.threadFilter); await applyThreadFilters(); return; }
       if (event.target.closest('#close-thread')) {
         resetThread(); renderThreads(); return;
       }
@@ -2989,7 +3217,7 @@
         catch (_) { toast(`Reference: ${reference}`); }
         return;
       }
-      if(event.target.closest('#thread-unread')) { $('#messages').scrollTop = $('#messages').scrollHeight; await markThreadRead(); return; }
+      if(event.target.closest('#thread-unread')) {if(state.thread?.messageWindow){await openThreadReference(state.selectedThread);return;} $('#messages').scrollTop = $('#messages').scrollHeight; await markThreadRead(); return; }
       if (event.target.closest('#save-config-as')) {
         if (state.saving || state.configLoading) return;
         if ($('#settings-form').reportValidity()) {
@@ -3124,6 +3352,7 @@
           $('#launch-form [name=task]').value=agent.task || '';
         } else if (action.dataset.action === 'details') {
           selectedAgent = id; agentRequest++;
+          agentThreads=null;$('#agent-threads').open=false;clearContent($('#agent-threads-items'));$('#agent-threads-count').textContent='';$('#agent-threads-more').hidden=true;$('#agent-threads-error').hidden=true;
           agentLog = null;
           agentLifecycle = null; $('#agent-lifecycle').open=false; $('#agent-lifecycle-items').replaceChildren(); $('#agent-lifecycle-error').hidden=true; $('#lifecycle-older').hidden=true;
           agentDiagnostics=null; $('#agent-diagnostics').open=false; $('#agent-diagnostics-items').replaceChildren(); $('#agent-diagnostics-error').hidden=true; $('#diagnostics-older').hidden=true;
@@ -3199,6 +3428,12 @@
       getSelection()?.removeAllRanges();
       state.editor = null;
       filterContextRevision++; setSelectedProject(event.target.value);
+      messageSearch.sequence++;messageSearch.page=null;messageSearch.history=[];messageSearch.pending=false;
+      if($('#message-search-dialog').open)$('#message-search-dialog').close();
+      clearContent($('#message-search-results'));$('#message-search-status').textContent='Search complete stored history. Previews do not mark messages read.';
+      state.threadListFilter={};state.threadFilterError=null;threadMemberPage=null;
+      for(const selector of ['#thread-search','#thread-search-id','#thread-member-filter','#thread-filter-member-search'])$(selector).value='';
+      $('#thread-member-match').value='all';renderThreadMemberPicker();
       state.projectActions = null;
       state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
@@ -3554,7 +3789,28 @@
       agentSearchTimer = setTimeout(() => { agentSearchTimer = null; refreshAgentBrowser(); }, 200);
       renderAgents(); updatePaging();
     });
-    $('#thread-search').addEventListener('input', renderThreads);
+    for(const selector of ['#thread-search','#thread-search-id','#thread-member-filter'])$(selector).addEventListener('input',()=>{
+      if(selector==='#thread-search')$('#thread-search-id').value='';
+      if(selector==='#thread-search-id')$('#thread-search').value='';
+      clearTimeout(threadSearchTimer);threadSearchTimer=setTimeout(()=>{threadSearchTimer=null;void applyThreadFilters();renderThreadMemberPicker();},200);
+    });
+    $('#thread-member-match').addEventListener('change',()=>void applyThreadFilters());
+    $('#thread-search-filters').addEventListener('toggle',()=>{if($('#thread-search-filters').open)void loadThreadMemberPicker();});
+    $('#thread-filter-member-search').addEventListener('input',()=>{clearTimeout(memberSearchTimer);memberSearchTimer=setTimeout(()=>void loadThreadMemberPicker(),200);});
+    $('#thread-filter-members-picker').addEventListener('change',event=>{
+      const input=event.target.closest('[data-thread-member]');if(!input)return;
+      delete $('#thread-filter-members-picker')._renderedHTML;
+      let ids;try{ids=new Set((idList($('#thread-member-filter').value)||'').split(',').filter(Boolean).map(Number));}catch(_){ids=new Set();}
+      if(input.checked)ids.add(Number(input.dataset.threadMember));else ids.delete(Number(input.dataset.threadMember));
+      $('#thread-member-filter').value=[...ids].sort((a,b)=>a-b).join(',');void applyThreadFilters();
+    });
+    $('#message-search-form').addEventListener('submit',event=>{event.preventDefault();void searchMessages();});
+    $('#message-search-form > details').insertAdjacentHTML('beforeend','<button type="button" class="small" id="message-search-clear-filters" style="margin-top:10px">Clear search filters</button>');
+    $('#message-search-form').addEventListener('input',()=>{messageSearch.sequence++;messageSearch.pending=false;messageSearch.page=null;clearContent($('#message-search-results'));$('#message-search-more').hidden=true;$('#message-search-previous').hidden=true;setText($('#message-search-status'),'Search changed. Select Search to update results.');syncMessageSearchScope();});
+    $('#message-search-dialog').addEventListener('close',()=>{messageSearch.sequence++;messageSearch.pending=false;$('#message-search-results').setAttribute('aria-busy','false');});
+    $('#message-search-dialog').addEventListener('keydown',event=>{if(event.key==='Escape'&&!event.isComposing){event.preventDefault();$('#message-search-dialog').close('cancel');}});
+    $('#agent-subscriptions').insertAdjacentHTML('beforebegin','<details id="agent-threads"><summary>Threads <span id="agent-threads-count"></span></summary><div id="agent-threads-items" role="region" aria-label="Agent thread memberships" tabindex="0"></div><p class="inline-error" id="agent-threads-error" hidden role="status"></p><div class="actions"><button type="button" class="small" id="agent-threads-more" hidden>More threads</button><button type="button" class="small" id="agent-threads-view-all">View all in Threads</button></div></details>');
+    $('#agent-threads').addEventListener('toggle',()=>{if($('#agent-threads').open)void loadAgentThreads();});
     window.addEventListener('resize', () => {
       const messages = $('#messages');
       if (messages?._followLatest && messages.getClientRects().length && !hasSelectedText(messages)) messages.scrollTop = messages.scrollHeight;
@@ -3711,7 +3967,14 @@
     });
 
     resetThread();
-    refresh(true).catch(e => toast(e.message, true));
+    refresh(true).then(async()=>{
+      const reference=initialThreadReference;initialThreadReference=null;
+      if(reference?.project!==state.selectedProject)return;
+      try{
+        if(reference.message&&!reference.thread){const message=await record(query('/messages/'+entityId(reference.message),{agent:0}));if(reference.project!==state.selectedProject)return;reference.thread=message.thread;}
+        if(reference.thread)await openThreadReference(reference.thread,reference.message);
+      }catch(error){toast(error.message,true);}
+    }).catch(e => toast(e.message, true));
     setInterval(() => { if (!refreshPending && document.visibilityState === 'visible') refresh(false); }, 2000);
     setInterval(updateWaitTimers, 1000);
   </script>

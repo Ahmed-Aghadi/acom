@@ -18,6 +18,7 @@ mod controls;
 mod diagnostics;
 mod drafts;
 mod globals;
+mod message_search;
 pub(crate) mod metric_history;
 pub(crate) mod portable;
 mod subscriptions;
@@ -26,7 +27,9 @@ pub(crate) mod tokens;
 pub use agent_query::ParsedAgentQuery;
 pub use controls::{ControlRequest, ControlTargets, PermissionGrant};
 pub use globals::GlobalSettings;
+pub use message_search::MessageSearch;
 pub use subscriptions::UsageWatch;
+pub use thread_sort::ThreadFilter;
 
 pub const GUIDE: &str = include_str!("guide.md");
 pub const MODELS: &str = include_str!("models.md");
@@ -787,6 +790,18 @@ fn initialize_views(db: &Connection) -> R<()> {
         rusqlite::functions::FunctionFlags::SQLITE_UTF8
             | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+    )?;
+    db.create_scalar_function(
+        "acom_snippet",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(message_search::snippet(
+                &ctx.get::<String>(0)?,
+                &ctx.get::<String>(1)?,
+            ))
+        },
     )?;
     for table in [
         "projects",
@@ -7010,8 +7025,19 @@ impl App {
         )
     }
 
+    #[cfg(test)]
     pub fn message_for(&self, id: i64, agent: Option<i64>) -> R<Value> {
+        self.message_for_thread(id, agent, None)
+    }
+
+    pub fn message_for_thread(&self, id: i64, agent: Option<i64>, thread: Option<i64>) -> R<Value> {
         let st = self.lock();
+        if let Some(thread) = thread {
+            if thread <= 0 {
+                return Err(bad("thread must be a positive thread ID"));
+            }
+            Self::require_thread_read(&st, thread, agent.unwrap_or(0))?;
+        }
         let mut m=rows(
             &st.db,
             "SELECT m.id, m.thread_id thread, t.title, m.sender, m.text, m.at FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.id=?1",
@@ -7020,6 +7046,12 @@ impl App {
         .pop()
         .ok_or_else(|| not_found(format!("no message {id}")))?;
         Self::require_thread_read(&st, m["thread"].as_i64().unwrap(), agent.unwrap_or(0))?;
+        if thread.is_some_and(|thread| m["thread"].as_i64() != Some(thread)) {
+            return Err(not_found(format!(
+                "message {id} is not in thread {}",
+                thread.unwrap()
+            )));
+        }
         Self::message_context(&st, &mut m, Some(agent.unwrap_or(0)))?;
         Ok(m)
     }

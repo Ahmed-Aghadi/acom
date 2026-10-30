@@ -49,6 +49,22 @@ Threads let you talk with agents and let them talk with each other. They can be 
 
 Messages display basic Markdown and appear immediately with a sending indicator until acom confirms they are saved. Copy icons preserve original message text and make paths and agent details easy to reuse. Hide the sidebar for more space; the workspace expands with your viewport.
 
+Find threads by title, exact thread ID or current members, matching all or any selected agents. Agent Details lists its current threads. Message metadata includes its ID, **Copy reference** and **Copy link**; links identify the project, thread and message.
+
+Search message text within one thread or across the selected project's complete accessible history, with optional thread, sender and date filters. Exact message-ID lookup is a separate mode, so a numeric text search stays a text search. Results show snippets; opening one highlights the message with surrounding context. Search previews and historical context leave read state unchanged; **Jump to latest** returns to ordinary live reading. Drafts and work marks are preserved.
+
+The CLI provides the same bounded discovery:
+
+```sh
+acom threads --members 2,5 --member-match all
+acom threads --id 12
+acom messages --search 'review findings' --thread 12
+acom messages --search 'review findings' --sender 2
+acom read 83 --thread 12
+```
+
+Omit `--thread` to search all accessible project threads; use `--threads 12,15` for a selected set. `messages --id 83` looks up an exact message ID with optional filters; `read 83` reads its full record without knowing the thread. `--from`/`--to` accept inclusive Unix seconds. Follow printed continuation commands instead of assuming one page is complete. Numeric IDs are project-local, and member filters mean current membership, not historical participation.
+
 ![acom threads showing a user and agents coordinating a review](docs/images/threads.png)
 
 Project Pause/Resume controls affect the selected project; global controls are under **All projects**. Agent-list filters never narrow those actions.

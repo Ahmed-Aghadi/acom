@@ -1,9 +1,9 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    AgentFilter, App, Fail, GlobalSettings, HistoryQuery, LaunchReq, PageQuery, ParsedAgentQuery,
-    R, Settings, ThreadReq, UsageWatch, WaitAgents, WaitOptions, acom_home, actor, bad,
-    bounded_record, not_found,
+    AgentFilter, App, Fail, GlobalSettings, HistoryQuery, LaunchReq, MessageSearch, PageQuery,
+    ParsedAgentQuery, R, Settings, ThreadFilter, ThreadReq, UsageWatch, WaitAgents, WaitOptions,
+    acom_home, actor, bad, bounded_record, not_found,
 };
 use crate::harness::catalog;
 use crate::workspace::Workspace;
@@ -495,7 +495,7 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
     const WATCH: &str = "agents states status_text after usage";
     const LAUNCH: &str = "task harness model effort name group force done ack_crashes";
     let (body, query, extra) = match (method, p) {
-        ("GET", []) => ("", "project", ""),
+        ("GET", []) => ("", "project thread message", ""),
         (
             "GET",
             [
@@ -521,7 +521,13 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
             PAGE,
         ),
         ("GET", ["agent-query"]) => ("", "search", RECORD),
-        ("GET", ["agents", _] | ["messages", _] | ["receipts", _]) => ("", "agent", RECORD),
+        ("GET", ["messages", "search"]) => (
+            "",
+            "project viewer text id thread threads sender from to",
+            PAGE,
+        ),
+        ("GET", ["messages", _]) => ("", "agent thread", RECORD),
+        ("GET", ["agents", _] | ["receipts", _]) => ("", "agent", RECORD),
         ("GET", ["agents", _, "permissions"]) => ("", "viewer", RECORD),
         ("PUT", ["agents", _, "permissions"]) => ("grants version via", "", ""),
         ("POST", ["controls"]) => ("agent action agents if_states limit after through", "", ""),
@@ -532,12 +538,17 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
         ),
         ("GET", ["subscriptions"]) => ("", "agent viewer", PAGE),
         ("GET", ["subscriptions", _]) => ("", "viewer", RECORD),
-        ("GET", ["threads"]) => ("", "project agent viewer sort cursor", PAGE),
+        ("GET", ["threads"]) => (
+            "",
+            "project agent viewer sort cursor search id members member_match category",
+            PAGE,
+        ),
         ("GET", ["threads", _]) => ("", "agent offset version", PAGE),
         ("GET", ["threads", _, "metadata"]) => ("", "agent", RECORD),
         ("GET", ["threads", _, "draft"]) => ("", "", RECORD),
         ("PUT", ["threads", _, "draft"]) => ("text version via", "", ""),
         ("GET", ["threads", _, "messages"]) => ("", "agent", PAGE),
+        ("GET", ["threads", _, "messages", "context"]) => ("", "agent message limit max_bytes", ""),
         ("GET", ["folders"]) => (
             "",
             "path hidden before after revision since limit max_bytes",
@@ -751,12 +762,13 @@ fn validate_query_value(p: &[&str], key: &str, value: &str) -> R<()> {
             .map_err(|_| bad(format!("{key} must be an integer")))
     };
     let valid = match key {
-        "agent" | "viewer" | "offset" | "through" => number()? >= 0,
-        "project" | "thread" => number()? > 0,
+        "agent" | "viewer" | "offset" | "through" | "sender" | "from" | "to" => number()? >= 0,
+        "project" | "thread" | "id" | "message" => number()? > 0,
         "limit" | "lines" => (1..=200).contains(&number()?),
         "max_bytes" => (512..=65536).contains(&number()?),
         "before" | "after" if p != ["folders"] => number()? >= 0,
         "hidden" => matches!(value, "0" | "1"),
+        "category" if p == ["threads"] => matches!(value, "all" | "mine" | "unread" | "agents"),
         "category" => {
             matches!(value, "all" | "active" | "attention" | "finished")
                 || crate::app::STATES.contains(&value)
@@ -1054,10 +1066,17 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // threads and messages
-        ("GET", ["threads"]) => J(app.sorted_threads_page(
+        ("GET", ["threads"]) => J(app.filtered_threads_page(
             q.int("project")?,
             q.int("agent")?,
             q.int("viewer")?,
+            ThreadFilter {
+                search: q.get("search"),
+                id: q.int("id")?,
+                members: q.get("members"),
+                member_match: q.get("member_match"),
+                category: q.get("category"),
+            },
             q.get("sort").as_deref().unwrap_or("latest_message"),
             q.get("cursor").as_deref(),
             page(q)?,
@@ -1093,6 +1112,14 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         ("GET", ["threads", t, "messages"]) => {
             J(app.messages_page(id(t)?, q.int("agent")?, page(q)?)?)
         }
+        ("GET", ["threads", t, "messages", "context"]) => J(app.message_context_page(
+            id(t)?,
+            q.int("message")?
+                .ok_or_else(|| bad("message is required"))?,
+            q.int("agent")?,
+            q.int("limit")?.unwrap_or(50),
+            q.int("max_bytes")?.unwrap_or(16000),
+        )?),
         ("POST", ["threads", t, "read"]) => {
             if b.get("agent").is_some_and(|a| a.as_i64() != Some(0)) {
                 return Err(bad("only the user can mark a thread read"));
@@ -1171,7 +1198,25 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 .collect();
             J(json!({ "id": mid, "not_woken": not_woken }))
         }
-        ("GET", ["messages", m]) => J(record(app, app.message_for(id(m)?, q.int("agent")?)?, q)?),
+        ("GET", ["messages", "search"]) => J(app.search_messages(
+            q.int("project")?,
+            q.int("viewer")?,
+            MessageSearch {
+                text: q.get("text"),
+                id: q.int("id")?,
+                thread: q.int("thread")?,
+                threads: q.get("threads"),
+                sender: q.int("sender")?,
+                from: q.int("from")?,
+                to: q.int("to")?,
+            },
+            page(q)?,
+        )?),
+        ("GET", ["messages", m]) => J(record(
+            app,
+            app.message_for_thread(id(m)?, q.int("agent")?, q.int("thread")?)?,
+            q,
+        )?),
         ("GET", ["inbox", a]) => {
             J(app.inbox_page(id(a)?, q.get("mark").as_deref().unwrap_or("new"), page(q)?)?)
         }
@@ -1922,6 +1967,35 @@ mod tests {
             super::route(&app, "GET", &[], &super::Query("project=999"), &Value::Null).unwrap(),
             super::Reply::Html(_)
         ));
+        assert!(matches!(
+            super::route(
+                &app,
+                "GET",
+                &[],
+                &super::Query("project=999&thread=12&message=83"),
+                &Value::Null
+            )
+            .unwrap(),
+            super::Reply::Html(_)
+        ));
+        for query in [
+            "thread=0",
+            "thread=-1",
+            "message=bad",
+            "message=0",
+            "thread=1&thread=2",
+            "message=1&message=2",
+            "thread=1&unknown=2",
+        ] {
+            assert_eq!(
+                super::route(&app, "GET", &[], &super::Query(query), &Value::Null)
+                    .err()
+                    .unwrap()
+                    .0,
+                400,
+                "{query}"
+            );
+        }
         assert_eq!(app.lock().db.total_changes(), before);
         drop(app);
         std::fs::remove_dir_all(home).unwrap();

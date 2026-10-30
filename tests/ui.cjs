@@ -336,7 +336,12 @@ async function fixture(run) {
         const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search,state,reason]));
         return send(result.error||result.unchanged ? result : {...result,counts:agentCounts(matched),project_total:data.agents.filter(agent=>agent.project===project).length});
       }
-      if(key==='threads')return send(sortedThreads(collection(key,project),params,revision(key,project)));
+      if(key==='threads') {
+        const search=(params.get('search')||'').toLowerCase(),id=params.has('id')?Number(params.get('id')):null;
+        const members=(params.get('members')||params.get('agent')||'').split(',').filter(Boolean).map(Number),memberMatch=params.get('member_match')||'all',category=params.get('category')||'all';
+        const rows=collection(key,project).filter(thread=>(!search||String(thread.title||'').toLowerCase().includes(search))&&(id===null||thread.id===id)&&(!members.length||(memberMatch==='any'?members.some(member=>thread.members.includes(member)):members.every(member=>thread.members.includes(member))))&&(category==='all'||category==='mine'&&thread.user_member||category==='unread'&&thread.unread>0||category==='agents'&&!thread.user_member));
+        return send(sortedThreads(rows,params,hash([revision(key,project),search,id,members,memberMatch,category])));
+      }
       if(['projects','configs'].includes(key))return send(registryPage(collection(key,project),params,revision(key,project)));
       return send(paged(collection(key,project),params,revision(key,project),key!=='activity'));
     }
@@ -513,9 +518,22 @@ async function fixture(run) {
     }
     if (req.url.startsWith('/threads/')) {
       const t=threadFor(Number(pathname.split('/')[2]));
+      if(!t)return send({status:404,error:'No such thread'});
       if(req.method==='GET') {
         const metadata={...t,owner:t.owner ?? t.created_by ?? 0,messages:undefined,last_read:readOf(t),unread:unread(t),latest_message:Math.max(0,...t.messages.map(m=>m.id)),first_unread:unread(t)>0?t.messages.find(m=>m.sender!==0&&!m.outside_membership&&m.id>readOf(t)).id:null};
         if(pathname.endsWith('/metadata'))return send(bounded(metadata,params));
+        if(pathname.endsWith('/messages/context')) {
+          const messages=[...t.messages].sort((a,b)=>a.id-b.id),target=Number(params.get('message')),index=messages.findIndex(message=>message.id===target);
+          if(index<0)return send({status:404,error:'No such message in this thread'});
+          const limit=Math.min(Number(params.get('limit')||50),data.pageLimit||200),start=Math.min(Math.max(0,index-Math.floor((limit-1)/2)),Math.max(0,messages.length-limit));
+          let items=messages.slice(start,start+limit);
+          const envelope=items=>({items,target,total:messages.length,through:messages.at(-1)?.id||0,revision:hash([t.messages,readOf(t)]),oldest:items[0]?.id??null,newest:items.at(-1)?.id??null,has_older:messages.some(message=>message.id<items[0]?.id),has_newer:messages.some(message=>message.id>items.at(-1)?.id)});
+          while(Buffer.byteLength(JSON.stringify(envelope(items)))>Number(params.get('max_bytes')||16000)) {
+            if(items.length===1) {items=[{id:target,thread:t.id,sender:items[0].sender,at:items[0].at,truncated:true}];break;}
+            if(items[0].id===target||items.at(-1).id-target>target-items[0].id)items.pop();else items.shift();
+          }
+          return send(envelope(items));
+        }
         const p=new URLSearchParams(params),first=t.messages.find(m=>m.sender!==0 && !m.outside_membership && m.id>readOf(t)),catchup=!p.has('before')&&!p.has('after')&&unread(t)>0;
         if(catchup)p.set('after',first.id-1);
         const messages=paged(t.messages,p,hash([t.messages,readOf(t)]),false);
@@ -561,7 +579,17 @@ async function fixture(run) {
       t.messages.push({ id, sender: 0, at: Date.now() / 1000, text: body.text });
       return send({id});
     }
-    if(req.method==='GET' && /^\/messages\/\d+$/.test(pathname))return send(bounded(data.threads.filter(thread=>thread.project===scopeProject).flatMap(t=>t.messages).find(m=>m.id===Number(pathname.split('/')[2])),params));
+    if(req.method==='GET' && pathname==='/messages/search') {
+      const text=(params.get('text')||'').toLowerCase(),id=params.has('id')?Number(params.get('id')):null;
+      const threads=(params.get('threads')||params.get('thread')||'').split(',').filter(Boolean).map(Number),sender=params.has('sender')?Number(params.get('sender')):null;
+      const rows=data.threads.filter(thread=>thread.project===scopeProject&&(!threads.length||threads.includes(thread.id))).flatMap(thread=>thread.messages.filter(message=>(id===null||message.id===id)&&(!text||String(message.text).toLowerCase().includes(text))&&(sender===null||message.sender===sender)&&(!params.has('from')||message.at>=Number(params.get('from')))&&(!params.has('to')||message.at<=Number(params.get('to')))).map(message=>({id:message.id,thread:thread.id,title:thread.title,sender:message.sender,at:message.at,snippet:String(message.text).slice(0,320),outside_membership:!!message.outside_membership,...(message.mark?{mark:message.mark}:{})})));
+      return send(paged(rows,params,hash([rows,params.get('text'),id,threads,sender,params.get('from'),params.get('to')]),false));
+    }
+    if(req.method==='GET' && /^\/messages\/\d+$/.test(pathname)) {
+      const thread=data.threads.find(thread=>thread.project===scopeProject&&thread.messages.some(message=>message.id===Number(pathname.split('/')[2])));
+      if(!thread||params.has('thread')&&thread.id!==Number(params.get('thread')))return send({status:404,error:'No such message in this thread'});
+      return send(bounded({...thread.messages.find(message=>message.id===Number(pathname.split('/')[2])),thread:thread.id},params));
+    }
     res.statusCode = 404; send({ error: 'not found' });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -2362,6 +2390,365 @@ test('cancelling member selection preserves a draft only within its project',asy
 
 const incoming = (id, text = `Message ${id}`) => ({ id, sender: 1, text, at: 1 });
 const conversation = (messages, extra = {}) => ({ id: 1, project:projectId(1), title: 'Review', members: [0, 1], messages, ...extra });
+
+const submitMessageSearch = async (page,{query,mode='text',scope,sender,from,to,threads}={}) => {
+  const form=page.locator('#message-search-form');
+  await form.locator('[name=mode]').selectOption(mode);
+  if(scope)await form.locator('[name=scope]').selectOption(scope);
+  await form.locator('[name=query]').fill(query);
+  for(const [name,value] of Object.entries({sender,from,to,threads}))if(value!==undefined) {
+    const input=form.locator(`[name=${name}]`);
+    if(!await input.isVisible())await input.evaluate(input=>{let parent=input.parentElement;while(parent){if(parent.tagName==='DETAILS')parent.open=true;parent=parent.parentElement;}});
+    await input.fill(value);
+  }
+  const response=page.waitForResponse(response=>new URL(response.url()).pathname.endsWith('/messages/search'));
+  await form.evaluate(form=>form.requestSubmit());
+  await response;
+};
+
+test('message search covers complete project history, distinguishes literal numbers from IDs and never acknowledges previews',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;
+  data.threads=[
+    conversation([incoming(1,'First matching needle'),incoming(2,'Text containing 83'),incoming(3,'Unrelated latest text')],{id:1,title:'Older conversation'}),
+    conversation([incoming(83,'Exact ID target without numeric text'),incoming(84,'Second matching needle')],{id:2,title:'Private conversation',private:true,joinable:false,members:[2]}),
+    conversation([incoming(85,'Other project matching needle')],{project:projectId(2)}),
+  ];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'needle'});
+  await page.locator('[data-message-result="84"]').waitFor();await page.locator('[data-message-result="1"]').waitFor();
+  assert.equal(await page.locator('#message-search-results [data-message-result]').count(),2);
+  assert.match(await page.locator('#message-search-results').textContent(),/Private conversation.*Older conversation/s);
+  assert.equal(await page.locator('#message-search-results [data-message-result="85"]').count(),0,'the other project is excluded');
+  assert.deepEqual(data.reads,{});assert.equal(data.requests.length,0,'previews do not join threads, read messages or change marks');
+  await submitMessageSearch(page,{query:'83'});await page.locator('[data-message-result="2"]').waitFor();
+  assert.equal(await page.locator('[data-message-result="83"]').count(),0,'numeric text is not implicit ID lookup');
+  await submitMessageSearch(page,{query:'83',mode:'id'});await page.locator('[data-message-result="83"]').waitFor();
+  assert.equal(await page.locator('#message-search-results [data-message-result]').count(),1);
+  assert.deepEqual(data.reads,{});assert.equal(data.requests.length,0);
+}));
+
+test('message search within a thread preserves the open conversation and its unsent draft until a result is opened',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([]),conversation([incoming(2,'Find matching text')],{id:2,title:'Other thread'})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Retain my unsent draft');await page.locator('#thread-message-search').click();
+  assert.equal(await page.locator('#message-search-form [name=scope]').inputValue(),'thread');
+  await submitMessageSearch(page,{query:'matching'});
+  await page.waitForFunction(()=>/no .*match|0 .*result/i.test(document.querySelector('#message-search-status').textContent+' '+document.querySelector('#message-search-results').textContent));
+  assert.equal(await page.evaluate(()=>state.selectedThread),1);
+  await submitMessageSearch(page,{query:'matching',scope:'all'});await page.locator('[data-message-result="2"]').waitFor();
+  assert.equal(await page.evaluate(()=>state.selectedThread),1,'showing other-thread previews does not switch conversations');
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retain my unsent draft');
+  await page.locator('[data-close-search]').first().click();
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retain my unsent draft');
+  assert.equal(data.requests.length,0);
+}));
+
+test('an exact message ID absent from the current thread offers an explicit project-wide lookup without switching threads',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([]),conversation([incoming(83,'Message in the other thread')],{id:2,title:'Other thread'})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep this draft');await page.locator('#thread-message-search').click();
+  await submitMessageSearch(page,{query:'83',mode:'id'});await page.locator('#message-search-all').waitFor();
+  assert.equal(await page.evaluate(()=>state.selectedThread),1);assert.equal(await page.locator('#message-search-results [data-message-result]').count(),0);
+  await page.locator('#message-search-all').click();await page.locator('[data-message-result="83"]').waitFor();
+  assert.equal(await page.locator('#message-search-form [name=scope]').inputValue(),'all');
+  assert.equal(await page.evaluate(()=>state.selectedThread),1,'broadening an ID lookup is not opening the other thread');
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep this draft');assert.equal(data.requests.length,0);
+  await page.locator('[data-message-result="83"]').click();await page.locator('#messages [data-message="83"].message-target').waitFor();
+  assert.equal(await page.evaluate(()=>state.selectedThread),2);assert.equal(data.reads[2],undefined,'opening historical context still does not acknowledge messages');
+}));
+
+test('reopening message search with a different scope clears results and cursors rather than relabeling old matches',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;data.threads=[conversation([]),conversation([incoming(1,'Needle'),incoming(2,'Needle'),incoming(3,'Needle')],{id:2})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.locator('#open-message-search').click();await submitMessageSearch(page,{query:'Needle'});await page.locator('[data-message-result="3"]').waitFor();
+  assert.equal(await page.locator('#message-search-more').isVisible(),true);
+  await page.locator('[data-close-search]').click();await page.locator('#thread-message-search').click();
+  assert.equal(await page.locator('#message-search-form [name=scope]').inputValue(),'thread');
+  assert.equal(await page.locator('#message-search-results [data-message-result]').count(),0,'global matches are not presented as within-thread matches');
+  assert.equal(await page.locator('#message-search-more').isVisible(),false);assert.equal(await page.locator('#message-search-previous').isVisible(),false);
+  assert.equal(data.requests.length,0);
+}));
+
+test('repeating an identical message search after clearing or reopening renders its matches instead of an empty cached panel',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([incoming(1,'Matching needle')])];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'needle'});await page.locator('[data-message-result="1"]').waitFor();
+  await submitMessageSearch(page,{query:'needle'});await page.waitForFunction(()=>!messageSearch.pending);
+  assert.equal(await page.locator('[data-message-result="1"]').count(),1,'clearing an input does not leave an obsolete cached HTML equality');
+  await page.locator('[data-close-search]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'needle'});await page.waitForFunction(()=>!messageSearch.pending);
+  assert.equal(await page.locator('[data-message-result="1"]').count(),1,'reopening the dialog can render the exact same successful result again');
+  assert.equal(data.requests.length,0);
+}));
+
+test('case-insensitive search highlighting preserves original Unicode text before and inside each match',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([incoming(1,'İstanbul foo and FOO after dotted İ'),incoming(2,'ΟΣ')])];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'foo'});await page.locator('[data-message-result="1"]').waitFor();
+  assert.deepEqual(await page.locator('[data-message-result="1"] mark').allTextContents(),['foo','FOO']);
+  assert.equal(await page.locator('[data-message-result="1"] .message-search-snippet').textContent(),'İstanbul foo and FOO after dotted İ');
+  await submitMessageSearch(page,{query:'ΟΣ'});await page.locator('[data-message-result="2"]').waitFor();
+  assert.deepEqual(await page.locator('[data-message-result="2"] mark').allTextContents(),['ΟΣ'],'context-sensitive lowercase keeps the original Greek final sigma match');
+  assert.equal(data.requests.length,0);
+}));
+
+test('message search filters sender, dates and selected threads and renders untrusted snippets as text',async()=>fixture(async(page,data)=>{
+  const at=Math.floor(new Date('2026-01-02T12:00:00').getTime()/1000);
+  data.threads=[
+    conversation([{...incoming(1,'Needle <img src=x onerror=alert(1)>'),at,sender:2},{...incoming(2,'Needle wrong sender'),at,sender:1},{...incoming(3,'Needle outside date'),at:at-86400,sender:2}],{id:1,title:'<img src=x onerror=alert(1)> title'}),
+    conversation([{...incoming(4,'Needle outside thread'),at,sender:2}],{id:2}),
+  ];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'needle',sender:'2',from:'2026-01-02T00:00',to:'2026-01-02T23:59',threads:'1'});
+  await page.locator('[data-message-result="1"]').waitFor();
+  assert.equal(await page.locator('#message-search-results [data-message-result]').count(),1);
+  assert.equal(await page.locator('#message-search-results img').count(),0);
+  assert.match(await page.locator('#message-search-results').textContent(),/<img src=x onerror=alert\(1\)>/);
+  const query=new URL(data.getRequests.filter(url=>url.startsWith('/messages/search?')).at(-1),'http://test').searchParams;
+  assert.equal(query.get('sender'),'2');assert.equal(query.get('threads'),'1');
+  assert.equal(Number(query.get('from')),Math.floor(new Date('2026-01-02T00:00').getTime()/1000));
+  assert.equal(Number(query.get('to')),Math.floor(new Date('2026-01-02T23:59').getTime()/1000));
+  assert.match(await page.locator('#message-search-form details > summary').textContent(),/4 set/);
+  await page.locator('#message-search-clear-filters').click();
+  for(const name of ['sender','from','to','threads'])assert.equal(await page.locator(`#message-search-form [name=${name}]`).inputValue(),'');
+  assert.equal(await page.locator('#message-search-form [name=query]').inputValue(),'needle');
+  assert.equal(await page.locator('#message-search-results [data-message-result]').count(),0,'clearing filters invalidates previous results rather than relabeling them');
+  await submitMessageSearch(page,{query:'needle'});await page.waitForFunction(()=>document.querySelectorAll('#message-search-results [data-message-result]').length===4);
+  assert.doesNotMatch(await page.locator('#message-search-form details > summary').textContent(),/set/);
+  assert.equal(data.requests.length,0);
+}));
+
+test('message search pages without duplicate results or admitting messages beyond its captured boundary',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;data.threads=[conversation(Array.from({length:7},(_,index)=>incoming(index+1,'Matching needle')))];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'needle'});await page.locator('[data-message-result="7"]').waitFor();
+  assert.deepEqual(await page.locator('#message-search-results [data-message-result]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.messageResult))),[7,6]);
+  data.threads[0].messages.push(incoming(8,'New matching needle'));
+  await page.locator('#message-search-more').click();await page.locator('[data-message-result="5"]').waitFor();
+  assert.deepEqual(await page.locator('#message-search-results [data-message-result]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.messageResult))),[5,4]);
+  assert.equal(await page.locator('[data-message-result="8"]').count(),0);
+  await page.locator('#message-search-previous').click();await page.locator('[data-message-result="7"]').waitFor();
+  assert.deepEqual(await page.locator('#message-search-results [data-message-result]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.messageResult))),[7,6]);
+  assert.equal(data.requests.length,0);
+}));
+
+test('stale message search responses cannot overwrite a newer query or another project',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([incoming(1,'First needle'),incoming(2,'Second needle')]),conversation([incoming(1,'Other project needle')],{project:projectId(2)})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  const held=await holdRequest(page,url=>url.pathname==='/messages/search'&&url.searchParams.get('text')==='First','GET');
+  await page.locator('#message-search-form [name=query]').fill('First');await page.locator('#message-search-form').evaluate(form=>form.requestSubmit());await held.started;
+  await page.locator('#message-search-form [name=query]').fill('Second');await page.locator('#message-search-form').evaluate(form=>form.requestSubmit());
+  await page.locator('[data-message-result="2"]').waitFor();held.release();await held.remove();
+  assert.equal(await page.locator('[data-message-result="1"]').count(),0);assert.equal(await page.locator('#message-search-form [name=query]').inputValue(),'Second');
+  const another=await holdRequest(page,url=>url.pathname==='/messages/search'&&url.searchParams.get('text')==='needle','GET');
+  await page.locator('#message-search-form [name=query]').fill('needle');await page.locator('#message-search-form').evaluate(form=>form.requestSubmit());await another.started;
+  await page.evaluate(project=>{document.querySelector('#project-select').value=project;document.querySelector('#project-select').dispatchEvent(new Event('change',{bubbles:true}));},projectId(2));
+  await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);another.release();await another.remove();
+  assert.equal(await page.locator('[data-message-result="2"]').count(),0,'the old project results cannot survive switching scope');
+  assert.equal(data.requests.length,0);
+}));
+
+test('opening a search result loads exact surrounding history without gaps, duplicates or false read-through',async()=>fixture(async(page,data)=>{
+  data.pageLimit=5;data.threads=[conversation(Array.from({length:25},(_,index)=>incoming(index+1)))];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();
+  await submitMessageSearch(page,{query:'13',mode:'id'});await page.locator('[data-message-result="13"]').click();
+  await page.locator('#messages [data-message="13"].message-target').waitFor();
+  const ids=()=>page.locator('#messages [data-message]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.message)));
+  assert.deepEqual(await ids(),[11,12,13,14,15]);assert.equal(data.reads[1],undefined);
+  await page.locator('#thread-older').click();await page.locator('#messages [data-message="6"]').waitFor();
+  assert.deepEqual(await ids(),Array.from({length:10},(_,index)=>index+6));
+  await page.locator('#thread-newer').click();await page.locator('#messages [data-message="20"]').waitFor();
+  assert.deepEqual(await ids(),Array.from({length:15},(_,index)=>index+6));
+  await page.locator('#thread-newer').click();await page.locator('#messages [data-message="25"]').waitFor();
+  assert.deepEqual(await ids(),Array.from({length:20},(_,index)=>index+6));
+  assert.equal(data.reads[1],undefined,'reaching latest still does not acknowledge omitted unread history');
+  data.threads[0].messages.push(incoming(26,'New live arrival'));await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#messages [data-message="26"]').count(),0,'polling does not graft a live gap onto a historical window');
+  assert.equal(data.requests.filter(request=>request.url.endsWith('/read')).length,0);
+  await page.locator('#thread-live').click();await page.locator('#messages [data-message="26"]').waitFor();
+  await page.waitForFunction(()=>state.thread?.last_read===26);
+  assert.deepEqual(await ids(),Array.from({length:26},(_,index)=>index+1));
+  assert.equal(data.reads[1],26);
+}));
+
+test('an oversized exact search target hydrates losslessly before copying without acknowledging the historical window',async()=>fixture(async(page,data)=>{
+  const text='Long Unicode history 🙂 é\n'.repeat(4500);
+  data.threads=[conversation([incoming(1),incoming(2,text),incoming(3)])];
+  await manualPolling(page);await reloadPage(page);await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('[data-page=threads]').click();await page.locator('#open-message-search').click();await submitMessageSearch(page,{query:'2',mode:'id'});
+  await page.locator('[data-message-result="2"]').click();await page.locator('#messages [data-message="2"].message-target').waitFor();
+  assert.equal(await page.locator('[data-message="2"] .message-text').textContent(),text);
+  await page.locator('[data-copy-message="2"]').click();await page.waitForFunction(text=>navigator.clipboard.readText().then(value=>value===text),text);
+  assert.ok(data.getRequests.some(url=>url.startsWith('/messages/2?')&&new URL(url,'http://test').searchParams.has('offset')));
+  assert.equal(data.requests.filter(request=>request.url.endsWith('/read')).length,0);
+}));
+
+test('persisted message IDs, copy references and deep links remain distinct from raw message copying and local send IDs',async()=>fixture(async(page,data)=>{
+  const source='**Original markdown**\nExact trailing spaces.  ';
+  data.threads=[conversation([incoming(1,source)])];data.reads[1]=1;
+  await manualPolling(page);await reloadPage(page);await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  assert.match(await page.locator('[data-message="1"] [data-message-id]').textContent(),/#1/);
+  await page.locator('[data-copy-message="1"]').click();
+  await page.waitForFunction(text=>navigator.clipboard.readText().then(value=>value===text),source);
+  await page.locator('[data-copy-message-reference="1"]').click();
+  await page.waitForFunction(()=>navigator.clipboard.readText().then(value=>/thread #1/i.test(value)&&/message #1/i.test(value)));
+  await page.locator('[data-copy-message-link="1"]').click();
+  await page.waitForFunction(()=>navigator.clipboard.readText().then(value=>/^https?:/.test(value)));
+  const link=await page.evaluate(()=>navigator.clipboard.readText());const url=new URL(link);
+  assert.equal(url.searchParams.get('project'),projectId(1));assert.equal(url.searchParams.get('thread'),'1');assert.equal(url.searchParams.get('message'),'1');
+  const held=await holdRequest(page,'**/messages');await page.locator('#message-form textarea').fill('Pending reply');await page.locator('#message-form button').click();await held.started;
+  const pending=page.locator('[data-pending-message]');await pending.waitFor();
+  assert.equal(await pending.locator('[data-message-id],[data-copy-message-reference],[data-copy-message-link]').count(),0,'local attempt IDs are never exposed as persisted references');
+  held.release();await held.remove();await page.locator('[data-message="2"] [data-message-id]').waitFor();
+  await page.goto(link);await page.waitForFunction(()=>state.selectedThread===1&&document.querySelector('#messages [data-message="1"].message-target'));
+  assert.equal(await page.locator('#page-threads').evaluate(node=>node.classList.contains('active')),true);
+  assert.match(await page.locator('#messages [data-message="1"] .message-text').textContent(),/Original markdown\nExact trailing spaces\./);
+}));
+
+test('thread title, exact ID and all-or-any member filters apply to the entire collection before paging',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;data.agents=[1,2,3].map(id=>({id,project:projectId(1),name:`Reviewer ${id}`,state:'idle'}));
+  data.threads=[conversation([],{id:1,title:'Old needle',members:[0,1,2]}),conversation([],{id:2,title:'Recent 17 title',members:[0,1]}),conversation([],{id:3,title:'Another recent',members:[0,2]}),conversation([],{id:17,title:'Exact thread',members:[0,3]})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();
+  await page.locator('#thread-search').fill('needle');await page.locator('#thread-list [data-thread="1"]').waitFor();
+  assert.equal(await page.locator('#thread-list [data-thread]').count(),1);assert.equal(await page.locator('#thread-count').textContent(),'1');
+  await page.locator('#thread-search').fill('17');await page.locator('#thread-list [data-thread="2"]').waitFor();
+  assert.equal(await page.locator('#thread-list [data-thread="17"]').count(),0,'title text remains a literal title search');
+  await page.locator('#thread-search-filters > summary').click();await page.locator('#thread-search-id').fill('17');
+  await page.locator('#thread-list [data-thread="17"]').waitFor();assert.equal(await page.locator('#thread-search').inputValue(),'');
+  assert.match(await page.locator('#thread-search-filters > summary').textContent(),/1 active/);
+  await page.locator('#thread-search-id').fill('');await page.locator('#thread-member-filter').fill('1,2');
+  await page.locator('#thread-list [data-thread="1"]').waitFor();assert.equal(await page.locator('#thread-count').textContent(),'1');
+  await page.locator('#thread-member-match').selectOption('any');await page.waitForFunction(()=>document.querySelector('#thread-count').textContent==='3');
+  assert.equal(await page.locator('#thread-list [data-thread="17"]').count(),0);
+  const query=new URL(data.getRequests.filter(url=>url.startsWith('/threads?')).at(-1),'http://test').searchParams;
+  assert.equal(query.get('members'),'1,2');assert.equal(query.get('member_match'),'any');
+  assert.equal(data.requests.length,0);
+}));
+
+test('agent details page current thread memberships and View all opens an exact server member filter',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;data.agents=[{id:1,project:projectId(1),name:'Reviewer',state:'idle'}];
+  data.threads=[conversation([],{id:1,title:'One'}),conversation([],{id:2,title:'Two'}),conversation([],{id:3,title:'Three'}),conversation([],{id:4,title:'Former membership',members:[0,2]})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();
+  await page.locator('#agent-threads > summary').click();await page.locator('#agent-threads-items [data-agent-thread]').first().waitFor();
+  assert.equal(await page.locator('#agent-threads-items [data-agent-thread]').count(),2);
+  assert.match(await page.locator('#agent-threads > summary').textContent(),/3/);
+  await page.locator('#agent-threads-more').click();await page.waitForFunction(()=>document.querySelectorAll('#agent-threads-items [data-agent-thread]').length===3);
+  assert.doesNotMatch(await page.locator('#agent-threads-items').textContent(),/Former membership/);
+  await page.locator('#agent-threads-view-all').click();await page.waitForFunction(()=>document.querySelector('#page-threads').classList.contains('active')&&document.querySelector('#thread-count').textContent==='3');
+  assert.equal(await page.locator('#agent-dialog').evaluate(dialog=>dialog.open),false);
+  assert.equal(await page.locator('#thread-member-filter').inputValue(),'1');
+  assert.equal(await page.locator('[data-thread-filter=all]').getAttribute('aria-pressed'),'true');
+  const query=new URL(data.getRequests.filter(url=>url.startsWith('/threads?')).at(-1),'http://test').searchParams;
+  assert.equal(query.get('members'),'1');assert.equal(query.get('category'),'all');
+  assert.equal(data.requests.length,0);
+}));
+
+test('reopening agent details can render unchanged thread memberships after the previous panel was cleared',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Reviewer',state:'idle'}];data.threads=[conversation([])];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();await page.locator('#agent-threads > summary').click();await page.locator('#agent-threads-items [data-agent-thread="1"]').waitFor();
+  await page.locator('#agent-dialog .dialog-close').click();await page.locator('[data-action=details]').click();await page.locator('#agent-threads > summary').click();
+  await page.waitForFunction(()=>agentThreads&&!agentThreads.pending);
+  assert.equal(await page.locator('#agent-threads-items [data-agent-thread="1"]').count(),1);
+  assert.match(await page.locator('#agent-threads > summary').textContent(),/1/);assert.equal(data.requests.length,0);
+}));
+
+test('a delayed agent membership page is revalidated after the project thread revision changes',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Reviewer',state:'idle'}];
+  data.threads=[conversation([],{id:1,title:'Original membership'}),conversation([],{id:2,title:'New membership',members:[0,2]})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();
+  let release,entered;const gate=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);
+  const matcher=url=>url.pathname.endsWith('/threads')&&url.searchParams.get('members')==='1';
+  const handler=async route=>{const response=await route.fetch();entered();await gate;await route.fulfill({response}).catch(()=>{});};
+  await page.route(matcher,handler);await page.locator('#agent-threads > summary').click();await started;
+  data.threads[1].members.push(1);await page.evaluate(()=>refresh());
+  release();await page.locator('#agent-threads-items [data-agent-thread="1"]').waitFor();await page.unroute(matcher,handler);
+  await page.evaluate(()=>refresh());await page.locator('#agent-threads-items [data-agent-thread="2"]').waitFor();
+  assert.equal(await page.locator('#agent-threads-items [data-agent-thread]').count(),2);
+  assert.match(await page.locator('#agent-threads > summary').textContent(),/2/);
+  assert.equal(data.requests.length,0);
+}));
+
+for(const change of ['project','filter'])test(`a failed read-triggered unread-list refresh cannot overwrite a newer ${change} scope`,async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([incoming(1)]),conversation([],{project:projectId(2),title:'Other project'})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread-filter=unread]').click();await page.locator('[data-thread="1"]').waitFor();
+  let release,entered;const gate=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);
+  const matcher=url=>url.pathname===`/p/${projectId(1)}/threads`&&url.searchParams.get('category')==='unread';
+  const handler=async route=>{entered();await gate;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Old unread scope offline'})}).catch(()=>{});};
+  await page.route(matcher,handler);await page.locator('[data-thread="1"]').click();await started;
+  await page.evaluate(()=>{window.oldUnreadReload=state.pages.threads.pending;});
+  if(change==='project') {await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);}
+  else {await page.locator('[data-thread-filter=all]').click();await page.waitForFunction(()=>state.pages.threads?.scope===collectionPath('threads')&&!state.pages.threads.pending);}
+  release();await page.evaluate(()=>window.oldUnreadReload?.catch(()=>{}));await page.unroute(matcher,handler);
+  assert.doesNotMatch(await page.locator('#thread-sort-status').textContent(),/Old unread scope offline/);
+  assert.equal(await page.evaluate(()=>state.threadFilterError||null),null,'an old failed reload does not label current results invalid');
+}));
+
+test('changing member filters rejects stale pages and retains an open thread draft and text selection',async()=>fixture(async(page,data)=>{
+  data.agents=[1,2].map(id=>({id,project:projectId(1),name:`Reviewer ${id}`,state:'idle'}));
+  data.threads=[conversation([incoming(1,'Retain selected message text')],{id:1,members:[0,1]}),conversation([],{id:2,members:[0,2]})];data.reads[1]=1;
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.locator('#message-form textarea').fill('Keep my draft');
+  await page.locator('#thread-search-filters > summary').click();
+  const held=await holdRequest(page,url=>url.pathname==='/threads'&&url.searchParams.get('members')==='1','GET');
+  await page.locator('#thread-member-filter').fill('1');await held.started;
+  const next=await holdRequest(page,url=>url.pathname==='/threads'&&url.searchParams.get('members')==='2','GET');
+  await page.locator('#thread-member-filter').fill('2');await next.started;
+  const selection=await selectText(page,'[data-message="1"] .message-text');next.release();await next.remove();
+  await page.locator('#thread-list [data-thread="2"]').waitFor();await page.waitForFunction(()=>document.querySelectorAll('#thread-list [data-thread]').length===1);held.release();await held.remove();
+  assert.equal(await page.locator('#thread-list [data-thread="1"]').count(),0);
+  assert.equal(await page.evaluate(()=>state.selectedThread),1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep my draft');
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selection);
+  await page.locator('#thread-filter-member-search').fill('Reviewer 1');
+  await page.locator('#thread-filter-members-picker [data-thread-member="1"]').waitFor();
+  await page.locator('#thread-filter-members-picker [data-thread-member="1"]').check();
+  await page.waitForFunction(()=>document.querySelector('#thread-member-filter').value==='1,2');
+  assert.equal(data.requests.length,0);
+}));
+
+test('visual member selections clear with the CSV filter and never carry a checked user into another project',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([],{members:[0]}),conversation([],{project:projectId(2),members:[0]})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('#thread-search-filters > summary').click();
+  await page.waitForFunction(()=>threadMemberPage&&!threadMemberPage.pending);
+  const user=page.locator('#thread-filter-members-picker [data-thread-member="0"]');
+  await user.check();assert.equal(await page.locator('#thread-member-filter').inputValue(),'0');
+  await page.locator('#thread-member-filter').fill('');await page.waitForFunction(()=>!document.querySelector('#thread-filter-members-picker [data-thread-member="0"]').checked);
+  assert.equal(await user.isChecked(),false);
+  await user.check();assert.equal(await page.locator('#thread-member-filter').inputValue(),'0');
+  await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+  assert.equal(await page.locator('#thread-member-filter').inputValue(),'');assert.equal(await user.isChecked(),false);
+  assert.equal(data.requests.length,0);
+}));
+
+for(const width of [1600,390,320])test(`thread and message search remain usable at ${width}px with bounded controls and rich results`,async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Reviewer with a long readable name',state:'idle'}];
+  data.threads=[conversation([incoming(1,'Search needle with aVeryLongUnbrokenToken'.repeat(10))],{title:'Review with a long readable conversation title'})];data.reads[1]=1;
+  await manualPolling(page);await page.setViewportSize({width,height:900});await reloadPage(page);await openSidebar(page);await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('#thread-search-filters').evaluate(details=>details.open),false,'advanced member controls start collapsed');
+  await page.locator('#thread-search-filters > summary').click();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.locator('#open-message-search').click();await submitMessageSearch(page,{query:'needle'});await page.locator('[data-message-result="1"]').waitFor();
+  const bounds=await page.locator('#message-search-dialog').evaluate(dialog=>({width:dialog.getBoundingClientRect().width,height:dialog.getBoundingClientRect().height,overflow:dialog.scrollWidth>dialog.clientWidth,viewportWidth:innerWidth,viewportHeight:innerHeight}));
+  assert.ok(bounds.width<=bounds.viewportWidth&&bounds.height<=bounds.viewportHeight);assert.equal(bounds.overflow,false,'long snippets wrap inside the dialog');
+  assert.ok(await page.locator('#message-search-results').getAttribute('aria-label'));
+  assert.equal(data.requests.length,0);
+  if(process.env.ACOM_UI_SCREENSHOT_DIR) {
+    fs.mkdirSync(process.env.ACOM_UI_SCREENSHOT_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,`message-search-${width}.png`)});
+  }
+  await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.querySelector('#message-search-dialog').open);
+  await page.locator('#thread-search-filters > summary').click();await page.locator('[data-thread="1"]').click();await page.locator('[data-message="1"]').waitFor();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'persisted message reference controls fit the conversation');
+  if(process.env.ACOM_UI_SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,`message-reference-${width}.png`)});
+  if(width===320) {
+    await page.emulateMedia({colorScheme:'dark'});await page.locator('#thread-message-search').click();await submitMessageSearch(page,{query:'needle'});await page.waitForFunction(()=>!messageSearch.pending);
+    assert.equal(await page.locator('[data-message-result="1"]').count(),1,'reopening search in dark mode still renders unchanged matches');
+    assert.equal(await page.locator('#message-search-results mark').count()>0,true);
+    assert.equal(await page.locator('#message-search-dialog').evaluate(dialog=>dialog.scrollWidth<=dialog.clientWidth),true);
+    if(process.env.ACOM_UI_SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,'message-search-dark-320.png')});
+  }
+}));
 
 test('unread badges span projects, exclude own and agent-only messages, and persist across reloads', async () => fixture(async (page, data) => {
   data.threads = [
@@ -5275,13 +5662,17 @@ test('workspace thread search scopes participation filters without discarding an
   const search=page.locator('#thread-search');
   assert.ok(await search.getAttribute('aria-label') || await search.evaluate(el=>el.labels?.length));
   await search.fill('REVIEW');
+  await page.waitForFunction(()=>document.querySelectorAll('#thread-list [data-thread]').length===1);
   assert.equal(await page.locator('#thread-list [data-thread]').count(),1);
   await page.locator('[data-thread-filter=all]').click();
+  await page.waitForFunction(()=>document.querySelectorAll('#thread-list [data-thread]').length===2);
   assert.equal(await page.locator('#thread-list [data-thread]').count(),2);
   await page.locator('[data-thread-filter=agents]').click();
+  await page.locator('#thread-list [data-thread="2"]').waitFor();
   assert.equal(await page.locator('#thread-list [data-thread="2"]').count(),1);
   assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep the design notes');
   await search.fill('nothing matches this query');
+  await page.waitForFunction(()=>document.querySelectorAll('#thread-list [data-thread]').length===0);
   assert.equal(await page.locator('#thread-list [data-thread]').count(),0);
   assert.match(await page.locator('#thread-list').textContent(),/no .*match/i);
   await page.evaluate(()=>refresh());
@@ -5289,6 +5680,7 @@ test('workspace thread search scopes participation filters without discarding an
   assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep the design notes');
   await search.fill('');
   await page.locator('[data-thread-filter=mine]').click();
+  await page.waitForFunction(()=>document.querySelectorAll('#thread-list [data-thread]').length===2);
   assert.equal(await page.locator('#thread-list [data-thread]').count(),2);
   assert.equal(data.requests.length,0,'browsing empty conversations does not write to the API');
 }));

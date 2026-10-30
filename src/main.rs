@@ -93,7 +93,8 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
                                           Launch a helper agent; --done also marks you done,
                                           so you hand over without needing a second slot
                                           --replace queues a terminal cross-provider handoff
-  threads                                 List threads
+  threads [--search TEXT | --id TID] [--members IDs] [--member-match all|any]
+          [--category all|mine|unread|agents] List matching project threads
   thread new --title <text> [--members <ID or selector,...> | --watch <states,group:name,...>] [--include-user] [--private|--no-join]
   thread read <TID>                       A bounded page of thread messages
   thread details <TID>                   Thread metadata, without message bodies
@@ -110,7 +111,10 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   activity [ID]                           Project activity / one full activity record
   log <ID> [--before BYTE | --after BYTE] [--through BYTE] [--version V] [--since R]
            [--lines N] [--max-bytes N]    Bounded captured-activity chunks (JSON); agents only their own
-  read <msg ID>                           One bounded message record
+  messages (--search TEXT | --id ID) [--thread TID | --threads IDs]
+           [--sender ID] [--from UNIX] [--to UNIX]
+                                          Search complete accessible message history (snippets)
+  read <msg ID> [--thread TID]            One bounded message record; optionally verify its thread
   mark <msg ID,...> new|in-progress|handled
   locks                                   List locks
   lock read <ID>                          One lock's details
@@ -152,7 +156,7 @@ Watch flags (wait and subscribe; agent and usage conditions combine with OR):
   Use window IDs from limits; Claude display aliases are accepted and normalized in receipts.
   --idle returns a wait ID immediately; finish the turn without `acom done`. It does not stop tools.
 
-Lists (agents, inbox, notices, locks, activity, subscriptions, thread read):
+Lists (agents, inbox, messages, notices, locks, activity, subscriptions, thread read):
   [--before ID | --after ID] [--through ID] [--revision R] [--since R]
   [--limit N] [--max-bytes N]            Defaults: 50 items, 16000 JSON bytes.
   Continue with the printed cursor, through and revision; changed snapshots fail visibly.
@@ -640,28 +644,29 @@ mod cli_tests {
         for command in [
             "agents",
             "inbox",
+            "messages",
             "notices",
             "locks",
             "activity",
             "subscriptions",
         ] {
-            assert!(
-                Cli::try_parse_from([
-                    "acom",
-                    command,
-                    "--after",
-                    "0",
-                    "--through",
-                    "130",
-                    "--revision",
-                    "snapshot",
-                    "--limit",
-                    "3",
-                    "--max-bytes",
-                    "2048"
-                ])
-                .is_ok()
-            );
+            let mut args = vec!["acom", command];
+            if command == "messages" {
+                args.extend(["--search", "needle"]);
+            }
+            args.extend([
+                "--after",
+                "0",
+                "--through",
+                "130",
+                "--revision",
+                "snapshot",
+                "--limit",
+                "3",
+                "--max-bytes",
+                "2048",
+            ]);
+            assert!(Cli::try_parse_from(args).is_ok());
             for (flag, value) in [
                 ("--limit", "0"),
                 ("--limit", "201"),
@@ -710,7 +715,7 @@ mod cli_tests {
     #[test]
     fn thread_lists_use_sorted_opaque_cursors_not_numeric_id_ranges() {
         let Cli {
-            cmd: Cmd::Threads { page },
+            cmd: Cmd::Threads { page, .. },
         } = Cli::try_parse_from(["acom", "threads"]).unwrap()
         else {
             panic!("wrong command")
@@ -718,7 +723,7 @@ mod cli_tests {
         assert_eq!(page.sort, "latest_message");
         for sort in ["latest_message", "newest", "oldest", "title"] {
             let Cli {
-                cmd: Cmd::Threads { page },
+                cmd: Cmd::Threads { page, .. },
             } = Cli::try_parse_from([
                 "acom",
                 "threads",
@@ -753,6 +758,117 @@ mod cli_tests {
             args.extend(suffix);
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn thread_search_flags_validate_and_survive_continuation_commands() {
+        let Cli {
+            cmd: Cmd::Threads { search, .. },
+        } = Cli::try_parse_from([
+            "acom",
+            "threads",
+            "--search",
+            "A & B",
+            "--members",
+            "0,2,2",
+            "--member-match",
+            "any",
+            "--category",
+            "mine",
+        ])
+        .unwrap()
+        else {
+            panic!("wrong command")
+        };
+        let (query, command) = search_options(search.options(), "acom threads --sort title");
+        assert!(query.contains("search=A%20%26%20B"));
+        assert!(query.contains("members=0%2C2%2C2"));
+        assert!(query.contains("member_match=any"));
+        assert!(command.contains("--member-match 'any'"));
+        assert!(command.contains("--category 'mine'"));
+        assert!(Cli::try_parse_from(["acom", "threads", "--id", "42"]).is_ok());
+        for suffix in [
+            vec!["--search", ""],
+            vec!["--id", "0"],
+            vec!["--search", "x", "--id", "1"],
+            vec!["--members", ""],
+            vec!["--members", "1,"],
+            vec!["--members", "-1"],
+            vec!["--members", "user"],
+            vec!["--member-match", "all"],
+            vec!["--members", "1", "--member-match", "both"],
+            vec!["--category", "closed"],
+        ] {
+            let mut args = vec!["acom", "threads"];
+            args.extend(suffix);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(search_text(&"é".repeat(2049)).is_err());
+        assert!(search_text("   ").is_ok());
+        assert!(member_search_ids(&vec!["1"; 65].join(",")).is_err());
+    }
+
+    #[test]
+    fn message_search_is_explicit_bounded_and_preserves_literal_filters() {
+        let Cli {
+            cmd: Cmd::Messages { search, page },
+        } = Cli::try_parse_from([
+            "acom",
+            "messages",
+            "--search",
+            "a'b & 83%",
+            "--threads",
+            "1,2",
+            "--sender",
+            "0",
+            "--from",
+            "0",
+            "--to",
+            "200",
+            "--after",
+            "0",
+            "--limit",
+            "2",
+        ])
+        .unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert!(search.validate().is_ok());
+        let (query, command) = search_options(search.options(), "acom messages");
+        assert!(query.contains("text=a%27b%20%26%2083%25"));
+        assert!(query.contains("sender=0"));
+        assert!(command.contains("--search 'a'\\''b & 83%'"));
+        assert!(command.contains("--threads '1,2'"));
+        assert!(page.query().contains("after=0"));
+        assert!(Cli::try_parse_from(["acom", "messages", "--id", "83", "--thread", "2"]).is_ok());
+        assert!(Cli::try_parse_from(["acom", "read", "83", "--thread", "2"]).is_ok());
+        for suffix in [
+            vec![],
+            vec!["--id", "0"],
+            vec!["--search", "x", "--id", "1"],
+            vec!["--id", "1", "--thread", "0"],
+            vec!["--id", "1", "--threads", "0,1"],
+            vec!["--id", "1", "--threads", "1", "--thread", "1"],
+            vec!["--search", "x", "--sender", "-1"],
+            vec!["--search", "x", "--from", "-1"],
+            vec!["--search", "x", "--to", "tomorrow"],
+            vec!["--id", "1", "--limit", "201"],
+        ] {
+            let mut args = vec!["acom", "messages"];
+            args.extend(suffix);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let Cli {
+            cmd: Cmd::Messages { search, .. },
+        } = Cli::try_parse_from([
+            "acom", "messages", "--search", "x", "--from", "2", "--to", "1",
+        ])
+        .unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert!(search.validate().is_err());
     }
 
     #[test]
@@ -946,6 +1062,138 @@ struct ThreadPageArgs {
 impl ThreadPageArgs {
     fn query(&self) -> String {
         format!("sort={}&{}", encode(&self.sort), self.page.query())
+    }
+}
+
+fn search_text(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 4096 {
+        return Err("search text must be nonempty and at most 4096 UTF-8 bytes".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn search_ids(value: &str, minimum: i64) -> Result<String, String> {
+    let ids: Vec<_> = value.split(',').collect();
+    if ids.len() > 64
+        || ids.iter().any(|id| {
+            id.is_empty()
+                || !id.bytes().all(|byte| byte.is_ascii_digit())
+                || !id.parse::<i64>().is_ok_and(|id| id >= minimum)
+        })
+    {
+        return Err(format!(
+            "expected 1–64 comma-separated integer IDs, each at least {minimum}"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn member_search_ids(value: &str) -> Result<String, String> {
+    search_ids(value, 0)
+}
+
+fn thread_search_ids(value: &str) -> Result<String, String> {
+    search_ids(value, 1)
+}
+
+fn search_options(options: Vec<(&str, String)>, command: &str) -> (String, String) {
+    let mut query = String::new();
+    let mut command = command.to_owned();
+    for (key, value) in options {
+        query += &format!("&{key}={}", encode(&value));
+        command += &format!(
+            " --{} {}",
+            if key == "text" {
+                "search".into()
+            } else {
+                key.replace('_', "-")
+            },
+            shell_word(&value)
+        );
+    }
+    (query, command)
+}
+
+#[derive(Args)]
+struct ThreadSearchArgs {
+    #[arg(long, conflicts_with = "id", value_parser = search_text)]
+    search: Option<String>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    id: Option<i64>,
+    #[arg(long, value_parser = member_search_ids)]
+    members: Option<String>,
+    #[arg(long, requires = "members", value_parser = ["all", "any"])]
+    member_match: Option<String>,
+    #[arg(long, value_parser = ["all", "mine", "unread", "agents"])]
+    category: Option<String>,
+}
+
+impl ThreadSearchArgs {
+    fn options(&self) -> Vec<(&str, String)> {
+        let mut options = Vec::new();
+        for (key, value) in [
+            ("search", &self.search),
+            ("members", &self.members),
+            ("member_match", &self.member_match),
+            ("category", &self.category),
+        ] {
+            if let Some(value) = value {
+                options.push((key, value.clone()));
+            }
+        }
+        if let Some(id) = self.id {
+            options.push(("id", id.to_string()));
+        }
+        options
+    }
+}
+
+#[derive(Args)]
+struct MessageSearchArgs {
+    #[arg(long, required_unless_present = "id", conflicts_with = "id", value_parser = search_text)]
+    search: Option<String>,
+    #[arg(long, required_unless_present = "search", value_parser = clap::value_parser!(i64).range(1..))]
+    id: Option<i64>,
+    #[arg(long, conflicts_with = "threads", value_parser = clap::value_parser!(i64).range(1..))]
+    thread: Option<i64>,
+    #[arg(long, value_parser = thread_search_ids)]
+    threads: Option<String>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    sender: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    from: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    to: Option<i64>,
+}
+
+impl MessageSearchArgs {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.from.zip(self.to).is_some_and(|(from, to)| from > to) {
+            return Err("--from must not be later than --to (inclusive Unix seconds)");
+        }
+        Ok(())
+    }
+
+    fn options(&self) -> Vec<(&str, String)> {
+        let mut options = Vec::new();
+        if let Some(text) = &self.search {
+            options.push(("text", text.clone()));
+        }
+        if let Some(threads) = &self.threads {
+            options.push(("threads", threads.clone()));
+        }
+        for (key, value) in [
+            ("id", self.id),
+            ("thread", self.thread),
+            ("sender", self.sender),
+            ("from", self.from),
+            ("to", self.to),
+        ] {
+            if let Some(value) = value {
+                options.push((key, value.to_string()));
+            }
+        }
+        options
     }
 }
 
@@ -1235,6 +1483,8 @@ enum Cmd {
     },
     Threads {
         #[command(flatten)]
+        search: ThreadSearchArgs,
+        #[command(flatten)]
         page: ThreadPageArgs,
     },
     Thread {
@@ -1252,8 +1502,17 @@ enum Cmd {
         #[command(flatten)]
         page: PageArgs,
     },
+    Messages {
+        #[command(flatten)]
+        search: MessageSearchArgs,
+        #[command(flatten)]
+        page: PageArgs,
+    },
     Read {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
         id: i64,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        thread: Option<i64>,
         #[command(flatten)]
         record: RecordArgs,
     },
@@ -2138,6 +2397,28 @@ fn print_agent(a: &Value) {
             locks.join(", ")
         }
     );
+    if let Some(threads) = a["threads"].as_array() {
+        let memberships: Vec<String> = threads
+            .iter()
+            .map(|thread| {
+                format!(
+                    "#{} \"{}\"",
+                    thread["id"],
+                    thread["title"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        println!(
+            "Threads ({} visible): {}",
+            memberships.len(),
+            if memberships.is_empty() {
+                "none".into()
+            } else {
+                memberships.join(", ")
+            }
+        );
+        println!("Thread list: acom threads --members {}", a["id"]);
+    }
     if a["waiting"].is_object() {
         println!("Foreground wait: {}", a["waiting"]);
     }
@@ -2587,9 +2868,13 @@ fn main() {
                 println!("{}", w.as_str().unwrap_or(""));
             }
         }
-        Cmd::Threads { page } => {
+        Cmd::Threads { search, page } => {
+            let (filters, command) = search_options(
+                search.options(),
+                &format!("acom threads --sort {}", page.sort),
+            );
             let result = get(&format!(
-                "/threads?{}{}",
+                "/threads?{}{filters}{}",
                 page.query(),
                 viewer_query("viewer")
             ));
@@ -2619,11 +2904,7 @@ fn main() {
                     t(&th["last_at"])
                 );
             }
-            cursor_page_hint(
-                &result,
-                &page.page,
-                &format!("acom threads --sort {}", page.sort),
-            );
+            cursor_page_hint(&result, &page.page, &command);
         }
         Cmd::Thread { cmd } => match cmd {
             ThreadCmd::New {
@@ -2875,10 +3156,52 @@ fn main() {
                 );
             }
         }
-        Cmd::Read { id, record } => {
+        Cmd::Messages { search, page } => {
+            search.validate().unwrap_or_else(|error| die(error));
+            let (filters, command) = search_options(search.options(), "acom messages");
+            let result = get(&format!(
+                "/messages/search?{}{filters}{}",
+                page.query(),
+                viewer_query("viewer")
+            ));
+            for message in page_items(&result) {
+                if item_truncated(message, &format!("acom read {}", message["id"])) {
+                    continue;
+                }
+                println!(
+                    "#{} · thread {} \"{}\" · {} · {}{}\n{}\n",
+                    message["id"],
+                    message["thread"],
+                    message["title"].as_str().unwrap_or(""),
+                    sender(&message["sender"]),
+                    t(&message["at"]),
+                    message_context(message),
+                    message["snippet"].as_str().unwrap_or("")
+                );
+            }
+            if let Some(total) = result["total"].as_u64() {
+                println!(
+                    "{total} matching messages (snippets); use acom read <ID> for full content."
+                );
+            }
+            page_hint(&result, &page, &command);
+        }
+        Cmd::Read { id, thread, record } => {
             let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
-            let result = get(&format!("/messages/{id}?{context}{}", record.query()));
-            if !record_output(&result, &record, &format!("acom read {id}")) {
+            let thread_query = thread
+                .map(|thread| format!("&thread={thread}"))
+                .unwrap_or_default();
+            let command = format!(
+                "acom read {id}{}",
+                thread
+                    .map(|thread| format!(" --thread {thread}"))
+                    .unwrap_or_default()
+            );
+            let result = get(&format!(
+                "/messages/{id}?{context}{}{thread_query}",
+                record.query()
+            ));
+            if !record_output(&result, &record, &command) {
                 print_message(&result);
             }
         }

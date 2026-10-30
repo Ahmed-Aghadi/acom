@@ -48,7 +48,11 @@ The user always has access and management rights. These are acom rules, not file
 - Live `active` threads exclude done agents and cannot wake them. Include `done` if that is intended. A done-only member leaves on waking but retains the delivered message, not relabelled as catch-up.
 - The creator initially owns the thread. Leaving retains ownership, not private read/post access; an owner can add itself again (live filters still apply). `acom thread transfer-owner <TID> <AGENT_ID>` transfers exclusive ownership to a non-replaced project agent without changing memberships. The previous owner's special rights end; metadata distinguishes current `owner` from original `created_by`.
 
-`acom threads` lists threads; `acom thread details <TID>` shows metadata; `acom thread read <TID>` reads messages. Refer peers to `thread #<TID>`. To message the user, include `user` in static members or `--include-user` in a live thread, then post:
+`acom threads` lists threads; filter with `--search <title text>`, `--id <TID>` or `--members <IDs> --member-match all|any` (current members; user is `0`). `acom me`/`agent` shows visible current memberships. `acom thread details <TID>` shows metadata; `acom thread read <TID>` reads messages. Refer peers to `thread #<TID>, message #<ID>`.
+
+`acom messages --search "<literal text>"` searches complete accessible project message history; `--id <ID>` instead looks up an exact ID. Optional `--thread <TID>`/`--threads <IDs>`, `--sender <ID>`, inclusive Unix-second `--from`/`--to` narrow results. These are bounded snippets, not full messages: use `acom read <ID>` (optionally `--thread <TID>` to verify its thread), and follow paging hints. Search/read does not join threads or change work marks; search does not acknowledge notifications.
+
+To message the user, include `user` in static members or `--include-user` in a live thread, then post:
 
 ```sh
 acom send --thread <TID> <<'EOF'

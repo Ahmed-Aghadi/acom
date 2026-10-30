@@ -10,7 +10,7 @@ const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/deb
 const project = '11111111-1111-4111-8111-111111111111';
 const other = '22222222-2222-4222-8222-222222222222';
 
-async function fixture(run, { actor, scoped = false, existing = true } = {}) {
+async function fixture(run, { actor, scoped = false, existing = true, respond } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'acom-cli-context-'));
   const requests = [];
   let present = existing;
@@ -29,6 +29,7 @@ async function fixture(run, { actor, scoped = false, existing = true } = {}) {
     } else if (request.method === 'POST' && url.pathname.endsWith('/agents')) result = { id: 1 };
     else if (url.pathname.endsWith('/agents/1')) result = { id: 1, name: 'Sample', state: 'idle' };
     else if (url.pathname === '/limits') result = { text: 'Account limits', usage_windows: {} };
+    if (respond) result = respond({ url, body, result });
     response.end(JSON.stringify(result));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -136,4 +137,91 @@ test('invalid delegated controls reject before HTTP', async () => {
     }
     assert.deepEqual(requests, []);
   }, { actor: 7, scoped: true });
+});
+
+test('thread discovery sends exact filters and retains them in sorted continuation commands', async () => {
+  await fixture(async ({ cli, requests }) => {
+    const result = await cli(['threads', '--search', 'Design & review', '--members', '0,2', '--member-match', 'any', '--category', 'mine', '--sort', 'title', '--limit', '1']);
+    assert.equal(result.status, 0, result.stderr);
+    const request = requests[0];
+    assert.equal(request.path, `/p/${project}/threads`);
+    assert.deepEqual(Object.fromEntries(request.query), {
+      sort: 'title', limit: '1', max_bytes: '16000', search: 'Design & review', members: '0,2', member_match: 'any', category: 'mine', viewer: '7',
+    });
+    assert.match(result.stdout, /thread|Design/);
+    const continuation = result.stdout.split('\n').find(line => line.startsWith('More available: '));
+    for (const part of ["--search 'Design & review'", "--members '0,2'", "--member-match 'any'", "--category 'mine'", "--sort title", "--cursor 'next'"]) assert.ok(continuation.includes(part), continuation);
+    assert.equal((await cli(['threads', '--id', '42'])).status, 0);
+    assert.equal(requests[1].query.get('id'), '42');
+  }, { actor: 7, scoped: true, respond: ({ url, result }) => url.pathname.endsWith('/threads') ? {
+    items: [{ id: 42, title: 'Design & review', members: [0, 2], messages: 3, last_at: 1 }], has_more: true, next_cursor: 'next',
+  } : result });
+});
+
+test('message search uses complete-history endpoint and preserves filters in ID paging hints', async () => {
+  await fixture(async ({ cli, requests }) => {
+    const result = await cli(['messages', '--search', "a'b %", '--threads', '1,2', '--sender', '0', '--from', '0', '--to', '200', '--after', '0', '--limit', '1']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(requests[0].path, `/p/${project}/messages/search`);
+    assert.deepEqual(Object.fromEntries(requests[0].query), {
+      limit: '1', max_bytes: '16000', after: '0', text: "a'b %", threads: '1,2', sender: '0', from: '0', to: '200', viewer: '7',
+    });
+    assert.match(result.stdout, /#83 · thread 2 "Review"/);
+    assert.match(result.stdout, /a'b % snippet/);
+    assert.match(result.stdout, /2 matching messages \(snippets\)/);
+    const continuation = result.stdout.split('\n').find(line => line.startsWith('More available: '));
+    for (const part of ["--search 'a'\\''b %'", "--threads '1,2'", "--sender '0'", "--from '0'", "--to '200'", '--after 83', '--through 90', "--revision 'r'"]) assert.ok(continuation.includes(part), continuation);
+    assert.equal((await cli(['messages', '--id', '83', '--thread', '2'])).status, 0);
+    assert.equal(requests[1].query.get('id'), '83');
+    assert.equal(requests[1].query.get('thread'), '2');
+    assert.equal(requests[1].query.has('text'), false);
+    assert.ok(requests.every(request => request.method === 'GET'));
+  }, { actor: 7, scoped: true, respond: ({ url, result }) => url.pathname.endsWith('/messages/search') ? {
+    items: [{ id: 83, thread: 2, title: 'Review', sender: 0, at: 100, snippet: "a'b % snippet" }],
+    total: 2, has_more: true, next_after: 83, through: 90, revision: 'r',
+  } : result });
+});
+
+test('exact message read verifies its thread and retains that check for oversized records', async () => {
+  await fixture(async ({ cli, requests }) => {
+    const result = await cli(['read', '83', '--thread', '2', '--max-bytes', '512']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(requests[0].path, `/p/${project}/messages/83`);
+    assert.equal(requests[0].query.get('thread'), '2');
+    assert.equal(requests[0].query.get('agent'), '7');
+    assert.match(result.stdout, /Continue record: acom read 83 --thread 2 --offset 0 --max-bytes 512 --version 'r'/);
+  }, { actor: 7, scoped: true, respond: ({ url, result }) => url.pathname.endsWith('/messages/83') ? {
+    id: 83, truncated: true, next_offset: 0, version: 'r',
+  } : result });
+});
+
+test('agent details print visible current thread memberships with a discovery command', async () => {
+  await fixture(async ({ cli }) => {
+    const result = await cli(['agent', '1']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Threads \(2 visible\): #4 "Planning", #8 "Review"/);
+    assert.match(result.stdout, /Thread list: acom threads --members 1/);
+  }, { actor: 7, scoped: true, respond: ({ url, result }) => url.pathname.endsWith('/agents/1') ? {
+    ...result, threads: [{ id: 4, title: 'Planning' }, { id: 8, title: 'Review' }],
+  } : result });
+});
+
+test('invalid thread and message search requests reject before project discovery or any network request', async () => {
+  await fixture(async ({ cli, requests }) => {
+    for (const args of [
+      ['threads', '--search', ''], ['threads', '--id', '0'], ['threads', '--member-match', 'any'],
+      ['threads', '--members', '1,'], ['threads', '--members', Array(65).fill('1').join(',')],
+      ['threads', '--search', 'x', '--id', '1'], ['threads', '--category', 'private'],
+      ['messages'], ['messages', '--search', ''], ['messages', '--id', '0'],
+      ['messages', '--search', 'x', '--id', '1'], ['messages', '--search', 'x', '--threads', '0'],
+      ['messages', '--search', 'x', '--thread', '1', '--threads', '2'],
+      ['messages', '--search', 'x', '--from', '200', '--to', '100'],
+      ['messages', '--search', 'x', '--sender', '-1'], ['messages', '--search', 'é'.repeat(2049)],
+      ['read', '1', '--thread', '0'],
+    ]) {
+      const result = await cli(args);
+      assert.notEqual(result.status, 0, args.join(' '));
+    }
+    assert.deepEqual(requests, []);
+  });
 });

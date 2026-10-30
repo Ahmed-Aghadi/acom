@@ -50,6 +50,7 @@ node --test tests/storage.cjs tests/http-boundaries.cjs tests/process-cleanup.cj
 node --test tests/failure-reporting.cjs
 node --test tests/token-usage.cjs
 node --test tests/cli-context.cjs
+node --test tests/search.cjs
 node --test tests/licenses.cjs
 cargo audit
 ```
@@ -62,6 +63,7 @@ npx playwright install chromium
 node --test tests/ui.cjs
 node --test tests/charts.cjs tests/project-data.cjs
 ACOM_BROWSER_TEST=1 node --test tests/server.cjs
+ACOM_BROWSER_TEST=1 node --test tests/search.cjs
 ```
 
 For just the real-server browser setup/settings/filter flow, add `ACOM_BROWSER_TEST_ONLY=1` and `--test-name-pattern='single server'` to the last command.
