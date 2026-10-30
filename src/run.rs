@@ -376,6 +376,9 @@ fn append_entry(path: &Path, at: &str, kind: &str, text: &str) {
 fn stdout_line(app: &Arc<App>, id: i64, harness: &str, model: &str, line: &str) {
     let at = capture_time();
     append(&log_path(app, id, "jsonl"), line);
+    if let Err(error) = app.record_output(id, crate::app::now()) {
+        eprintln!("agent {id}: couldn't record output time: {}", error.1);
+    }
     for event in harness::parse_line(harness, line) {
         apply(app, id, harness, model, event, &at);
     }
@@ -659,6 +662,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             failure: None,
             diagnostic: None,
             completed: false,
+            progress: std::collections::HashMap::new(),
         },
     );
     st.reaped.remove(&id);
@@ -727,6 +731,7 @@ pub(crate) fn activate_turn(app: &Arc<App>, st: &mut St, id: i64, mut turn: Prep
             }
             thread::sleep(Duration::from_secs(1));
         }
+        app.capture_agent_metrics(id, true);
     });
 }
 
@@ -785,17 +790,17 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event, at: &st
             resets_at,
         } => app.record_usage(harness, &win, used_pct, resets_at),
         Event::Failed(reason) => {
-            append_entry(&log_path(app, id, "txt"), at, "error", &reason);
-            app.fail_turn(id, &reason)
+            append_entry(&log_path(app, id, "txt"), at, "error", &reason.message);
+            app.fail_turn_detail(id, reason)
         }
         Event::Diagnostic(reason) => {
             append_entry(
                 &log_path(app, id, "txt"),
                 at,
                 "message",
-                &format!("notice: {reason}"),
+                &format!("notice: {}", reason.message),
             );
-            app.diagnose_turn(id, &reason)
+            app.diagnose_turn_detail(id, reason)
         }
         Event::TurnCompleted => app.complete_turn(id),
         Event::ModelSwitched(reason) => {
@@ -811,6 +816,62 @@ fn apply(app: &Arc<App>, id: i64, harness: &str, asked: &str, ev: Event, at: &st
         }
         Event::Tool(t) => {
             append_entry(&log_path(app, id, "txt"), at, "tool", &t);
+            Ok(())
+        }
+        Event::Activity {
+            id: native_id,
+            kind,
+            phase,
+            text,
+        } => {
+            let activity = {
+                let mut st = app.lock();
+                st.procs.get_mut(&id).and_then(|worker| {
+                    if phase == "completed" {
+                        let previous = worker.progress.get(&native_id);
+                        if previous.is_some_and(|(_, phase, _)| phase == "completed")
+                            || previous.is_none() && kind == "block"
+                        {
+                            None
+                        } else {
+                            let (previous_kind, _, previous_text) = previous
+                                .cloned()
+                                .unwrap_or_else(|| (kind.clone(), String::new(), String::new()));
+                            let kind = if kind == "block" { previous_kind } else { kind };
+                            let text = if text.is_empty() { previous_text } else { text };
+                            worker.progress.insert(
+                                native_id.clone(),
+                                (kind.clone(), phase.clone(), text.clone()),
+                            );
+                            Some((kind, text))
+                        }
+                    } else {
+                        let next = (kind.clone(), phase.clone(), text.clone());
+                        if worker.progress.get(&native_id) == Some(&next) {
+                            None
+                        } else {
+                            worker.progress.insert(native_id.clone(), next);
+                            Some((kind, text))
+                        }
+                    }
+                })
+            };
+            let Some((kind, text)) = activity else {
+                return;
+            };
+            let kind = match (kind.as_str(), phase.as_str()) {
+                ("thinking", "started") => "thinking-start",
+                ("thinking", "completed") => "thinking-end",
+                (_, "started") => "tool-start",
+                (_, "completed") => "tool-end",
+                _ => "progress",
+            };
+            append_entry(
+                &log_path(app, id, "txt"),
+                at,
+                kind,
+                &format!("{text} [{native_id}]"),
+            );
             Ok(())
         }
     };
@@ -945,7 +1006,7 @@ fn apply_side_line(
 mod tests {
     use super::*;
     use crate::app::now;
-    use std::sync::{Condvar, Mutex};
+    use std::sync::Mutex;
 
     #[test]
     fn readable_entries_preserve_multiline_text_with_one_utc_prefix() {
@@ -1009,7 +1070,10 @@ mod tests {
             assert_eq!(text, expected);
         }
         assert_eq!(
-            app.lock().procs[&1].diagnostic.as_deref(),
+            app.lock().procs[&1]
+                .diagnostic
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
             Some("captured failure")
         );
         std::fs::remove_dir_all(&app.home).unwrap();
@@ -1110,10 +1174,13 @@ mod tests {
         assert!(st.procs.is_empty(), "fake turn did not finish");
         assert_eq!(
             st.db
-                .query_row("SELECT context FROM agents WHERE id=1", [], |r| r
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT value FROM context_observations WHERE agent_id=1",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
                 .unwrap(),
-            123
+            "123"
         );
         assert_eq!(st.used_pct("codex").unwrap(), Some(98.0));
         let output = std::fs::read_to_string(log_path(&app, 1, "txt")).unwrap();
@@ -1143,40 +1210,28 @@ mod tests {
     }
 
     fn test_app(pid: u32) -> Arc<App> {
-        let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE agents(id INTEGER PRIMARY KEY,state TEXT,done_req INTEGER DEFAULT 0,rest TEXT DEFAULT 'idle',fresh_in INTEGER DEFAULT 0,cache_write INTEGER DEFAULT 0,cache_read INTEGER DEFAULT 0,output INTEGER DEFAULT 0,harness TEXT DEFAULT 'codex',session_id TEXT,session_started INTEGER DEFAULT 0,turns INTEGER DEFAULT 0); INSERT INTO agents(id,state) VALUES(1,'working');
-            CREATE TABLE agent_token_usage(agent_id INTEGER PRIMARY KEY,ledger TEXT NOT NULL);
-            CREATE TABLE view_revisions(name TEXT PRIMARY KEY,value INTEGER); INSERT INTO view_revisions VALUES('agents',0);
-            CREATE TABLE agent_handoffs(agent_id INTEGER); CREATE TABLE agent_continuations(agent_id INTEGER);").unwrap();
-        Arc::new(App {
-            st: Mutex::new(St {
-                db,
-                shutting_down: false,
-                stopping_agents: Default::default(),
-                waiting_updates: Default::default(),
-                queues: Default::default(),
-                procs: [(
-                    1,
-                    Proc {
-                        pid,
-                        stopping: false,
-                        model: "gpt-6-sol".into(),
-                        effort: "medium".into(),
-                        failure: None,
-                        diagnostic: None,
-                        completed: false,
-                    },
-                )]
-                .into(),
-                reaped: Default::default(),
-            }),
-            cv: Condvar::new(),
-            home: std::env::temp_dir().join(format!("acom-worker-test-{}", harness::new_uuid())),
-            url: String::new(),
-            exe: PathBuf::new(),
-        })
+        let home = std::env::temp_dir().join(format!("acom-worker-test-{}", harness::new_uuid()));
+        let app = App::open(home, String::new()).unwrap();
+        {
+            let mut st = app.lock();
+            st.db.execute_batch("INSERT INTO projects(id,path,name,created_at) VALUES(1,'/synthetic','Synthetic',0);
+                INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(1,1,'Worker','Synthetic task','codex','gpt-6-sol','medium','working',0,0)").unwrap();
+            st.procs.insert(
+                1,
+                Proc {
+                    pid,
+                    stopping: false,
+                    model: "gpt-6-sol".into(),
+                    effort: "medium".into(),
+                    failure: None,
+                    diagnostic: None,
+                    completed: false,
+                    progress: Default::default(),
+                },
+            );
+        }
+        app
     }
-
     #[test]
     fn old_session_events_are_fenced_by_the_same_gate_as_confirmed_stdout_sessions() {
         let app = test_app(0);
@@ -1217,14 +1272,7 @@ mod tests {
         .unwrap();
         drop(changing);
         stale.join().unwrap();
-        assert_eq!(
-            app.lock()
-                .db
-                .query_row("SELECT fresh_in FROM agents WHERE id=1", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            12
-        );
+        assert_eq!(app.agent_view_for(1, None).unwrap()["fresh_in"], 12);
         assert!(app.lock().procs[&1].failure.is_none());
         assert!(
             apply_side_line(
@@ -1292,13 +1340,9 @@ mod tests {
         let wait = |expected| {
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
-                let actual: i64 = app
-                    .lock()
-                    .db
-                    .query_row("SELECT fresh_in FROM agents WHERE id=1", [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
+                let actual = app.agent_view_for(1, None).unwrap()["fresh_in"]
+                    .as_i64()
+                    .unwrap_or(0);
                 if actual == expected {
                     return;
                 }
@@ -1530,6 +1574,7 @@ mod tests {
                     failure: None,
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
         }
@@ -1616,7 +1661,13 @@ mod tests {
         }
         let st = app.lock();
         let worker = st.procs.get(&1).unwrap();
-        assert_eq!(worker.failure.as_deref(), Some("stream disconnected"));
+        assert_eq!(
+            worker
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("stream disconnected")
+        );
         assert!(!worker.stopping);
         assert_eq!(
             st.db
@@ -1658,7 +1709,10 @@ mod tests {
             }
         }
         assert_eq!(
-            app.lock().procs[&1].failure.as_deref(),
+            app.lock().procs[&1]
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
             Some("terminal synthetic failure")
         );
     }
@@ -1680,7 +1734,10 @@ mod tests {
             }
         }
         assert_eq!(
-            app.lock().procs[&1].failure.as_deref(),
+            app.lock().procs[&1]
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
             Some("actual request rejected")
         );
     }

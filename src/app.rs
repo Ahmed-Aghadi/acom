@@ -1,5 +1,5 @@
-// Server state and all the rules: agents, threads, messages, locks, limits.
-// Everything happens under one mutex, so no two changes ever interleave.
+// Project state and rules; related transitions serialize under its core mutex.
+// Shared account transactions and optional history have separate storage lifecycles.
 
 use crate::run;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -12,12 +12,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::paging::fingerprint;
 pub use crate::paging::{PageQuery, bounded_record};
+mod accounts;
 mod agent_query;
+mod controls;
 mod diagnostics;
-mod storage;
+mod drafts;
+mod globals;
+pub(crate) mod metric_history;
+pub(crate) mod portable;
 mod subscriptions;
+mod thread_sort;
 pub(crate) mod tokens;
 pub use agent_query::ParsedAgentQuery;
+pub use controls::{ControlRequest, ControlTargets, PermissionGrant};
+pub use globals::GlobalSettings;
 pub use subscriptions::UsageWatch;
 
 pub const GUIDE: &str = include_str!("guide.md");
@@ -69,6 +77,14 @@ pub fn acom_home() -> PathBuf {
         Some(h) => PathBuf::from(h),
         None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".acom"),
     }
+}
+
+pub fn private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 pub fn now() -> i64 {
@@ -175,8 +191,7 @@ impl Limits {
                 "seven_day_fable" => return self.usage.get("claude_seven_day_fable"),
                 _ => return None,
             };
-            // Previously saved provider-wide thresholds supply both windows until edited.
-            self.usage.get(key).or_else(|| self.usage.get("claude"))
+            self.usage.get(key)
         } else {
             self.usage.get(provider)
         }
@@ -203,10 +218,7 @@ pub struct Settings {
     pub limits: Limits,
     pub auto_resume: bool,
     pub done_closes: bool,
-    #[serde(default = "default_max_lock_ttl_secs")]
     pub max_lock_ttl_secs: u32,
-    #[serde(default = "poll_interval")]
-    pub usage_poll_secs: u64,
     #[serde(default)]
     pub prompts: Prompts,
     #[serde(default)]
@@ -277,10 +289,6 @@ fn check_choice(harness: &str, model: &str, effort: &str) -> R<()> {
         )));
     }
     Ok(())
-}
-
-fn poll_interval() -> u64 {
-    120
 }
 
 fn default_max_lock_ttl_secs() -> u32 {
@@ -369,7 +377,6 @@ impl Default for Settings {
             auto_resume: true,
             done_closes: true,
             max_lock_ttl_secs: default_max_lock_ttl_secs(),
-            usage_poll_secs: poll_interval(),
             prompts: Prompts::default(),
             allow_agent_model_change: false,
             allow_agent_effort_change: false,
@@ -382,9 +389,6 @@ impl Settings {
     fn check(&self) -> R<()> {
         if self.max_lock_ttl_secs == 0 {
             return Err(bad("maximum lock TTL must be a positive number of seconds"));
-        }
-        if !(15..=3600).contains(&self.usage_poll_secs) {
-            return Err(bad("usage check interval must be 15–3600 seconds"));
         }
         if [
             &self.prompts.launch,
@@ -462,7 +466,6 @@ impl Settings {
         }
         for (k, lim) in &l.usage {
             if ![
-                "claude",
                 "claude_five_hour",
                 "claude_seven_day",
                 "claude_seven_day_fable",
@@ -513,17 +516,23 @@ pub struct Proc {
     pub stopping: bool,
     pub model: String,
     pub effort: String,
-    pub failure: Option<String>,
-    pub diagnostic: Option<String>,
+    pub failure: Option<crate::harness::Failure>,
+    pub diagnostic: Option<crate::harness::Failure>,
     pub completed: bool,
+    pub progress: HashMap<String, (String, String, String)>,
 }
 
 impl Proc {
     pub fn failure_reason(&self) -> Option<&str> {
-        self.failure.as_deref().or(if self.completed {
+        self.failure_detail()
+            .map(|failure| failure.message.as_str())
+    }
+
+    pub fn failure_detail(&self) -> Option<&crate::harness::Failure> {
+        self.failure.as_ref().or(if self.completed {
             None
         } else {
-            self.diagnostic.as_deref()
+            self.diagnostic.as_ref()
         })
     }
 }
@@ -545,6 +554,7 @@ pub struct WaitOptions {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentWatch {
     agents: Option<WaitAgents>,
     states: Vec<String>,
@@ -603,13 +613,10 @@ pub struct App {
     pub home: PathBuf,
     pub url: String,
     pub exe: PathBuf,
+    pub metric_history: Mutex<metric_history::History>,
 }
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS configs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, settings TEXT NOT NULL);
--- ID 1 belongs to the binary's virtual Default, not a stored config.
-INSERT INTO sqlite_sequence(name,seq) SELECT 'configs',1
-  WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='configs');
 CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL,
   config INTEGER DEFAULT 1, custom TEXT);
 CREATE TABLE IF NOT EXISTS agents (
@@ -618,9 +625,7 @@ CREATE TABLE IF NOT EXISTS agents (
   state TEXT NOT NULL, rest TEXT NOT NULL DEFAULT 'idle', status_text TEXT, session_id TEXT,
   launched_by INTEGER NOT NULL, launched_at INTEGER NOT NULL, pid INTEGER,
   pause_reason TEXT, pause_from TEXT, paused_at INTEGER, done_req INTEGER NOT NULL DEFAULT 0,
-  context INTEGER NOT NULL DEFAULT 0, context_warned INTEGER NOT NULL DEFAULT 0,
-  fresh_in INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
-  cache_read INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
+  context_warned INTEGER NOT NULL DEFAULT 0,
   turns INTEGER NOT NULL DEFAULT 0, ended_at INTEGER, wake_queued_at INTEGER, wake_why TEXT,
   session_started INTEGER NOT NULL DEFAULT 0, seen_model TEXT, problem TEXT);
 CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, project INTEGER NOT NULL, title TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
@@ -630,10 +635,12 @@ CREATE TABLE IF NOT EXISTS thread_exclusions (thread_id INTEGER NOT NULL, agent_
 CREATE TABLE IF NOT EXISTS members (thread_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, last_notified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (thread_id, agent_id));
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, sender INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_id, id);
+CREATE INDEX IF NOT EXISTS messages_recent ON messages(thread_id, at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS user_reads (thread_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS user_drafts (thread_id INTEGER PRIMARY KEY, text TEXT NOT NULL, version TEXT NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS marks (agent_id INTEGER NOT NULL, message_id INTEGER NOT NULL, mark TEXT NOT NULL, PRIMARY KEY (agent_id, message_id));
 CREATE TABLE IF NOT EXISTS locks (project INTEGER NOT NULL, name TEXT NOT NULL, about TEXT NOT NULL, created_at INTEGER NOT NULL,
-  holder INTEGER, acquired_at INTEGER, expires_at INTEGER, frozen INTEGER NOT NULL DEFAULT 0, frozen_left INTEGER,
+  holder INTEGER, acquired_at INTEGER, expires_at INTEGER,
   PRIMARY KEY (project, name));
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, shown INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS notices_agent ON notices(agent_id,id);
@@ -641,12 +648,14 @@ CREATE INDEX IF NOT EXISTS notices_delivery ON notices(agent_id,shown,id);
 CREATE TABLE IF NOT EXISTS update_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER NOT NULL UNIQUE, text TEXT);
 CREATE TABLE IF NOT EXISTS wait_watch_cursors (agent_id INTEGER NOT NULL, filter TEXT NOT NULL, event_id INTEGER NOT NULL,
   PRIMARY KEY(agent_id,filter));
-CREATE TABLE IF NOT EXISTS usage (provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL, PRIMARY KEY (provider, win));
-CREATE TABLE IF NOT EXISTS usage_checks (provider TEXT PRIMARY KEY, checked_at INTEGER, attempted_at INTEGER, next_check INTEGER, error TEXT, in_flight INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage_soft_warnings (agent_id INTEGER NOT NULL, provider TEXT NOT NULL, scope TEXT NOT NULL,
   threshold REAL NOT NULL, windows TEXT NOT NULL, PRIMARY KEY(agent_id,provider,scope));
 CREATE TABLE IF NOT EXISTS agent_retries (agent_id INTEGER PRIMARY KEY, source TEXT NOT NULL, effort TEXT, tried TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0, replacement INTEGER, blocked TEXT, same_model_attempts INTEGER NOT NULL DEFAULT 0, eligible_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_quota_blocks (agent_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, win TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_failures (agent_id INTEGER PRIMARY KEY, details TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_log_state (agent_id INTEGER PRIMARY KEY, last_output_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS account_cursor(id INTEGER PRIMARY KEY CHECK(id=1), event_id INTEGER NOT NULL);
+INSERT OR IGNORE INTO account_cursor VALUES(1,0);
 CREATE TABLE IF NOT EXISTS agent_continuations (agent_id INTEGER PRIMARY KEY, text TEXT NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_handoffs (agent_id INTEGER PRIMARY KEY, request TEXT NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_starts (agent_id INTEGER PRIMARY KEY, predecessor INTEGER NOT NULL, blocked TEXT, attempted INTEGER NOT NULL DEFAULT 0);
@@ -660,12 +669,6 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project
 CREATE INDEX IF NOT EXISTS events_agent ON events(project,agent,id);
 CREATE INDEX IF NOT EXISTS events_thread ON events(project,thread,id);
 CREATE TABLE IF NOT EXISTS summary_cursors (agent_id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS history_origin (id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL);
-INSERT OR IGNORE INTO history_origin(id,message_id) SELECT 1,coalesce(max(id),0) FROM messages;
--- Existing current members are retained; earlier membership context is unknown.
-INSERT INTO member_intervals(thread_id,agent_id,start_after)
-  SELECT b.thread_id,b.agent_id,0 FROM members b WHERE NOT EXISTS(
-    SELECT 1 FROM member_intervals i WHERE i.thread_id=b.thread_id AND i.agent_id=b.agent_id);
 
 -- Membership intervals and their events are part of the statement that joins/leaves.
 CREATE TRIGGER IF NOT EXISTS member_joined AFTER INSERT ON members BEGIN
@@ -747,16 +750,15 @@ END;
 CREATE TRIGGER IF NOT EXISTS lock_released AFTER UPDATE OF holder ON locks
 WHEN OLD.holder IS NOT NULL AND OLD.holder IS NOT NEW.holder BEGIN
   INSERT INTO events(project,at,kind,actor,agent,lock,details)
-    VALUES(OLD.project,unixepoch(),CASE WHEN OLD.frozen=0 AND OLD.expires_at<=unixepoch() THEN 'lock.expired' ELSE 'lock.released' END,
+    VALUES(OLD.project,unixepoch(),CASE WHEN OLD.expires_at<=unixepoch() THEN 'lock.expired' ELSE 'lock.released' END,
       'acom',OLD.holder,OLD.name,json_object('acquired_at',OLD.acquired_at,'expires_at',OLD.expires_at));
 END;
-CREATE TRIGGER IF NOT EXISTS lock_changed AFTER UPDATE OF expires_at,frozen,frozen_left ON locks
+CREATE TRIGGER IF NOT EXISTS lock_changed AFTER UPDATE OF expires_at ON locks
 WHEN NEW.holder IS NOT NULL AND OLD.holder=NEW.holder
-  AND (OLD.expires_at IS NOT NEW.expires_at OR OLD.frozen<>NEW.frozen OR OLD.frozen_left IS NOT NEW.frozen_left) BEGIN
+  AND OLD.expires_at IS NOT NEW.expires_at BEGIN
   INSERT INTO events(project,at,kind,actor,agent,lock,details)
-    VALUES(NEW.project,unixepoch(),CASE WHEN OLD.frozen<>NEW.frozen THEN CASE WHEN NEW.frozen=1 THEN 'lock.frozen' ELSE 'lock.unfrozen' END
-      ELSE CASE WHEN NEW.expires_at<OLD.expires_at OR NEW.frozen_left<OLD.frozen_left THEN 'lock.shortened' ELSE 'lock.renewed' END END,
-      'acom',NEW.holder,NEW.name,json_object('expires_at',NEW.expires_at,'frozen_left',NEW.frozen_left));
+    VALUES(NEW.project,unixepoch(),CASE WHEN NEW.expires_at<OLD.expires_at THEN 'lock.shortened' ELSE 'lock.renewed' END,
+      'acom',NEW.holder,NEW.name,json_object('expires_at',NEW.expires_at));
 END;
 CREATE TABLE IF NOT EXISTS view_revisions (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO view_revisions VALUES('epoch',0);
@@ -766,14 +768,19 @@ INSERT OR IGNORE INTO view_ids SELECT 'messages',coalesce(max(id),0) FROM messag
 INSERT OR IGNORE INTO view_ids SELECT 'threads',coalesce(max(id),0) FROM threads;
 INSERT OR IGNORE INTO view_ids SELECT 'locks',coalesce(max(rowid),0) FROM locks;
 INSERT OR IGNORE INTO view_ids SELECT 'notices',coalesce(max(id),0) FROM notices;
+PRAGMA application_id=1094929731;
+PRAGMA user_version=2;
 ";
 
 // Revision counters participate in the same SQLite transaction as their rows,
 // including external writes. No-op updates do not invalidate a snapshot.
 fn initialize_views(db: &Connection) -> R<()> {
+    db.execute_batch(controls::SCHEMA)?;
+    accounts::initialize(db, None)?;
     db.execute_batch(subscriptions::SCHEMA)?;
     db.execute_batch(diagnostics::SCHEMA)?;
     db.execute_batch(tokens::SCHEMA)?;
+    db.execute_batch(metric_history::SCHEMA)?;
     db.create_scalar_function(
         "acom_lower",
         1,
@@ -783,9 +790,9 @@ fn initialize_views(db: &Connection) -> R<()> {
     )?;
     for table in [
         "projects",
-        "configs",
         "agents",
         "agent_token_usage",
+        "context_observations",
         "threads",
         "messages",
         "members",
@@ -799,12 +806,12 @@ fn initialize_views(db: &Connection) -> R<()> {
         "locks",
         "activity",
         "events",
-        "usage",
-        "usage_checks",
         "notices",
         "agent_handoffs",
         "agent_starts",
         "agent_retries",
+        "agent_failures",
+        "agent_log_state",
         "subscriptions",
         "subscription_updates",
     ] {
@@ -831,6 +838,18 @@ fn initialize_views(db: &Connection) -> R<()> {
         db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS view_id_{table} AFTER INSERT ON {table} BEGIN UPDATE view_ids SET id=max(id,NEW.rowid) WHERE name='{table}'; END;"))?;
     }
     db.execute(
+        "INSERT OR IGNORE INTO view_revisions VALUES('project_counts',0)",
+        [],
+    )?;
+    for operation in ["INSERT", "UPDATE", "DELETE"] {
+        let when = if operation == "UPDATE" {
+            "WHEN OLD.project IS NOT NEW.project OR (OLD.state IN ('working','idle')) IS NOT (NEW.state IN ('working','idle'))"
+        } else {
+            ""
+        };
+        db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS view_project_counts_{operation} AFTER {operation} ON agents {when} BEGIN UPDATE view_revisions SET value=value+1 WHERE name='project_counts'; END;"))?;
+    }
+    db.execute(
         "UPDATE view_revisions SET value=value+1 WHERE name='epoch'",
         [],
     )?;
@@ -840,74 +859,47 @@ fn initialize_views(db: &Connection) -> R<()> {
 /// Development schemas changed before release; don't serve a half-working old
 /// database or alter its records. Starting with a separate ACOM_HOME is safe.
 fn check_stored_schema(db: &Connection) -> R<()> {
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('agents','configs','projects'))",
+    let populated: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table')",
         [],
         |r| r.get(0),
     )?;
-    if !exists {
-        return Ok(());
-    }
-    let autoincrement_tables: i64 = db.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('projects','configs')
-         AND upper(sql) LIKE '%AUTOINCREMENT%'",
-        [],
-        |r| r.get(0),
-    )?;
-    let mut interrupted_schema = false;
-    for table in ["agent_continuations", "agent_handoffs"] {
-        let exists: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-            [table],
-            |r| r.get(0),
-        )?;
-        if exists
-            && db
-                .prepare(&format!("SELECT attempted FROM {table} LIMIT 0"))
-                .is_err()
-        {
-            interrupted_schema = true;
-        }
-    }
-    if db
-        .prepare(
-            "SELECT a.project, a.seen_model, a.problem, t.project, l.project, x.project,
-                    p.config, p.custom, c.settings, r.effort, r.same_model_attempts, r.eligible_at
-                   FROM agents a, threads t, locks l, activity x, projects p, configs c, agent_retries r LIMIT 0",
-        )
-        .is_err()
-        || autoincrement_tables != 2
-        || interrupted_schema
-        || db.query_row("SELECT EXISTS(SELECT 1 FROM configs WHERE id=1 OR name='Default')", [], |r| r.get::<_, bool>(0))?
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let application: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    if (populated || version != 0 || application != 0)
+        && (version != 2 || application != 1094929731)
     {
-        return Err(bad(
-            "this database uses an earlier development schema. It has not been changed. Keep it as a backup and start with a separate ACOM_HOME folder.",
+        return Err(conflict(
+            "this database uses an unsupported development format. It has not been changed. Keep a backup and use a fresh ACOM_HOME.",
         ));
     }
-    for (kind, query) in [
-        ("config", "SELECT id,settings FROM configs"),
-        (
-            "project",
+    if populated {
+        for saved in rows(
+            db,
             "SELECT id,custom FROM projects WHERE custom IS NOT NULL",
-        ),
-    ] {
-        let mut statement = db.prepare(query)?;
-        let saved = statement.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for item in saved {
-            let (id, text) = item?;
-            let settings: Settings = serde_json::from_str(&text).map_err(|error| {
-                bad(format!("invalid saved settings for {kind} {id}: {error}. Saved data has not been changed; restore valid settings or use a separate ACOM_HOME."))
+            [],
+        )? {
+            let id = &saved["id"];
+            let text = saved["custom"].as_str().ok_or_else(|| {
+                bad(format!(
+                    "invalid saved settings type for project {id}; saved data has not been changed"
+                ))
             })?;
-            settings.check().map_err(|Fail(_, message)| {
-                bad(format!("invalid saved settings for {kind} {id}: {message}. Saved data has not been changed; restore valid settings or use a separate ACOM_HOME."))
+            let settings: Settings = serde_json::from_str(text).map_err(|e| {
+                bad(format!(
+                    "invalid saved settings for project {id}: {e}; saved data has not been changed"
+                ))
+            })?;
+            settings.check().map_err(|e| {
+                bad(format!(
+                    "invalid saved settings for project {id}: {}; saved data has not been changed",
+                    e.1
+                ))
             })?;
         }
     }
     Ok(())
 }
-
 /// An agent row, as the rules need it.
 pub struct Agent {
     pub project: i64,
@@ -940,6 +932,26 @@ pub fn actor(agent: i64, via: Option<i64>) -> String {
     match (agent, via) {
         (0, Some(v)) => format!("user (via agent {v})"),
         (a, _) => who(a),
+    }
+}
+
+fn public_project(value: &mut Value, project: &str) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                public_project(item, project);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                if key == "project" && item.is_number() {
+                    *item = json!(project);
+                } else {
+                    public_project(item, project);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -976,14 +988,54 @@ pub fn rows(db: &Connection, sql: &str, p: impl rusqlite::Params) -> R<Vec<Value
 }
 
 impl St {
+    fn save_failure(&self, id: i64, failure: &crate::harness::Failure) -> R<()> {
+        self.db.execute(
+            "INSERT INTO agent_failures(agent_id,details) VALUES(?1,?2)
+             ON CONFLICT(agent_id) DO UPDATE SET details=excluded.details",
+            params![id, json!(failure).to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn failure_details(&self, id: i64) -> R<Value> {
+        let saved: Option<String> = self
+            .db
+            .query_row(
+                "SELECT details FROM agent_failures WHERE agent_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        saved
+            .map(|saved| serde_json::from_str(&saved).map_err(|e| Fail(500, e.to_string())))
+            .transpose()
+            .map(|value| value.unwrap_or(Value::Null))
+    }
+
     /// Commit a related group of writes together, also inside an existing savepoint.
     fn atomic<T>(&mut self, change: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
-        self.db.execute_batch("SAVEPOINT change")?;
+        let outer = self.db.is_autocommit();
+        if outer {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        if let Err(error) = self.db.execute_batch("SAVEPOINT change") {
+            if outer {
+                let _ = self.db.execute_batch("ROLLBACK");
+            }
+            return Err(error.into());
+        }
         let result = change(self);
         match result {
             Ok(value) => {
                 if let Err(e) = self.db.execute_batch("RELEASE change") {
                     let _ = self.db.execute_batch("ROLLBACK TO change; RELEASE change");
+                    if outer {
+                        let _ = self.db.execute_batch("ROLLBACK");
+                    }
+                    return Err(e.into());
+                }
+                if outer && let Err(e) = self.db.execute_batch("COMMIT") {
+                    let _ = self.db.execute_batch("ROLLBACK");
                     return Err(e.into());
                 }
                 Ok(value)
@@ -991,6 +1043,9 @@ impl St {
             Err(e) => {
                 self.db
                     .execute_batch("ROLLBACK TO change; RELEASE change")?;
+                if outer {
+                    self.db.execute_batch("ROLLBACK")?;
+                }
                 Err(e)
             }
         }
@@ -1030,7 +1085,7 @@ impl St {
                 .db
                 .query_row(
                     "SELECT coalesce(p.custom, c.settings) FROM projects p
-                     LEFT JOIN configs c ON c.id=p.config AND p.config<>1 WHERE p.id=?1",
+                     LEFT JOIN global.configs c ON c.id=p.config AND p.config<>1 WHERE p.id=?1",
                     [p],
                     |r| r.get(0),
                 )
@@ -1163,7 +1218,7 @@ impl St {
     /// Last observed usage, including expired windows until a fresh check confirms a reset.
     pub fn used_pct(&self, provider: &str) -> R<Option<f64>> {
         Ok(self.db.query_row(
-            "SELECT max(used_pct) FROM usage WHERE provider=?1 AND win<>'seven_day_fable'",
+            "SELECT max(used_pct) FROM global.usage WHERE provider=?1 AND win<>'seven_day_fable'",
             [provider],
             |r| r.get::<_, Option<f64>>(0),
         )?)
@@ -1173,7 +1228,7 @@ impl St {
         Ok(self
             .db
             .query_row(
-                "SELECT used_pct FROM usage WHERE provider=?1 AND win=?2",
+                "SELECT used_pct FROM global.usage WHERE provider=?1 AND win=?2",
                 params![provider, window],
                 |r| r.get(0),
             )
@@ -1196,7 +1251,7 @@ impl St {
         } else {
             for r in rows(
                 &self.db,
-                "SELECT win,used_pct FROM usage WHERE provider=?1",
+                "SELECT win,used_pct FROM global.usage WHERE provider=?1",
                 [provider],
             )? {
                 let window = r["win"].as_str().unwrap();
@@ -1224,7 +1279,7 @@ impl St {
         limits: &Limits,
     ) -> R<bool> {
         self.atomic(|st| {
-            let readings = rows(&st.db, "SELECT win,used_pct FROM usage WHERE provider=?1 AND win<>'limit'", [provider])?;
+            let readings = rows(&st.db, "SELECT win,used_pct FROM global.usage WHERE provider=?1 AND win<>'limit'", [provider])?;
             let label = |scope: &str| {
                 if scope.is_empty() {
                     format!("{provider} subscription usage")
@@ -1254,7 +1309,7 @@ impl St {
                 let mut used: f64 = 0.0;
                 for window in &windows {
                     let observed: Option<f64> = st.db.query_row(
-                        "SELECT used_pct FROM usage_observations WHERE provider=?1 AND win=?2",
+                        "SELECT used_pct FROM global.usage_observations WHERE provider=?1 AND win=?2",
                         params![provider,window], |r| r.get(0)).optional()?;
                     recovered &= observed.is_some_and(|v| v < threshold);
                     used = used.max(observed.unwrap_or(100.0));
@@ -1459,7 +1514,7 @@ impl St {
                 |r| r.get(0),
             )?;
             st.db.execute(
-                "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL, frozen=0, frozen_left=NULL
+                "UPDATE locks SET holder=NULL, acquired_at=NULL, expires_at=NULL
                  WHERE project=?1 AND name=?2",
                 params![project, name],
             )?;
@@ -1511,29 +1566,32 @@ impl St {
 
     /// Shorten oversized or untimed leases without extending valid leases.
     fn cap_lock_ttls(&mut self, project: i64, max: u32) -> R<bool> {
-        self.atomic(|st| {
-            let deadline = now() + i64::from(max);
-            let affected = rows(
-                &st.db,
-                "SELECT name,holder FROM locks WHERE project=?1 AND holder IS NOT NULL AND
+        self.atomic(|st| st.cap_lock_ttls_inner(project, max))
+    }
+
+    fn cap_lock_ttls_inner(&self, project: i64, max: u32) -> R<bool> {
+        let st = self;
+        let deadline = now() + i64::from(max);
+        let affected = rows(
+            &st.db,
+            "SELECT name,holder FROM locks WHERE project=?1 AND holder IS NOT NULL AND
                  (expires_at IS NULL OR expires_at>?2)",
-                params![project, deadline],
+            params![project, deadline],
+        )?;
+        for l in &affected {
+            let name = l["name"].as_str().unwrap();
+            st.db.execute(
+                "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
+                params![project, name, deadline],
             )?;
-            for l in &affected {
-                let name = l["name"].as_str().unwrap();
-                st.db.execute(
-                    "UPDATE locks SET expires_at=?3 WHERE project=?1 AND name=?2",
-                    params![project, name, deadline],
-                )?;
-                st.notice(
-                    l["holder"].as_i64().unwrap(),
-                    &format!(
-                        "Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining."
-                    ),
-                )?;
-            }
-            Ok(!affected.is_empty())
-        })
+            st.notice(
+                l["holder"].as_i64().unwrap(),
+                &format!(
+                    "Lock `{name}` was shortened to the project's maximum TTL: {max}s remaining."
+                ),
+            )?;
+        }
+        Ok(!affected.is_empty())
     }
 
     // ---------- messages ----------
@@ -1843,16 +1901,27 @@ struct SelectedPage {
     through: i64,
     total: i64,
     revision: String,
+    project_key: Option<String>,
 }
 impl SelectedPage {
-    fn finish(self, q: &PageQuery) -> R<Value> {
+    fn finish(mut self, q: &PageQuery) -> R<Value> {
+        if let Some(project) = &self.project_key {
+            for item in &mut self.items {
+                public_project(item, project);
+            }
+        }
         match self.unchanged {
             Some(value) => Ok(value),
             None => q.finish(self.items, self.total, self.through, &self.revision),
         }
     }
 
-    fn finish_with(self, q: &PageQuery, extra: &Value) -> R<Value> {
+    fn finish_with(mut self, q: &PageQuery, extra: &Value) -> R<Value> {
+        if let Some(project) = &self.project_key {
+            for item in &mut self.items {
+                public_project(item, project);
+            }
+        }
         match self.unchanged {
             Some(value) => Ok(value),
             None => q.finish_with(self.items, self.total, self.through, &self.revision, extra),
@@ -1861,20 +1930,36 @@ impl SelectedPage {
 }
 
 impl App {
+    pub fn project_key(&self) -> Option<&str> {
+        self.url.rsplit_once("/p/").map(|(_, id)| id)
+    }
+
+    pub fn public_value(&self, mut value: Value) -> Value {
+        if let Some(project) = self.project_key() {
+            public_project(&mut value, project);
+        }
+        value
+    }
+    #[cfg(test)]
     pub fn open(home: PathBuf, url: String) -> R<Arc<App>> {
-        std::fs::create_dir_all(home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
+        let shared = home.join("shared.db");
+        let app = Self::open_shared(home, url, &shared)?;
+        app.lock()
+            .db
+            .execute("UPDATE global.usage_checks SET in_flight=0", [])?;
+        Ok(app)
+    }
+
+    pub fn open_shared(home: PathBuf, url: String, shared: &std::path::Path) -> R<Arc<App>> {
+        private_directory(&home.join("logs")).map_err(|e| Fail(500, e.to_string()))?;
         let home = std::fs::canonicalize(home).map_err(|e| Fail(500, e.to_string()))?;
         let db = Connection::open(home.join("acom.db"))?;
         check_stored_schema(&db)?;
         // Refuse ambiguous live ownership before schema/cursor writes or cleanup.
         // The old address remains saved until startup completes, including when
         // this restart selects a different port.
-        let previous_url = std::fs::read_to_string(home.join("port"))
-            .ok()
-            .and_then(|port| port.trim().parse::<u16>().ok())
-            .filter(|port| *port != 0)
-            .map(|port| format!("http://127.0.0.1:{port}"))
-            .unwrap_or_else(|| url.clone());
+        let previous_url =
+            std::fs::read_to_string(home.join("server-url")).unwrap_or_else(|_| url.clone());
         let has_agents: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents')",
             [],
@@ -1893,9 +1978,9 @@ impl App {
                 "cannot verify ownership of live agent {id} worker PID {pid}: ACOM_HOME is missing. Stop its workers using the previous server/version, then restart; no workers or saved agent state were changed."
             )));
         }
+        accounts::initialize(&db, Some(shared))?;
         db.execute_batch(SCHEMA)?;
         initialize_views(&db)?;
-        db.execute("UPDATE usage_checks SET in_flight=0", [])?;
         let mut st = St {
             db,
             shutting_down: false,
@@ -1936,12 +2021,16 @@ impl App {
             )?;
         }
         let exe = std::env::current_exe().map_err(|e| Fail(500, e.to_string()))?;
+        let metric_history = Mutex::new(metric_history::History::open_optional(
+            home.join("metrics.db"),
+        ));
         let app = Arc::new(App {
             st: Mutex::new(st),
             cv: Condvar::new(),
             home,
             url,
             exe,
+            metric_history,
         });
         run::StopTools::new(&app, &agent_ids, &groups, &previous_url)?.stop(&app)?;
         app.lock().atomic(|st| {
@@ -1952,6 +2041,8 @@ impl App {
                 .execute("UPDATE agents SET pid=NULL WHERE pid IS NOT NULL", [])?;
             Ok(())
         })?;
+        std::fs::write(app.home.join("server-url"), &app.url)
+            .map_err(|e| Fail(500, format!("cannot save server ownership marker: {e}")))?;
         Ok(app)
     }
 
@@ -1993,6 +2084,10 @@ impl App {
             Err(e) => {
                 st.atomic(|st| {
                 let a=st.agent(id)?;
+                st.save_failure(id, &crate::harness::Failure {
+                    message: e.1.clone(), kind: crate::harness::FailureKind::Startup,
+                    code: None, source: Some("launch".into()),
+                })?;
                 st.remember_crash(id,&a)?;
                 st.set_state(id, "crashed")?;
                 st.db.execute("UPDATE agents SET problem=?2 WHERE id=?1",params![id,e.1])?;
@@ -2169,6 +2264,7 @@ impl App {
             .effort
             .as_deref()
             .ok_or_else(|| bad("missing resolved effort"))?;
+        accounts::catch_up(st)?;
         let session = if harness == "claude" {
             Some(crate::harness::new_uuid())
         } else {
@@ -2229,7 +2325,10 @@ impl App {
         if st.shutting_down {
             return Ok(());
         }
-        st.atomic(|st| subscriptions::process(st))?;
+        st.atomic(|st| {
+            accounts::sync(st)?;
+            subscriptions::process(st)
+        })?;
         if st.procs.contains_key(&id) || st.stopping_agents.contains(&id) {
             return Ok(()); // still stopping; turn_ended wakes it if needed
         }
@@ -2289,6 +2388,10 @@ impl App {
                 if let Err(error) = result {
                     st.atomic(|st| {
                         st.db.execute("UPDATE subscription_starts SET error=?2 WHERE agent=?1",params![id,error.1])?;
+                        st.save_failure(id, &crate::harness::Failure {
+                            message: error.1.clone(), kind: crate::harness::FailureKind::Startup,
+                            code: None, source: Some("subscription_wake".into()),
+                        })?;
                         st.remember_crash(id,&a)?;
                         st.set_state(id,"crashed")?;
                         st.db.execute("UPDATE agents SET problem=?2 WHERE id=?1",params![id,error.1])?;
@@ -2425,10 +2528,7 @@ impl App {
             self.pause_locked(&mut st, id, "limit", "acom")?;
             a = st.agent(id)?;
         }
-        let failure = st
-            .procs
-            .get(&id)
-            .and_then(|p| p.failure_reason().map(str::to_owned));
+        let failure = st.procs.get(&id).and_then(|p| p.failure_detail().cloned());
         let stopping = st.procs.get(&id).is_some_and(|p| p.stopping);
         let failed = (!ok || failure.is_some()) && !stopping && a.state == "working";
         if a.state != "working" {
@@ -2486,10 +2586,14 @@ impl App {
                 st.release_all(id, &format!("you became {next}"))?;
             }
             if next == "crashed" {
-                let why = failure
-                    .as_deref()
-                    .or(error)
-                    .unwrap_or("its process exited with an error");
+                let failure = failure.clone().unwrap_or_else(|| crate::harness::Failure {
+                    message: error.unwrap_or("its process exited with an error").into(),
+                    kind: crate::harness::FailureKind::ProcessExit,
+                    code: None,
+                    source: Some("process_exit".into()),
+                });
+                let why = &failure.message;
+                st.save_failure(id, &failure)?;
                 st.db
                     .execute("UPDATE agents SET problem=?2 WHERE id=?1", params![id, why])?;
                 st.log_for(id, "acom", &format!("agent {id} crashed: {why}"))?;
@@ -2499,7 +2603,7 @@ impl App {
                     None,
                     "agent.failed",
                     "acom",
-                    json!({"reason":why,"harness":a.harness,"model":st.procs.get(&id).map_or(a.model.as_str(),|p|p.model.as_str()),"effort":st.procs.get(&id).map_or(a.effort.as_str(),|p|p.effort.as_str())}),
+                    json!({"reason":why,"failure":failure,"harness":a.harness,"model":st.procs.get(&id).map_or(a.model.as_str(),|p|p.model.as_str()),"effort":st.procs.get(&id).map_or(a.effort.as_str(),|p|p.effort.as_str())}),
                 )?;
             } else {
                 st.db
@@ -2522,11 +2626,32 @@ impl App {
     // ---------- agent controls (user commands) ----------
 
     pub fn pause(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
+        self.pause_as(id, by, None)
+    }
+
+    fn pause_as(
+        self: &Arc<Self>,
+        id: i64,
+        by: &str,
+        guard: Option<&controls::ControlGuard>,
+    ) -> R<()> {
         let mut st = self.lock();
-        self.pause_locked(&mut st, id, "user", by)
+        self.pause_locked_as(&mut st, id, "user", by, guard)
     }
 
     fn pause_locked(self: &Arc<Self>, st: &mut St, id: i64, reason: &str, by: &str) -> R<()> {
+        self.pause_locked_as(st, id, reason, by, None)
+    }
+
+    fn pause_locked_as(
+        self: &Arc<Self>,
+        st: &mut St,
+        id: i64,
+        reason: &str,
+        by: &str,
+        guard: Option<&controls::ControlGuard>,
+    ) -> R<()> {
+        controls::check(st, guard, id, "pause")?;
         let a = st.agent(id)?;
         if !matches!(a.state.as_str(), "working" | "idle" | "done") {
             return Err(conflict(format!("agent {id} is {}", a.state)));
@@ -2542,6 +2667,7 @@ impl App {
           if matches!(reason, "user" | "all") {
               st.log_for(id, by, &format!("paused agent {id}"))?;
           }
+          controls::audit(st, guard, id, "pause", &a.state)?;
           Ok(())
         })?;
         if let Some(p) = st.procs.get_mut(&id) {
@@ -2651,8 +2777,19 @@ impl App {
     }
 
     pub fn resume(self: &Arc<Self>, id: i64, by: &str) -> R<Vec<String>> {
-        let mut st = self.wait_stopped(self.lock(), &[id]);
-        self.resume_locked(&mut st, id, by)?;
+        self.resume_as(id, by, None)
+    }
+
+    fn resume_as(
+        self: &Arc<Self>,
+        id: i64,
+        by: &str,
+        guard: Option<&controls::ControlGuard>,
+    ) -> R<Vec<String>> {
+        let st = self.lock();
+        controls::check(&st, guard, id, "resume")?;
+        let mut st = self.wait_stopped(st, &[id]);
+        self.resume_locked_as(&mut st, id, by, guard)?;
         // A failed stop can still reserve locks until cleanup is confirmed.
         let project = st.agent(id)?.project;
         let mut warn = Vec::new();
@@ -2668,9 +2805,25 @@ impl App {
     }
 
     fn resume_locked(self: &Arc<Self>, st: &mut St, id: i64, by: &str) -> R<()> {
-        let turn = st.atomic(|st| match self.prepare_resume(st, id, by)? {
-            Some(prompt) => run::prepare_turn(self, st, id, &prompt, None).map(Some),
-            None => Ok(None),
+        self.resume_locked_as(st, id, by, None)
+    }
+
+    fn resume_locked_as(
+        self: &Arc<Self>,
+        st: &mut St,
+        id: i64,
+        by: &str,
+        guard: Option<&controls::ControlGuard>,
+    ) -> R<()> {
+        let turn = st.atomic(|st| {
+            controls::check(st, guard, id, "resume")?;
+            let before = st.agent(id)?.state;
+            let turn = match self.prepare_resume(st, id, by)? {
+                Some(prompt) => run::prepare_turn(self, st, id, &prompt, None).map(Some),
+                None => Ok(None),
+            }?;
+            controls::audit(st, guard, id, "resume", &before)?;
+            Ok(turn)
         })?;
         if let Some(turn) = turn {
             run::activate_turn(self, st, id, turn);
@@ -2696,6 +2849,7 @@ impl App {
                 "agent {id} is still stopping; try again in a moment"
             )));
         }
+        accounts::catch_up(st)?;
         if by != "acom" {
             st.db
                 .execute("DELETE FROM agent_retries WHERE agent_id=?1", [id])?;
@@ -2898,7 +3052,17 @@ impl App {
     }
 
     pub fn close(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
+        self.close_as(id, by, None)
+    }
+
+    fn close_as(
+        self: &Arc<Self>,
+        id: i64,
+        by: &str,
+        guard: Option<&controls::ControlGuard>,
+    ) -> R<()> {
         let mut st = self.lock();
+        controls::check(&st, guard, id, "close")?;
         if st.stopping_agents.contains(&id) {
             return Err(conflict(
                 "the old worker is still stopping; try again shortly",
@@ -2919,6 +3083,7 @@ impl App {
             st.db.execute("UPDATE agents SET pause_reason=NULL, pause_from=NULL, paused_at=NULL, rest='idle' WHERE id=?1", [id])?;
             st.set_state(id, "closed")?;
             st.log_for(id, by, &format!("closed agent {id}"))?;
+            controls::audit(st, guard, id, "close", &a.state)?;
             Ok(())
         })?;
         if let Some(p) = st.procs.get_mut(&id) {
@@ -2930,21 +3095,38 @@ impl App {
     }
 
     pub fn reopen(self: &Arc<Self>, id: i64, by: &str) -> R<()> {
-        let mut st = self.wait_stopped(self.lock(), &[id]);
+        self.reopen_as(id, by, None)
+    }
+
+    fn reopen_as(
+        self: &Arc<Self>,
+        id: i64,
+        by: &str,
+        guard: Option<&controls::ControlGuard>,
+    ) -> R<()> {
+        let st = self.lock();
+        controls::check(&st, guard, id, "reopen")?;
+        let mut st = self.wait_stopped(st, &[id]);
+        controls::check(&st, guard, id, "reopen")?;
         if st.agent(id)?.state != "closed" {
             return Err(conflict(format!("agent {id} isn't closed")));
         }
-        st.set_state(
-            id,
-            if Self::has_start(&st, id)? {
-                "done"
-            } else {
-                "idle"
-            },
-        )?;
-        st.db
-            .execute("UPDATE agents SET problem=NULL WHERE id=?1", [id])?;
-        st.log_for(id, by, &format!("reopened agent {id}"))?;
+        st.atomic(|st| {
+            accounts::catch_up(st)?;
+            st.set_state(
+                id,
+                if Self::has_start(st, id)? {
+                    "done"
+                } else {
+                    "idle"
+                },
+            )?;
+            st.db
+                .execute("UPDATE agents SET problem=NULL WHERE id=?1", [id])?;
+            st.log_for(id, by, &format!("reopened agent {id}"))?;
+            controls::audit(st, guard, id, "reopen", "closed")?;
+            Ok(())
+        })?;
         self.maybe_wake(&mut st, id)
     }
 
@@ -3290,6 +3472,10 @@ impl App {
     fn failed_start(st: &mut St, id: i64, reason: &str) -> R<()> {
         st.atomic(|st| {
             let a = st.agent(id)?;
+            st.save_failure(id, &crate::harness::Failure {
+                message: reason.into(), kind: crate::harness::FailureKind::Startup,
+                code: None, source: Some("startup".into()),
+            })?;
             st.db.execute("DELETE FROM agent_starts WHERE agent_id=?1",[id])?;
             st.remember_crash(id,&a)?;
             st.set_state(id,"crashed")?;
@@ -3316,6 +3502,7 @@ impl App {
     }
 
     fn inherit_memberships(st: &St, id: i64, new: i64) -> R<()> {
+        controls::inherit(st, id, new)?;
         st.db.execute(
             "INSERT OR IGNORE INTO members(thread_id,agent_id,last_notified)
             SELECT b.thread_id,?2,b.last_notified FROM members b WHERE b.agent_id=?1
@@ -3550,48 +3737,20 @@ impl App {
                 usage: Some(usage),
             }));
         }
-        let mut agents = options.agents.clone().unwrap();
-        let project = st.agent(id)?.project;
-        match &mut agents {
-            WaitAgents::All(value) if value == "all" => {}
-            WaitAgents::All(_) => return Err(bad("agents must be all or an array of agent IDs")),
-            WaitAgents::Selected(ids) => {
-                ids.sort_unstable();
-                ids.dedup();
-                if ids.is_empty() || ids.len() > 200 {
-                    return Err(bad("watch 1–200 agent IDs, or all"));
-                }
-                for agent in ids {
-                    if *agent <= 0 {
-                        return Err(bad("watched agent IDs must be positive"));
-                    }
-                    if *agent == id {
-                        return Err(bad("watch peer agents, not yourself"));
-                    }
-                    if st.agent(*agent)?.project != project {
-                        return Err(bad(format!("agent {agent} is in another project")));
-                    }
-                }
-            }
-        }
-        let mut states = options
-            .states
-            .clone()
-            .unwrap_or_else(|| STATES.iter().map(|s| s.to_string()).collect());
-        states.sort();
-        states.dedup();
-        if states.is_empty() || states.iter().any(|state| !STATES.contains(&state.as_str())) {
-            return Err(bad(format!(
-                "states must contain lifecycle states: {}",
-                STATES.join(", ")
-            )));
-        }
-        Ok(Some(AgentWatch {
-            agents: Some(agents),
-            states,
-            status_text: options.status_text,
-            usage,
-        }))
+        subscriptions::normalize_watch(
+            &st.db,
+            id,
+            AgentWatch {
+                agents: options.agents.clone(),
+                states: options
+                    .states
+                    .clone()
+                    .unwrap_or_else(|| STATES.iter().map(|state| (*state).to_string()).collect()),
+                status_text: options.status_text,
+                usage,
+            },
+        )
+        .map(Some)
     }
 
     fn watch_updates(st: &St, id: i64, watch: &AgentWatch, after: Option<i64>) -> R<String> {
@@ -4539,7 +4698,7 @@ impl App {
                 let first = st.queues.get(&key).and_then(|q| q.first().copied());
                 if holder.is_none() && (first.is_none() || first == Some(agent)) {
                     st.db.execute(
-                        "UPDATE locks SET holder=?3, acquired_at=?4, expires_at=?5, frozen=0, frozen_left=NULL
+                        "UPDATE locks SET holder=?3, acquired_at=?4, expires_at=?5
                          WHERE project=?1 AND name=?2",
                         params![project, name, agent, now(), expires],
                     )?;
@@ -4657,35 +4816,43 @@ impl App {
     pub fn record_tokens(&self, id: i64, sample: crate::harness::TokenUsage) -> R<()> {
         let mut st = self.lock();
         st.atomic(|st| tokens::record(st, id, sample))?;
+        drop(st);
+        self.capture_agent_metrics(id, false);
         Ok(())
     }
 
     pub fn record_context(&self, id: i64, tokens: u64) -> R<()> {
-        let st = self.lock();
-        let lim = st.settings_for(Some(st.agent(id)?.project)).limits.context;
-        let warned: i64 =
-            st.db
-                .query_row("SELECT context_warned FROM agents WHERE id=?1", [id], |r| {
-                    r.get(0)
-                })?;
-        let over = lim.soft.is_some_and(|s| tokens as f64 >= s);
-        if over && warned == 0 {
-            let then = match lim.hard {
-                Some(h) => format!("It will be compacted at {h}."),
-                None => "There's no hard limit, so it won't be compacted early.".into(),
-            };
-            st.notice(
-                id,
-                &format!(
-                    "Your context is {tokens} tokens, past the soft limit of {}. {then}",
-                    lim.soft.unwrap_or_default()
-                ),
+        let mut st = self.lock();
+        st.atomic(|st| {
+            let lim = st.settings_for(Some(st.agent(id)?.project)).limits.context;
+            let warned: i64 =
+                st.db
+                    .query_row("SELECT context_warned FROM agents WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })?;
+            let over = lim.soft.is_some_and(|s| tokens as f64 >= s);
+            if over && warned == 0 {
+                let then = match lim.hard {
+                    Some(h) => format!("It will be compacted at {h}."),
+                    None => "There's no hard limit, so it won't be compacted early.".into(),
+                };
+                st.notice(
+                    id,
+                    &format!(
+                        "Your context is {tokens} tokens, past the soft limit of {}. {then}",
+                        lim.soft.unwrap_or_default()
+                    ),
+                )?;
+            }
+            st.db.execute(
+                "UPDATE agents SET context_warned=?2 WHERE id=?1",
+                params![id, over],
             )?;
-        }
-        st.db.execute(
-            "UPDATE agents SET context=?2, context_warned=?3 WHERE id=?1",
-            params![id, tokens as i64, over],
-        )?;
+            metric_history::record_context(st, id, tokens)?;
+            Ok(())
+        })?;
+        drop(st);
+        self.capture_agent_metrics(id, false);
         Ok(())
     }
 
@@ -4698,16 +4865,32 @@ impl App {
     ) -> R<()> {
         let mut st = self.lock();
         st.atomic(|st| subscriptions::observe_usage(st, provider, win, used_pct, resets_at))?;
+        drop(st);
+        self.capture_account_metrics();
         self.cv.notify_all();
         Ok(())
     }
 
+    pub fn record_output(&self, id: i64, at: i64) -> R<()> {
+        self.lock().db.execute(
+            "INSERT INTO agent_log_state(agent_id,last_output_at) VALUES(?1,?2)
+             ON CONFLICT(agent_id) DO UPDATE SET last_output_at=max(last_output_at,excluded.last_output_at)",
+            params![id,at],
+        )?;
+        Ok(())
+    }
+
     /// An error frame may describe a recovered attempt, not the turn's final outcome.
+    #[cfg(test)]
     pub fn diagnose_turn(&self, id: i64, reason: &str) -> R<()> {
+        self.diagnose_turn_detail(id, reason.into())
+    }
+
+    pub fn diagnose_turn_detail(&self, id: i64, failure: crate::harness::Failure) -> R<()> {
         if let Some(p) = self.lock().procs.get_mut(&id)
             && !p.completed
         {
-            p.diagnostic = Some(reason.into());
+            p.diagnostic = Some(failure);
         }
         Ok(())
     }
@@ -4722,11 +4905,16 @@ impl App {
 
     /// A provider reported a failed turn, even if its process later exits with status zero.
     /// Do not recover until stdout and side-file workers finish and the child is reaped.
+    #[cfg(test)]
     pub fn fail_turn(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
+        self.fail_turn_detail(id, reason.into())
+    }
+
+    pub fn fail_turn_detail(self: &Arc<Self>, id: i64, failure: crate::harness::Failure) -> R<()> {
         let mut st = self.lock();
         let reaped = st.reaped.contains(&id);
         if let Some(p) = st.procs.get_mut(&id) {
-            p.failure.get_or_insert_with(|| reason.into());
+            p.failure.get_or_insert(failure);
         }
         if reaped && st.procs.contains_key(&id) {
             self.finish_stop(&mut st, id, "turn", None)?;
@@ -4738,7 +4926,12 @@ impl App {
     pub fn fail_and_stop(self: &Arc<Self>, id: i64, reason: &str) -> R<()> {
         let mut st = self.lock();
         if let Some(p) = st.procs.get_mut(&id) {
-            p.failure.get_or_insert_with(|| reason.into());
+            p.failure.get_or_insert_with(|| crate::harness::Failure {
+                message: reason.into(),
+                kind: crate::harness::FailureKind::ModelSwitched,
+                code: None,
+                source: Some("model_guard".into()),
+            });
             self.finish_stop(&mut st, id, "turn", None)?;
         }
         Ok(())
@@ -4789,11 +4982,11 @@ impl App {
             if why == "limit" {
             // Only a fresh provider check can clear this marker; don't invent a reset time.
             let win = window.unwrap_or("limit");
-            let reset:Option<i64>=st.db.query_row("SELECT coalesce((SELECT resets_at FROM usage WHERE provider=?1 AND win=?2),(SELECT resets_at FROM usage_observations WHERE provider=?1 AND win=?2))",params![a.harness,win],|r|r.get(0))?;
+            let reset:Option<i64>=st.db.query_row("SELECT coalesce((SELECT resets_at FROM global.usage WHERE provider=?1 AND win=?2),(SELECT resets_at FROM global.usage_observations WHERE provider=?1 AND win=?2))",params![a.harness,win],|r|r.get(0))?;
             subscriptions::observe_usage(st, &a.harness, win, 100.0, reset)?;
             st.db.execute("INSERT OR REPLACE INTO agent_quota_blocks(agent_id,provider,win) VALUES(?1,?2,?3)", params![id, a.harness, win])?;
             st.db.execute(
-                "UPDATE usage_checks SET next_check=?2 WHERE provider=?1",
+                "UPDATE global.usage_checks SET next_check=?2 WHERE provider=?1",
                 params![a.harness, now()],
             )?;
             }
@@ -5235,12 +5428,12 @@ impl App {
     // ---------- configs ----------
 
     /// Tell a project's agents its limits or rules changed, if they did.
-    fn rules_changed(st: &mut St, project: i64, old: &Settings) -> R<()> {
+    fn rules_changed(st: &St, project: i64, old: &Settings) -> R<()> {
         let new = st.settings_for(Some(project));
         if old == &new {
             return Ok(());
         }
-        st.cap_lock_ttls(project, new.max_lock_ttl_secs)?;
+        st.cap_lock_ttls_inner(project, new.max_lock_ttl_secs)?;
         let text = format!(
             "The user changed the limits or rules. Now:\n{}",
             st.limits_text(Some(project))?
@@ -5261,7 +5454,7 @@ impl App {
         let mut v = vec![json!({"id":1,"name":"Default","settings":Settings::default()})];
         v.extend(rows(
             &st.db,
-            "SELECT id, name, settings FROM configs ORDER BY id",
+            "SELECT id, name, settings FROM global.configs ORDER BY id",
             [],
         )?);
         for c in &mut v {
@@ -5292,7 +5485,7 @@ impl App {
         }
         st.atomic(|st| {
             let added = st.db.execute(
-                "INSERT OR IGNORE INTO configs(name,settings) VALUES(?1,?2)",
+                "INSERT OR IGNORE INTO global.configs(name,settings) VALUES(?1,?2)",
                 params![name, serde_json::to_string(&settings).unwrap()],
             )?;
             if added == 0 {
@@ -5319,18 +5512,16 @@ impl App {
         let mut st = self.lock();
         let old_name: String = st
             .db
-            .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+            .query_row("SELECT name FROM global.configs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .optional()?
             .ok_or_else(|| not_found(format!("no config {id}")))?;
-        let users: Vec<i64> = rows(
-            &st.db,
-            "SELECT id FROM projects WHERE config=?1 AND custom IS NULL",
+        let previous: String = st.db.query_row(
+            "SELECT settings FROM global.configs WHERE id=?1",
             [id],
-        )?
-        .iter()
-        .map(|r| r["id"].as_i64().unwrap())
-        .collect();
-        let before: Vec<Settings> = users.iter().map(|p| st.settings_for(Some(*p))).collect();
+            |r| r.get(0),
+        )?;
         let name = name.unwrap_or(&old_name);
         if name == "Default" {
             return Err(conflict("Default is reserved for the built-in config"));
@@ -5338,7 +5529,7 @@ impl App {
         st.atomic(|st| {
             st.db
                 .execute(
-                    "UPDATE configs SET name=?2, settings=?3 WHERE id=?1",
+                    "UPDATE global.configs SET name=?2, settings=?3 WHERE id=?1",
                     params![id, name, serde_json::to_string(&settings).unwrap()],
                 )
                 .map_err(|error| match error {
@@ -5350,9 +5541,7 @@ impl App {
                     error => error.into(),
                 })?;
             st.log(None, by, &format!("changed config {name}"))?;
-            for (p, old) in users.iter().zip(&before) {
-                Self::rules_changed(st, *p, old)?;
-            }
+            accounts::record(st,"config.changed",json!({"config":id,"previous":serde_json::from_str::<Value>(&previous).map_err(|e|Fail(500,e.to_string()))?}))?;
             Ok(())
         })
     }
@@ -5365,21 +5554,25 @@ impl App {
         }
         let name: String = st
             .db
-            .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+            .query_row("SELECT name FROM global.configs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .optional()?
             .ok_or_else(|| not_found(format!("no config {id}")))?;
-        let used: i64 = st.db.query_row(
-            "SELECT count(*) FROM projects WHERE config=?1 AND custom IS NULL",
-            [id],
-            |r| r.get(0),
-        )?;
-        if used > 0 {
-            return Err(conflict(format!(
-                "{name} is used by {used} project(s); switch them first"
-            )));
-        }
         st.atomic(|st| {
-            st.db.execute("DELETE FROM configs WHERE id=?1", [id])?;
+            let used: i64 = st.db.query_row(
+                "SELECT (SELECT count(*) FROM projects WHERE config=?1 AND custom IS NULL)
+                   +(SELECT count(*) FROM global.config_uses WHERE config=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if used > 0 {
+                return Err(conflict(format!(
+                    "{name} is used by {used} project(s); switch them first"
+                )));
+            }
+            st.db
+                .execute("DELETE FROM global.configs WHERE id=?1", [id])?;
             st.log(None, by, &format!("removed config {name}"))?;
             Ok(())
         })
@@ -5403,7 +5596,9 @@ impl App {
                         "Default".into()
                     } else {
                         st.db
-                            .query_row("SELECT name FROM configs WHERE id=?1", [id], |r| r.get(0))
+                            .query_row("SELECT name FROM global.configs WHERE id=?1", [id], |r| {
+                                r.get(0)
+                            })
                             .optional()?
                             .ok_or_else(|| not_found(format!("no config {id}")))?
                     };
@@ -5429,6 +5624,16 @@ impl App {
                     return Err(bad(
                         "give either config (Default or a saved config's id) or custom (settings)",
                     ));
+                }
+            }
+            if let Some(key) = self.project_key() {
+                st.db
+                    .execute("DELETE FROM global.config_uses WHERE project=?1", [key])?;
+                if let Some(config) = config {
+                    st.db.execute(
+                        "INSERT INTO global.config_uses(project,config) VALUES(?1,?2)",
+                        params![key, config],
+                    )?;
                 }
             }
             Self::rules_changed(st, project, &old)
@@ -5502,7 +5707,7 @@ impl App {
                      WHERE t.project=p.id AND m.sender<>0 AND m.id>coalesce(r.message_id,0)
                        AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0
                          AND m.id>i.start_after AND (i.end_after IS NULL OR m.id<=i.end_after))) unread
-             FROM projects p LEFT JOIN configs c ON c.id=p.config ORDER BY p.name, p.id",
+             FROM projects p LEFT JOIN global.configs c ON c.id=p.config ORDER BY p.name, p.id",
             [],
         )
     }
@@ -5548,8 +5753,13 @@ impl App {
     fn view_revision(&self, st: &St, tables: &[&str], scope: &str) -> R<String> {
         let mut parts = vec![self.home.to_string_lossy().into_owned(), scope.to_string()];
         for name in std::iter::once(&"epoch").chain(tables.iter()) {
+            let revisions = if accounts::TABLES.contains(name) {
+                "global.view_revisions"
+            } else {
+                "view_revisions"
+            };
             let value: i64 = st.db.query_row(
-                "SELECT value FROM view_revisions WHERE name=?1",
+                &format!("SELECT value FROM {revisions} WHERE name=?1"),
                 [name],
                 |r| r.get(0),
             )?;
@@ -5581,6 +5791,7 @@ impl App {
         };
         if let Some(value) = unchanged {
             return Ok(SelectedPage {
+                project_key: self.project_key().map(str::to_owned),
                 unchanged: Some(value),
                 items: vec![],
                 through: 0,
@@ -5616,6 +5827,7 @@ impl App {
             rusqlite::params_from_iter(args),
         )?;
         Ok(SelectedPage {
+            project_key: self.project_key().map(str::to_owned),
             unchanged: None,
             items,
             through,
@@ -5633,7 +5845,7 @@ impl App {
            LEFT JOIN user_reads r ON r.thread_id=t.id WHERE t.project=p.id AND m.sender<>0 AND m.id>coalesce(r.message_id,0)
            AND EXISTS(SELECT 1 FROM member_intervals i WHERE i.thread_id=m.thread_id AND i.agent_id=0 AND m.id>i.start_after
              AND (i.end_after IS NULL OR m.id<=i.end_after))) unread
-         FROM projects p LEFT JOIN configs c ON c.id=p.config"
+         FROM projects p LEFT JOIN global.configs c ON c.id=p.config"
     }
 
     pub fn project_view(&self, id: i64) -> R<Value> {
@@ -5644,6 +5856,24 @@ impl App {
         )?
         .pop()
         .ok_or_else(|| not_found(format!("no project {id}")))
+    }
+
+    pub(crate) fn project_revision(&self) -> R<String> {
+        let st = self.lock();
+        self.view_revision(
+            &st,
+            &[
+                "projects",
+                "configs",
+                "project_counts",
+                "threads",
+                "messages",
+                "members",
+                "member_intervals",
+                "user_reads",
+            ],
+            "project-summary",
+        )
     }
 
     pub fn projects_page(&self, q: PageQuery) -> R<Value> {
@@ -5752,7 +5982,12 @@ impl App {
 
     fn agent_counts(st: &St, project: Option<i64>, query: &ParsedAgentQuery) -> R<Value> {
         let (predicate, params) = query.compile(project);
-        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished FROM ({})", Self::agent_source(st, &predicate)), rusqlite::params_from_iter(params))?.remove(0))
+        let states = STATES
+            .iter()
+            .map(|state| format!("coalesce(sum(state='{state}'),0) \"{state}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(rows(&st.db, &format!("SELECT count(*) \"all\",coalesce(sum(is_active),0) active,coalesce(sum(needs_attention),0) attention,coalesce(sum(is_finished),0) finished,{states} FROM ({})", Self::agent_source(st, &predicate)), rusqlite::params_from_iter(params))?.remove(0))
     }
 
     pub fn filtered_agents_page(
@@ -5767,6 +6002,13 @@ impl App {
             "active" => "is_active",
             "attention" => "needs_attention",
             "finished" => "is_finished",
+            "working" => "state='working'",
+            "idle" => "state='idle'",
+            "paused" => "state='paused'",
+            "crashed" => "state='crashed'",
+            "done" => "state='done'",
+            "closed" => "state='closed'",
+            "replaced" => "state='replaced'",
             _ => unreachable!(),
         };
         let mut st = self.lock();
@@ -5774,9 +6016,8 @@ impl App {
         let (condition, args) = query.compile(project);
         let sql=format!("SELECT id,project,name,grp \"group\",harness,model,effort,state,status_text status,substr(task,1,400) task_preview,
           substr(problem,1,400) problem_preview,problem IS NOT NULL has_problem,
-          (lower(problem) LIKE '%model%not supported%' OR lower(problem) LIKE '%model%not available%'
-           OR lower(problem) LIKE '%model%not found%' OR lower(problem) LIKE '%not supported%account%') model_unavailable,launched_by,launched_at,
-          pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,turns,ended_at,wake_queued_at,wake_why wake_reason
+          (state='crashed' AND EXISTS(SELECT 1 FROM agent_failures f WHERE f.agent_id=id AND json_extract(f.details,'$.kind')='model_unavailable')) model_unavailable,launched_by,launched_at,
+          pause_reason,paused_at,done_req,turns,ended_at,wake_queued_at,wake_why wake_reason
           FROM ({}) WHERE {predicate}", Self::agent_source(st, &condition));
         let mut page = self.select_page(
             st,
@@ -5784,9 +6025,11 @@ impl App {
             &[
                 "agents",
                 "agent_token_usage",
+                "context_observations",
                 "locks",
                 "agent_handoffs",
                 "agent_starts",
+                "agent_failures",
                 "events",
             ],
             &Self::agent_scope(st, project, filters.category, &query),
@@ -5809,6 +6052,7 @@ impl App {
         })
     }
 
+    #[cfg(test)]
     pub fn threads_page(
         &self,
         project: Option<i64>,
@@ -5927,7 +6171,7 @@ impl App {
         } else {
             let mut c = rows(
                 &st.db,
-                "SELECT id,name,settings FROM configs WHERE id=?1",
+                "SELECT id,name,settings FROM global.configs WHERE id=?1",
                 [id],
             )?
             .pop()
@@ -5955,7 +6199,7 @@ impl App {
 
     pub fn configs_page(&self, q: PageQuery) -> R<Value> {
         let st = self.lock();
-        let sql = "SELECT 1 id,'Default' name UNION ALL SELECT id,name FROM configs";
+        let sql = "SELECT 1 id,'Default' name UNION ALL SELECT id,name FROM global.configs";
         let mut page =
             self.select_page(&st, &q, &["configs", "projects"], "configs", sql, &[], true)?;
         for item in &mut page.items {
@@ -6103,7 +6347,12 @@ impl App {
                 Ok(st.db.last_insert_rowid())
             });
         match stored {
-            Ok(id) => result["receipt_event"] = json!(id),
+            Ok(id) => {
+                result["receipt_event"] = json!(id);
+                if let Some(project) = self.project_key() {
+                    result["receipt_path"] = json!(format!("/p/{project}/receipts/{id}"));
+                }
+            }
             Err(error) => {
                 result["receipt_error"] = json!(format!(
                     "Action completed, but its full receipt could not be saved: {}. Inspect current state before any retry.",
@@ -6153,14 +6402,17 @@ impl App {
             ),
             ("configs", vec!["configs", "projects"]),
             ("settings", vec!["configs", "projects"]),
+            ("global_settings", vec!["global_settings"]),
             (
                 "agents",
                 vec![
                     "agents",
                     "agent_token_usage",
+                    "context_observations",
                     "locks",
                     "agent_handoffs",
                     "agent_starts",
+                    "agent_failures",
                     "events",
                 ],
             ),
@@ -6199,8 +6451,11 @@ impl App {
             &[
                 "projects",
                 "configs",
+                "global_settings",
                 "agents",
                 "agent_token_usage",
+                "context_observations",
+                "agent_failures",
                 "threads",
                 "messages",
                 "members",
@@ -6234,7 +6489,7 @@ impl App {
         };
         let agent_counts = Self::agent_counts(&st, pid, &ParsedAgentQuery::default())?;
         let (total, per) = st.active_counts(pid)?;
-        let limits = json!({"limits":s.limits,"active":{"total":total,"per_harness":per},"usage":rows(&st.db,"SELECT provider,win,used_pct,resets_at,at FROM usage ORDER BY provider,win",[])?,"checks":rows(&st.db,"SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider",[])?,"text":st.limits_text(pid)?});
+        let limits = json!({"limits":s.limits,"active":{"total":total,"per_harness":per},"usage":rows(&st.db,"SELECT provider,win,used_pct,resets_at,at FROM global.usage ORDER BY provider,win",[])?,"checks":rows(&st.db,"SELECT provider,checked_at,attempted_at,next_check,error FROM global.usage_checks ORDER BY provider",[])?,"text":st.limits_text(pid)?});
         Ok(
             json!({"url":self.url,"project":current,"unread_total":unread_total,"restart_paused":global_actions["restart_paused"],"resume_eligible":global_actions["resume_eligible"],"pause_eligible":global_actions["pause_eligible"],"project_actions":project_actions,"agent_counts":agent_counts,"limits":limits,"revisions":revisions,"revision":revision}),
         )
@@ -6503,8 +6758,8 @@ impl App {
         let mut v = rows(
             &st.db,
             "SELECT id, project, name, grp \"group\", task, harness, model, effort, state, status_text status,
-                    session_id session, launched_by, launched_at, pause_reason, paused_at, done_req, context,
-                    fresh_in, cache_write, cache_read, output, turns, ended_at, wake_queued_at,
+                    session_id session, launched_by, launched_at, pause_reason, paused_at, done_req,
+                    turns, ended_at, wake_queued_at,
                     wake_why wake_reason, problem
              FROM agents WHERE (?1 IS NULL OR project=?1) AND (?2 IS NULL OR grp=?2) ORDER BY id",
             params![project, group],
@@ -6531,9 +6786,23 @@ impl App {
             return Err(bad("agent is in another project"));
         }
         let mut a = rows(&st.db,"SELECT id,project,name,grp \"group\",task,harness,model,effort,state,status_text status,
-            session_id session,launched_by,launched_at,pause_reason,paused_at,done_req,context,fresh_in,cache_write,cache_read,output,
+            session_id session,launched_by,launched_at,pause_reason,paused_at,done_req,
             turns,ended_at,wake_queued_at,wake_why wake_reason,problem FROM agents WHERE id=?1",[id])?.remove(0);
         tokens::attach(&st, &mut a)?;
+        a["failure"] = if a["state"] == "crashed" || a["state"] == "replaced" {
+            st.failure_details(id)?
+        } else {
+            Value::Null
+        };
+        a["last_output_at"] = json!(
+            st.db
+                .query_row(
+                    "SELECT last_output_at FROM agent_log_state WHERE agent_id=?1",
+                    [id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .optional()?
+        );
         a["locks"] = json!(st.held_by(id)?);
         let (name, path) = st.project(project)?;
         a["project_name"] = json!(name);
@@ -6773,19 +7042,13 @@ impl App {
         if let Some(a) = agent {
             let mid = m["id"].as_i64().unwrap();
             let tid = m["thread"].as_i64().unwrap();
-            let unknown: bool = st.db.query_row(
-                "SELECT ?1<=(SELECT message_id FROM history_origin WHERE id=1)",
-                [mid],
-                |r| r.get(0),
-            )?;
             let inside: bool = st.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM member_intervals WHERE thread_id=?1 AND agent_id=?2
                 AND ?3>start_after AND (end_after IS NULL OR ?3<=end_after))",
                 params![tid, a, mid],
                 |r| r.get(0),
             )?;
-            m["membership_unknown"] = json!(unknown);
-            m["outside_membership"] = json!(!unknown && !inside);
+            m["outside_membership"] = json!(!inside);
             if a > 0 {
                 let mark: Option<String> = st
                     .db
@@ -6878,6 +7141,7 @@ impl App {
         let total = candidates.len();
         let mut events = Vec::new();
         for mut e in candidates.into_iter().take(q.limit as usize) {
+            e = self.public_value(e);
             events.push(e.clone());
             if envelope(&events, true).to_string().len() > q.max_bytes as usize {
                 events.pop();
@@ -6905,7 +7169,7 @@ impl App {
         let (total, per) = st.active_counts(project)?;
         let usage = rows(
             &st.db,
-            "SELECT provider, win, used_pct, resets_at, at FROM usage ORDER BY provider, win",
+            "SELECT provider, win, used_pct, resets_at, at FROM global.usage ORDER BY provider, win",
             [],
         )?;
         let usage_windows: BTreeMap<&str, Vec<String>> = crate::harness::KNOWN
@@ -6917,7 +7181,7 @@ impl App {
             "active": { "total": total, "per_harness": per },
             "usage": usage,
             "usage_windows": usage_windows,
-            "checks": rows(&st.db, "SELECT provider,checked_at,attempted_at,next_check,error FROM usage_checks ORDER BY provider", [])?,
+            "checks": rows(&st.db, "SELECT provider,checked_at,attempted_at,next_check,error FROM global.usage_checks ORDER BY provider", [])?,
             "text": st.limits_text(project)?,
         }))
     }
@@ -6932,90 +7196,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn older_development_state_is_refused_without_changing_records() {
+    fn incompatible_core_format_is_rejected_without_changing_records() {
         let db = Connection::open_in_memory().unwrap();
         assert!(check_stored_schema(&db).is_ok());
-        db.execute_batch(&SCHEMA.replace(
-            "projects (id INTEGER PRIMARY KEY AUTOINCREMENT",
-            "projects (id INTEGER PRIMARY KEY",
-        ))
-        .unwrap();
-        db.execute(
-            "INSERT INTO projects(id,path,name,created_at) VALUES(42,'/test','test',0)",
-            [],
-        )
-        .unwrap();
-        let error = check_stored_schema(&db).unwrap_err();
-        assert!(error.1.contains("earlier development schema"));
-        assert_eq!(
-            db.query_row("SELECT id FROM projects", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            42
-        );
-        let current = Connection::open_in_memory().unwrap();
-        current.execute_batch(SCHEMA).unwrap();
-        assert!(check_stored_schema(&current).is_ok());
-        let bad_allocator = Connection::open_in_memory().unwrap();
-        bad_allocator.execute_batch(SCHEMA).unwrap();
-        bad_allocator.execute_batch("DROP TABLE configs;
-            CREATE TABLE configs(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,settings TEXT NOT NULL);").unwrap();
-        assert!(
-            check_stored_schema(&bad_allocator)
-                .unwrap_err()
-                .1
-                .contains("earlier development schema")
-        );
-        current
-            .execute(
-                "INSERT INTO configs(id,name,settings) VALUES(1,'Default','{}')",
-                [],
-            )
+        db.execute_batch("PRAGMA user_version=999").unwrap();
+        assert!(check_stored_schema(&db).is_err());
+        db.execute_batch("PRAGMA user_version=0").unwrap();
+        db.execute_batch("CREATE TABLE projects(id INTEGER PRIMARY KEY,custom TEXT); INSERT INTO projects VALUES(42,NULL)").unwrap();
+        for version in [0, 1, 3, 999] {
+            db.execute_batch(&format!("PRAGMA user_version={version}"))
+                .unwrap();
+            assert!(
+                check_stored_schema(&db)
+                    .unwrap_err()
+                    .1
+                    .contains("unsupported development format")
+            );
+            assert_eq!(
+                db.query_row("SELECT id FROM projects", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                42
+            );
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+        }
+        db.execute_batch("PRAGMA user_version=2; PRAGMA application_id=1094929731")
             .unwrap();
-        assert!(
-            check_stored_schema(&current)
-                .unwrap_err()
-                .1
-                .contains("earlier development schema")
-        );
-        assert_eq!(
-            current
-                .query_row("SELECT count(*) FROM configs WHERE id=1", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        current
-            .execute("DELETE FROM configs WHERE id=1", [])
-            .unwrap();
-        let partial = Connection::open_in_memory().unwrap();
-        partial
-            .execute_batch(
-                "CREATE TABLE configs(id INTEGER PRIMARY KEY,name TEXT,settings TEXT);
-            INSERT INTO configs VALUES(1,'Default','{}');",
-            )
-            .unwrap();
-        assert!(
-            check_stored_schema(&partial)
-                .unwrap_err()
-                .1
-                .contains("earlier development schema")
-        );
-        current.execute_batch("DROP TABLE agent_retries;
-            CREATE TABLE agent_retries(agent_id INTEGER PRIMARY KEY,source TEXT,tried TEXT,handled INTEGER,replacement INTEGER,blocked TEXT);
-            INSERT INTO agent_retries VALUES(1,'m','[]',0,NULL,NULL);").unwrap();
-        assert!(
-            check_stored_schema(&current)
-                .unwrap_err()
-                .1
-                .contains("earlier development schema")
-        );
-        assert_eq!(
-            current
-                .query_row("SELECT count(*) FROM agent_retries", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+        assert!(check_stored_schema(&db).is_ok());
     }
 
     /// Project 1 with three working claude agents (1, 2, 3); project 2 with agent 4.
@@ -7055,12 +7265,12 @@ mod tests {
             .unwrap();
     }
 
-    fn lock(st: &St, name: &str) -> (Option<i64>, Option<i64>, i64, Option<i64>) {
+    fn lock(st: &St, name: &str) -> (Option<i64>, Option<i64>) {
         st.db
             .query_row(
-                "SELECT holder, expires_at, frozen, frozen_left FROM locks WHERE name=?1",
+                "SELECT holder, expires_at FROM locks WHERE name=?1",
                 [name],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
     }
@@ -7162,7 +7372,7 @@ mod tests {
                 app.lock()
                     .db
                     .execute(
-                        "UPDATE configs SET settings=?1 WHERE id=?2",
+                        "UPDATE global.configs SET settings=?1 WHERE id=?2",
                         params![text, id],
                     )
                     .unwrap();
@@ -7175,10 +7385,15 @@ mod tests {
                 .unwrap();
             assert!(error.1.contains("invalid saved settings"));
             let db = Connection::open(home.join("acom.db")).unwrap();
+            db.execute(
+                "ATTACH DATABASE ?1 AS global",
+                [home.join("shared.db").to_string_lossy().as_ref()],
+            )
+            .unwrap();
             let query = if custom {
                 "SELECT custom FROM projects WHERE id=?1"
             } else {
-                "SELECT settings FROM configs WHERE id=?1"
+                "SELECT settings FROM global.configs WHERE id=?1"
             };
             let retained: String = db.query_row(query, [id], |row| row.get(0)).unwrap();
             assert_eq!(retained, text);
@@ -7207,10 +7422,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_ttl_settings_have_a_finite_legacy_default_and_reject_invalid_values() {
+    fn lock_ttl_settings_require_an_explicit_finite_ceiling() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         value.as_object_mut().unwrap().remove("max_lock_ttl_secs");
-        let mut s: Settings = serde_json::from_value(value.clone()).unwrap();
+        assert!(serde_json::from_value::<Settings>(value.clone()).is_err());
+        let mut s = Settings::default();
         assert_eq!(s.max_lock_ttl_secs, 900);
         s.max_lock_ttl_secs = 0;
         assert!(s.check().is_err());
@@ -7420,7 +7636,7 @@ mod tests {
             app.lock()
                 .db
                 .query_row(
-                    "SELECT count(*) FROM configs WHERE name='not saved'",
+                    "SELECT count(*) FROM global.configs WHERE name='not saved'",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
@@ -7449,7 +7665,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(duplicate.0, 409);
         assert!(duplicate.1.contains("already a config"));
-        app.lock().db.execute_batch("CREATE TRIGGER fail_config_write BEFORE UPDATE ON configs BEGIN SELECT RAISE(ABORT,'injected config write failure'); END;").unwrap();
+        app.lock().db.execute_batch("CREATE TRIGGER global.fail_config_write BEFORE UPDATE ON configs BEGIN SELECT RAISE(ABORT,'injected config write failure'); END;").unwrap();
         let error = app
             .put_config(id, None, Settings::default(), "user")
             .unwrap_err();
@@ -7611,10 +7827,10 @@ mod tests {
                 app.pause(1, "user").unwrap();
             }
             drop(app.wait_stopped(app.lock(), &[1, 2]));
-            assert_eq!(lock(&app.lock(), "schema"), (None, None, 0, None));
+            assert_eq!(lock(&app.lock(), "schema"), (None, None));
             app.resume(1, "user").unwrap();
             assert_eq!(app.lock().agent(1).unwrap().state, "idle");
-            assert_eq!(lock(&app.lock(), "schema"), (None, None, 0, None));
+            assert_eq!(lock(&app.lock(), "schema"), (None, None));
         }
     }
 
@@ -7623,7 +7839,7 @@ mod tests {
         let mut st = st();
         hold(&st, "late", 1, Some(now() - 1));
         st.expire_locks().unwrap();
-        assert_eq!(lock(&st, "late"), (None, None, 0, None));
+        assert_eq!(lock(&st, "late"), (None, None));
         let text = st.take_updates(1).unwrap();
         assert!(
             text.contains("You no longer hold lock `late`: its TTL ran out"),
@@ -7719,7 +7935,7 @@ mod tests {
             .unwrap();
         app.free(1, "forced-activity", "user").unwrap();
         let after = snapshot(&app.lock());
-        assert_eq!(after.0, (None, None, 0, None));
+        assert_eq!(after.0, (None, None));
         assert_eq!(after.1.len(), before.1.len() + 1);
         assert_eq!(
             after.1.last().unwrap()["text"],
@@ -7787,7 +8003,7 @@ mod tests {
     fn save_config(st: &St, id: i64, s: &Settings) {
         st.db
             .execute(
-                "INSERT OR REPLACE INTO configs(id,name,settings) VALUES(?1,?2,?3)",
+                "INSERT OR REPLACE INTO global.configs(id,name,settings) VALUES(?1,?2,?3)",
                 params![
                     id,
                     format!("config {id}"),
@@ -8165,7 +8381,7 @@ mod tests {
         assert_eq!(agents[1]["state"], "idle");
         assert_eq!(agents[2]["pause_reason"], "user");
         assert_eq!(agents[3]["pause_reason"], "limit");
-        assert_eq!(lock(&st, "schema"), (None, None, 0, None));
+        assert_eq!(lock(&st, "schema"), (None, None));
         assert!(!App::has_handoff(&st, 1).unwrap());
         assert_eq!(
             st.db
@@ -8242,8 +8458,7 @@ mod tests {
                 .execute("UPDATE agents SET task=task WHERE id=1", [])
                 .unwrap();
             let failed: R<()> = st.atomic(|st| {
-                st.db
-                    .execute("UPDATE agents SET context=context+1 WHERE id=1", [])?;
+                metric_history::record_context(st, 1, 1)?;
                 Err(bad("rollback fixture"))
             });
             assert!(failed.is_err());
@@ -8254,10 +8469,7 @@ mod tests {
                 .unwrap()["revision"],
             revision
         );
-        app.lock()
-            .db
-            .execute("UPDATE agents SET context=context+1 WHERE id=1", [])
-            .unwrap();
+        metric_history::record_context(&app.lock(), 1, 1).unwrap();
         assert_eq!(
             app.agents_page(
                 Some(1),
@@ -9522,7 +9734,7 @@ mod tests {
         drop(app.wait_stopped(app.lock(), &[1]));
         let st = app.lock();
         assert!(!st.stopping_agents.contains(&1));
-        assert_eq!(lock(&st, "guarded"), (None, None, 0, None));
+        assert_eq!(lock(&st, "guarded"), (None, None));
         let count: i64 = st.db.query_row("SELECT count(*) FROM notices WHERE agent_id=1 AND text LIKE 'You no longer hold lock `guarded`:%'",[],|r|r.get(0)).unwrap();
         assert_eq!(
             count, 1,
@@ -9582,7 +9794,8 @@ mod tests {
         assert_eq!(
             app.lock()
                 .db
-                .query_row("SELECT count(*) FROM configs", [], |r| r.get::<_, i64>(0))
+                .query_row("SELECT count(*) FROM global.configs", [], |r| r
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
@@ -9651,14 +9864,15 @@ mod tests {
             let st = app.lock();
             let saved: (i64, String) = st
                 .db
-                .query_row("SELECT id,name FROM configs", [], |r| {
+                .query_row("SELECT id,name FROM global.configs", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .unwrap();
             assert_eq!(saved, (id, "Mine".into()));
             assert_eq!(
                 st.db
-                    .query_row("SELECT count(*) FROM configs", [], |r| r.get::<_, i64>(0))
+                    .query_row("SELECT count(*) FROM global.configs", [], |r| r
+                        .get::<_, i64>(0))
                     .unwrap(),
                 1
             );
@@ -9801,7 +10015,7 @@ mod tests {
         let st = app.lock();
         st.db
             .execute(
-                "INSERT OR REPLACE INTO usage(provider,win,used_pct,resets_at,at) VALUES('claude','five_hour',?1,?2,0)",
+                "INSERT OR REPLACE INTO global.usage(provider,win,used_pct,resets_at,at) VALUES('claude','five_hour',?1,?2,0)",
                 params![pct, now() + 3600],
             )
             .unwrap();
@@ -9952,11 +10166,11 @@ mod tests {
         app.record_usage("claude", "seven_day", 90.0, None).unwrap();
         app.tick().unwrap();
         assert_eq!(usage_notice_count(&app, 1, "Soft limit reached"), 2);
-        crate::usage::finish(&app, "claude", 120, Err("unavailable".into())).unwrap();
+        crate::usage::finish(&app, "claude", Err("unavailable".into())).unwrap();
         app.lock()
             .db
             .execute(
-                "DELETE FROM usage WHERE provider='claude' AND win='seven_day'",
+                "DELETE FROM global.usage WHERE provider='claude' AND win='seven_day'",
                 [],
             )
             .unwrap();
@@ -10018,7 +10232,7 @@ mod tests {
         app.lock()
             .db
             .execute(
-                "DELETE FROM usage WHERE provider='codex' AND win='secondary'",
+                "DELETE FROM global.usage WHERE provider='codex' AND win='secondary'",
                 [],
             )
             .unwrap();
@@ -10088,7 +10302,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "codex",
-            120,
             crate::usage::parse(
                 "codex",
                 &json!({"rateLimits":{
@@ -10109,7 +10322,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "codex",
-            120,
             crate::usage::parse(
                 "codex",
                 &json!({"rateLimitsByLimitId":{
@@ -10127,7 +10339,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "codex",
-            120,
             crate::usage::parse(
                 "codex",
                 &json!({"rateLimitsByLimitId":{
@@ -10164,7 +10375,7 @@ mod tests {
             );
         });
         let observe = |value: Value| {
-            crate::usage::finish(&app, "codex", 120, crate::usage::parse("codex", &value)).unwrap();
+            crate::usage::finish(&app, "codex", crate::usage::parse("codex", &value)).unwrap();
             app.tick().unwrap();
         };
         observe(json!({"rateLimits":{"primary":{"usedPercent":10},
@@ -10358,7 +10569,7 @@ mod tests {
             "five-hour reset cannot clear the weekly limit"
         );
         let incomplete = crate::usage::parse("claude", &json!({"five_hour":{"utilization":0}}));
-        crate::usage::finish(&app, "claude", 120, incomplete).unwrap();
+        crate::usage::finish(&app, "claude", incomplete).unwrap();
         app.tick().unwrap();
         assert_eq!(
             state(&app, 1).0,
@@ -10417,40 +10628,51 @@ mod tests {
     }
 
     #[test]
-    fn usage_settings_validate_windows_and_preserve_saved_provider_thresholds() {
-        let mut s = Settings::default();
-        s.limits.usage.clear();
-        s.limits.usage.insert(
+    fn usage_settings_validate_explicit_windows_without_legacy_provider_defaults() {
+        let mut settings = Settings::default();
+        settings.limits.usage.clear();
+        assert!(settings.check().is_ok());
+        assert!(settings.limits.usage_limit("claude", "five_hour").is_none());
+        settings.limits.usage.insert(
             "claude".into(),
             Limit {
                 soft: Some(80.0),
                 hard: Some(95.0),
             },
         );
-        assert!(s.check().is_ok());
-        assert_eq!(
-            s.limits.usage_limit("claude", "five_hour").unwrap().hard,
-            Some(95.0)
+        assert!(
+            settings
+                .check()
+                .unwrap_err()
+                .1
+                .contains("unknown subscription window")
         );
-        assert_eq!(
-            s.limits.usage_limit("claude", "seven_day").unwrap().hard,
-            Some(95.0)
-        );
-        s.limits.usage.insert(
+        settings.limits.usage.remove("claude");
+        settings.limits.usage.insert(
             "claude_seven_day".into(),
             Limit {
                 soft: None,
                 hard: Some(60.0),
             },
         );
+        assert!(settings.check().is_ok());
+        assert!(settings.limits.usage_limit("claude", "five_hour").is_none());
         assert_eq!(
-            s.limits.usage_limit("claude", "seven_day").unwrap().hard,
+            settings
+                .limits
+                .usage_limit("claude", "seven_day")
+                .unwrap()
+                .hard,
             Some(60.0)
         );
-        s.limits.usage.get_mut("claude_seven_day").unwrap().hard = Some(101.0);
-        assert!(s.check().is_err());
+        settings
+            .limits
+            .usage
+            .get_mut("claude_seven_day")
+            .unwrap()
+            .hard = Some(101.0);
+        assert!(settings.check().is_err());
     }
-
     #[test]
     fn codex_usage_stays_aggregated_without_duplicate_warnings() {
         let app = app_with_two_projects();
@@ -10486,7 +10708,7 @@ mod tests {
                 },
             );
         });
-        crate::usage::finish(&app,"codex",120,crate::usage::parse("codex",&json!({"rateLimitsByLimitId":{
+        crate::usage::finish(&app,"codex",crate::usage::parse("codex",&json!({"rateLimitsByLimitId":{
             "codex":{"primary":{"usedPercent":95,"resetsAt":now()-60},"secondary":{"usedPercent":10}}
         }}))).unwrap();
         app.tick().unwrap();
@@ -10495,7 +10717,7 @@ mod tests {
         app.lock()
             .db
             .execute(
-                "UPDATE usage SET at=?1 WHERE provider='codex' AND win='codex primary'",
+                "UPDATE global.usage SET at=?1 WHERE provider='codex' AND win='codex primary'",
                 [now() - 600],
             )
             .unwrap();
@@ -10503,7 +10725,7 @@ mod tests {
             .lock()
             .db
             .query_row(
-                "SELECT at FROM usage WHERE provider='codex' AND win='codex primary'",
+                "SELECT at FROM global.usage WHERE provider='codex' AND win='codex primary'",
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -10511,7 +10733,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "codex",
-            120,
             crate::usage::parse(
                 "codex",
                 &json!({"rateLimitsByLimitId":{
@@ -10520,7 +10741,7 @@ mod tests {
             ),
         )
         .unwrap();
-        crate::usage::finish(&app, "codex", 120, Err("usage unavailable".into())).unwrap();
+        crate::usage::finish(&app, "codex", Err("usage unavailable".into())).unwrap();
         app.tick().unwrap();
         assert_eq!(
             state(&app, 1).0,
@@ -10531,7 +10752,7 @@ mod tests {
             app.lock()
                 .db
                 .query_row(
-                    "SELECT at FROM usage WHERE provider='codex' AND win='codex primary'",
+                    "SELECT at FROM global.usage WHERE provider='codex' AND win='codex primary'",
                     [],
                     |r| r.get::<_, i64>(0)
                 )
@@ -10546,7 +10767,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "codex",
-            120,
             crate::usage::parse(
                 "codex",
                 &json!({"rateLimitsByLimitId":{
@@ -10574,7 +10794,7 @@ mod tests {
             )
             .unwrap();
         let observe = |value: Value| {
-            crate::usage::finish(&app, "codex", 120, crate::usage::parse("codex", &value)).unwrap();
+            crate::usage::finish(&app, "codex", crate::usage::parse("codex", &value)).unwrap();
             app.tick().unwrap();
         };
         observe(json!({"rateLimits":{"primary":{"usedPercent":10},
@@ -10607,12 +10827,11 @@ mod tests {
             .unwrap();
         app.limit_hit(1, "actual provider interruption").unwrap();
         drop(app.wait_stopped(app.lock(), &[1]));
-        app.lock().db.execute("INSERT INTO usage_checks(provider,attempted_at) VALUES('codex',(SELECT at-1 FROM usage WHERE provider='codex' AND win='limit'))",[]).unwrap();
+        app.lock().db.execute("INSERT INTO global.usage_checks(provider,attempted_at) VALUES('codex',(SELECT at-1 FROM global.usage WHERE provider='codex' AND win='limit'))",[]).unwrap();
         let check = || {
             crate::usage::finish(
                 &app,
                 "codex",
-                120,
                 crate::usage::parse(
                     "codex",
                     &json!({"rateLimits":{"primary":{"usedPercent":5}}}),
@@ -10626,14 +10845,14 @@ mod tests {
         app.lock()
             .db
             .execute(
-                "UPDATE usage SET at=?1 WHERE provider='codex' AND win='limit'",
+                "UPDATE global.usage SET at=?1 WHERE provider='codex' AND win='limit'",
                 [now() - 2],
             )
             .unwrap();
         app.lock()
             .db
             .execute(
-                "UPDATE usage_checks SET attempted_at=?1 WHERE provider='codex'",
+                "UPDATE global.usage_checks SET attempted_at=?1 WHERE provider='codex'",
                 [now()],
             )
             .unwrap();
@@ -10671,18 +10890,18 @@ mod tests {
         {
             let st = app.lock();
             st.db
-                .execute("UPDATE usage SET resets_at=?1", [now() - 10])
+                .execute("UPDATE global.usage SET resets_at=?1", [now() - 10])
                 .unwrap();
         }
         app.tick().unwrap();
         assert_eq!(state(&app, 1).0, "paused");
-        crate::usage::finish(&app, "claude", 120, Err("status unavailable".into())).unwrap();
+        crate::usage::finish(&app, "claude", Err("status unavailable".into())).unwrap();
         app.tick().unwrap();
         assert_eq!(state(&app, 1).0, "paused");
         app.lock()
             .db
             .execute(
-                "INSERT INTO usage_checks(provider,attempted_at) VALUES('claude',?1)",
+                "INSERT INTO global.usage_checks(provider,attempted_at) VALUES('claude',?1)",
                 [now() - 1],
             )
             .unwrap();
@@ -10690,7 +10909,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "claude",
-            120,
             Ok(vec![crate::usage::Window {
                 name: "five_hour".into(),
                 used: 0.0,
@@ -10703,11 +10921,14 @@ mod tests {
         {
             let st = app.lock();
             st.db
-                .execute("UPDATE usage SET at=?1 WHERE win='limit'", [now() - 1])
+                .execute(
+                    "UPDATE global.usage SET at=?1 WHERE win='limit'",
+                    [now() - 1],
+                )
                 .unwrap();
             st.db
                 .execute(
-                    "UPDATE usage_checks SET attempted_at=?1 WHERE provider='claude'",
+                    "UPDATE global.usage_checks SET attempted_at=?1 WHERE provider='claude'",
                     [now()],
                 )
                 .unwrap();
@@ -10715,7 +10936,6 @@ mod tests {
         crate::usage::finish(
             &app,
             "claude",
-            120,
             Ok(vec![crate::usage::Window {
                 name: "five_hour".into(),
                 used: 0.0,
@@ -10763,9 +10983,9 @@ mod tests {
                 && text.contains(GUIDE)
         );
         assert!(
-            Settings {
+            GlobalSettings {
                 usage_poll_secs: 0,
-                ..Settings::default()
+                ..GlobalSettings::default()
             }
             .check()
             .is_err()
@@ -11014,6 +11234,7 @@ mod tests {
                         failure: None,
                         diagnostic: None,
                         completed: false,
+                        progress: std::collections::HashMap::new(),
                     },
                 );
                 st.reaped.insert(1);
@@ -11057,7 +11278,7 @@ mod tests {
     fn restart_on_a_new_port_stops_only_the_previous_servers_owned_client() {
         use std::os::unix::process::CommandExt;
         let app = self_change_app();
-        std::fs::write(app.home.join("port"), "45678").unwrap();
+        std::fs::write(app.home.join("server-url"), "http://127.0.0.1:45678").unwrap();
         let spawn = |url: &str| {
             std::process::Command::new("sleep")
                 .arg("30")
@@ -11112,7 +11333,7 @@ mod tests {
         }
         for state in ["paused", "closed"] {
             let app = self_change_app();
-            std::fs::write(app.home.join("port"), "45678").unwrap();
+            std::fs::write(app.home.join("server-url"), "http://127.0.0.1:45678").unwrap();
             let ready = app.home.join("resists-term");
             let mut child = OwnedGroup(
                 std::process::Command::new("/bin/sh")
@@ -11217,7 +11438,11 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}");
         for identity in ["unmarked", "idle-unmarked", "foreign-home", "owned"] {
             let app = self_change_app();
-            std::fs::write(app.home.join("port"), port.to_string()).unwrap();
+            std::fs::write(
+                app.home.join("server-url"),
+                format!("http://127.0.0.1:{port}"),
+            )
+            .unwrap();
             let ready = app.home.join("preflight-ready");
             let mut command = std::process::Command::new("/bin/sh");
             command
@@ -11262,7 +11487,7 @@ mod tests {
                     .unwrap();
                 st.db.execute_batch("INSERT INTO agent_continuations(agent_id,text) VALUES(1,'pending continuation');
                     INSERT INTO summary_cursors(agent_id,event_id) VALUES(1,0);
-                    INSERT INTO usage_checks(provider,in_flight) VALUES('claude',1);").unwrap();
+                    INSERT INTO global.usage_checks(provider,in_flight) VALUES('claude',1);").unwrap();
                 if identity == "idle-unmarked" {
                     st.db
                         .execute("UPDATE agents SET state='idle',pid=NULL WHERE id=1", [])
@@ -11320,7 +11545,7 @@ mod tests {
         for url in ["http://127.0.0.1:45678", "http://127.0.0.1:45680"] {
             let owned = url.ends_with(":45678");
             let app = self_change_app();
-            std::fs::write(app.home.join("port"), "45678").unwrap();
+            std::fs::write(app.home.join("server-url"), "http://127.0.0.1:45678").unwrap();
             let child_pid = app.home.join("descendant-pid");
             let mut worker = OwnedGroup(
                 std::process::Command::new("/bin/sh")
@@ -11643,6 +11868,7 @@ mod tests {
                     failure: Some("network failure".into()),
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
         }
@@ -12456,6 +12682,7 @@ mod tests {
                     failure: None,
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
         }
@@ -12498,6 +12725,7 @@ mod tests {
                         failure: None,
                         diagnostic: None,
                         completed: false,
+                        progress: std::collections::HashMap::new(),
                     },
                 );
             }
@@ -12551,6 +12779,7 @@ mod tests {
                             failure: None,
                             diagnostic: None,
                             completed: false,
+                            progress: std::collections::HashMap::new(),
                         },
                     );
                 }
@@ -12658,14 +12887,14 @@ mod tests {
                     reset: None,
                 });
             }
-            crate::usage::finish(&app, "claude", 120, Ok(windows)).unwrap();
+            crate::usage::finish(&app, "claude", Ok(windows)).unwrap();
         };
         refresh(None); // omitted optional is not zero
         assert_eq!(
             app.lock().window_pct("claude", "seven_day_fable").unwrap(),
             Some(100.0)
         );
-        app.lock().db.execute("UPDATE usage_checks SET attempted_at=(SELECT at-1 FROM usage WHERE provider='claude' AND win='seven_day_fable') WHERE provider='claude'", []).unwrap();
+        app.lock().db.execute("UPDATE global.usage_checks SET attempted_at=(SELECT at-1 FROM global.usage WHERE provider='claude' AND win='seven_day_fable') WHERE provider='claude'", []).unwrap();
         refresh(Some(0.0)); // begun before exhaustion: still not recovery
         assert_eq!(
             app.lock().window_pct("claude", "seven_day_fable").unwrap(),
@@ -12675,11 +12904,11 @@ mod tests {
             let st = app.lock();
             st.db
                 .execute(
-                    "UPDATE usage SET at=?1 WHERE win='seven_day_fable'",
+                    "UPDATE global.usage SET at=?1 WHERE win='seven_day_fable'",
                     [now() - 1],
                 )
                 .unwrap();
-            st.db.execute("INSERT OR REPLACE INTO usage_checks(provider,attempted_at) VALUES('claude',?1)", [now()]).unwrap();
+            st.db.execute("INSERT OR REPLACE INTO global.usage_checks(provider,attempted_at) VALUES('claude',?1)", [now()]).unwrap();
         }
         refresh(Some(0.0));
         app.tick().unwrap();
@@ -12751,7 +12980,7 @@ mod tests {
         app.lock()
             .db
             .execute(
-                "DELETE FROM usage WHERE provider='claude' AND win='five_hour'",
+                "DELETE FROM global.usage WHERE provider='claude' AND win='five_hour'",
                 [],
             )
             .unwrap();
@@ -13011,6 +13240,7 @@ mod tests {
                     failure: None,
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
             st.remember_crash(1, &st.agent(1).unwrap()).unwrap();
@@ -13179,6 +13409,7 @@ mod tests {
                     failure: None,
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
             st.procs.insert(
@@ -13191,6 +13422,7 @@ mod tests {
                     failure: None,
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
         }
@@ -13479,7 +13711,7 @@ mod tests {
         assert!(st.db.is_autocommit());
         assert_eq!(st.agent(1).unwrap().state, "paused");
         assert_eq!(st.agent(1).unwrap().pause_from.as_deref(), Some("working"));
-        assert_eq!(lock(&st, "schema"), (None, None, 0, None));
+        assert_eq!(lock(&st, "schema"), (None, None));
         assert_eq!(
             rows(&st.db, "SELECT * FROM events ORDER BY id", []).unwrap(),
             before
@@ -13571,6 +13803,7 @@ mod tests {
                     failure: Some("failed turn".into()),
                     diagnostic: None,
                     completed: false,
+                    progress: std::collections::HashMap::new(),
                 },
             );
             st.db
@@ -13858,7 +14091,10 @@ mod tests {
         let attention =
             |id: i64, state: &str| matches!(state, "paused" | "crashed") || [3, 4, 8].contains(&id);
         let finished = |state: &str| matches!(state, "done" | "closed" | "replaced");
-        let expected = json!({"all":101,"active":seeded.iter().filter(|(_,s)| active(s)).count(),"attention":seeded.iter().filter(|(id,s)| attention(*id,s)).count(),"finished":seeded.iter().filter(|(_,s)| finished(s)).count()});
+        let mut expected = json!({"all":101,"active":seeded.iter().filter(|(_,s)| active(s)).count(),"attention":seeded.iter().filter(|(id,s)| attention(*id,s)).count(),"finished":seeded.iter().filter(|(_,s)| finished(s)).count()});
+        for state in STATES {
+            expected[state] = json!(seeded.iter().filter(|(_, s)| *s == state).count());
+        }
         let mut seen = Vec::new();
         let mut q = PageQuery {
             limit: 3,
@@ -14081,7 +14317,7 @@ mod tests {
         assert_eq!(first["total"], 2);
         assert_eq!(
             first["counts"],
-            json!({"all":2,"active":0,"attention":2,"finished":0})
+            json!({"all":2,"active":0,"attention":2,"finished":0,"working":0,"idle":0,"paused":1,"crashed":1,"done":0,"closed":0,"replaced":0})
         );
         assert_eq!(first["items"][0]["id"], 4);
         let next_query = PageQuery {
@@ -14160,7 +14396,7 @@ mod tests {
             );
             assert_eq!(app.lock().db.total_changes(), before);
         }
-        for search in ["provider:bad", "task:x", "group:"] {
+        for search in ["provider:bad", "unknown_field:x", "group:"] {
             assert_eq!(
                 app.filtered_agents_page(
                     Some(1),
@@ -14363,7 +14599,7 @@ mod tests {
             first, explicit,
             "an implied paused state has the same cursor scope"
         );
-        let expected_counts = json!({"all":26,"active":0,"attention":26,"finished":0});
+        let expected_counts = json!({"all":26,"active":0,"attention":26,"finished":0,"working":0,"idle":0,"paused":26,"crashed":0,"done":0,"closed":0,"replaced":0});
         let mut ids = Vec::new();
         loop {
             let page = app
@@ -14578,65 +14814,30 @@ mod tests {
     }
 
     #[test]
-    fn existing_members_and_mine_survive_initializing_history_without_invented_events() {
-        let home = std::env::temp_dir().join(format!("acom-test-{}", crate::harness::new_uuid()));
-        std::fs::create_dir(&home).unwrap();
-        let db = Connection::open(home.join("acom.db")).unwrap();
-        db.execute_batch(
-            SCHEMA
-                .split("CREATE TABLE IF NOT EXISTS thread_filters")
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        let mine = serde_json::to_string(&Settings::default()).unwrap();
-        db.execute(
-            "INSERT INTO configs(id,name,settings) VALUES(2,'Mine',?1)",
-            [&mine],
-        )
-        .unwrap();
-        db.execute_batch("INSERT INTO projects(id,path,name,created_at,config) VALUES(1,'/p1','p1',0,2);
-            INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(1,1,'a','t','claude','m','e','paused',0,0);
-            INSERT INTO threads VALUES(1,1,'old',0,0);
-            INSERT INTO members VALUES(1,0,10),(1,1,10);
-            INSERT INTO messages VALUES(10,1,0,'old message',0);
-            INSERT INTO marks VALUES(1,10,'handled');").unwrap();
-        drop(db);
-        let app = App::open(home.clone(), "http://127.0.0.1:0".into()).unwrap();
-        let old = app.message_for(10, Some(1)).unwrap();
-        assert_eq!(old["membership_unknown"], true);
-        assert_eq!(old["outside_membership"], false);
-        assert_eq!(old["mark"], "handled");
-        assert!(
-            app.history(Some(1), None, history_query()).unwrap()["events"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        let (mid, _) = app.post(0, 1, "new message").unwrap();
-        let new = app.message_for(mid, Some(1)).unwrap();
-        assert_eq!(new["membership_unknown"], false);
-        assert_eq!(new["outside_membership"], false);
-        assert_eq!(
-            app.lock()
-                .db
-                .query_row("SELECT settings FROM configs WHERE name='Mine'", [], |r| {
-                    r.get::<_, String>(0)
-                })
-                .unwrap(),
-            mine
-        );
-        let before = app.history(Some(1), None, history_query()).unwrap();
+    fn current_membership_history_and_config_survive_restart() {
+        let app = app_with_two_projects();
+        app.lock()
+            .db
+            .execute("UPDATE agents SET state='paused'", [])
+            .unwrap();
+        let config = app
+            .add_config("Example", Settings::default(), "user")
+            .unwrap();
+        app.set_project_config(1, Some(config), None, "user")
+            .unwrap();
+        let (thread, _) = app
+            .new_thread(0, Some(1), "Current history", &["1".into()], true, &[])
+            .unwrap();
+        let (message, _) = app.post(0, thread, "Retained message").unwrap();
+        app.set_marks(1, &[message], "handled").unwrap();
+        let before = app.message_for(message, Some(1)).unwrap();
+        assert_eq!(before["outside_membership"], false);
+        assert!(before.get("membership_unknown").is_none());
+        let home = app.home.clone();
         drop(app);
         let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
-        assert_eq!(app.history(Some(1), None, history_query()).unwrap(), before);
-        assert_eq!(
-            app.lock()
-                .db
-                .query_row("SELECT count(*) FROM member_intervals", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
+        assert_eq!(app.message_for(message, Some(1)).unwrap(), before);
+        assert_eq!(app.project_view(1).unwrap()["config"], config);
+        assert_eq!(app.config_view(config).unwrap()["name"], "Example");
     }
 }

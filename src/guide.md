@@ -1,6 +1,6 @@
 # acom guide
 
-acom launched you in a project: the folder you're working in. Project agents share its files, not isolated copies. Use `acom` to communicate, coordinate work and launch independent peers. Agent-facing commands act on your project; `ACOM_ID` supplies your caller identity automatically.
+acom launched you in a project: the folder you're working in. Project agents share its files, not isolated copies. Use `acom` to communicate, coordinate work and launch independent peers. Commands act on your project; `ACOM_URL` supplies its scope and `ACOM_ID` your identity. Numeric IDs are local to that project.
 
 Use documented commands and flags; check `acom <command> --help` when unsure. Read the response and check the exit status before assuming success. Errors go to stderr with a nonzero exit status: don't suppress or mask them. If an action may have completed, inspect its receipt/current state before retrying. `acom receipt <ID>` retrieves a saved full result without repeating the action.
 
@@ -16,7 +16,7 @@ A turn runs until your process exits. Between turns no model turn runs, but an i
 | `idle` | Between turns, still active | Member messages, subscription events, a deferred-wait deadline or queued continuation, subject to limits. |
 | `paused` | Suspended by the user, a limit or restart | Resume, or confirmed usage recovery when auto-resume is enabled; messages wait. |
 | `done` | Finished but message-wakeable; also used while a successor awaits startup | Member messages, subject to limits; not while a handoff/startup is pending. |
-| `closed` | Inactive | User Reopen; messages wait. |
+| `closed` | Inactive | Explicit Reopen; messages wait. |
 | `crashed` | A turn failed | Manual or configured recovery, not messages. |
 | `replaced` | Terminal predecessor | Never; records remain inspectable. |
 
@@ -25,6 +25,8 @@ End your turn normally to become idle. Register any needed event/deadline trigge
 `acom status "<text>"` sets a user-visible progress summary, not your lifecycle state. Prefer setting a short status at task start. Update it when the overall phase, blocker or outcome meaningfully changes, including before yielding or finishing if it would otherwise be misleading. No per-step or periodic updates are needed.
 
 `acom group <name>` changes your group. `acom me` shows identity, current/next-turn configuration, pending requests and history/output paths; `acom agent <ID>` inspects a peer.
+
+`acom permissions` shows any user-granted peer controls (none by default). Use `acom control pause|resume|close|reopen --agents launched|all|IDs` only within those grants; `launched` means direct helpers, following true replacements, not their descendants. Optional `--if-state` prevents acting on changed states. Inspect each target's outcome and paging hints; do not impersonate the user to bypass a refusal. Replacements inherit grants; ordinary helpers do not.
 
 While working, `[acom]` hook notices report new messages, limits, lost locks, subscribed events and coordination warnings. Message notifications contain counts/senders, not bodies: use `acom inbox`. Shortened notices identify `acom notices <ID>` for the full text. Turn-start and membership/lock summaries give nonzero counts and point to `acom history` for details.
 
@@ -76,17 +78,17 @@ Prefer narrowly filtered event watches over repeated polling for supported chang
 | `acom wait --idle --timeout 10m [filters]` | Returns immediately with a one-shot deferred-wait ID. Register, read the response, then end your turn normally without `acom done`. |
 | `acom subscribe <filters>` | Persistent selected-event subscription until canceled; updates reach working hooks or wake you when idle. |
 
-Wait timeouts default to 60s and allow 1s–1h. Foreground wait is **not a fixed sleep**: its timeout is an upper bound and notifications return early. Keep it below your shell tool's timeout, read every return, and inspect relevant inbox/notices before waiting again—even in timer loops. It still occupies an active slot and held lock TTLs continue.
+Wait timeouts default to 60s and allow 1s–1h. Foreground wait is **not a fixed sleep**: notifications return early, you remain working, shell timeouts apply and lock TTLs continue. Read its response before acting. If you intentionally defer processing, redirect output or wait again, printed notifications are still acknowledged and need not repeat; `acom inbox` still includes acknowledged-but-unhandled `new` messages (`--mark in-progress` selects started work). Ending your turn allows an eligible wake promptly; it does not create a batching delay or quiet interval.
 
 A deferred wait resolves once on an ordinary notification, selected event or deadline. Ordinary notifications include member messages, notices, lock updates and pending event deliveries, **not membership changes alone**. An early-resolution notice names the wait ID/cause and cancels its timeout. Registration can already be resolved: read its response and immediate updates before yielding. It does not make you idle or suspend commands; your process must exit. Updates consumed while working do not start another turn. Subscription events/deadlines only wake idle agents, never done/paused/crashed/closed/replaced ones. Registrations, pending updates and IDs survive restart and true replacement.
 
-Foreground deliveries have their own receipt IDs. Printed notifications are automatically acknowledged even if redirected; message marks are unchanged. If acknowledgement fails after complete text was received, follow the printed `acom wait --ack <delivery ID>` instruction. Otherwise repeat wait to replay the same delivery before changed filters apply; do not repeat the underlying action.
+Foreground deliveries have receipt IDs, separate from message work marks. After acknowledgement, their exact text is cleared; retained notices/history and message content remain accessible. If acknowledgement fails after complete text was received, use the printed `acom wait --ack <delivery ID>` instruction. Otherwise repeat wait to replay that delivery before changed filters apply; do not repeat the underlying action.
 
 ### Event filters
 
 - `--agents all` or `--agents 2,5` watches **peer lifecycle transitions**, not messages or current-state snapshots. `all` includes future project agents, excluding you; explicit IDs do not follow replacements. `--states crashed,done,replaced` selects destination states (all states if omitted); `--status-text` independently adds descriptive status changes.
 - To avoid a check/register race, capture `acom agents --event-cursor` **before** inspecting the relevant agents, then register with `--after <cursor>` to include intervening changes. The returned page and cursor share a snapshot; follow paging hints if more agents are needed. If the condition already holds, act on it rather than await a transition that may never occur. New filters otherwise start now. Repeated ordinary waits continue a durable cursor per filter; explicitly repeating `--after` rescans. `--after` requires `--agents`.
-- `--usage <provider> --window <name>` selects exactly one of `--above <percent>`, `--below <percent>`, `--reset` or `--reset-due`. Use window IDs from `acom limits`; Claude display labels are also accepted and receipts show canonical IDs. Unknown names fail; recognized windows may lack readings. Thresholds are strict: above 80 excludes 80. A qualifying latest-known threshold reports immediately, then only new crossings. Missing readings are not zero. `--reset` means freshly observed rollover/recovery; `--reset-due` only means the estimated time arrived. Detection depends on provider streams/checks, not an instant account signal.
+- `--usage <provider> --window <name>` selects exactly one of `--above <percent>`, `--below <percent>` or `--reset-due`. Use window IDs from `acom limits`; Claude display labels are accepted and receipts show canonical IDs. Unknown names fail; recognized windows may lack readings. Thresholds are strict: above 80 excludes 80. A qualifying latest-known threshold reports immediately, then new crossings; missing readings are not zero. For a reset-like wake, subscribe below current usage: this detects a decrease, not necessarily a full reset. Choose a threshold for particular headroom and recheck applicable limits when notified. Waiting until the estimated reset time (`--reset-due`) is simpler but can miss early recovery. Detection follows provider streams/checks, not an instant account signal.
 
 Agent and usage conditions combine with OR. Persistent subscriptions require a filter; deferred waits can use just ordinary notifications and a deadline. There are no selectable message/membership watches; ordinary member-message delivery is automatic.
 
@@ -96,7 +98,7 @@ Check peers' waits/subscriptions before depending on them. Avoid circular waits:
 
 ## Bounded reads and history
 
-List, thread and inbox reads default to 50 records and 16,000 JSON bytes; maxima are 200 records and 65,536 bytes. One page need not contain every pending item. Follow printed continuation commands, retaining `--through` and `--revision`; a changed mutable snapshot rejects its old revision, requiring a fresh traversal. `--before` and `--after` are exclusive ID cursors; `--after 0` starts from the oldest. Inbox starts with oldest outstanding messages.
+List, thread and inbox reads default to 50 records and 16,000 JSON bytes; maxima are 200 records and 65,536 bytes. One page need not contain every pending item. Follow printed continuation commands, retaining their cursors/revisions; changed mutable snapshots require a fresh traversal. Most lists use exclusive `--before`/`--after` IDs and `--through`; `--after 0` starts oldest-first, as inbox does by default. Sorted thread lists instead use opaque `--cursor` values.
 
 A `truncated` stub has not delivered full content. Read by ID (`read`, `agent`, `thread details`, `lock read`, `subscription`, `notices`, `receipt` or `history`), then follow its `--offset`/`--version` hint. Concatenate returned `chunk` strings while `has_more`; offsets are UTF-8 bytes, not characters. If version changes, discard partial content and restart at zero. Omitted/truncated inbox messages are not acknowledged; marks still need `acom mark`.
 
@@ -167,4 +169,4 @@ Working and idle count as active; finished agents do not. Messages waking done a
 
 Run `acom --help` for the command index, bounded-read options and syntax. Agent commands include the operations above, `guide`, `models`, `notices`, `receipt` and project-scoped `activity`; `log` is limited to your own agent.
 
-User controls are not agent commands: never run `serve`, project add/remove, `pause`, `pause-all`, `resume`, `resume-all`, `resume-restart`, `close`, `reopen`, `lock free` or `launch --force`, or edit settings to bypass limits/permissions.
+User controls are not agent commands: never run `serve`, project management/import/export, `pause`, `pause-all`, `resume`, `resume-all`, `resume-restart`, `close`, `reopen`, `lock free` or `launch --force`, or edit settings to bypass limits/permissions. Granted peer actions use `acom control`, not owner commands.

@@ -5,8 +5,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const http = require('node:http');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
+const { attachGlobal } = require('./fixture-workspace.cjs');
 
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
 const MAX_BODY = 16 * 1024 * 1024;
@@ -65,8 +67,12 @@ async function fixture(run) {
       if (Date.now() > deadline) throw Error(`Fixture startup timed out: ${errors}`);
       await new Promise(resolve => setTimeout(resolve, 25));
     }
-    db = new DatabaseSync(path.join(home, 'acom.db'));
-    const snapshot = () => Object.fromEntries(['projects', 'agents', 'configs', 'activity', 'events'].map(table => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+    db = new DatabaseSync(path.join(home, 'global', 'acom.db'));
+    attachGlobal(db,home);
+    const snapshot = () => ({
+      ...Object.fromEntries(Object.entries({projects:'workspace_projects',agents:'agents',configs:'global.configs',activity:'activity',events:'events'}).map(([key,table])=>[key,db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])),
+      projectDirectories:fs.readdirSync(path.join(home,'projects')).sort(),
+    });
     await run({ raw, project, snapshot, base });
   } finally {
     for (const socket of sockets) socket.destroy();
@@ -146,4 +152,32 @@ test('HTTP truncated chunked bodies cannot commit a valid JSON prefix', async ()
   const complete = await raw({ headers: ['Content-Type: application/json', 'Transfer-Encoding: chunked'], body });
   assert.equal(complete.status, 200);
   assert.equal(complete.value.path, project);
+}));
+
+test('HTTP persistent static connections never starve new connections or subsequent requests', async t => fixture(async ({base}) => {
+  const agents=Array.from({length:2},()=>new http.Agent({keepAlive:true,maxSockets:64,maxFreeSockets:64}));
+  const get=agent=>new Promise((resolve,reject)=>{
+    const request=http.get(`${base}/assets/charts.js`,{agent},response=>{
+      const socket=response.socket;let bytes=0;
+      response.on('data',chunk=>bytes+=chunk.length);response.once('error',error=>{clearTimeout(timer);reject(error);});
+      response.once('end',()=>{
+        clearTimeout(timer);
+        if(response.statusCode!==200||!response.complete||bytes===0)return reject(Error('Incomplete or rejected static response'));
+        resolve(socket);
+      });
+    });
+    const timer=setTimeout(()=>request.destroy(Error('A static request stalled while earlier keep-alive sockets remained open')),3000);
+    request.once('error',error=>{clearTimeout(timer);reject(error);});
+  });
+  const burst=agent=>Promise.all(Array.from({length:64},()=>get(agent)));
+  try {
+    const started=performance.now(),first=await burst(agents[0]);
+    assert.equal(new Set(first).size,64,'each initial request uses a separate persistent connection');
+    assert.ok(first.every(socket=>!socket.destroyed),'completed connections must remain open for the next burst');
+    const firstMs=Math.round(performance.now()-started),second=await burst(agents[1]);
+    assert.ok([...first,...second].every(socket=>!socket.destroyed));
+    const original=new Set(first),reused=await burst(agents[0]);
+    assert.ok(reused.every(socket=>original.has(socket)),'subsequent requests reuse the original still-open sockets');
+    t.diagnostic(`64 initial + 64 additional held-open sockets + 64 reused requests completed in ${Math.round(performance.now()-started)} ms (first burst ${firstMs} ms)`);
+  } finally {for(const agent of agents)agent.destroy();}
 }));

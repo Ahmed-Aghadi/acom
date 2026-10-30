@@ -3,6 +3,7 @@
 // ACOM_BROWSER_TEST=1 node --test tests/server.cjs also drives the real page.
 // ACOM_FOLLOWUP_TEST_ONLY=1 runs the continuation/replacement subset.
 // ACOM_WAIT_RESTART_TEST_ONLY=1 runs foreground wait/graceful restart coverage.
+// ACOM_CORE_TEST_ONLY=1 skips the separately runnable lifecycle subsets.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -13,6 +14,7 @@ const http = require('node:http');
 const { DatabaseSync } = require('node:sqlite');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const {scoped,projectHome,attachGlobal}=require('./fixture-workspace.cjs');
 const startupDiagnostic={type:'item.completed',item:{id:'item_0',type:'error',message:'`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.'}};
 const resumeWarning="Commands may be partial; unsaved work may be lost. Old commands, background tasks and monitors stopped—don't wait for them. Previous locks released; reacquire required locks before protected work.";
 function assertResumeWarning(prompt,guidance) {
@@ -25,8 +27,10 @@ function assertResumeWarning(prompt,guidance) {
 
 // These lifecycle tests inspect complete fixture state. Follow the bounded API
 // explicitly; raw envelope and byte-budget assertions live in pagination.cjs.
-async function fixtureRead(base, method, route, body, status=200) {
-  const requested = new URL(route, base);
+async function fixtureRead(base, method, route, body, status=200, project) {
+  const requested = new URL(project ? scoped(route,project,body) : route, base);
+  const localPath=requested.pathname.replace(/^\/p\/[^/]+/,'');
+  const localProject=/^\/p\/([^/]+)/.exec(requested.pathname)?.[1] ?? project;
   const read = async (url, method='GET', body, status=200) => {
     const response = await fetch(url, {method, headers:{'Content-Type':'application/json'}, ...(body === undefined || body === null ? {} : {body:JSON.stringify(body)})});
     const value = await response.json();
@@ -57,26 +61,30 @@ async function fixtureRead(base, method, route, body, status=200) {
     let page=value;
     while (page.has_more) {
       const next = new URL(requested);
-      const direction = page.next_after == null ? 'before' : 'after';
-      next.searchParams.delete(direction === 'before' ? 'after' : 'before');
-      next.searchParams.set(direction, page[`next_${direction}`]);
-      next.searchParams.set('through', value.through);
+      if(page.next_cursor!=null)next.searchParams.set('cursor',page.next_cursor);
+      else {
+        const direction = page.next_after == null ? 'before' : 'after';
+        next.searchParams.delete(direction === 'before' ? 'after' : 'before');
+        next.searchParams.set(direction, page[`next_${direction}`]);
+        next.searchParams.set('through', value.through);
+      }
       next.searchParams.set('revision', value.revision);
       page = await read(next);
       assert.ok(page.items.length > 0, 'collection pages must advance');
       items.push(...page.items);
     }
-    const collection=requested.pathname.split('/')[1];
+    const collection=localPath.split('/')[1];
     for (let index=0; index<items.length; index++) {
       if (!items[index].truncated) continue;
-      const detail = new URL(collection === 'inbox' ? `/messages/${items[index].id}` : `/${collection}/${items[index].id}`, base);
-      const agent=requested.searchParams.get('agent') || (collection === 'inbox' ? requested.pathname.split('/')[2] : null);
+      const detailPath=collection === 'inbox' ? `/messages/${items[index].id}` : `/${collection}/${items[index].id}`;
+      const detail = new URL(localProject ? scoped(detailPath,localProject) : detailPath, base);
+      const agent=requested.searchParams.get('agent') || (collection === 'inbox' ? localPath.split('/')[2] : null);
       if (agent !== null) detail.searchParams.set('agent',agent);
       items[index]=await fullRecord(detail,await read(detail));
     }
-    return items.sort((a,b)=>a.id-b.id);
+    return items.sort((a,b)=>typeof a.id==='string' ? a.id.localeCompare(b.id) : a.id-b.id);
   }
-  if (/^\/threads\/\d+$/.test(requested.pathname) && value.messages?.items) {
+  if (/^\/threads\/\d+$/.test(localPath) && value.messages?.items) {
     const next = new URL(requested);
     next.searchParams.delete('before'); next.searchParams.set('after',0);
     next.searchParams.set('limit',200); next.searchParams.set('max_bytes',65536);
@@ -90,20 +98,20 @@ async function fixtureRead(base, method, route, body, status=200) {
     }
     for (let index=0; index<messages.length; index++) {
       if (!messages[index].truncated) continue;
-      const detail = new URL(`/messages/${messages[index].id}`,base);
+      const detail = new URL(scoped(`/messages/${messages[index].id}`,localProject),base);
       if (requested.searchParams.has('agent')) detail.searchParams.set('agent',requested.searchParams.get('agent'));
       messages[index]=await fullRecord(detail,await read(detail));
     }
     value.messages=messages;
   }
-  if (/^\/agents\/\d+\/log$/.test(requested.pathname)) value.lines=value.text.split('\n').filter(Boolean);
+  if (/^\/agents\/\d+\/log$/.test(localPath)) value.lines=value.text.split('\n').filter(Boolean);
   if (requested.pathname === '/overview' && !value.unchanged) {
     const project=value.project?.id;
     const scope=project == null ? '' : `?project=${project}`;
     const [projects,agents,threads,locks,configs,settings]=await Promise.all([
-      fixtureRead(base,'GET','/projects'), fixtureRead(base,'GET','/agents'+scope),
-      fixtureRead(base,'GET','/threads'+scope), fixtureRead(base,'GET','/locks'+scope),
-      fixtureRead(base,'GET','/configs'), fixtureRead(base,'GET','/settings'+scope),
+      fixtureRead(base,'GET','/projects'), project ? fixtureRead(base,'GET','/agents'+scope,undefined,200,project) : [],
+      project ? fixtureRead(base,'GET','/threads'+scope,undefined,200,project) : [], project ? fixtureRead(base,'GET','/locks'+scope,undefined,200,project) : [],
+      fixtureRead(base,'GET','/configs'), project ? fixtureRead(base,'GET','/settings'+scope,undefined,200,project) : (await fixtureRead(base,'GET','/configs/default')).settings,
     ]);
     Object.assign(value,{projects,agents,threads,locks,configs,settings});
   }
@@ -154,7 +162,8 @@ test('CLI paths and agent details use caller context; negative API actors cannot
   const url=`http://127.0.0.1:${await freePort()}`;
   const server=spawn(binary,['serve','--port',new URL(url).port],{cwd:serverCwd,env,stdio:['ignore','ignore','pipe']});
   let errors=''; server.stderr.on('data',chunk=>errors+=chunk);
-  const api=(method,route,body,status=200)=>fixtureRead(url,method,route,body,status);
+  let selectedProject;
+  const api=(method,route,body,status=200)=>fixtureRead(url,method,route,body,status,selectedProject);
   const cli=(args,extra={})=>spawnSync(binary,args,{cwd:clientCwd,env:{...env,...extra},encoding:'utf8'});
   try {
     await until(async()=>{
@@ -167,28 +176,31 @@ test('CLI paths and agent details use caller context; negative API actors cannot
     assert.equal(projects.length,1);
     assert.equal(projects[0].path,path.join(clientCwd,'child'),'relative paths belong to the CLI caller, even when the server has the same child name');
     const a=await api('POST','/projects',{path:clientCwd}), b=await api('POST','/projects',{path:serverCwd});
-    const db=new DatabaseSync(path.join(home,'acom.db'));
+    selectedProject=a.id;
+    const db=new DatabaseSync(path.join(projectHome(home,a.id),'acom.db'));attachGlobal(db,home);
     try {
       const insert=db.prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
-      insert.run(1,a.id,'local agent','local task','codex','gpt-6-sol','medium','closed',0,0);
-      insert.run(2,b.id,'foreign agent','foreign private task','codex','gpt-6-sol','medium','closed',0,0);
-      insert.run(3,a.id,'local peer','peer task','codex','gpt-6-sol','medium','closed',0,0);
+      insert.run(1,1,'local agent','local task','codex','gpt-6-sol','medium','closed',0,0);
+      insert.run(3,1,'local peer','peer task','codex','gpt-6-sol','medium','closed',0,0);
     } finally {db.close();}
-    const actor={ACOM_ID:'1'};
+    const foreignDb=new DatabaseSync(path.join(projectHome(home,b.id),'acom.db'));attachGlobal(foreignDb,home);
+    try{foreignDb.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(2,1,'foreign agent','foreign private task','codex','gpt-6-sol','medium','closed',0,0)").run();}finally{foreignDb.close();}
+    const actor={ACOM_ID:'1',ACOM_URL:`${url}/p/${a.id}`};
     const local=cli(['agent','1'],actor);
     assert.equal(local.status,0,local.stderr); assert.match(local.stdout,/local task/);
     const peer=cli(['agent','3'],actor);
     assert.equal(peer.status,0,peer.stderr); assert.match(peer.stdout,/peer task/);
     const foreign=cli(['agent','2'],actor);
-    assert.equal(foreign.status,1); assert.match(foreign.stderr,/another project/);
+    assert.equal(foreign.status,1); assert.match(foreign.stderr,/no agent 2/);
     assert.doesNotMatch(foreign.stdout,/foreign private task/);
-    const user=cli(['agent','2']);
+    assert.notEqual(cli(['agent','2']).status,0,'an owner local ID must not fall back to another project');
+    const user=cli(['agent','2'],{ACOM_URL:`${url}/p/${b.id}`});
     assert.equal(user.status,0,user.stderr); assert.match(user.stdout,/foreign private task/);
     assert.equal((await api('GET','/agents/1?agent=1')).id,1);
     assert.equal((await api('GET','/agents/3?agent=1')).id,3);
-    await api('GET','/agents/2?agent=1',null,400);
+    await api('GET','/agents/2?agent=1',null,404);
     await api('GET','/agents/2?agent=99999',null,404);
-    assert.equal((await api('GET','/agents/2?agent=0')).id,2);
+    assert.equal((await api('GET',`/p/${b.id}/agents/2?agent=0`)).id,2);
     for (const duration of ['9223372036854775807s','18446744073709551615s']) {
       const excessiveWait=cli(['lock','acquire','unused','--wait',duration],actor);
       assert.notEqual(excessiveWait.status,0);
@@ -217,7 +229,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
     await api('POST','/agent-config',{agent:-7,id:1,effort:'high'},400);
     await api('POST','/projects',{via:-7,path:clientCwd},400);
     await api('GET','/agents/2?agent=-7',null,400);
-    assert.equal((await api('GET','/agents')).length,3);
+    assert.equal((await api('GET','/agents')).length,2);
     assert.equal((await api('GET','/threads')).length,1);
     assert.equal((await api('GET','/agents/1')).effort,'medium');
     await t.test('server validates request boundaries before business-state changes',async()=>{
@@ -225,7 +237,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
       assert.ok((await api('POST',`/threads/${thread.id}/members`,{members:[3]})).members.includes(3),'numeric member IDs remain valid selectors');
       const message=await api('POST','/messages',{thread:thread.id,text:'Keep this message unhandled'});
       const snapshot=()=>{
-        const connection=new DatabaseSync(path.join(home,'acom.db'));
+        const connection=new DatabaseSync(path.join(projectHome(home,a.id),'acom.db'));attachGlobal(connection,home);
         try {
           connection.exec('PRAGMA busy_timeout=5000');
           return Object.fromEntries([
@@ -235,7 +247,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
           ].map(table=>[table,connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
         } finally {connection.close();}
       };
-      const settings=(await api('GET','/configs/1')).settings;
+      const settings=(await api('GET','/configs/default')).settings;
       const malformedSettings=[
         value=>{value.typo=true;},
         value=>{value.prompts.resuem='typo';},
@@ -301,7 +313,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
       assert.equal(deepLink.status,200);
       assert.match(deepLink.headers.get('content-type'),/text\/html/);
       assert.match(await deepLink.text(),/<title>acom<\/title>/);
-      assert.equal((await fetch(`${url}/?project=999999`)).status,200,'a stale bookmark must still load the UI shell');
+      assert.equal((await fetch(`${url}/?project=99999999-9999-4999-8999-999999999999`)).status,200,'a stale UUID bookmark must still load the UI shell');
       for(const ids of ['',',','1,',',1','1,,2','0','1,0']) {
         const before=snapshot();
         const rejected=cli(['resume',ids]);
@@ -315,7 +327,7 @@ test('CLI paths and agent details use caller context; negative API actors cannot
       custom.harnesses.codex.model='custom-local-model';
       const saved=await api('POST','/configs',{name:'Custom model',settings:custom});
       assert.equal((await api('GET',`/configs/${saved.id}`)).settings.harnesses.codex.model,'custom-local-model','open-ended model IDs stay supported');
-      assert.equal((await api('GET','/agents')).length,3,'rejected launches must not create agents');
+      assert.equal((await api('GET','/agents')).length,2,'rejected launches must not create agents');
     });
   } finally {
     if(server.exitCode===null && server.signalCode===null) {
@@ -364,12 +376,12 @@ test('CLI wait validates delivery envelopes before acknowledgement', async t => 
       await new Promise(resolve=>mock.listen(0,'127.0.0.1',resolve));
       let child;
       try {
-        const url=`http://127.0.0.1:${mock.address().port}`;
+        const url=`http://127.0.0.1:${mock.address().port}/p/11111111-1111-4111-8111-111111111111`;
         child=spawn(binary,['wait','--timeout','1s'],{env:{...env,ACOM_URL:url},stdio:['ignore','pipe','pipe']});
         let stdout='',stderr=''; child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk);
         const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});
-        assert.equal(requests.filter(route=>route==='/wait/1').length,1);
-        assert.equal(requests.filter(route=>route==='/wait/1/ack').length,valid && payload.delivery_id ? 1 : 0,'malformed response must never be acknowledged');
+        assert.equal(requests.filter(route=>route.endsWith('/wait/1')).length,1);
+        assert.equal(requests.filter(route=>route.endsWith('/wait/1/ack')).length,valid && payload.delivery_id ? 1 : 0,'malformed response must never be acknowledged');
         if(valid) {
           if(payload.delivery_id && ackResponse?.acknowledged!==true) {
             assert.notEqual(status,0); assert.match(stderr,/acom wait --ack 7/);
@@ -392,12 +404,17 @@ test('CLI resume-restart retains compact partial failure status', async t => {
   const env={...process.env,ACOM_HOME:home,PATH:emptyBin};
   delete env.ACOM_ID; delete env.CLAUDE_CODE_OAUTH_TOKEN;
   try {
-    for(const errors of [1,0]) await t.test(errors ? 'unsampled error still fails' : 'successful compact control',async()=>{
+    for(const errors of [1,0]) for(const nested of [false,true]) await t.test(`${nested?'project-qualified':'flat compact'} ${errors?'error still fails':'success'}`,async()=>{
       const requests=[];
       const mock=http.createServer((req,res)=>{
         requests.push([req.method,req.url]); req.resume();
         res.writeHead(200,{'Content-Type':'application/json'});
-        res.end(JSON.stringify({result_truncated:true,counts:{ids:2,errors,warnings:0},ids:[],errors:[],warnings:[],receipt_event:77}));
+        res.end(JSON.stringify(nested ? {
+          results:[
+            {project:'00000000-0000-4000-8000-000000000001',ids:[1],errors:[],warnings:[]},
+            {project:'00000000-0000-4000-8000-000000000002',ids:[1],errors:errors?['agent 2: synthetic startup failure']:[],warnings:[]},
+          ],errors:[],
+        } : {result_truncated:true,counts:{ids:2,errors,warnings:0},ids:[],errors:[],warnings:[],receipt_event:77}));
       });
       await new Promise(resolve=>mock.listen(0,'127.0.0.1',resolve));
       let child;
@@ -407,7 +424,8 @@ test('CLI resume-restart retains compact partial failure status', async t => {
         const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});
         assert.equal(status,errors ? 1 : 0,stderr);
         assert.match(stdout,/resumed 2 restart-paused agent/i);
-        assert.match(stderr,/acom receipt 77/,'full error details remain recoverable without reexecuting the action');
+        if(!nested) assert.match(stderr,/acom receipt 77/,'full error details remain recoverable without reexecuting the action');
+        else if(errors) assert.match(stderr,/project 00000000-0000-4000-8000-000000000002: agent 2: synthetic startup failure/,'partial global errors retain their project qualifier');
         assert.deepEqual(requests,[['POST','/resume-restart']],'receipt sampling must not trigger automatic resumption retries');
       } finally {
         if(child && child.exitCode===null && child.signalCode===null) child.kill('SIGTERM');
@@ -558,9 +576,11 @@ process.stdin.on('end', async () => {
   // No inherited PATH: a missing fake client must never fall through to a real provider.
   const env = { ...process.env, ACOM_HOME: home, CODEX_HOME:path.join(root,'codex'), CLAUDE_CONFIG_DIR:path.join(root,'no-credentials'), PATH: bin };
   delete env.ACOM_ID; delete env.ACOM_URL; delete env.CLAUDE_CODE_OAUTH_TOKEN;
-  let server, stderr = '';
+  let server, stderr = '', compiledGuide='';
   const start = async (nextPort=port) => {
     port=nextPort; url=`http://127.0.0.1:${port}`;
+    const guide=spawnSync(binary,['guide'],{env,encoding:'utf8'});
+    assert.equal(guide.status,0,guide.stderr);compiledGuide=guide.stdout;
     server = spawn(binary, ['serve', '--port', String(port)], { env, stdio: ['ignore', 'ignore', 'pipe'] });
     server.stderr.on('data', chunk => stderr += chunk);
     await until(async () => {
@@ -575,25 +595,47 @@ process.stdin.on('end', async () => {
       server.kill(signal); await exited;
     }
   };
-  const api = (method,route,body,status=200)=>fixtureRead(url,method,route,body,status);
+  const projectPaths=new Map();
+  const projectApi = project => {
+    const request=async(method,route,body,status=200)=>{
+      const value=await fixtureRead(url,method,route,body,status,project);
+      if(method==='POST'&&route==='/projects'&&status===200){
+        for(const [id,path]of projectPaths)if(path===value.path&&id!==value.id)projectPaths.delete(id);
+        projectPaths.set(value.id,value.path);
+      }
+      return value;
+    };
+    request.forProject=projectApi;
+    request.url=()=>project ? `${url}/p/${project}` : url;
+    return request;
+  };
+  let api=projectApi();
   const cli = (cwd, args, extra = {}, input) => {
-    const result = spawnSync(binary, args, { cwd, env: { ...env, ...extra }, encoding: 'utf8', input });
+    const context=[...projectPaths].filter(([,folder])=>cwd===folder||cwd.startsWith(folder+path.sep)).sort((a,b)=>b[1].length-a[1].length)[0]?.[0] ?? primaryProject;
+    const result = spawnSync(binary, args, { cwd, env: { ...env, ...(context?{ACOM_URL:`${url}/p/${context}`}:{}) ,...extra }, encoding: 'utf8', input });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
   };
   // A read can overlap appendFileSync; only newline-terminated records are complete.
-  const runs = () => fs.existsSync(path.join(home, 'runs.jsonl')) ? fs.readFileSync(path.join(home, 'runs.jsonl'), 'utf8').split('\n').slice(0,-1).map(JSON.parse) : [];
+  let primaryProject;
+  const runs = (project=primaryProject) => {
+    const projects=project ? [project] : fs.readdirSync(path.join(home,'projects')).filter(name=>/^[0-9a-f-]{36}$/.test(name));
+    return projects.flatMap(project=>{
+      const file=path.join(projectHome(home,project),'runs.jsonl');
+      return fs.existsSync(file) ? fs.readFileSync(file,'utf8').split('\n').slice(0,-1).map(line=>({...JSON.parse(line),project})) : [];
+    });
+  };
   const storedConfigs = () => {
-    const db=new DatabaseSync(path.join(home,'acom.db'),{readOnly:true});
-    try { return db.prepare('SELECT id,name,settings FROM configs ORDER BY id').all().map(row=>({...row})); }
+    const db=new DatabaseSync(path.join(home,'global','shared.db'),{readOnly:true});
+    try { return db.prepare('SELECT uuid id,name,settings FROM configs ORDER BY uuid').all().map(row=>({...row})); }
     finally { db.close(); }
   };
-  const finished = (id, state = 'closed') => until(async () => (await api('GET', `/agents/${id}`)).state === state, `agent ${id} ${state}`);
+  const finished = (id, state = 'closed', project=primaryProject) => until(async () => (await projectApi(project)('GET', `/agents/${id}`)).state === state, `agent ${id} ${state}`);
   try {
     await start();
     assert.equal((await api('GET', '/overview')).project, null);
     await api('POST', '/agents', { harness: 'codex', task: 'Missing project' }, 400);
-    const builtin = (await api('GET', '/configs')).find(c=>c.id===1);
+    const builtin = (await api('GET', '/configs')).find(c=>c.id==='default');
     assert.equal(builtin.name,'Default');
     assert.deepEqual(storedConfigs(),[],'fresh database contains no saved Default settings');
     const defaults = structuredClone(builtin.settings);
@@ -623,17 +665,17 @@ process.stdin.on('end', async () => {
         request.on('error',reject);request.end(invalidBody);
       });
       assert.equal(bodyResponse.status,400);
-      assert.match(JSON.parse(bodyResponse.body).error,/unknown request field/);
+      assert.match(JSON.parse(bodyResponse.body).error,/GET requests do not accept body fields/);
     }
     await api('GET','/assets/unknown.js',null,404);
     await api('GET',parserAsset+'/extra',null,404);
     assert.equal(defaults.harnesses.codex.model,'gpt-6-sol');
-    await api('PUT','/configs/1',{settings:defaults},409);
-    await api('PUT','/configs/1',{name:'Changed Default',settings:defaults},409);
-    await api('POST','/configs/1/remove',{},409);
+    await api('PUT','/configs/default',{settings:defaults},409);
+    await api('PUT','/configs/default',{name:'Changed Default',settings:defaults},409);
+    await api('POST','/configs/default/remove',{},409);
     defaults.prompts={launch:'Literal {task} launch',wake:'Literal {updates} wake',resume:'Literal {updates} resume'};
     const mine=await api('POST','/configs',{name:'Mine',settings:defaults});
-    assert.equal(mine.id,2,'the virtual Default reserves ID 1 without storing a config row');
+    assert.match(mine.id,/^[0-9a-f]{32}$/,'named configuration IDs are opaque strings');
     await api('PUT',`/configs/${mine.id}`,{name:'Default',settings:defaults},409);
     await api('POST','/configs',{name:'Default',settings:defaults},409);
     assert.deepEqual(storedConfigs().map(c=>({id:c.id,name:c.name})),[{id:mine.id,name:'Mine'}]);
@@ -673,6 +715,8 @@ process.stdin.on('end', async () => {
     }
     const a = await api('POST', '/projects', { path: first });
     const b = await api('POST', '/projects', { path: second });
+    primaryProject=a.id;api=api.forProject(a.id);
+    const aHome=projectHome(home,a.id), bHome=projectHome(home,b.id);
     for(const project of [a.id,b.id]) await api('PUT',`/projects/${project}/config`,{config:mine.id});
     const windowConfig = structuredClone(defaults);
     windowConfig.limits.usage.claude_five_hour = {soft:25,hard:75};
@@ -694,42 +738,43 @@ process.stdin.on('end', async () => {
     const duplicate = spawnSync(binary, ['serve', '--port', String(port + 1)], { env, encoding: 'utf8' });
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already running/);
-    const waitProjects=await waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,env,defaults});
-    const lifecycleProject=await lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults});
-    const followupProject=await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
+    const waitProjects=process.env.ACOM_CORE_TEST_ONLY ? [] : await waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,env,defaults});
+    const lifecycleProject=process.env.ACOM_CORE_TEST_ONLY ? null : await lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults});
+    const followupProject=process.env.ACOM_CORE_TEST_ONLY ? null : await followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors:()=>stderr});
     await api('POST', '/agents', { project: a.id, harness: 'codex', model: 'gpt-6-luna', effort: 'ultra', task: 'Unsupported effort' }, 400);
     const boundedLocks=structuredClone(defaults); boundedLocks.max_lock_ttl_secs=60;
     await api('PUT',`/projects/${b.id}/config`,{custom:boundedLocks});
     const one = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'First project INITIAL_LOCK_HOLD_TEST' });
     const two = await api('POST', '/agents', { project: b.id, harness: 'codex', model: 'custom-id', task: 'Second project INITIAL_LOCK_HOLD_TEST' });
-    await until(() => [one.id,two.id].every(id=>runs().some(r=>r.id===id)), 'both harnesses started');
-    for (const [agent, project] of [[one.id, first], [two.id, second]]) {
-      const run = runs().find(r => r.id === agent);
-      assert.equal(run.cwd, project);
+    assert.equal(one.id,two.id,'independent project-local agent counters both start at one');
+    await until(() => [[one.id,a.id],[two.id,b.id]].every(([id,project])=>runs(project).some(r=>r.id===id)), 'both harnesses started');
+    for (const [agent, project, folder, ttl] of [[one.id,a.id,first,900],[two.id,b.id,second,60]]) {
+      const run = runs(project).find(r => r.id === agent);
+      assert.equal(run.cwd, folder);
       assert.ok(run.args.includes('--dangerously-bypass-approvals-and-sandbox'));
       assert.ok(run.args.includes('--skip-git-repo-check'));
       assert.match(run.prompt, /messages wait until the user explicitly reopens/);
       assert.match(run.prompt, /# acom guide/);
-      assert.ok(run.prompt.includes(fs.readFileSync(path.resolve(__dirname,'../src/guide.md'),'utf8')),'launch includes the current complete guide');
+      assert.ok(run.prompt.includes(compiledGuide),'launch includes the server binary’s complete guide');
       assert.match(run.prompt, /acom inbox/);
       assert.match(run.prompt, /acom lock acquire/);
-      assert.match(run.prompt, new RegExp(`Lock TTL: maximum ${agent===one.id ? 900 : 60}s`));
-      assert.ok(run.prompt.includes(project));
+      assert.match(run.prompt, new RegExp(`Lock TTL: maximum ${ttl}s`));
+      assert.ok(run.prompt.includes(folder));
       assert.match(run.prompt,/Literal \{task\} launch/);
     }
     assert.deepEqual((await api('GET', `/overview?project=${a.id}`)).agents.map(x => x.id), [one.id]);
     assert.deepEqual((await api('GET', `/overview?project=${b.id}`)).agents.map(x => x.id), [two.id]);
     assert.match(cli(first, ['agents']), new RegExp(`agent ${one.id}`));
-    assert.doesNotMatch(cli(first, ['agents']), new RegExp(`agent ${two.id}`));
-    assert.doesNotMatch(cli(root, ['agents'], { ACOM_ID: String(one.id) }), new RegExp(`agent ${two.id}`));
+    assert.doesNotMatch(cli(first, ['agents']), /Second project/);
+    assert.doesNotMatch(cli(root, ['agents'], { ACOM_ID: String(one.id) }), /Second project/);
     for (const p of [a.id, b.id]) await api('POST', '/locks', { project: p, name: 'build', about: 'Independent' });
-    for (const agent of [one.id, two.id]) await api('POST', '/locks/acquire', { agent, name: 'build', wait: 0 });
+    for (const [agent,project] of [[one.id,a.id],[two.id,b.id]]) await api.forProject(project)('POST', '/locks/acquire', { agent, name: 'build', wait: 0 });
     assert.equal((await api('GET', `/locks?project=${a.id}`))[0].holder, one.id);
     assert.equal((await api('GET', `/locks?project=${b.id}`))[0].holder, two.id);
     const ownLock=(await api('GET',`/locks?project=${b.id}`))[0];
     assert.ok(ownLock.expires_at>Math.floor(Date.now()/1000) && ownLock.expires_at<=Math.floor(Date.now()/1000)+60);
     for (const ttl of [0,-1,1.5,'10',true,61,Number.MAX_SAFE_INTEGER]) {
-      await api('POST','/locks/acquire',{agent:two.id,name:'build',wait:0,ttl},400);
+      await api.forProject(b.id)('POST','/locks/acquire',{agent:two.id,name:'build',wait:0,ttl},400);
     }
     assert.equal((await api('GET',`/locks?project=${b.id}`))[0].expires_at,ownLock.expires_at,'invalid renewals preserve the lease');
     assert.match(cli(second,['lock','acquire','build','--ttl','30s'],{ACOM_ID:String(two.id)}),/renewed build, expires/);
@@ -744,14 +789,14 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET',`/locks?project=${b.id}`))[0].expires_at,shortened,'raising the ceiling never extends a held lock');
     assert.ok((await api('GET',`/locks?project=${a.id}`))[0].expires_at>shortened,'other project retains its ceiling');
     await api('PUT',`/projects/${b.id}/config`,{config:mine.id});
-    await api('POST', '/threads', { project: a.id, title: 'Wrong project', members: [String(two.id)] }, 400);
+    await api('POST', `/p/${a.id}/threads`, { project: b.id, title: 'Wrong project', members: [String(two.id)] }, 400);
     const thread = await api('POST', '/threads', { project: a.id, title: 'Review', members: [String(one.id)] });
-    await api('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 400);
+    await api.forProject(b.id)('POST', '/messages', { agent: two.id, thread: thread.id, text: 'Wrong project' }, 404);
     await api('POST', `/projects/${a.id}/remove`, {}, 409);
-    for(const id of [one.id,two.id]) fs.writeFileSync(path.join(home,'release-'+id),'');
-    await finished(one.id); await finished(two.id);
+    for(const [id,runHome] of [[one.id,aHome],[two.id,bHome]]) fs.writeFileSync(path.join(runHome,'release-'+id),'');
+    await finished(one.id); await finished(two.id,'closed',b.id);
     const cliThread=await api('POST','/threads',{project:a.id,title:'CLI stdin delivery',members:[]});
-    const actor={ACOM_ID:String(one.id),ACOM_URL:url};
+    const actor={ACOM_ID:String(one.id),ACOM_URL:api.url()};
     const multiline='**First line from stdin**\n`Second line from stdin`\n';
     const acknowledged=cli(first,['send','--thread',String(cliThread.id)],actor,multiline);
     const sent=acknowledged.match(/^sent #(\d+) to thread (\d+)$/m);
@@ -789,7 +834,7 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', `/threads?project=${a.id}`)).find(t => t.id === thread.id).unread, 1);
     assert.equal((await api('GET', `/overview?project=${a.id}`)).projects.find(p => p.id === a.id).unread, 1);
     // Agent reads and notification cursors must not clear the user's unread state.
-    assert.match(cli(root, ['thread', 'read', String(thread.id)], { ACOM_ID: String(one.id), ACOM_URL: url }), /Unread for the user/);
+    assert.match(cli(root, ['thread', 'read', String(thread.id)], { ACOM_ID: String(one.id), ACOM_URL: api.url() }), /Unread for the user/);
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, 0);
     await api('POST', `/threads/${thread.id}/read`, { agent: one.id, message: firstMessage.id }, 400);
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, 0);
@@ -801,7 +846,7 @@ process.stdin.on('end', async () => {
     assert.match(cli(first, ['thread', 'read', String(thread.id)]), /Arrived after the snapshot/);
     assert.equal((await api('GET', `/threads/${thread.id}`)).last_read, secondMessage.id);
     assert.equal((await api('GET', `/threads/${thread.id}`)).unread, 0);
-    if (process.env.ACOM_BROWSER_TEST) await browserMessageChecks(url, api, a.id, one.id, thread.id, home);
+    if (process.env.ACOM_BROWSER_TEST) await browserMessageChecks(url, api, a.id, one.id, thread.id, aHome);
     // Closed agents miss rule-change notices, so their next turn needs a fresh snapshot.
     const changedWhileClosed = structuredClone(defaults);
     changedWhileClosed.done_closes = false;
@@ -940,26 +985,26 @@ process.stdin.on('end', async () => {
     assert.match(diagnosticLog[0],/\[turn-start\] turn 1 started$/);
     assert.ok(diagnosticLog[1].includes(`[message] notice: ${startupDiagnostic.item.message}`),'startup diagnostics remain visible without becoming failures');
     assert.match(diagnosticLog[2],/\[turn-end\] turn 1 ended$/);
-    const rawDiagnostic=fs.readFileSync(path.join(home,'logs',`${diagnostic.id}.jsonl`),'utf8').trim().split('\n').map(JSON.parse);
+    const rawDiagnostic=fs.readFileSync(path.join(aHome,'logs',`${diagnostic.id}.jsonl`),'utf8').trim().split('\n').map(JSON.parse);
     assert.equal(rawDiagnostic.filter(event=>event.item?.message===startupDiagnostic.item.message).length,1,'raw JSONL stays parseable and does not duplicate the diagnostic');
     const diagnosticFailure=await api('POST','/agents',{project:b.id,harness:'codex',task:'STARTUP_DIAGNOSTIC_FAILURE_TEST'});
-    await finished(diagnosticFailure.id,'crashed');
-    assert.equal((await api('GET',`/agents/${diagnosticFailure.id}`)).problem,'its process exited with an error','a warning alone is not invented as the cause of a nonzero exit');
-    await api('POST',`/agents/${diagnosticFailure.id}/close`,{});
+    await finished(diagnosticFailure.id,'crashed',b.id);
+    assert.equal((await api.forProject(b.id)('GET',`/agents/${diagnosticFailure.id}`)).problem,'its process exited with an error','a warning alone is not invented as the cause of a nonzero exit');
+    await api.forProject(b.id)('POST',`/agents/${diagnosticFailure.id}/close`,{});
 
     // The parent already exited successfully when its stdout-owning descendant
     // reports failure. That late frame must stop the pipe owner, not hang forever.
     const lateFailure=await api('POST','/agents',{project:b.id,harness:'codex',task:'LATE_FAILURE_PIPE_TEST'});
-    const lateChildFile=path.join(home,`late-failure-child-${lateFailure.id}`);
+    const lateChildFile=path.join(bHome,`late-failure-child-${lateFailure.id}`);
     await until(()=>fs.existsSync(lateChildFile),'late-failure descendant starts');
     const lateChild=Number(fs.readFileSync(lateChildFile,'utf8'));
-    await finished(lateFailure.id,'crashed');
-    assert.equal((await api('GET',`/agents/${lateFailure.id}`)).problem,'Delayed background failure');
-    assert.equal(fs.existsSync(`/proc/${runs().find(r=>r.id===lateFailure.id).pid}`),false,'successful parent was reaped despite the inherited stdout pipe');
+    await finished(lateFailure.id,'crashed',b.id);
+    assert.equal((await api.forProject(b.id)('GET',`/agents/${lateFailure.id}`)).problem,'Delayed background failure');
+    assert.equal(fs.existsSync(`/proc/${runs(b.id).find(r=>r.id===lateFailure.id).pid}`),false,'successful parent was reaped despite the inherited stdout pipe');
     await until(()=>!fs.existsSync(`/proc/${lateChild}/stat`) || fs.readFileSync(`/proc/${lateChild}/stat`,'utf8').includes(') Z '),'late-failure descendant is stopped');
     await new Promise(resolve=>setTimeout(resolve,1100));
-    assert.equal(runs().filter(r=>r.id===lateFailure.id).length,1,'no configured rule means no invented automatic retry');
-    await api('POST',`/agents/${lateFailure.id}/close`,{});
+    assert.equal(runs(b.id).filter(r=>r.id===lateFailure.id).length,1,'no configured rule means no invented automatic retry');
+    await api.forProject(b.id)('POST',`/agents/${lateFailure.id}/close`,{});
 
     // Duplicate error frames and the real cyber-risk wording are a single crash.
     const cyber=await api('POST','/agents',{project:a.id,harness:'codex',task:'CYBER_FAILURE_TEST'});
@@ -1138,9 +1183,10 @@ process.stdin.on('end', async () => {
     const rejected=await api('POST','/agents',{project:a.id,harness:'codex',model:'gpt-6.1-sol',task:'UNSUPPORTED_TEST'});
     await until(async()=>(await api('GET',`/agents/${rejected.id}`)).state==='crashed','unsupported model error');
     assert.match((await api('GET',`/agents/${rejected.id}`)).problem,/^The 'gpt-6.1-sol' model is not supported/);
-    const noCap=structuredClone(defaults); noCap.limits.usage.codex={soft:null,hard:null}; noCap.auto_resume=false; noCap.usage_poll_secs=15;
+    const noCap=structuredClone(defaults); noCap.limits.usage.codex={soft:null,hard:null}; noCap.auto_resume=false;
     noCap.crash_retries['gpt-6-sol']={harness:'codex',model:'gpt-6-luna',same_model_retries:2};
     await api('PUT',`/configs/${mine.id}`,{settings:noCap});
+    await api('PUT','/global-settings',{settings:{usage_poll_secs:15,metrics_sample_secs:5}});
     const quota=(used,reset)=>({rateLimits:{primary:{usedPercent:used,resetsAt:reset}}});
     const subscription=path.join(home,'subscription.json');
     const resetAt=Math.floor(Date.now()/1000)+2;
@@ -1152,7 +1198,7 @@ process.stdin.on('end', async () => {
     assert.equal(runs().filter(r=>r.id===exhausted.id).length,1,'quota waits do not consume crash retries');
     const checks=fs.readFileSync(path.join(home,'checks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     assert.ok(checks.some(c=>c.at>=resetAt*1000 && c.at<=(resetAt+2)*1000),'provider-reported reset gets an immediate check, not the periodic delay');
-    noCap.usage_poll_secs=3600; await api('PUT',`/configs/${mine.id}`,{settings:noCap});
+    await api('PUT','/global-settings',{settings:{usage_poll_secs:3600,metrics_sample_secs:5}});
     fs.writeFileSync(subscription,JSON.stringify({hang:true})); await api('POST','/usage/check',{provider:'codex'});
     await until(async()=>(await api('GET',`/limits?project=${a.id}`)).checks.some(c=>c.provider==='codex'&&c.error?.includes('timed out')),'a stalled usage probe times out',20000);
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
@@ -1163,7 +1209,7 @@ process.stdin.on('end', async () => {
     fs.writeFileSync(subscription,'{}'); await api('POST','/usage/check',{provider:'codex'});
     await until(async()=>(await api('GET',`/limits?project=${a.id}`)).checks.some(c=>c.provider==='codex'&&c.error),'unknown status does not clear quota');
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused');
-    noCap.usage_poll_secs=15; await api('PUT',`/configs/${mine.id}`,{settings:noCap});
+    await api('PUT','/global-settings',{settings:{usage_poll_secs:15,metrics_sample_secs:5}});
     fs.writeFileSync(subscription,JSON.stringify(quota(0,Math.floor(Date.now()/1000)+3600)));
     await until(async()=>(await api('GET',`/limits?project=${a.id}`)).usage.filter(u=>u.provider==='codex').every(u=>u.used_pct===0),'periodic checks discover an early reset',20000);
     assert.equal((await api('GET',`/agents/${exhausted.id}`)).state,'paused','auto-resume is off');
@@ -1182,9 +1228,9 @@ process.stdin.on('end', async () => {
     assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[]);
     await api('POST','/messages',{thread:solo.id,text:'Posting joins me again'});
     assert.deepEqual((await api('GET',`/threads/${solo.id}`)).members,[0]);
-    assert.deepEqual(await api('GET','/settings'),builtin.settings);
-    await api('GET','/not-a-route',null,404);
-    await api('POST', '/configs/1/remove', {}, 409);
+    assert.deepEqual(await api('GET','/settings'),defaults);
+    await api('GET',`/p/${a.id}/not-a-route`,null,404);
+    await api('POST', '/configs/default/remove', {}, 409);
     await api('POST', '/configs', { name: '  ', settings: defaults }, 400);
     await api('POST', '/configs', { name: 'Default', settings: defaults }, 409);
     const small = structuredClone(defaults);
@@ -1201,14 +1247,14 @@ process.stdin.on('end', async () => {
     custom.auto_resume = false; custom.done_closes = false;
     await api('PUT', `/projects/${b.id}/config`, { custom });
     await api('PUT', `/projects/${a.id}/config`, { config: saved.id, custom }, 400);
-    await api('PUT', `/projects/${a.id}/config`, { config: 99999 }, 404);
+    await api('PUT', `/projects/${a.id}/config`, { config: '99999999999999999999999999999999' }, 404);
     await api('POST', `/configs/${saved.id}/remove`, {}, 409);
     const scopedA = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'Project A defaults' });
     const scopedB = await api('POST', '/agents', { project: b.id, harness: 'codex', task: 'Project B defaults' });
     // Each hard-1 project gets a slot: there is no machine-wide hard-1 cap.
     for (const p of [a.id, b.id]) assert.equal((await api('GET', `/limits?project=${p}`)).active.total, 1);
     await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'Over project cap' }, 409);
-    await api('POST', '/agents', { agent: scopedA.id, project: b.id, harness: 'codex', model: 'gpt-6.1-sol', task: 'Disallowed helper' }, 400);
+    await api('POST', `/p/${a.id}/agents`, { agent: scopedA.id, project: b.id, harness: 'codex', model: 'gpt-6.1-sol', task: 'Disallowed helper' }, 400);
     await until(() => runs().some(r => r.id === scopedA.id), 'saved config harness started');
     const scopedRun = runs().find(r => r.id === scopedA.id);
     assert.equal(scopedRun.args[scopedRun.args.indexOf('-m') + 1], 'gpt-6-luna');
@@ -1216,16 +1262,16 @@ process.stdin.on('end', async () => {
     assert.ok(scopedRun.args.includes('acom_test=true'));
     assert.ok(scopedRun.args.includes('model_auto_compact_token_limit=123456'));
     assert.match(scopedRun.prompt, /any new message in its threads wakes/);
-    await finished(scopedA.id, 'done'); await finished(scopedB.id, 'done');
+    await finished(scopedA.id, 'done'); await finished(scopedB.id, 'done',b.id);
     // A queued wake in a full project must not hold up a different project's wake.
     const blocker = await api('POST', '/agents', { project: a.id, harness: 'codex', task: 'Hold project A slot' });
     const configThread = await api('POST', '/threads', { project: a.id, title: 'Changed rules', members: [String(scopedA.id)] });
     await api('POST', '/messages', { thread: configThread.id, text: 'Wait for project A slot' });
     assert.ok((await api('GET', `/agents/${scopedA.id}`)).wake_queued_at);
     const otherThread = await api('POST', '/threads', { project: b.id, title: 'Independent done-only wake', watch: ['done'] });
-    await api('POST', '/messages', { thread: otherThread.id, text: 'Use project B slot' });
-    await until(() => runs().filter(r => r.id === scopedB.id).length === 2, 'project B wakes despite blocked project A');
-    const doneWake=runs().filter(r=>r.id===scopedB.id)[1];
+    await api.forProject(b.id)('POST', '/messages', { thread: otherThread.id, text: 'Use project B slot' });
+    await until(() => runs(b.id).filter(r => r.id === scopedB.id).length === 2, 'project B wakes despite blocked project A');
+    const doneWake=runs(b.id).filter(r=>r.id===scopedB.id)[1];
     assert.match(doneWake.prompt, /## Limits and rules right now/);
     const doneCoordination=doneWake.prompt.split('\n').find(line=>line.startsWith('[acom] Coordination:'));
     assert.match(doneCoordination,/\bleft 1\b/,'done-only membership leaves before the wake prompt is rendered');
@@ -1233,17 +1279,17 @@ process.stdin.on('end', async () => {
     assert.doesNotMatch(doneCoordination,/\bthreads [1-9]/,'summary describes the current working audience rather than the old done audience');
     assert.equal(doneWake.membership_snapshot.state,'working');
     assert.ok(!doneWake.membership_snapshot.threads.includes(otherThread.id));
-    assert.deepEqual((await api('GET',`/threads/${otherThread.id}`)).members,[0]);
+    assert.deepEqual((await api.forProject(b.id)('GET',`/threads/${otherThread.id}`)).members,[0]);
     assert.equal((await api('GET', `/agents/${scopedA.id}`)).state, 'done');
     await finished(blocker.id, 'done');
     await until(() => runs().filter(r => r.id === scopedA.id).length === 2, 'project A wakes when its slot clears');
-    await finished(scopedA.id, 'done'); await finished(scopedB.id, 'done');
+    await finished(scopedA.id, 'done'); await finished(scopedB.id, 'done',b.id);
     // Shared config edits propagate, while a project's custom config is unchanged.
     small.limits.active.hard = 2;
     await api('PUT', `/configs/${saved.id}`, { name: 'Small renamed', settings: small });
     assert.equal((await api('GET', `/overview?project=${a.id}`)).settings.limits.active.hard, 2);
     assert.equal((await api('GET', `/overview?project=${b.id}`)).settings.limits.active.hard, 1);
-    assert.equal((await api('GET', '/configs'))[0].settings.limits.active.hard, 8);
+    assert.equal((await api('GET', '/configs')).find(config=>config.id==='default').settings.limits.active.hard, 8);
     await api('POST', '/messages', { thread: configThread.id, text: 'Check changed settings' });
     await until(() => runs().filter(r => r.id === scopedA.id).length === 3, 'rule change delivered on wake');
     assert.match(runs().filter(r => r.id === scopedA.id)[2].prompt, /user changed the limits or rules/);
@@ -1262,20 +1308,21 @@ process.stdin.on('end', async () => {
     assert.equal((await api('GET', `/overview?project=${a.id}`)).settings.auto_resume, false);
     assert.equal((await api('GET', `/overview?project=${b.id}`)).project.config, null);
     assert.equal((await api('GET', '/configs')).find(c => c.id === saved.id).name, 'Small renamed');
-    assert.deepEqual((await api('GET','/configs')).find(c=>c.id===1).settings,builtin.settings,'Default stays built-in after configuration edits and restart');
+    assert.deepEqual((await api('GET','/configs')).find(c=>c.id==='default').settings,builtin.settings,'Default stays built-in after configuration edits and restart');
     assert.equal((await api('GET','/configs')).find(c=>c.id===mine.id).name,'Mine renamed');
     assert.deepEqual((await api('GET','/configs')).find(c=>c.id===mine.id).settings,defaults,'startup preserves editable saved configurations');
     await api('PUT', `/projects/${b.id}/config`, { config: saved.id });
-    assert.deepEqual((await api('GET', '/configs')).find(c => c.id === saved.id).projects, [a.id, b.id]);
+    assert.deepEqual((await api('GET', '/configs')).find(c => c.id === saved.id).projects.toSorted(), [a.id, b.id].toSorted());
     for (const p of [a.id, b.id]) await api('PUT', `/projects/${p}/config`, { config: mine.id });
     await api('POST', `/configs/${saved.id}/remove`, {});
-    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).sort((a,b)=>a-b),[a.id,b.id,...waitProjects.map(p=>p.id),lifecycleProject.id,followupProject.id].sort((a,b)=>a-b));
+    assert.deepEqual((await api('GET', '/projects')).map(p=>p.id).toSorted(),[a.id,b.id,...waitProjects.map(p=>p.id),...[lifecycleProject,followupProject].filter(Boolean).map(p=>p.id)].toSorted());
     assert.equal(fs.existsSync(path.join(first, '.acom')), false);
     assert.equal(fs.existsSync(path.join(second, '.acom')), false);
     // Percentages are not provider rejections. Exercise actual stream parsing
     // and unsuccessful provider exits for both fake clients with no hard cap.
     const uncapped=structuredClone(defaults);
-    uncapped.auto_resume=false; uncapped.usage_poll_secs=3600; uncapped.crash_retries={};
+    uncapped.auto_resume=false; uncapped.crash_retries={};
+    await api('PUT','/global-settings',{settings:{usage_poll_secs:3600,metrics_sample_secs:5}});
     uncapped.limits.active={soft:null,hard:null};
     for(const limits of [uncapped.limits.active_per_harness,uncapped.limits.usage]) for(const key of Object.keys(limits)) limits[key]={soft:null,hard:null};
     await api('PUT',`/projects/${a.id}/config`,{custom:uncapped});
@@ -1302,26 +1349,29 @@ process.stdin.on('end', async () => {
       uncapped.crash_retries={};
       await api('PUT',`/projects/${a.id}/config`,{custom:uncapped});
     }
-    assert.equal(stderr.replace(/tick: database: TEST_REPLACEMENT_(OWNERSHIP|START)_FAILURE\n/g,''),'','only deliberately injected replacement persistence failures may reach stderr');
+    assert.equal(stderr.replace(/tick: project [0-9a-f-]{36}: database: TEST_REPLACEMENT_(OWNERSHIP|START)_FAILURE\n/g,''),'','only deliberately injected replacement persistence failures may reach stderr');
   } finally {
     await stop();
     // Failed assertions can leave a deliberately held fake turn alive after
     // SIGTERM. Validate its temp home and fake path before stopping its group.
-    for(const {pid} of runs()) {
+    for(const {pid,project} of runs(null)) {
       try {
         const vars=fs.readFileSync(`/proc/${pid}/environ`,'utf8').split('\0');
         const args=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').split('\0');
-        if(vars.includes(`ACOM_HOME=${home}`) && args.some(arg=>arg===path.join(bin,'codex') || arg===path.join(bin,'claude'))) process.kill(-pid,'SIGKILL');
+        if(vars.includes(`ACOM_HOME=${projectHome(home,project)}`) && args.some(arg=>arg===path.join(bin,'codex') || arg===path.join(bin,'claude'))) process.kill(-pid,'SIGKILL');
       } catch(error) { if(!['ENOENT','ESRCH'].includes(error.code)) throw error; }
     }
-    for(const name of fs.readdirSync(home).filter(name=>/^(replacement|late-failure)-child-\d+$/.test(name) || /^restart-(escaped|late|idle)-\d+$/.test(name))) {
+    for(const project of fs.readdirSync(path.join(home,'projects')).filter(name=>/^[0-9a-f-]{36}$/.test(name))) {
+      const runHome=projectHome(home,project);
+      for(const name of fs.readdirSync(runHome).filter(name=>/^(replacement|late-failure)-child-\d+$/.test(name) || /^restart-(escaped|late|idle)-\d+$/.test(name))) {
       try {
-        const pid=Number(fs.readFileSync(path.join(home,name),'utf8'));
+        const pid=Number(fs.readFileSync(path.join(runHome,name),'utf8'));
         const vars=fs.readFileSync(`/proc/${pid}/environ`,'utf8').split('\0');
         const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
         const group=Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[2]);
-        if(vars.includes(`ACOM_HOME=${home}`) && (runs().some(run=>run.pid===group) || (name.startsWith('restart-') && group===pid))) process.kill(-group,'SIGKILL');
+        if(vars.includes(`ACOM_HOME=${runHome}`) && (runs(project).some(run=>run.pid===group) || (name.startsWith('restart-') && group===pid))) process.kill(-group,'SIGKILL');
       } catch(error) { if(!['ENOENT','ESRCH'].includes(error.code)) throw error; }
+      }
     }
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1331,6 +1381,12 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
   const folder=path.join(root,'wait-restart'), otherFolder=path.join(root,'wait-restart-other');
   fs.mkdirSync(folder); fs.mkdirSync(otherFolder);
   const project=await api('POST','/projects',{path:folder}), other=await api('POST','/projects',{path:otherFolder});
+  api=api.forProject(project.id);
+  const accountHome=home;home=projectHome(home,project.id);
+  const allRuns=runs;runs=(selected=project.id)=>allRuns(selected);
+  const finish=finished;finished=(id,state,selected=project.id)=>finish(id,state,selected);
+  const ownerCli=cli;cli=(cwd,args,extra={},input)=>ownerCli(cwd,args,{ACOM_URL:api.url(),...extra},input);
+  env={...env,ACOM_URL:api.url()};
   const config=structuredClone(defaults);
   config.done_closes=false; config.auto_resume=false;
   config.prompts.resume='PAUSE_CUSTOM_GUIDANCE_WITHOUT_WARNINGS';
@@ -1339,18 +1395,18 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
   for(const provider of Object.keys(config.limits.active_per_harness)) config.limits.active_per_harness[provider]={soft:null,hard:null};
   config.limits.usage.codex={soft:null,hard:50};
   for(const p of [project,other]) await api('PUT',`/projects/${p.id}/config`,{custom:config});
-  const view=id=>api('GET',`/agents/${id}`), captures=id=>runs().filter(run=>run.id===id);
-  const dbAction=action=>{
-    const db=new DatabaseSync(path.join(home,'acom.db'));
-    try {db.exec('PRAGMA busy_timeout=5000');return action(db);} finally {db.close();}
+  const view=(id,selected=project.id)=>api.forProject(selected)('GET',`/agents/${id}`), captures=(id,selected=project.id)=>runs(selected).filter(run=>run.id===id);
+  const dbAction=(action,selected=project.id)=>{
+    const db=new DatabaseSync(path.join(projectHome(accountHome,selected),'acom.db'));
+    try {attachGlobal(db,accountHome);return action(db);} finally {db.close();}
   };
   const alive=pid=>{
     try {return !fs.readFileSync(`/proc/${pid}/stat`,'utf8').includes(') Z ');} catch(error) {if(error.code==='ENOENT') return false;throw error;}
   };
   const launch=async(task,p=project,harness='codex')=>{
     const a=await api('POST','/agents',{project:p.id,harness,task});
-    await until(()=>captures(a.id).length===1,`wait/restart fake agent ${a.id} starts`);
-    await until(async()=>(await view(a.id)).session,`wait/restart fake agent ${a.id} records its session`);
+    await until(()=>captures(a.id,p.id).length===1,`wait/restart fake agent ${a.id} starts`);
+    await until(async()=>(await view(a.id,p.id)).session,`wait/restart fake agent ${a.id} records its session`);
     return {...a,project:p.id};
   };
   const ack=(id,delivery)=>api('POST',`/wait/${id}/ack`,{delivery_id:delivery});
@@ -1363,7 +1419,7 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
   };
   const rawWait=async(id,timeout)=>{
     try {
-      const url=`http://127.0.0.1:${fs.readFileSync(path.join(home,'port'),'utf8').trim()}`;
+      const url=api.url();
       const response=await fetch(`${url}/wait/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout})});
       return {status:response.status,body:await response.json()};
     } catch(error) {return {error};}
@@ -1379,7 +1435,7 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     process.kill(-child.pid,'SIGKILL');
   };
   let ownUrl;
-  const subscription=path.join(home,'subscription.json');
+  const subscription=path.join(accountHome,'subscription.json');
   try {
     const waiter=await launch('MEMBERSHIP_HOLD_TEST foreground notification wait');
     const thread=await api('POST','/threads',{project:project.id,title:'Foreground wait notifications',members:[String(waiter.id)]});
@@ -1496,7 +1552,7 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     await until(()=>fs.existsSync(path.join(home,`restart-late-${manual.id}`)),'manual pause TERM handler creates its owned detached child');
     const manualLate=Number(fs.readFileSync(path.join(home,`restart-late-${manual.id}`),'utf8'));
     // Expire this lease without consuming the finite process-stop grace period.
-    dbAction(db=>db.prepare("UPDATE locks SET expires_at=unixepoch()-1 WHERE project=? AND name='manual-released'").run(project.id));
+    dbAction(db=>db.prepare("UPDATE locks SET expires_at=unixepoch()-1 WHERE project=? AND name='manual-released'").run(1));
     assert.ok(alive(manualEscaped),`the ready TERM-resistant tool remains alive during the protected stopping phase (${Date.now()-manualPauseAt}ms since Pause)`);
     // A newly forked tool can safely die before installing its own TERM handler;
     // both tools must still be gone before the reservation is released/resumed.
@@ -1527,7 +1583,8 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     await api('POST','/locks',{project:project.id,name:'pause-all-released',about:'Pause all uses the same release policy'});
     await api('POST','/locks/acquire',{agent:contender.id,name:'pause-all-released',wait:0,ttl:30});
     const all=await api('POST','/pause-all',{});
-    assert.deepEqual(all.ids.toSorted((a,b)=>a-b),[idle.id,contender.id].toSorted((a,b)=>a-b));
+    assert.deepEqual(all.errors,[]);
+    assert.deepEqual(all.results.find(result=>result.project===project.id).ids.toSorted((a,b)=>a-b),[idle.id,contender.id].toSorted((a,b)=>a-b));
     await until(async()=>(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='pause-all-released').holder===null,'Pause all releases its held locks');
     await until(async()=>(await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='idle-released').holder===null,'Pause all also releases an idle agent\'s held lease');
     await api('POST',`/agents/${idle.id}/resume`,{});
@@ -1540,33 +1597,36 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     const working=await launch('MEMBERSHIP_HOLD_TEST RESTART_ESCAPE_TEST RESTART_LATE_FORK_TEST interrupted continuation');
     const cross=await launch('MEMBERSHIP_HOLD_TEST interrupted replacement',other,'claude');
     await api('POST','/agent-config',{id:working.id,agent:working.id,effort:'high',continuation:'WAIT_RESTART_CANCELLED_CONTINUATION'});
-    await api('POST',`/agents/${cross.id}/replacement`,{harness:'codex',model:'gpt-6-luna',effort:'low',task:'WAIT_RESTART_CANCELLED_REPLACEMENT'});
+    await api.forProject(other.id)('POST',`/agents/${cross.id}/replacement`,{harness:'codex',model:'gpt-6-luna',effort:'low',task:'WAIT_RESTART_CANCELLED_REPLACEMENT'});
     await api('POST','/locks',{project:project.id,name:'restart-released',about:'Graceful shutdown releases locks after workers stop'});
     await api('POST','/locks/acquire',{agent:working.id,name:'restart-released',wait:0,ttl:30});
     await until(()=>fs.existsSync(path.join(home,`restart-escaped-${working.id}`)),'owned escaped fake process starts');
     const escaped=Number(fs.readFileSync(path.join(home,`restart-escaped-${working.id}`),'utf8'));
-    foreign=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(working.id),ACOM_URL:'http://127.0.0.1:1'},detached:true,stdio:'ignore'});
+    foreign=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_HOME:home,ACOM_ID:String(working.id),ACOM_URL:'http://127.0.0.1:1'},detached:true,stdio:'ignore'});
     await until(()=>alive(foreign.pid),'owned foreign-URL process starts');
-    ownUrl=`http://127.0.0.1:${fs.readFileSync(path.join(home,'port'),'utf8').trim()}`;
+    ownUrl=api.url();
     foreignHome=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(working.id),ACOM_URL:ownUrl,ACOM_HOME:foreignHomePath},detached:true,stdio:'ignore'});
     await until(()=>alive(foreignHome.pid),'owned foreign-home process starts');
     await api('POST',`/hook/${working.id}`,{});
     const recoveryThread=await api('POST','/threads',{project:other.id,title:'Receipt survives interrupted startup',members:[String(cross.id)]});
-    await api('POST','/messages',{thread:recoveryThread.id,text:'WAIT_RECOVERED_PRIVATE_CONTENT'});
-    const recovery=await api('POST',`/wait/${cross.id}`,{timeout:1});
+    await api.forProject(other.id)('POST','/messages',{thread:recoveryThread.id,text:'WAIT_RECOVERED_PRIVATE_CONTENT'});
+    const recovery=await api.forProject(other.id)('POST',`/wait/${cross.id}`,{timeout:1});
     assert.ok(recovery.delivery_id>0);
     await api('POST',`/wait/${manual.id}/ack`,{delivery_id:recovery.delivery_id},404);
-    assert.deepEqual(await api('POST',`/wait/${cross.id}`,{timeout:1}),recovery,'another agent cannot acknowledge this pending receipt');
+    assert.deepEqual(await api.forProject(other.id)('POST',`/wait/${cross.id}`,{timeout:1}),recovery,'another agent cannot acknowledge this pending receipt');
     const shutdownWait=rawWait(working.id,5);
     await new Promise(resolve=>setTimeout(resolve,150));
     await stop('SIGTERM');
-    const saved=()=>dbAction(db=>db.prepare('SELECT id,state,pause_reason,pause_from,paused_at FROM agents WHERE id IN (?,?,?,?,?) ORDER BY id').all(waiter.id,idle.id,manual.id,working.id,cross.id));
+    const saved=()=>[
+      ...dbAction(db=>db.prepare('SELECT id,state,pause_reason,pause_from,paused_at FROM agents WHERE id IN (?,?,?,?) ORDER BY id').all(waiter.id,idle.id,manual.id,working.id)).map(row=>({project:project.id,...row})),
+      ...dbAction(db=>db.prepare('SELECT id,state,pause_reason,pause_from,paused_at FROM agents WHERE id=?').all(cross.id),other.id).map(row=>({project:other.id,...row})),
+    ];
     const persisted=saved();
     for(const a of [working,cross]) {
-      const row=persisted.find(row=>row.id===a.id);
+      const row=persisted.find(row=>row.project===a.project && row.id===a.id);
       assert.equal(row.state,'paused','graceful handler saves pause before boot cleanup');
       assert.equal(row.pause_reason,'restart'); assert.equal(row.pause_from,'working'); assert.ok(row.paused_at>0);
-      await until(()=>!alive(captures(a.id)[0].pid),`owned worker ${a.id} stops before server exits`);
+      await until(()=>!alive(captures(a.id,a.project)[0].pid),`owned worker ${a.project}/${a.id} stops before server exits`);
     }
     await until(()=>!alive(escaped),'escaped owned background group stops at graceful shutdown');
     const late=Number(fs.readFileSync(path.join(home,`restart-late-${working.id}`),'utf8'));
@@ -1577,54 +1637,56 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     assert.equal(persisted.find(row=>row.id===manual.id).pause_reason,manualBefore.pause_reason);
     assert.equal(persisted.find(row=>row.id===manual.id).paused_at,manualBefore.paused_at);
     assert.equal(persisted.find(row=>row.id===waiter.id).pause_reason,'limit');
-    const released=dbAction(db=>db.prepare('SELECT holder,frozen,frozen_left,expires_at FROM locks WHERE project=? AND name=?').get(project.id,'restart-released'));
-    assert.equal(released.holder,null); assert.equal(released.frozen,0); assert.equal(released.frozen_left,null); assert.equal(released.expires_at,null);
+    const released=dbAction(db=>db.prepare('SELECT holder,expires_at FROM locks WHERE project=? AND name=?').get(1,'restart-released'));
+    assert.equal(released.holder,null); assert.equal(released.expires_at,null);
     const stoppedWait=await shutdownWait;
     assert.ok(stoppedWait.error || [409,503].includes(stoppedWait.status),'shutdown interrupts a foreground wait instead of delivering fake success');
     await start();
     assert.deepEqual(saved(),persisted,'boot does not resave already graceful-paused state');
     for(const a of [working,cross]) {
-      assert.equal(captures(a.id).length,1,'starting the server does not automatically resume restart pauses');
-      assert.equal((await view(a.id)).continuation,null); assert.equal((await view(a.id)).replacement_request,null);
+      assert.equal(captures(a.id,a.project).length,1,'starting the server does not automatically resume restart pauses');
+      assert.equal((await view(a.id,a.project)).continuation,null); assert.equal((await view(a.id,a.project)).replacement_request,null);
     }
     await api('POST',`/wait/${manual.id}/ack`,{delivery_id:newer.delivery_id},404);
     fs.renameSync(path.join(env.PATH,'claude'),path.join(env.PATH,'claude.disabled'));
     let resumed;
     try {resumed=await api('POST','/resume-restart',{});} finally {fs.renameSync(path.join(env.PATH,'claude.disabled'),path.join(env.PATH,'claude'));}
-    assert.deepEqual(resumed.ids,[working.id]);
-    assert.equal(resumed.errors.length,1); assert.match(resumed.errors[0],new RegExp(`agent ${cross.id}:`));
-    assert.equal((await view(cross.id)).pause_reason,'restart');
-    assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text),recovery.text,'failed successor turn preparation rolls back recovered receipt consumption');
+    assert.deepEqual(resumed.errors,[]);
+    assert.deepEqual(resumed.results.find(result=>result.project===project.id).ids,[working.id]);
+    const failedResume=resumed.results.find(result=>result.project===other.id);
+    assert.equal(failedResume.errors.length,1); assert.match(failedResume.errors[0],new RegExp(`agent ${cross.id}:`));
+    assert.equal((await view(cross.id,other.id)).pause_reason,'restart');
+    assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text,other.id),recovery.text,'failed successor turn preparation rolls back recovered receipt consumption');
     const retryResumed=await api('POST','/resume-restart',{});
-    assert.deepEqual(retryResumed.ids,[cross.id]); assert.deepEqual(retryResumed.errors,[]);
-    resumed.ids.push(...retryResumed.ids);
-    assert.deepEqual(resumed.ids.toSorted((a,b)=>a-b),[working.id,cross.id].toSorted((a,b)=>a-b),'restart resume is global but excludes manual and usage pauses');
-    assert.deepEqual(resumed.warnings,[],'completed pauses leave no retained-lock warnings');
+    assert.deepEqual(retryResumed.results.find(result=>result.project===other.id).ids,[cross.id]); assert.deepEqual(retryResumed.errors,[]);
+    const resumedKeys=[resumed,retryResumed].flatMap(reply=>reply.results.flatMap(result=>result.ids.map(id=>`${result.project}/${id}`)));
+    assert.deepEqual(resumedKeys.toSorted(),[`${project.id}/${working.id}`,`${other.id}/${cross.id}`].toSorted(),'restart resume is global but excludes manual and usage pauses');
+    assert.ok(resumed.results.every(result=>result.warnings.length===0),'completed pauses leave no retained-lock warnings');
     for(const a of [working,cross]) {
-      await until(()=>captures(a.id).length===2,`restart-only resume starts ${a.id} once`);
-      assertResumeWarning(captures(a.id)[1].prompt,config.prompts.resume);
+      await until(()=>captures(a.id,a.project).length===2,`restart-only resume starts ${a.project}/${a.id} once`);
+      assertResumeWarning(captures(a.id,a.project)[1].prompt,config.prompts.resume);
     }
     assert.doesNotMatch(captures(working.id)[1].prompt,/WAIT_RESTART_CANCELLED_CONTINUATION/);
-    assert.doesNotMatch(captures(cross.id)[1].prompt,/WAIT_RESTART_CANCELLED_REPLACEMENT/);
-    assert.equal(captures(cross.id)[1].prompt.split(`Recovered delivery #${recovery.delivery_id}`).length-1,1,'committed startup recovers the unacknowledged immutable batch once');
-    assert.doesNotMatch(captures(cross.id)[1].prompt,/WAIT_RECOVERED_PRIVATE_CONTENT/);
-    assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text),null);
+    assert.doesNotMatch(captures(cross.id,other.id)[1].prompt,/WAIT_RESTART_CANCELLED_REPLACEMENT/);
+    assert.equal(captures(cross.id,other.id)[1].prompt.split(`Recovered delivery #${recovery.delivery_id}`).length-1,1,'committed startup recovers the unacknowledged immutable batch once');
+    assert.doesNotMatch(captures(cross.id,other.id)[1].prompt,/WAIT_RECOVERED_PRIVATE_CONTENT/);
+    assert.equal(dbAction(db=>db.prepare('SELECT text FROM update_deliveries WHERE agent_id=?').get(cross.id).text,other.id),null);
     assert.equal((await view(manual.id)).state,'paused'); assert.equal((await view(waiter.id)).state,'paused');
     assert.equal((await api('GET',`/locks?project=${project.id}`)).find(lock=>lock.name==='restart-released').holder,null,'Resume does not reacquire old locks');
     await api('POST','/locks/acquire',{agent:working.id,name:'restart-released',wait:0,ttl:30});
     await stop('SIGINT');
-    assert.equal(dbAction(db=>db.prepare('SELECT holder FROM locks WHERE project=? AND name=?').get(project.id,'restart-released').holder),null,'SIGINT also releases held locks after stopping workers');
-    for(const row of saved().filter(row=>[working.id,cross.id].includes(row.id))) {assert.equal(row.state,'paused');assert.equal(row.pause_reason,'restart');}
+    assert.equal(dbAction(db=>db.prepare('SELECT holder FROM locks WHERE project=? AND name=?').get(1,'restart-released').holder),null,'SIGINT also releases held locks after stopping workers');
+    for(const row of saved().filter(row=>[working,cross].some(agent=>agent.project===row.project && agent.id===row.id))) {assert.equal(row.state,'paused');assert.equal(row.pause_reason,'restart');}
     assert.ok(alive(foreign.pid),'SIGINT also preserves the foreign-URL process');
     assert.ok(alive(foreignHome.pid),'SIGINT also preserves the foreign-home process');
     await start();
     assert.match(cli(folder,['resume-restart']),/resumed 2 restart-paused agent/i,'user CLI resumes across projects, not just its current folder');
-    for(const a of [working,cross]) await until(()=>captures(a.id).length===3,`CLI restart-only resume starts ${a.id} once`);
+    for(const a of [working,cross]) await until(()=>captures(a.id,a.project).length===3,`CLI restart-only resume starts ${a.project}/${a.id} once`);
     await api('POST','/locks/acquire',{agent:working.id,name:'restart-released',wait:0,ttl:30});
 
     // Abrupt exit leaves saved working state; boot reconciles owned tools even
     // when a tool belongs to an idle agent, without altering that idle state.
-    idleTool=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_ID:String(idle.id),ACOM_URL:ownUrl},detached:true,stdio:'ignore'});
+    idleTool=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{env:{...env,ACOM_HOME:home,ACOM_ID:String(idle.id),ACOM_URL:ownUrl},detached:true,stdio:'ignore'});
     fs.writeFileSync(path.join(home,`restart-idle-${idle.id}`),String(idleTool.pid));
     await until(()=>alive(idleTool.pid),'owned idle orphan fixture starts');
     await stop('SIGKILL');
@@ -1636,11 +1698,11 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
     assert.equal((await view(idle.id)).state,'idle');
     assert.equal((await view(manual.id)).pause_reason,'user'); assert.equal((await view(waiter.id)).pause_reason,'limit');
     for(const a of [working,cross]) {
-      assert.equal((await view(a.id)).pause_reason,'restart'); assert.equal(captures(a.id).length,3);
+      assert.equal((await view(a.id,a.project)).pause_reason,'restart'); assert.equal(captures(a.id,a.project).length,3);
       assert.equal((await api('GET',`/history?project=${a.project}&agent=${a.id}&kind=agent.failed`)).events.length,0,'server interruptions do not enter normal crash history');
     }
     assert.ok(alive(foreign.pid)); assert.ok(alive(foreignHome.pid));
-    for(const a of [waiter,idle,manual,working,cross]) await api('POST',`/agents/${a.id}/close`,{});
+    for(const a of [waiter,idle,manual,working,cross]) await api.forProject(a.project)('POST',`/agents/${a.id}/close`,{});
     return [project,other];
   } finally {
     stopOwnedTool(foreign,home,'http://127.0.0.1:1');
@@ -1652,13 +1714,19 @@ async function waitShutdownChecks({api,cli,runs,finished,start,stop,root,home,en
 async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,env,defaults,serverErrors}) {
   const folder=path.join(root,'followups'); fs.mkdirSync(folder);
   const project=await api('POST','/projects',{path:folder});
+  api=api.forProject(project.id);
+  const accountHome=home;home=projectHome(home,project.id);
+  const allRuns=runs;runs=()=>allRuns(project.id);
+  const finish=finished;finished=(id,state)=>finish(id,state,project.id);
+  const ownerCli=cli;cli=(cwd,args,extra={},input)=>ownerCli(cwd,args,{ACOM_URL:api.url(),...extra},input);
+  env={...env,ACOM_URL:api.url()};
   const config=structuredClone(defaults);
   config.done_closes=false; config.auto_resume=false;
   config.allow_agent_model_change=true; config.allow_agent_effort_change=true;
   const settings=custom=>api('PUT',`/projects/${project.id}/config`,{custom});
   const dbAction=action=>{
     const db=new DatabaseSync(path.join(home,'acom.db'));
-    try { db.exec('PRAGMA busy_timeout=5000'); return action(db); } finally { db.close(); }
+    try { attachGlobal(db,accountHome); return action(db); } finally { db.close(); }
   };
   await settings(config);
   const view=id=>api('GET',`/agents/${id}`);
@@ -2126,7 +2194,7 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
     release(persistenceFailure.id);
     await until(async()=>pendingStart()?.attempted===1 && (await view(persistenceFailure.id)).state==='replaced','owned start attempt persists despite rejected cleanup');
     const interruptedTarget=pendingStart().agent_id;
-    await until(()=>serverErrors().includes('tick: database: TEST_REPLACEMENT_START_FAILURE'),'failed startup recording is retried as persistence only');
+    await until(()=>serverErrors().includes(`tick: project ${project.id}: database: TEST_REPLACEMENT_START_FAILURE`),'failed startup recording is retried as persistence only');
     assert.equal((await api('GET',`/agents?project=${project.id}`)).length,beforePersistenceFailure+1);
     fs.renameSync(path.join(bin,'claude.disabled'),path.join(bin,'claude'));
     await stop(); await start();
@@ -2184,6 +2252,10 @@ async function followupChecks({api,cli,runs,finished,start,stop,root,home,bin,en
 async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defaults}) {
   const folder=path.join(root,'lifecycle'); fs.mkdirSync(folder);
   const project=await api('POST','/projects',{path:folder});
+  api=api.forProject(project.id);const accountHome=home;home=projectHome(home,project.id);
+  const allRuns=runs;runs=()=>allRuns(project.id);
+  const finish=finished;finished=(id,state)=>finish(id,state,project.id);
+  const ownerCli=cli;cli=(cwd,args,extra={},input)=>ownerCli(cwd,args,{ACOM_URL:api.url(),...extra},input);
   const config=structuredClone(defaults); config.done_closes=false; config.auto_resume=false;
   await api('PUT',`/projects/${project.id}/config`,{custom:config});
   const active=await api('POST','/threads',{project:project.id,title:'Live active audience',watch:['active']});
@@ -2279,12 +2351,12 @@ async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defau
   await api('POST','/locks',{project:project.id,name:'history-lock',about:'Structured lock events'});
   await api('POST','/locks/acquire',{agent:held.id,name:'history-lock',wait:0,ttl:30});
   await api('POST','/locks/release',{agent:held.id,name:'history-lock'});
-  const previousPort=Number(fs.readFileSync(path.join(home,'port'),'utf8'));
+  const previousPort=Number(fs.readFileSync(path.join(accountHome,'port'),'utf8'));
   let nextPort=await freePort();
   while(nextPort===previousPort) nextPort=await freePort();
   const oldPid=runs().find(run=>run.id===held.id).pid;
   await stop(); await start(nextPort);
-  assert.equal(Number(fs.readFileSync(path.join(home,'port'),'utf8')),nextPort);
+  assert.equal(Number(fs.readFileSync(path.join(accountHome,'port'),'utf8')),nextPort);
   await until(()=>!fs.existsSync(`/proc/${oldPid}/stat`) || fs.readFileSync(`/proc/${oldPid}/stat`,'utf8').includes(') Z '),'changed-port restart stops its previously owned fake client');
   assert.equal((await api('GET',`/agents/${held.id}`)).state,'paused');
   assert.ok(!(await members(active)).includes(held.id));
@@ -2365,7 +2437,8 @@ async function lifecycleChecks({api,cli,runs,finished,start,stop,root,home,defau
 
 async function browserMarkdownSendCheck(page,api) {
   const source='**Sent through the UI** <exact text>\nSecond line with `code`';
-  const receipt=page.waitForResponse(response=>new URL(response.url()).pathname==='/messages'&&response.request().method()==='POST');
+  const project=await page.evaluate(()=>state.selectedProject);
+  const receipt=page.waitForResponse(response=>new URL(response.url()).pathname===`/p/${project}/messages`&&response.request().method()==='POST');
   await page.locator('#message-form textarea').fill(source); await page.locator('#message-form button').click();
   const sent=await(await receipt).json();
   assert.ok(Number.isSafeInteger(sent.id)&&sent.id>0);
@@ -2526,6 +2599,36 @@ async function browserMessageChecks(url, api, project, agent, thread, home) {
   } finally { await browser.close(); }
 }
 
+async function browserProjectDataChecks(page,project,folder) {
+  const panel=page.locator('#project-data-host');
+  await panel.getByText('Project archives and captured files',{exact:true}).click();
+  const destination=path.join(path.dirname(folder),'browser-snapshot.tar');
+  await panel.getByLabel('Archive destination',{exact:true}).fill(destination);
+  assert.equal(await panel.getByLabel('Include native conversation copies',{exact:true}).isChecked(),false);
+  const exported=page.waitForResponse(response=>new URL(response.url()).pathname===`/projects/${project}/export`);
+  page.once('dialog',dialog=>dialog.accept());await panel.getByRole('button',{name:'Export snapshot',exact:true}).click();
+  assert.equal((await(await exported).json()).exported,true);
+  await page.waitForFunction(()=>document.querySelector('#project-data-host > section > [role=status]').textContent.includes('Snapshot exported'));
+  assert.equal(fs.statSync(destination).isFile(),true);assert.equal(fs.statSync(destination).mode&0o777,0o600,'private archives are published owner-only');
+  await panel.getByLabel('Archive source',{exact:true}).fill(destination);
+  const inspected=page.waitForResponse(response=>new URL(response.url()).pathname==='/projects/inspect-archive');
+  await panel.getByRole('button',{name:'Inspect archive',exact:true}).click();
+  const review=await(await inspected).json();assert.equal(review.project,project);assert.equal(typeof review.version,'string');assert.equal(review.already_exists,true);
+  assert.equal(typeof review.configuration.settings,'object');
+  await page.waitForFunction(()=>document.querySelector('#project-data-host > section > [role=status]').textContent.includes('already exists'));
+  await panel.getByLabel('Imported project folder',{exact:true}).fill(folder);
+  assert.equal(await panel.getByRole('button',{name:'Import inspected archive',exact:true}).isDisabled(),true,'inspecting an existing identity never enables overwriting it');
+  const previewed=page.waitForResponse(response=>new URL(response.url()).pathname===`/projects/${project}/cleanup`);
+  await panel.getByRole('button',{name:'Preview cleanup',exact:true}).click();
+  const preview=await(await previewed).json();assert.equal(preview.preview,true);assert.equal(preview.files,0);
+  await page.waitForFunction(()=>document.querySelector('#project-data-host > section > [role=status]').textContent.includes('Cleanup preview ready'));
+  const cleaned=page.waitForResponse(response=>new URL(response.url()).pathname===`/projects/${project}/cleanup`&&response.request().postDataJSON().confirm===true);
+  page.once('dialog',dialog=>dialog.accept());await panel.getByRole('button',{name:'Move captured files to trash',exact:true}).click();
+  assert.equal((await(await cleaned).json()).removed,true);
+  await page.waitForFunction(()=>document.querySelector('#project-data-host > section > [role=status]').textContent.includes('cleanup completed'));
+  await panel.getByText('Project archives and captured files',{exact:true}).click();
+}
+
 async function browserChecks(url, api, first, second, defaults, mineId) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
@@ -2574,9 +2677,10 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     const projects = await api('GET', '/projects');
     const firstId = projects.find(p => p.path === first).id;
     const secondId = projects.find(p => p.path === second).id;
+    api=api.forProject(secondId);
     assert.equal(await page.locator('#project-path').textContent(), second);
     await page.locator('[data-page=settings]').click();
-    await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'default');
     assert.equal(storageRequests.length, 0, 'opening Settings never calculates disk usage');
     const storageResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/storage');
     await page.locator('#storage-calculate').click();
@@ -2584,20 +2688,21 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     assert.equal(storageReport.project, secondId);
     assert.equal(storageReport.complete, true);
     assert.equal(storageReport.bytes.project_logs, 0);
-    assert.equal(storageReport.bytes.total, storageReport.bytes.all_project_logs + storageReport.bytes.database + storageReport.bytes.other);
+    assert.equal(storageReport.bytes.total, ['all_project_logs','database','metrics','native','trash','other'].reduce((total,key)=>total+storageReport.bytes[key],0));
     await page.waitForFunction(() => document.querySelector('#storage-report').hidden === false);
     assert.equal(await page.locator('#storage-home').textContent(), storageReport.home);
-    assert.equal(await page.locator('#storage-project').textContent(), '0 B');
+    assert.equal(await page.locator('#storage-project').getAttribute('title'), `${storageReport.bytes.project.toLocaleString()} allocated bytes`);
     assert.match(await page.locator('#storage-status').textContent(), /Calculation complete/);
     assert.equal(storageRequests.length, 1, 'one click performs one non-hydrated scan');
     assert.equal(await page.locator('[form=settings-form]').isDisabled(), true, 'storage calculation does not dirty Default');
+    await browserProjectDataChecks(page,secondId,second);
     assert.equal(await page.locator('#confirm-agent-actions').isChecked(), true);
     const configBeforePreference = await api('GET', '/configs');
     await page.locator('#confirm-agent-actions').uncheck();
     assert.equal(await page.locator('[form=settings-form]').isDisabled(), true, 'browser preferences do not dirty Default');
     await page.reload();
     await page.locator('[data-page=settings]').click();
-    await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'default');
     assert.equal(storageRequests.length, 1, 'reload and reopening Settings do not scan automatically');
     assert.equal(await page.locator('#storage-report').isHidden(), true, 'storage reports are tab-memory only');
     assert.equal(await page.locator('#confirm-agent-actions').isChecked(), false, 'preference survives reload against the real server');
@@ -2608,7 +2713,7 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     await browserAddFilterCondition(page,page.locator('[data-filter-root]'),'pause_reason','limit');
     await browserApplyFilters(page);
     assert.equal(await page.evaluate(()=>state.pages.agentBrowser.total),0);
-    assert.deepEqual(await page.evaluate(()=>state.pages.agentBrowser.counts),{ all: 0, active: 0, attention: 0, finished: 0 });
+    assert.deepEqual(await page.evaluate(()=>state.pages.agentBrowser.counts),Object.fromEntries(['all','active','attention','finished','working','idle','paused','crashed','done','closed','replaced'].map(key=>[key,0])));
     await page.locator('[data-edit-agent-filter=pause_reason]').waitFor();
     assert.match(await page.locator('[data-edit-agent-filter=pause_reason]').textContent(), /limit/);
     assert.match(await page.locator('#agent-filter-scope').textContent(), /ignore these filters/);
@@ -2670,7 +2775,10 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     const editedMine=(await api('GET','/configs')).find(c=>c.id===mineId);
     assert.equal(editedMine.settings.limits.active.soft, null);
     assert.equal(editedMine.settings.prompts.resume,guidance);
-    assert.equal(editedMine.settings.usage_poll_secs,45);
+    assert.equal('usage_poll_secs' in editedMine.settings,false,'account polling is not part of project configuration');
+    await page.locator('[form=server-settings-form]').click();
+    await page.waitForFunction(()=>document.querySelector('#server-settings-status').textContent==='Server settings saved.');
+    assert.equal((await api('GET','/global-settings')).usage_poll_secs,45);
     await page.reload();
     await page.locator('[data-page=settings]').click();
     await cfg.locator('[name=model] option[value=custom-next]').waitFor({ state: 'attached' });
@@ -2690,13 +2798,13 @@ async function browserChecks(url, api, first, second, defaults, mineId) {
     const named = (await api('GET', '/configs')).find(c => c.name === 'Browser config');
     assert.ok(named);
     assert.equal((await api('GET', `/overview?project=${secondId}`)).project.config, named.id);
-    assert.equal((await api('GET', '/configs'))[0].settings.limits.active.hard, 8);
+    assert.equal((await api('GET', '/configs')).find(config=>config.id==='default').settings.limits.active.hard, 8);
     await page.locator('#project-select').selectOption(String(firstId));
-    await page.waitForFunction(() => document.querySelector('#config-select')?.value === '1');
+    await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'default');
     await page.locator('#config-select').selectOption(String(named.id));
     await page.locator('[form=settings-form]').click();
     await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
-    assert.deepEqual((await api('GET', '/configs')).find(c => c.id === named.id).projects, [firstId, secondId]);
+    assert.deepEqual((await api('GET', '/configs')).find(c => c.id === named.id).projects.toSorted(), [firstId, secondId].toSorted());
     await page.locator('#config-select').selectOption('custom');
     assert.equal(await active.locator('[name=hard]').inputValue(), '8');
     await active.locator('[name=soft]').fill('');

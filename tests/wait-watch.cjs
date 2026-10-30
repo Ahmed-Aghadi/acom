@@ -9,6 +9,7 @@ const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome, attachGlobal } = require('./fixture-workspace.cjs');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fixture(run) {
@@ -27,16 +28,16 @@ async function fixture(run) {
   let errors = '';
   server.stderr.on('data', chunk => errors += chunk);
   const children = new Set();
-  let db;
+  let db, foreignDb, project;
   const api = async (method, route, body, expected = 200) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' },
+    const response = await fetch(url + scoped(route,project,body), { method, headers: { 'Content-Type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = await response.json();
     assert.equal(response.status, expected, `${method} ${route}: ${JSON.stringify(value)}`);
     return value;
   };
   const startCli = args => {
-    const child = spawn(binary, args, { cwd: root, env: { ...env, ACOM_URL: url, ACOM_ID: '1' },
+    const child = spawn(binary, args, { cwd: root, env: { ...env, ACOM_URL: `${url}/p/${project}`, ACOM_ID: '1' },
       stdio: ['ignore', 'pipe', 'pipe'] });
     children.add(child);
     let stdout = '', stderr = '';
@@ -64,18 +65,23 @@ async function fixture(run) {
       if (server.exitCode !== null) throw Error(`Server exited: ${errors}`);
       try { return (await fetch(url + '/overview')).ok; } catch { return false; }
     });
+    const projects=[];
     for (const name of ['one', 'two']) {
       const folder = path.join(root, name); fs.mkdirSync(folder);
-      await api('POST', '/projects', { path: folder });
+      projects.push(await api('POST', '/projects', { path: folder }));
     }
-    db = new DatabaseSync(path.join(home, 'acom.db'));
+    project=projects[0].id;
+    db = new DatabaseSync(path.join(projectHome(home,project), 'acom.db'));attachGlobal(db,home);
+    foreignDb = new DatabaseSync(path.join(projectHome(home,projects[1].id), 'acom.db'));attachGlobal(foreignDb,home);
     db.exec('PRAGMA busy_timeout=5000');
     const insert = db.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,'fixture','claude','claude-opus-5','medium','working',0,0)");
-    insert.run(1, 1, 'observer'); insert.run(2, 1, 'peer'); insert.run(3, 2, 'foreign');
-    await run({ api, db, startCli, until, insert });
+    insert.run(1, 1, 'observer'); insert.run(2, 1, 'peer');
+    foreignDb.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(3,1,'foreign','fixture','claude','claude-opus-5','medium','working',0,0)").run();
+    await run({ api, db, foreignDb, project, startCli, until, insert });
   } finally {
     for (const child of children) child.kill('SIGKILL');
     db?.close();
+    foreignDb?.close();
     if (server.exitCode === null && server.signalCode === null) {
       const exited = new Promise(resolve => server.once('exit', resolve));
       const timeout = setTimeout(() => server.kill('SIGKILL'), 10000);
@@ -87,7 +93,7 @@ async function fixture(run) {
 }
 
 test('wait watches integrate CLI cursors, live descriptors, stable ACKs and detail chunks', { timeout: 45000 }, async t => {
-  await fixture(async ({ api, db, startCli, until, insert }) => {
+  await fixture(async ({ api, db, foreignDb, project, startCli, until, insert }) => {
     const cursor = () => Number(db.prepare('SELECT coalesce(max(id),0) id FROM events').get().id);
     await t.test('CLI snapshot baseline and additive dynamic watch return promptly', async () => {
       const baseline = await startCli(['agents', '--event-cursor']).result;
@@ -100,12 +106,13 @@ test('wait watches integrate CLI cursors, live descriptors, stable ACKs and deta
       assert.equal(detail.state, 'working'); assert.equal(detail.waiting.status_text, true);
       assert.equal(detail.waiting.expires_at - detail.waiting.started_at, 5);
       assert.deepEqual(detail.waiting.states, ['crashed']);
-      const listed = (await api('GET', '/agents?project=1')).items.find(agent => agent.id === 1);
+      const listed = (await api('GET', `/agents?project=${project}`)).items.find(agent => agent.id === 1);
       assert.ok(listed.waiting.remaining_secs >= 0 && listed.waiting.remaining_secs <= 5);
-      db.exec("BEGIN IMMEDIATE; UPDATE agents SET state='crashed' WHERE id=2; UPDATE agents SET state='working',status_text='peer has news' WHERE id=2; UPDATE agents SET state='crashed' WHERE id=3; COMMIT");
+      db.exec("BEGIN IMMEDIATE; UPDATE agents SET state='crashed' WHERE id=2; UPDATE agents SET state='working',status_text='peer has news' WHERE id=2; COMMIT");
+      foreignDb.exec("UPDATE agents SET state='crashed' WHERE id=3");
       insert.run(4, 1, 'future peer');
       db.exec("UPDATE agents SET state='crashed' WHERE id=4");
-      const thread = await api('POST', '/threads', { project: 1, title: 'normal message', members: ['1'] });
+      const thread = await api('POST', '/threads', { project, title: 'normal message', members: ['1'] });
       await api('POST', '/messages', { thread: thread.id, text: 'normal messages stay additive' });
       const result = await waiting.result;
       assert.equal(result.status, 0, result.stderr); assert.equal(result.signal, null);
@@ -136,7 +143,7 @@ test('wait watches integrate CLI cursors, live descriptors, stable ACKs and deta
       for (const body of [{ agents: null }, { agents: ['2'] }, { agents: [2.5] }, { agents: [1] },
         { agents: [3] }, { agents: 'all', states: ['busy'] }, { agents: 'all', after: cursor() + 1 },
         { agents: 'all', after: -1 }, { agents: 'all', status_text: 'true' }, { states: ['crashed'] }]) {
-        await api('POST', '/wait/1', { timeout: 1, ...body }, 400);
+        await api('POST', '/wait/1', { timeout: 1, ...body }, body.agents?.[0]===3 ? 404 : 400);
         assert.equal((await api('GET', '/agents/1')).waiting, null);
       }
     });
@@ -165,15 +172,15 @@ test('wait watches integrate CLI cursors, live descriptors, stable ACKs and deta
 });
 
 test('foreground waits keep membership changes passive without consuming their summary', { timeout: 20000 }, async () => {
-  await fixture(async ({ api, db, until }) => {
+  await fixture(async ({ api, db, project, until }) => {
     const cursor = () => db.prepare('SELECT event_id FROM summary_cursors WHERE agent_id=1').get()?.event_id ?? 0;
     const before = cursor();
     const waiting = api('POST', '/wait/1', { timeout: 1 });
     await until(async () => Boolean((await api('GET', '/agents/1')).waiting));
-    const fixed = await api('POST', '/threads', { project: 1, title: 'empty fixed roster', members: ['1'] });
+    const fixed = await api('POST', '/threads', { project, title: 'empty fixed roster', members: ['1'] });
     await api('POST', `/threads/${fixed.id}/members/remove`, { members: ['1'] });
     await api('POST', `/threads/${fixed.id}/members`, { members: ['1'] });
-    await api('POST', '/threads', { project: 1, title: 'empty live roster', watch: ['working'] });
+    await api('POST', '/threads', { project, title: 'empty live roster', watch: ['working'] });
     assert.deepEqual(await waiting, { text: '', delivery_id: null, timed_out: true });
     assert.equal(cursor(), before, 'a membership-only timeout must preserve unreported changes');
     const summary = (await api('POST', '/hook/1', {})).text;
@@ -192,7 +199,7 @@ test('foreground waits keep membership changes passive without consuming their s
     assert.equal((await api('GET', `/messages/${message.id}?agent=1`)).mark, 'new');
     await api('POST', '/wait/1/ack', { delivery_id: result.delivery_id });
     assert.equal((await api('POST', '/hook/1', {})).text, '');
-    await api('POST', '/locks', { project: 1, name: 'wait-regression', about: 'preserve lock notifications' });
+    await api('POST', '/locks', { project, name: 'wait-regression', about: 'preserve lock notifications' });
     await api('POST', '/locks/acquire', { agent: 1, name: 'wait-regression' });
     const lock = await api('POST', '/wait/1', { timeout: 1 });
     assert.equal(lock.timed_out, false);

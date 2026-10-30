@@ -9,6 +9,9 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const markdownAsset = '/assets/markdown-it-15.0.3.min.js';
+const projectId = id => `10000000-0000-4000-8000-${String(id).padStart(12,'0')}`;
+const configId = id => Number(id)===1 ? 'default' : `20000000-0000-4000-8000-${String(id).padStart(12,'0')}`;
+const tokenFieldReport=(tokens,awaiting_update=false,at=1720000000)=>({last_known:tokens==null?null:{tokens,at},observed_at:tokens==null?null:at,state_at:at,awaiting_update});
 
 test('chat Markdown uses the reviewed local parser artifact with matching script integrity', () => {
   const bytes=fs.readFileSync(path.join(__dirname,'../src/vendor/markdown-it-15.0.3.min.js'));
@@ -35,7 +38,6 @@ function settings() {
     auto_resume: true, done_closes: true,
     max_lock_ttl_secs: 900,
     allow_agent_model_change: false, allow_agent_effort_change: false, crash_retries: {},
-    usage_poll_secs: 120,
     prompts: { launch:'Launch guidance', wake:'Wake guidance', resume:'Resume guidance' },
   };
 }
@@ -46,7 +48,7 @@ const reloadPage = async page => {
 
 // Test-server query fixture only; the page obtains the AST and editable clauses from the server.
 function agentQueryFixture(source) {
-  const fields=['group','provider','model','effort','state','pause_reason']; let i=0;
+  const fields=['group','provider','model','effort','state','pause_reason','id','name','launched_by','task','status','failure_kind']; let i=0;
   const quote=value=>'"'+value.replaceAll('\\','\\\\').replaceAll('"','\\"')+'"',fail=message=>{throw new Error(message);};
   const isSpace=char=>/[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/.test(char);
   const space=()=>{while(i<source.length&&isSpace(source[i]))i++;};
@@ -73,8 +75,13 @@ function agentQueryFixture(source) {
       field=first;i++;if(!fields.includes(field))fail(`Unknown search field: ${field}`);
       values=[value(true)];while(source[i]===','){i++;values.push(value(true));}
       if(field!=='group'&&values.includes(''))fail(`Empty ${field} value`);
-      const valid={provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']}[field];
+      const valid={provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart'],failure_kind:['unknown','transport','authentication','model_unavailable','provider_rejected','model_switched','startup','process_exit']}[field];
       if(valid&&values.some(value=>!valid.includes(value)))fail(`Unknown ${field} value`);
+      if(['id','launched_by'].includes(field))values=values.map(value=>{
+        if(field==='launched_by'&&value==='user')return '0';
+        if(!/^\d+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)<(field==='id'?1:0))fail(`Invalid ${field} value`);
+        return String(Number(value));
+      });
       values=[...new Set(values)].sort();
     } else if(first==='')fail('Empty text term');
     if(i<source.length&&!isSpace(source[i])&&!/[()]/.test(source[i]))fail('Expected space between clauses');
@@ -111,25 +118,35 @@ function agentQueryMatches(expression,agent) {
   const clause=expression.clause;
   if(clause.field==null)return [agent.name,agent.id,agent.harness,agent.model,agent.group,agent.status,agent.task].some(value=>String(value??'').toLowerCase().includes(clause.values[0].toLowerCase()));
   if(clause.field==='pause_reason')return agent.state==='paused'&&clause.values.includes(['user','all'].includes(agent.pause_reason)?'manual':agent.pause_reason);
+  if(clause.field==='failure_kind')return agent.state==='crashed'&&clause.values.includes(agent.failure_kind||'unknown');
+  if(['task','status'].includes(clause.field))return clause.values.some(value=>String(agent[clause.field]??'').toLowerCase().includes(value.toLowerCase()));
+  if(clause.field==='launched_by')return clause.values.some(value=>Number(value==='user'?0:value)===agent.launched_by);
   return clause.values.includes(String(clause.field==='provider'?agent.harness:clause.field==='group'?agent.group||'':agent[clause.field]));
 }
 
 async function fixture(run) {
-  const data = { settings: settings(), agents: [], threads: [], subscriptions: [], reads: {}, agentLogs: {}, detailRequests: [], getRequests: [], projects: [{ id: 1, name: 'example', path: '/projects/example', config: 2 }, { id: 2, name: 'other', path: '/projects/other', config: 2 }], requests: [], hardLimit: false };
-  data.configs = [{ id: 1, name: 'Default', settings: settings() }, { id: 2, name: 'Mine', settings: data.settings }];
+  const data = { settings: settings(), globalSettings:{usage_poll_secs:120,metrics_sample_secs:5}, agents: [], threads: [], subscriptions: [], reads: {}, agentLogs: {}, detailRequests: [], getRequests: [], projects: [{ id:projectId(1), name: 'example', path: '/projects/example', config:configId(2) }, { id:projectId(2), name: 'other', path: '/projects/other', config:configId(2) }], requests: [], hardLimit: false };
+  data.configs = [{ id:configId(1), name: 'Default', settings: settings() }, { id:configId(2), name: 'Mine', settings: data.settings }];
+  let nextProject=3,nextConfig=3;
   data.folders = { '/home/example': { path:'/home/example', parent:'/home', home:'/home/example', entries:[{name:'work',path:'/home/example/work',directory:true},{name:'note.txt',path:'/home/example/note.txt',directory:false}] }, '/home/example/work':{path:'/home/example/work',parent:'/home/example',home:'/home/example',entries:[]} };
   const configs = () => data.configs.map(c => ({ ...c, projects: data.projects.filter(p => p.config === c.id).map(p => p.id) }));
-  const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? 1)).settings;
-  const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > (data.reads[t.id] || 0)).length : 0;
+  const effective = p => p?.config == null && p ? p.custom : data.configs.find(c => c.id === (p?.config ?? configId(1))).settings;
+  const readOf=t=>data.projectReads?.[`${t.project}:${t.id}`]??(data.threads.filter(thread=>thread.id===t.id).length===1?data.reads[t.id]||0:0);
+  const unread = t => t.members.includes(0) ? t.messages.filter(m => m.sender !== 0 && !m.outside_membership && m.id > readOf(t)).length : 0;
   const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,16);
-  const agentCategory = (agent, category) => category==='active' ? ['working','idle'].includes(agent.state) : category==='attention' ? ['paused','crashed'].includes(agent.state)||!!(agent.stopping||agent.wake_queued_at||agent.replacement_start||agent.replacement_start_pending) : category==='finished' ? ['done','closed','replaced'].includes(agent.state) : true;
-  const agentCounts = agents => Object.fromEntries(['all','active','attention','finished'].map(category=>[category,agents.filter(agent=>agentCategory(agent,category)).length]));
+  const agentCategory = (agent, category) => category==='active' ? ['working','idle'].includes(agent.state) : category==='attention' ? ['paused','crashed'].includes(agent.state)||!!(agent.stopping||agent.wake_queued_at||agent.replacement_start||agent.replacement_start_pending) : category==='finished' ? ['done','closed','replaced'].includes(agent.state) : category==='all' ? true : agent.state===category;
+  const agentCounts = agents => Object.fromEntries(['all','active','attention','finished','working','idle','paused','crashed','done','closed','replaced'].map(category=>[category,agents.filter(agent=>agentCategory(agent,category)).length]));
   const globalEligible = () => ({pause_eligible:data.agents.filter(agent=>['working','idle','done'].includes(agent.state)).length,resume_eligible:data.agents.filter(agent=>agent.state==='paused').length});
+  const bulkResponse=(eligible,successful,warnings=[],failures=[])=>{
+    const projects=[...new Set(eligible.map(agent=>agent.project))];
+    const results=projects.map((project,index)=>({project,ids:successful.filter(agent=>agent.project===project).map(agent=>agent.id),warnings:index===0?warnings:[],errors:failures.filter(item=>item.agent.project===project).map(item=>item.error)}));
+    return {results,errors:[],counts:{ids:successful.length,warnings:warnings.length,errors:failures.length}};
+  };
   const projectRows = () => data.projects.map(p => ({...p, agents:data.agents.filter(a => a.project === p.id).length, active:data.agents.filter(a => a.project === p.id && ['working','idle'].includes(a.state)).length, unread:data.threads.filter(t => t.project === p.id).reduce((n,t) => n + unread(t),0)}));
   const collection = (key, project) => {
     if (key === 'projects') return projectRows();
     if (key === 'configs') return configs();
-    if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,owner:t.owner ?? t.created_by ?? 0,user_member:t.members.includes(0),messages:t.messages.length,unread:unread(t)}));
+    if (key === 'threads') return data.threads.filter(t => t.project === project).map(t => ({...t,owner:t.owner ?? t.created_by ?? 0,user_member:t.members.includes(0),last_at:t.messages.length?Math.max(...t.messages.map(message=>message.at)):null,last_message_id:Math.max(0,...t.messages.map(message=>message.id)),messages:t.messages.length,unread:unread(t)}));
     if (key === 'agents') return data.agents.filter(a => a.project === project).map(({task,problem,...a})=>({...a,stopping:!!a.stopping,is_waiting:!!a.waiting,replacement:a.replacement ?? (a.state==='replaced' ? a.retry?.replacement : null),replacement_pending:!!a.replacement_request,replacement_start_pending:!!a.replacement_start,task_preview:task?.slice(0,400),problem_preview:problem,has_problem:!!problem,model_unavailable:/model.*(not supported|not available|not found)|not supported.*account/i.test(problem || '')}));
     if (key === 'locks') return (data.locks || []).filter(lock=>lock.project == null || lock.project === project).map((lock,i)=>({id:i+1,...lock,holder_stopping:!!(lock.holder && (lock.holder_stopping || data.agents.find(agent=>agent.id===lock.holder)?.stopping))}));
     return (data[key] || []).filter(row => row.project == null || row.project === project).map((row,i) => ({id:i+1,...row}));
@@ -148,7 +165,7 @@ async function fixture(run) {
       items.push(row);
       if (Buffer.byteLength(JSON.stringify(envelope(items))) > budget) {
         items.pop();
-        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline','total_tokens','token_usage_state','token_usage_last_total'].filter(k => row[k] != null).map(k => [k,row[k]]))});
+        if (!items.length) items.push({id:row.id,truncated:true,...Object.fromEntries(['project','thread','sender','at','kind','state','stopping','is_waiting','has_diagnostics','holder_stopping','user_member','unread','messages','private','joinable','owner','created_by','replacement','replacement_pending','replacement_start_pending','agent','mode','deadline','total_tokens','token_usage_state','token_usage_fields'].filter(k => row[k] != null).map(k => [k,row[k]]))});
         break;
       }
     }
@@ -165,19 +182,92 @@ async function fixture(run) {
     while(low+1<high) {const mid=Math.floor((low+high)/2);if(Buffer.byteLength(JSON.stringify(envelope(mid)))<=budget)low=mid;else high=mid;}
     return envelope(low);
   }
-  const releaseLocks = id => {
-    const agent=data.agents.find(a=>a.id===id); if(agent)agent.locks=[];
-    for(const lock of data.locks || [])if(lock.holder===id)Object.assign(lock,{holder:null,holder_name:null,acquired_at:null,expires_at:null});
+  function sortedThreads(rows,params,revision) {
+    const sort=params.get('sort')||'latest_message';revision=hash([revision,sort]);
+    if(params.has('revision')&&params.get('revision')!==revision)return {status:409,error:'collection changed; restart paging without a cursor'};
+    if(params.get('since')===revision)return {unchanged:true,revision};
+    rows.sort((a,b)=>sort==='oldest'?(a.created_at??a.id)-(b.created_at??b.id)||a.id-b.id:sort==='newest'?(b.created_at??b.id)-(a.created_at??a.id)||b.id-a.id:sort==='title'?Buffer.compare(Buffer.from(String(a.title).toLowerCase()),Buffer.from(String(b.title).toLowerCase()))||a.id-b.id:(b.last_at!=null)-(a.last_at!=null)||(b.last_at??0)-(a.last_at??0)||b.last_message_id-a.last_message_id||b.id-a.id);
+    let offset=0;
+    if(params.has('cursor')) {
+      const cursor=JSON.parse(Buffer.from(params.get('cursor'),'base64url').toString());
+      if(cursor.revision!==revision||cursor.sort!==sort)return {status:409,error:'collection changed; restart paging without a cursor'};
+      offset=rows.findIndex(row=>row.id===cursor.last)+1;
+    }
+    const limit=Math.min(Number(params.get('limit')||50),data.pageLimit||200),budget=Number(params.get('max_bytes')||16000);
+    const candidates=rows.slice(offset),envelope=items=>({items,revision,total:rows.length,has_more:items.length<candidates.length,next_cursor:items.length?Buffer.from(JSON.stringify({sort,revision,last:items.at(-1).id})).toString('base64url'):null});
+    const items=[];
+    for(const row of candidates.slice(0,limit)) {
+      items.push(row);
+      if(Buffer.byteLength(JSON.stringify(envelope(items)))>budget) {
+        items.pop();
+        if(!items.length)items.push({id:row.id,truncated:true,project:row.project,user_member:row.user_member,unread:row.unread,messages:row.messages,last_at:row.last_at,owner:row.owner,private:row.private,joinable:row.joinable});
+        break;
+      }
+    }
+    return envelope(items);
+  }
+  function registryPage(rows,params,revision) {
+    if(params.has('revision')&&params.get('revision')!==revision)return {status:409,error:'collection changed; restart paging without a cursor'};
+    if(params.get('since')===revision)return {unchanged:true,revision};
+    rows=[...rows].reverse();let offset=0;
+    if(params.has('cursor')) {const cursor=JSON.parse(Buffer.from(params.get('cursor'),'base64url').toString());if(cursor.revision!==revision)return {status:409,error:'collection changed; restart paging without a cursor'};offset=rows.findIndex(row=>row.id===cursor.last)+1;}
+    const candidates=rows.slice(offset),limit=Math.min(Number(params.get('limit')||50),data.pageLimit||200),budget=Number(params.get('max_bytes')||16000),items=[];
+    const envelope=items=>({items,revision,total:rows.length,has_more:items.length<candidates.length,next_cursor:items.length?Buffer.from(JSON.stringify({revision,last:items.at(-1).id})).toString('base64url'):null});
+    for(const row of candidates.slice(0,limit)) {items.push(row);if(Buffer.byteLength(JSON.stringify(envelope(items)))>budget){items.pop();if(!items.length)items.push({id:row.id,truncated:true});break;}}
+    return envelope(items);
+  }
+  const releaseLocks = (id,project) => {
+    const agent=data.agents.find(a=>a.id===id&&(!project||a.project===project)); if(agent)agent.locks=[];
+    for(const lock of data.locks || [])if(lock.holder===id&&(!project||lock.project==null||lock.project===project))Object.assign(lock,{holder:null,holder_name:null,acquired_at:null,expires_at:null});
   };
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = raw ? JSON.parse(raw) : null;
-    const url = new URL(req.url,'http://localhost'), pathname = url.pathname, params = url.searchParams;
+    const wireUrl=req.url,url = new URL(req.url,'http://localhost'), wireQuery=url.search;
+    let pathname=url.pathname;
+    const scope=/^\/p\/([^/]+)(\/.*)$/.exec(pathname),scopeProject=scope&&decodeURIComponent(scope[1]);
+    if(scope) {pathname=scope[2];url.pathname=pathname;url.searchParams.set('project',scopeProject);req.url=pathname+(req.method==='GET'?url.search:wireQuery);}
+    const params=url.searchParams;
+    (data.wireRequests ||= []).push({url:wireUrl,method:req.method,body});
     if(req.method==='GET') data.getRequests.push(req.url);
-    if (req.method !== 'GET') data.requests.push({ url: req.url, method: req.method, body });
+    if (req.method !== 'GET'&&!/^\/threads\/\d+\/draft$/.test(pathname)) data.requests.push({ url: req.url, method: req.method, body });
     res.setHeader('Content-Type', 'application/json');
     const send = value => {if(value?.status && value?.error)res.statusCode=value.status;res.end(JSON.stringify(value));};
+    if(scope&&!data.projects.some(project=>project.id===scopeProject))return send({status:404,error:'Unknown project'});
+    if(!scope&&/^\/(agents|threads|messages|locks|activity|history|subscriptions|agent-config)(\/|$)/.test(pathname))return send({status:400,error:'Project context required'});
+    const agentFor=id=>data.agents.find(agent=>agent.id===id&&agent.project===scopeProject);
+    const threadFor=id=>data.threads.find(thread=>thread.id===id&&thread.project===scopeProject);
+    if(/^\/threads\/\d+\/draft$/.test(pathname)) {
+      const id=Number(pathname.split('/')[2]),key=`${scopeProject}:${id}`;
+      if(!threadFor(id))return send({status:404,error:'No such thread'});
+      const saved=(data.serverDrafts||={})[key]||{thread:id,text:'',version:'empty',updated_at:null};
+      (data.draftRequests||=[]).push({url:wireUrl,method:req.method,body});
+      if(data.draftError)return send({status:503,error:data.draftError});
+      if(req.method==='GET')return send(bounded(saved,params));
+      if(req.method==='PUT') {
+        if(body.version!==saved.version)return send({status:409,error:'Saved draft changed; reload before saving'});
+        if(typeof body.text!=='string'||Buffer.byteLength(body.text)>1048576)return send({status:400,error:'Draft text exceeds limit'});
+        const version=`draft-${data.draftSequence=(data.draftSequence||0)+1}`;
+        data.serverDrafts[key]={thread:id,text:body.text,version,updated_at:Math.floor(Date.now()/1000)};
+        return send({saved:true,thread:id,version});
+      }
+    }
+    if(/^\/agents\/\d+\/permissions$/.test(pathname)) {
+      const id=Number(pathname.split('/')[2]),key=`${scopeProject}:${id}`;
+      if(!agentFor(id))return send({status:404,error:'No such agent'});
+      const grants=(data.permissionGrants||={})[key]||[],version=hash([key,grants]);
+      if(req.method==='GET') {
+        if(data.permissionsReadError)return send({status:503,error:data.permissionsReadError});
+        return send(bounded({agent:id,grants,version},params));
+      }
+      if(req.method==='PUT') {
+        if(data.permissionsWriteError)return send({status:503,error:data.permissionsWriteError});
+        if(body.version!==version||agentFor(id).state==='replaced')return send({status:409,error:'Permissions changed; reload before saving'});
+        data.permissionGrants[key]=body.grants;
+        return send({agent:id,grants:body.grants,version:hash([key,body.grants])});
+      }
+    }
     if (new URL(req.url, 'http://localhost').pathname === '/') {
       res.setHeader('Content-Type', 'text/html');
       return res.end(fs.readFileSync(path.join(__dirname, '../src/ui.html')));
@@ -189,12 +279,24 @@ async function fixture(run) {
       res.setHeader('X-Content-Type-Options', 'nosniff');
       return res.end(fs.readFileSync(asset));
     }
+    if(req.method==='GET'&&['/assets/charts.js','/assets/project-data.js'].includes(pathname)) {
+      res.setHeader('Content-Type','text/javascript; charset=utf-8');res.setHeader('X-Content-Type-Options','nosniff');
+      return res.end(fs.readFileSync(path.join(__dirname,'../src',path.basename(pathname))));
+    }
+    if(req.method==='GET'&&(pathname==='/metrics'||pathname==='/metrics/projects'||pathname==='/metrics/series')) {
+      if(pathname==='/metrics/series')return send({items:[{id:1,series:{entity:'account:claude:five_hour',metric:'usage_pct',kind:'gauge'},first_at:1,last_at:2}],next:null,status:{available:true}});
+      const project=scopeProject||params.get('projects')?.split(',')[0],entity=params.get('entity')||(project?'agent:1':'account:claude:five_hour'),metric=params.get('metric')||'total_tokens',at=Math.floor(Date.now()/1000),counter=metric!=='usage_pct';
+      if(!scopeProject&&pathname==='/metrics'&&entity.startsWith('agent:'))return send({status:400,error:'Agent metrics require a project context'});
+      const point={observed_at:at,value_observed_at:at,value:{kind:counter?'counter':'gauge',value:counter?'9007199254740993':42},quality:'final'};
+      return send({items:[{...(project?{project}:{}),id:1,series:{entity,metric,kind:counter?'counter':'gauge'},origin:{id:'30000000-0000-4000-8000-000000000001',source_instance:'40000000-0000-4000-8000-000000000001',imported_at:null},envelope:{first:point,last:point,minimum:point,maximum:point,observations:1,qualities:['final'],has_gap:false,has_correction:false,checkpoint:false,resolution_secs:60,sampled_at:at},crosses_range:false}],summaries:[],next:null,status:{available:true},range:{from:Number(params.get('from')),to:Number(params.get('to'))}});
+    }
     if (req.url.startsWith('/overview')) {
-      const id = Number(new URL(req.url, 'http://localhost').searchParams.get('project'));
+      const id = params.get('project');
       const project = data.projects.find(p => p.id === id) || data.projects[0] || null;
       if (data.delays?.[id]) await new Promise(resolve => setTimeout(resolve, data.delays[id]));
       const revisions = Object.fromEntries(['projects','configs','agents','threads','locks','activity'].map(key => [key,revision(key,project?.id)]));
       revisions.settings=hash([data.projects,configs()]);
+      revisions.global_settings=hash(data.globalSettings);
       const restartPaused=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart').length;
       const projectAgents=data.agents.filter(a=>a.project===project?.id);
       const projectActions={pause_eligible:projectAgents.filter(a=>['working','idle','done'].includes(a.state)).length,resume_eligible:projectAgents.filter(a=>a.state==='paused').length,restart_paused:projectAgents.filter(a=>a.state==='paused'&&a.pause_reason==='restart').length};
@@ -203,9 +305,14 @@ async function fixture(run) {
       return send(bounded({revision:rev,revisions,unread_total:projectRows().reduce((n,p)=>n+p.unread,0),...(data.unknownGlobalCounts?{}:{restart_paused:restartPaused,...globalEligible()}),...(data.unknownProjectCounts?{}:{project_actions:projectActions}),agent_counts:agentCounts(projectAgents), limits:{usage:data.usage || [],checks:data.checks || [],limits:effective(project).limits},project:projectRows().find(p=>p.id===project?.id) || null,url:`http://127.0.0.1:${server.address().port}`},params));
     }
     if(req.method==='GET' && pathname==='/catalog') return send(bounded(catalog,params));
+    if(pathname==='/global-settings') {
+      if(data.globalSettingsError)return send({status:503,error:data.globalSettingsError});
+      if(req.method==='PUT')data.globalSettings=body.settings;
+      return send(data.globalSettings);
+    }
     if(req.method==='GET' && pathname==='/storage') {
-      const project=params.has('project')?Number(params.get('project')):null;
-      const report=structuredClone(data.storageReports?.[project] || {home:'/home/example/.acom',project,started_at:1720000000,completed_at:1720000001,complete:true,limited:false,entries:8,skipped:0,bytes:{project_logs:project===null?null:0,all_project_logs:4096,database:8192,other:4096,total:16384}});
+      const project=params.has('project')?params.get('project'):null;
+      const report=structuredClone(data.storageReports?.[project] || {home:'/home/example/.acom',project,started_at:1720000000,completed_at:1720000001,complete:true,limited:false,entries:8,skipped:0,bytes:{project:project===null?null:0,project_core:project===null?null:0,project_logs:project===null?null:0,project_metrics:project===null?null:0,project_native:project===null?null:0,all_project_logs:4096,database:8192,metrics:0,native:0,trash:0,other:4096,total:16384}});
       if(data.storageDelay)await new Promise(resolve=>setTimeout(resolve,data.storageDelay));
       if(data.storageError)return send({status:503,error:data.storageError});
       return send(report);
@@ -215,12 +322,12 @@ async function fixture(run) {
       return send(result.error?result:bounded(result,params));
     }
     if(req.method==='GET' && pathname==='/settings') {
-      const id=Number(params.get('project')),project=data.projects.find(p=>p.id===id);
+      const id=params.get('project'),project=data.projects.find(p=>p.id===id);
       if(data.delays?.[id])await new Promise(resolve=>setTimeout(resolve,data.delays[id]));
       return send(bounded(effective(project),params));
     }
     if(req.method==='GET' && /^\/(projects|configs|agents|threads|locks|activity)$/.test(pathname)) {
-      const key=pathname.slice(1),project=Number(params.get('project')) || data.projects[0]?.id;
+      const key=pathname.slice(1),project=params.get('project') || data.projects[0]?.id;
       if(key==='agents') {
         const category=params.get('category')||'all', search=params.get('search')||'',state=params.get('state'),reason=params.get('pause_reason'),parsed=agentQueryFixture(search);
         if(parsed.error)return send(parsed);
@@ -229,6 +336,8 @@ async function fixture(run) {
         const result=paged(collection(key,project).filter(agent=>ids.has(agent.id)),params,hash([revision(key,project),category,search,state,reason]));
         return send(result.error||result.unchanged ? result : {...result,counts:agentCounts(matched),project_total:data.agents.filter(agent=>agent.project===project).length});
       }
+      if(key==='threads')return send(sortedThreads(collection(key,project),params,revision(key,project)));
+      if(['projects','configs'].includes(key))return send(registryPage(collection(key,project),params,revision(key,project)));
       return send(paged(collection(key,project),params,revision(key,project),key!=='activity'));
     }
     if(req.method==='GET' && pathname==='/history') {
@@ -239,22 +348,22 @@ async function fixture(run) {
     }
     if(req.method==='GET' && pathname==='/subscriptions') {
       if(data.subscriptionFailure)return send({status:503,error:data.subscriptionFailure});
-      const rows=data.subscriptions.filter(item=>item.agent===Number(params.get('agent')));
+      const rows=data.subscriptions.filter(item=>item.agent===Number(params.get('agent'))&&(!item.project||item.project===scopeProject));
       return send(paged(rows,params,hash(rows)));
     }
-    if(req.method==='GET' && /^\/subscriptions\/\d+$/.test(pathname))return send(bounded(data.subscriptions.find(item=>item.id===Number(pathname.split('/')[2])),params));
+    if(req.method==='GET' && /^\/subscriptions\/\d+$/.test(pathname))return send(bounded(data.subscriptions.find(item=>item.id===Number(pathname.split('/')[2])&&(!item.project||item.project===scopeProject)),params));
     if(req.method==='POST' && /^\/subscriptions\/\d+\/cancel$/.test(pathname)) {
       if(data.cancelSubscriptionDelay)await new Promise(resolve=>setTimeout(resolve,data.cancelSubscriptionDelay));
       if(data.cancelSubscriptionError)return send({status:503,error:data.cancelSubscriptionError});
-      const item=data.subscriptions.find(item=>item.id===Number(pathname.split('/')[2]));
+      const item=data.subscriptions.find(item=>item.id===Number(pathname.split('/')[2])&&(!item.project||item.project===scopeProject));
       Object.assign(item,{state:'canceled',completed_at:Math.floor(Date.now()/1000),completion:{kind:'notice',summary:'Canceled by user'}});
       return send({id:item.id,state:item.state});
     }
-    if(req.method==='GET' && /^\/(projects|configs|locks|activity)\/\d+$/.test(pathname)) {
-      const [key,id]=pathname.slice(1).split('/'),project=Number(params.get('project')) || data.projects[0]?.id;
-      return send(bounded(collection(key,project).find(row=>row.id===Number(id)),params));
+    if(req.method==='GET' && /^\/(projects|configs|locks|activity)\/[^/]+$/.test(pathname)) {
+      const [key,id]=pathname.slice(1).split('/'),project=params.get('project') || data.projects[0]?.id;
+      return send(bounded(collection(key,project).find(row=>row.id===(['projects','configs'].includes(key)?id:Number(id))),params));
     }
-    if(req.method==='GET' && /^\/receipts\/\d+$/.test(pathname))return send(bounded(data.receipts[Number(pathname.split('/')[2])],params));
+    if(req.method==='GET' && (scopeProject?/^\/receipts\/\d+$/:/^\/global-receipts\/\d+$/).test(pathname))return send(bounded(data.receipts[Number(pathname.split('/')[2])],params));
     if(req.url.startsWith('/folders')) {
       if(req.method==='GET') {
         const p=new URL(req.url,'http://localhost').searchParams.get('path') || '/home/example';
@@ -272,34 +381,37 @@ async function fixture(run) {
       return send({path:p});
     }
     if(req.url==='/usage/check') return send({});
+    if(req.method==='POST'&&/^\/projects\/[^/]+\/export$/.test(pathname))return send({exported:true,archive:body.destination,files:1,warnings:[],notes:[]});
     if (req.url === '/projects') {
-      const p = { id: Math.max(0, ...data.projects.map(p => p.id)) + 1, path: body.path, name: body.path.split('/').at(-1), config: 1 };
+      while(data.projects.some(project=>project.id===projectId(nextProject)))nextProject++;
+      const p = { id:projectId(nextProject++), path: body.path, name: body.path.split('/').at(-1), config:configId(1) };
       data.projects.push(p);
       return send({ id: p.id });
     }
-    if (/^\/projects\/\d+\/remove$/.test(req.url)) {
-      data.projects = data.projects.filter(p => p.id !== Number(req.url.split('/')[2]));
+    if (/^\/projects\/[^/]+\/remove$/.test(req.url)) {
+      data.projects = data.projects.filter(p => p.id !== req.url.split('/')[2]);
       return send({});
     }
     if (req.url === '/configs') {
       if (req.method === 'GET') return send(configs());
       if (data.configs.some(c => c.name === body.name)) { res.statusCode = 409; return send({ error: 'Config name already exists' }); }
-      const id = Math.max(...data.configs.map(c => c.id)) + 1;
+      while(data.configs.some(config=>config.id===configId(nextConfig)))nextConfig++;
+      const id = configId(nextConfig++);
       data.configs.push({ id, ...body }); return send({ id });
     }
-    if (/^\/configs\/\d+(\/remove)?$/.test(req.url)) {
+    if (/^\/configs\/[^/]+(\/remove)?$/.test(req.url)) {
       if (data.writeDelay) await new Promise(resolve => setTimeout(resolve, data.writeDelay));
-      const id = Number(req.url.split('/')[2]);
-      if (id === 1) { res.statusCode = 403; return send({error:'Default is read-only'}); }
+      const id = req.url.split('/')[2];
+      if (id === configId(1)) { res.statusCode = 403; return send({error:'Default is read-only'}); }
       if (req.url.endsWith('/remove')) data.configs = data.configs.filter(c => c.id !== id);
       else {
         Object.assign(data.configs.find(c => c.id === id), body);
-        if (id === 2) data.settings = body.settings;
+        if (id === configId(2)) data.settings = body.settings;
       }
       return send({});
     }
-    if (/^\/projects\/\d+\/config$/.test(req.url)) {
-      const p = data.projects.find(p => p.id === Number(req.url.split('/')[2]));
+    if (/^\/projects\/[^/]+\/config$/.test(req.url)) {
+      const p = data.projects.find(p => p.id === req.url.split('/')[2]);
       Object.assign(p, body.custom ? { config: null, custom: body.custom } : { config: body.config });
       return send({});
     }
@@ -312,53 +424,53 @@ async function fixture(run) {
         res.statusCode = data.agentConfigError.status; return send({error:data.agentConfigError.message});
       }
       if (data.agentConfigDelay) await new Promise(resolve => setTimeout(resolve, data.agentConfigDelay));
-      const agent = data.agents.find(a => a.id === body.id);
+      const agent = agentFor(body.id);
       if (body.model != null) agent.model = body.model;
       if (body.effort != null) agent.effort = body.effort;
       if (typeof body.continuation === 'string') agent.continuation = {text:body.continuation,blocked:null};
       return send({});
     }
     if (/^\/agents\/\d+\/resume$/.test(req.url)) {
-      const agent=data.agents.find(a => a.id === Number(req.url.split('/')[2]));
+      const agent=agentFor(Number(req.url.split('/')[2]));
       if(agent.stopping)return send({status:409,error:'Agent is still stopping'});
       Object.assign(agent, {state:'working',pause_reason:null,problem:null});
       return send({warnings:[]});
     }
     if (/^\/agents\/\d+\/(close|reopen)$/.test(req.url)) {
-      const agent=data.agents.find(a=>a.id===Number(req.url.split('/')[2]));
+      const agent=agentFor(Number(req.url.split('/')[2]));
       if(data.agentTransitionError)return send({status:503,error:data.agentTransitionError});
       Object.assign(agent,{state:req.url.endsWith('/close')?'closed':'idle',pause_reason:null,problem:null});
       return send({});
     }
     if (req.url === '/resume-all') {
       if(data.resumeAllError)return send({status:503,error:data.resumeAllError});
-      const ids=data.agents.filter(a=>a.state==='paused'&&(body.project==null||a.project===body.project)).map(a=>a.id);
-      for(const id of ids)Object.assign(data.agents.find(a=>a.id===id),{state:'working',pause_reason:null});
-      return send({ids});
+      const eligible=data.agents.filter(a=>a.state==='paused'&&(body.project==null||a.project===body.project));
+      for(const agent of eligible)Object.assign(agent,{state:'working',pause_reason:null});
+      return send(data.resumeAllResult||bulkResponse(eligible,eligible));
     }
     if (req.url === '/resume-restart') {
       if(data.resumeRestartError)return send({status:503,error:data.resumeRestartError});
       const eligible=data.agents.filter(a=>a.state==='paused' && a.pause_reason==='restart'&&(body.project==null||a.project===body.project));
-      const ids=eligible.filter(a=>!data.resumeRestartFailures?.[a.id]).map(a=>a.id);
-      for(const id of ids)Object.assign(data.agents.find(a=>a.id===id),{state:'working',pause_reason:null});
-      return send(data.resumeRestartResult || {ids,warnings:data.resumeRestartWarnings || [],errors:eligible.filter(a=>data.resumeRestartFailures?.[a.id]).map(a=>data.resumeRestartFailures[a.id])});
+      const successful=eligible.filter(a=>!data.resumeRestartFailures?.[a.id]);
+      for(const agent of successful)Object.assign(agent,{state:'working',pause_reason:null});
+      return send(data.resumeRestartResult || bulkResponse(eligible,successful,data.resumeRestartWarnings||[],eligible.filter(agent=>data.resumeRestartFailures?.[agent.id]).map(agent=>({agent,error:data.resumeRestartFailures[agent.id]}))));
     }
     if (/^\/agents\/\d+\/pause$/.test(req.url)) {
       if(Object.hasOwn(body,'locks'))return send({status:400,error:'Pause always releases locks; lock options are unsupported'});
       if(data.pauseError)return send({status:503,error:data.pauseError});
       const id=Number(req.url.split('/')[2]);
-      Object.assign(data.agents.find(a => a.id === id), {state:'paused',pause_reason:'user',stopping:!!data.pauseStopping});
-      if(!data.pauseStopping)releaseLocks(id);
+      Object.assign(agentFor(id), {state:'paused',pause_reason:'user',stopping:!!data.pauseStopping});
+      if(!data.pauseStopping)releaseLocks(id,scopeProject);
       return send({});
     }
     if(req.url==='/pause-all') {
       if(data.pauseAllError)return send({status:503,error:data.pauseAllError});
-      const ids=data.agents.filter(a=>['working','idle','done'].includes(a.state)&&(body.project==null||a.project===body.project)).map(a=>a.id);
-      for(const id of ids) {
-        Object.assign(data.agents.find(a=>a.id===id),{state:'paused',pause_reason:body.project==null?'all':'user',stopping:!!data.pauseStopping});
-        if(!data.pauseStopping)releaseLocks(id);
+      const eligible=data.agents.filter(a=>['working','idle','done'].includes(a.state)&&(body.project==null||a.project===body.project));
+      for(const agent of eligible) {
+        Object.assign(agent,{state:'paused',pause_reason:body.project==null?'all':'user',stopping:!!data.pauseStopping});
+        if(!data.pauseStopping)releaseLocks(agent.id,agent.project);
       }
-      return send({ids});
+      return send(data.pauseAllResult||bulkResponse(eligible,eligible));
     }
     if (req.url === '/locks/free') {
       const lock=(data.locks || []).find(lock=>lock.project===body.project&&lock.name===body.name);
@@ -372,7 +484,7 @@ async function fixture(run) {
       data.detailRequests.push(req.url);
       let value;
       if(pathname.endsWith('/log')) {
-        const text=(data.agentLogs[id] || []).join('\n'), raw=Buffer.from(text), total=raw.length, version=data.logVersions?.[id] || `log:${id}`,rev=hash([version,text]);
+        const text=(data.projectLogs?.[`${scopeProject}:${id}`]??data.agentLogs[id]??[]).join('\n'), raw=Buffer.from(text), total=raw.length, version=data.logVersions?.[id] || `log:${scopeProject}:${id}`,rev=hash([version,text]);
         if(params.has('version') && params.get('version')!==version)return send({status:409,error:'log changed'});
         if(Number(params.get('after'))>total)return send({status:409,error:'log truncated'});
         if(params.get('since')===rev && (!params.has('after') || Number(params.get('after'))===total))return send({unchanged:true,revision:rev,version,next_after:total,total_bytes:total});
@@ -385,8 +497,8 @@ async function fixture(run) {
         while(end>start && end<total && (raw[end]&0xc0)===0x80)end--;
         value={text:raw.subarray(start,end).toString('utf8'),start,end,total_bytes:ceiling,next_before:start,next_after:end,has_more:params.has('after')?end<ceiling:start>0,eof:end===ceiling,version,revision:rev,start_partial:false,end_partial:false};
       } else {
-        const agent={...data.agents.find(a=>a.id===id)};
-        agent.subscriptions ||= {active:data.subscriptions.filter(item=>item.agent===id&&item.state==='active').length,pending:data.subscriptionPending?.[id] || 0};
+        const agent={...agentFor(id)};
+        agent.subscriptions ||= {active:data.subscriptions.filter(item=>item.agent===id&&item.state==='active'&&(!item.project||item.project===scopeProject)).length,pending:data.subscriptionPending?.[id] || 0};
         if(agent.waiting) {agent.waiting={...agent.waiting};delete agent.waiting.remaining_secs;}
         value=bounded(agent,params);
       }
@@ -395,26 +507,26 @@ async function fixture(run) {
       return send(value);
     }
     if (req.url === '/threads') {
-      const t = { id: data.threads.length + 1, created_by:0, owner:0, ...body, private:!!body.private, joinable:body.joinable !== false && !body.private, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
+      const t = { id:Math.max(0,...data.threads.filter(thread=>thread.project===scopeProject).map(thread=>thread.id))+1, created_by:0, owner:0, ...body, private:!!body.private, joinable:body.joinable !== false && !body.private, members:[...(body.include_user === false ? [] : [0]),...(body.members || [])], messages: [] };
       data.threads.push(t);
       return send({ id: t.id });
     }
     if (req.url.startsWith('/threads/')) {
-      const t=data.threads.find(t=>t.id===Number(pathname.split('/')[2]));
+      const t=threadFor(Number(pathname.split('/')[2]));
       if(req.method==='GET') {
-        const metadata={...t,owner:t.owner ?? t.created_by ?? 0,messages:undefined,last_read:data.reads[t.id] || 0,unread:unread(t),latest_message:Math.max(0,...t.messages.map(m=>m.id)),first_unread:unread(t)>0?t.messages.find(m=>m.sender!==0&&!m.outside_membership&&m.id>(data.reads[t.id] || 0)).id:null};
+        const metadata={...t,owner:t.owner ?? t.created_by ?? 0,messages:undefined,last_read:readOf(t),unread:unread(t),latest_message:Math.max(0,...t.messages.map(m=>m.id)),first_unread:unread(t)>0?t.messages.find(m=>m.sender!==0&&!m.outside_membership&&m.id>readOf(t)).id:null};
         if(pathname.endsWith('/metadata'))return send(bounded(metadata,params));
-        const p=new URLSearchParams(params),first=t.messages.find(m=>m.sender!==0 && !m.outside_membership && m.id>(data.reads[t.id] || 0)),catchup=!p.has('before')&&!p.has('after')&&unread(t)>0;
+        const p=new URLSearchParams(params),first=t.messages.find(m=>m.sender!==0 && !m.outside_membership && m.id>readOf(t)),catchup=!p.has('before')&&!p.has('after')&&unread(t)>0;
         if(catchup)p.set('after',first.id-1);
-        const messages=paged(t.messages,p,hash([t.messages,data.reads[t.id]]),false);
+        const messages=paged(t.messages,p,hash([t.messages,readOf(t)]),false);
         if(pathname.endsWith('/messages'))return send({...messages,catchup});
         return send(bounded({...metadata,messages,catchup},params));
       }
       if(req.url.endsWith('/read')) {
         if(data.readDelay) await new Promise(resolve => setTimeout(resolve, data.readDelay));
         if(data.readFailure) {res.statusCode=503;return send({error:'Offline'});}
-        data.reads[t.id]=Math.max(data.reads[t.id] || 0,body.message);
-        return send({last_read:data.reads[t.id],unread:unread(t)});
+        const value=Math.max(readOf(t),body.message);(data.projectReads ||= {})[`${t.project}:${t.id}`]=value;data.reads[t.id]=value;
+        return send({last_read:value,unread:unread(t)});
       }
       if(req.url.endsWith('/user')) t.members=body.joined ? [...new Set([0,...t.members])] : t.members.filter(id=>id!==0);
       if(req.url.endsWith('/members/remove')) {
@@ -438,18 +550,18 @@ async function fixture(run) {
         }
         return send({owner:t.owner});
       }
-      return send({...t,last_read:data.reads[t.id] || 0,unread:unread(t)});
+      return send({...t,last_read:readOf(t),unread:unread(t)});
     }
     if (req.url === '/messages') {
       if (data.messageDelay) await new Promise(resolve => setTimeout(resolve, data.messageDelay));
       if (data.messageFailure) { res.statusCode = data.messageFailureStatus || 503; return send({error:'Message send failed'}); }
-      const t = data.threads.find(t => t.id === body.thread);
+      const t = threadFor(body.thread);
       t.members=[...new Set([0,...t.members])];
-      const id = Math.max(0,...data.threads.flatMap(thread=>thread.messages.map(message=>message.id))) + 1;
+      const id = Math.max(0,...data.threads.filter(thread=>thread.project===scopeProject).flatMap(thread=>thread.messages.map(message=>message.id))) + 1;
       t.messages.push({ id, sender: 0, at: Date.now() / 1000, text: body.text });
       return send({id});
     }
-    if(req.method==='GET' && /^\/messages\/\d+$/.test(pathname))return send(bounded(data.threads.flatMap(t=>t.messages).find(m=>m.id===Number(pathname.split('/')[2])),params));
+    if(req.method==='GET' && /^\/messages\/\d+$/.test(pathname))return send(bounded(data.threads.filter(thread=>thread.project===scopeProject).flatMap(t=>t.messages).find(m=>m.id===Number(pathname.split('/')[2])),params));
     res.statusCode = 404; send({ error: 'not found' });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -457,6 +569,7 @@ async function fixture(run) {
   try {
     browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
     const page = await browser.newPage();
+    await page.addInitScript(`window.projectId=${projectId.toString()};window.configId=${configId.toString()};`);
     page.on('dialog', dialog => { if (page.listenerCount('dialog') === 1) dialog.accept(); });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
@@ -481,8 +594,387 @@ const saveSettings = async page => {
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
 };
 
+test('global server settings are independent of Default, project selection and project configuration saves',async()=>fixture(async(page,data)=>{
+  data.projects[0].config=configId(1);
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  await page.waitForFunction(()=>serverSettings.value);
+  const usage=page.locator('#server-settings-form [name=usage_poll_secs]'),sampling=page.locator('#server-settings-form [name=metrics_sample_secs]'),save=page.locator('[form=server-settings-form]');
+  assert.equal(await page.locator('[form=settings-form]').isDisabled(),true);
+  assert.equal(await save.isDisabled(),true);
+  await usage.fill('45');await sampling.fill('3');
+  await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+  assert.equal(await usage.inputValue(),'45','global drafts survive project switches');
+  assert.equal(await sampling.inputValue(),'3');
+  await save.click();await page.waitForFunction(()=>!serverSettings.saving&&!serverSettings.dirty);
+  assert.deepEqual(data.globalSettings,{usage_poll_secs:45,metrics_sample_secs:3});
+  assert.deepEqual(data.requests,[{url:'/global-settings',method:'PUT',body:{settings:{usage_poll_secs:45,metrics_sample_secs:3}}}]);
+  assert.equal(Object.hasOwn(data.settings,'usage_poll_secs'),false);
+  assert.equal(await save.isDisabled(),true);
+  await usage.fill('60');await usage.fill('45');assert.equal(await save.isDisabled(),true,'reverting a draft disables Save');
+  await reloadPage(page);await page.locator('[data-page=settings]').click();await page.waitForFunction(()=>serverSettings.value);
+  assert.equal(await usage.inputValue(),'45');
+}));
+
+test('global settings detect external edits without replacing a draft or accepting a stale overwrite',async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();await page.waitForFunction(()=>serverSettings.value);
+  await page.locator('#server-settings-form [name=usage_poll_secs]').fill('60');
+  data.globalSettings.usage_poll_secs=90;await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#server-settings-form [name=usage_poll_secs]').inputValue(),'60');
+  assert.match(await page.locator('#server-settings-status').textContent(),/changed elsewhere/);
+  assert.equal(await page.locator('[form=server-settings-form]').isDisabled(),true);
+  await page.locator('#server-settings-form').evaluate(form=>form.dispatchEvent(new Event('submit',{cancelable:true,bubbles:true})));
+  assert.equal(data.requests.length,0);
+  await page.locator('#server-settings-reset').click();
+  await page.waitForFunction(()=>!serverSettings.loading&&!serverSettings.conflict);
+  assert.equal(await page.locator('#server-settings-form [name=usage_poll_secs]').inputValue(),'90');
+}));
+
+test('global settings writes remain single-flight, preserve failed drafts and enforce numeric form bounds',async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();await page.waitForFunction(()=>serverSettings.value);
+  const usage=page.locator('#server-settings-form [name=usage_poll_secs]'),sampling=page.locator('#server-settings-form [name=metrics_sample_secs]'),save=page.locator('[form=server-settings-form]');
+  await usage.fill('0');await save.click();assert.equal(data.requests.length,0);
+  await usage.fill('45');await sampling.fill('0');await save.click();assert.equal(data.requests.length,0);
+  await sampling.fill('2');
+  const held=await holdRequest(page,'**/global-settings','PUT');
+  await save.click();await held.started;
+  await page.evaluate(()=>refresh());
+  assert.equal(await save.isDisabled(),true);assert.equal(await usage.isDisabled(),true);
+  await page.locator('#server-settings-form').evaluate(form=>form.dispatchEvent(new Event('submit',{cancelable:true,bubbles:true})));
+  data.globalSettingsError='Settings store unavailable';held.release();await held.remove();
+  await page.waitForFunction(()=>!serverSettings.saving);
+  assert.equal(await usage.inputValue(),'45');assert.equal(await sampling.inputValue(),'2');
+  assert.equal(await page.evaluate(()=>serverSettings.dirty),true);
+  assert.match(await page.locator('#server-settings-status').textContent(),/unavailable/);
+  await page.evaluate(()=>refresh());assert.equal(data.requests.filter(request=>request.url==='/global-settings').length,1,'failed writes are never retried automatically');
+}));
+
+test('identical local agent IDs never share in-flight lifecycle controls or retarget delayed requests across projects',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'First project worker',state:'working'},{id:1,project:projectId(2),name:'Second project worker',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);
+  const held=await holdRequest(page,url=>url.pathname==='/agents/1/pause'&&url.searchParams.get('project')===projectId(1));
+  await page.locator('[data-action=pause]').click();await held.started;
+  await page.locator('#project-select').selectOption(projectId(2));
+  await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+  assert.equal(await page.locator('[data-action=pause]').isEnabled(),true,'another project’s same ID is not locked by the first action');
+  await page.locator('[data-action=pause]').click();await page.waitForFunction(()=>state.agentBrowser[0]?.state==='paused');
+  assert.equal(data.agents[0].state,'working');assert.equal(data.agents[1].state,'paused');
+  held.release();await held.remove();await page.waitForFunction(()=>agentTransitions.size===0);
+  assert.deepEqual(data.agents.map(agent=>agent.state),['paused','paused']);
+  const paths=data.wireRequests.filter(request=>request.url.endsWith('/agents/1/pause')).map(request=>request.url).sort();
+  assert.deepEqual(paths,[`/p/${projectId(1)}/agents/1/pause`,`/p/${projectId(2)}/agents/1/pause`]);
+}));
+
+test('identical local thread and message IDs retain separate drafts, read acknowledgements and send destinations',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([incoming(1,'First project message')]),conversation([incoming(1,'Second project message')],{project:projectId(2)})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();
+  const held=await holdRequest(page,url=>url.pathname==='/threads/1/read'&&url.searchParams.get('project')===projectId(1));
+  await page.locator('[data-thread="1"]').click();await held.started;
+  await page.locator('#message-form textarea').fill('First project draft');
+  await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+  await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>state.thread?.project===projectId(2)&&state.thread.last_read===1);
+  assert.match(await page.locator('#messages').textContent(),/Second project message/);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'');
+  assert.equal(data.projectReads[`${projectId(2)}:1`],1);
+  assert.equal(data.projectReads[`${projectId(1)}:1`],undefined,'a blocked receipt in another project does not share read state');
+  await page.locator('#message-form textarea').fill('Reply in second project');await page.locator('#message-form button').click();
+  await page.waitForFunction(()=>!pendingSends.size);
+  assert.equal(data.threads[0].messages.length,1);assert.equal(data.threads[1].messages.at(-1).text,'Reply in second project');
+  held.release();await held.remove();await page.waitForFunction(()=>reading.size===0);
+  assert.equal(await page.evaluate(()=>state.thread.project),projectId(2));
+  await page.locator('#project-select').selectOption(projectId(1));await page.waitForFunction(()=>state.selectedProject===projectId(1)&&refreshPending===0);
+  await page.locator('[data-thread="1"]').click();await page.locator('#message-form textarea').waitFor();
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'First project draft');
+}));
+
+test('server-backed drafts survive browser cache removal and flush the original thread when it closes',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([])];const key=`${projectId(1)}:1`;
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+  await page.locator('#message-form textarea').fill('Persistent server draft');await page.locator('#close-thread').click();
+  await page.waitForFunction(()=>[...drafts.values()].every(entry=>!entry.dirty&&!entry.pending));
+  assert.equal(data.serverDrafts[key].text,'Persistent server draft');
+  await page.evaluate(()=>localStorage.clear());await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea')?.value==='Persistent server draft');
+  assert.match(await page.locator('#draft-status').textContent(),/saved to server/);
+  assert.equal(data.draftRequests.filter(request=>request.method==='PUT').length,1,'opening and reading a saved draft do not write it again');
+}));
+
+test('draft CAS conflicts retain both choices and require an explicit resolution before another save',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([])];const key=`${projectId(1)}:1`;
+  data.serverDrafts={[key]:{thread:1,text:'Original saved draft',version:'original',updated_at:1}};
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.waitForFunction(()=>document.querySelector('#message-form textarea')?.value==='Original saved draft');
+  data.serverDrafts[key]={thread:1,text:'Draft changed in another browser',version:'external',updated_at:2};
+  await page.locator('#message-form textarea').fill('Keep my local edits');
+  await page.waitForFunction(()=>draftEntry(state.selectedProject,1).conflict&&!draftEntry(state.selectedProject,1).pending);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep my local edits');assert.equal(data.serverDrafts[key].text,'Draft changed in another browser');
+  const writes=data.draftRequests.filter(request=>request.method==='PUT').length;await page.waitForTimeout(650);await page.evaluate(()=>refresh());
+  assert.equal(data.draftRequests.filter(request=>request.method==='PUT').length,writes,'a conflict is never automatically retried');
+  await page.locator('[data-draft-use-saved]').click();assert.equal(await page.locator('#message-form textarea').inputValue(),'Draft changed in another browser');
+  data.serverDrafts[key]={thread:1,text:'Another saved edit',version:'external-again',updated_at:3};
+  await page.locator('#message-form textarea').fill('Explicitly keep this version');await page.waitForFunction(()=>draftEntry(state.selectedProject,1).conflict&&!draftEntry(state.selectedProject,1).pending);
+  await page.locator('[data-draft-keep]').click();await page.waitForFunction(()=>!draftEntry(state.selectedProject,1).dirty&&!draftEntry(state.selectedProject,1).pending);
+  assert.equal(data.serverDrafts[key].text,'Explicitly keep this version');
+}));
+
+test('a delayed saved-draft read cannot replace newer typing or an acknowledged newer draft write',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([])];const key=`${projectId(1)}:1`;
+  data.serverDrafts={[key]:{thread:1,text:'Original draft',version:'original',updated_at:1}};
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+  let release,started;const gate=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>started=resolve);
+  const matcher=new RegExp(`/p/${projectId(1)}/threads/1/draft(?:\\?|$)`);
+  const handler=async route=>{if(route.request().method()!=='GET')return route.continue();const response=await route.fetch();started();await gate;await route.fulfill({response});};
+  await page.route(matcher,handler);
+  try {
+    await page.evaluate(()=>{window.oldDraftRead=loadServerDraft(draftEntry(state.selectedProject,1),true);});await ready;
+    await page.locator('#message-form textarea').fill('Newer acknowledged draft');await page.waitForFunction(()=>!draftEntry(state.selectedProject,1).dirty&&!draftEntry(state.selectedProject,1).pending);
+    release();await page.evaluate(()=>window.oldDraftRead);
+    assert.equal(await page.locator('#message-form textarea').inputValue(),'Newer acknowledged draft');
+    assert.equal(data.serverDrafts[key].text,'Newer acknowledged draft');
+    assert.equal(await page.evaluate(()=>draftEntry(state.selectedProject,1).version),data.serverDrafts[key].version);
+  } finally {release();await page.unroute(matcher,handler);}
+}));
+
+test('a delayed failed draft read cannot overwrite the status of a newer acknowledged save',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([])];await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+  let release,started;const gate=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>started=resolve),matcher=new RegExp(`/p/${projectId(1)}/threads/1/draft(?:\\?|$)`);
+  const handler=async route=>{if(route.request().method()!=='GET')return route.continue();started();await gate;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Stale read failed'})});};
+  await page.route(matcher,handler);
+  try {
+    await page.evaluate(()=>{window.oldDraftRead=loadServerDraft(draftEntry(state.selectedProject,1),true);});await ready;
+    await page.locator('#message-form textarea').fill('Acknowledged current draft');await page.waitForFunction(()=>!draftEntry(state.selectedProject,1).dirty&&!draftEntry(state.selectedProject,1).pending);
+    release();await page.evaluate(()=>window.oldDraftRead);
+    assert.equal(await page.evaluate(()=>draftEntry(state.selectedProject,1).error),null,'an old read failure cannot undo a newer successful save status');
+    assert.equal(await page.locator('#draft-status').textContent(),'Draft saved to server');
+  } finally {release();await page.unroute(matcher,handler);}
+}));
+
+test('draft sync failure keeps the browser copy, avoids write retry loops and recovers by explicit retry',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([])];const key=`${projectId(1)}:1`;
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+  data.draftError='Draft storage unavailable';await page.locator('#message-form textarea').fill('Keep through failed synchronization');
+  await page.waitForFunction(()=>draftEntry(state.selectedProject,1).blocked&&!draftEntry(state.selectedProject,1).pending);
+  const writes=data.draftRequests.filter(request=>request.method==='PUT').length;await page.waitForTimeout(800);await page.evaluate(()=>refresh());
+  assert.equal(data.draftRequests.filter(request=>request.method==='PUT').length,writes);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Keep through failed synchronization');
+  assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem(draftKey(state.selectedProject,1))).text),'Keep through failed synchronization');
+  data.draftError=null;await page.locator('[data-draft-retry]').click();await page.waitForFunction(()=>!draftEntry(state.selectedProject,1).dirty&&!draftEntry(state.selectedProject,1).pending);
+  assert.equal(data.serverDrafts[key].text,'Keep through failed synchronization');
+}));
+
+test('in-flight draft writes stay project-scoped and successful sends clear only the matching submitted draft',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([]),conversation([],{project:projectId(2)})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+  const held=await holdRequest(page,url=>url.pathname==='/threads/1/draft'&&url.searchParams.get('project')===projectId(1),'PUT');
+  try {
+    await page.locator('#message-form textarea').fill('First project draft');await page.locator('#close-thread').click();await held.started;
+    await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+    await page.locator('[data-thread="1"]').click();await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+    await page.locator('#message-form textarea').fill('Second project draft');await page.waitForFunction(()=>!draftEntry(state.selectedProject,1).dirty&&!draftEntry(state.selectedProject,1).pending);
+    held.release();await held.remove();await page.waitForFunction(()=>!draftEntry(projectId(1),1).dirty&&!draftEntry(projectId(1),1).pending);
+    assert.equal(await page.locator('#message-form textarea').inputValue(),'Second project draft');
+    assert.equal(data.serverDrafts[`${projectId(1)}:1`].text,'First project draft');assert.equal(data.serverDrafts[`${projectId(2)}:1`].text,'Second project draft');
+    await page.locator('#message-form > button.primary').click();await page.waitForFunction(()=>!pendingSends.size&&!draftEntry(state.selectedProject,1).dirty&&!draftEntry(state.selectedProject,1).pending);
+    assert.equal(data.serverDrafts[`${projectId(2)}:1`].text,'');assert.notEqual(data.serverDrafts[`${projectId(2)}:1`].version,'empty');
+    assert.equal(data.serverDrafts[`${projectId(1)}:1`].text,'First project draft');
+  } finally {held.release();await held.remove();}
+}));
+
+test('late details and log responses cannot overwrite another project’s same local agent ID',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'First worker',state:'idle'},{id:1,project:projectId(2),name:'Second worker',state:'idle'}];
+  data.projectLogs={[`${projectId(1)}:1`]:['First project output'],[`${projectId(2)}:1`]:['Second project output']};
+  await manualPolling(page);await reloadPage(page);
+  const held=await holdRequest(page,url=>url.pathname==='/agents/1'&&url.searchParams.get('project')===projectId(1),'GET');
+  try {
+    await page.locator('[data-action=details]').click();await held.started;
+    await page.locator('#agent-dialog .dialog-close').click();
+    await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+    await page.locator('[data-action=details]').click();await page.waitForFunction(()=>document.querySelector('#agent-title').textContent==='Second worker · #1');
+    held.release();await held.remove();await page.waitForTimeout(100);
+    assert.equal(await page.locator('#agent-title').textContent(),'Second worker · #1');
+    assert.equal(await page.locator('#agent-log').textContent(),'Second project output');
+    assert.ok((await page.locator('#agent-details').textContent()).includes(projectId(2)));
+  } finally {held.release();await held.remove();}
+}));
+
+test('subscription cancellations use the original project without locking the same local subscription elsewhere',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'First worker',state:'idle'},{id:1,project:projectId(2),name:'Second worker',state:'idle'}];
+  data.subscriptions=[1,2].map(project=>({id:1,project:projectId(project),agent:1,mode:'persistent',state:'active',created_at:100,watch:{agents:'all',states:['crashed']}}));
+  await manualPolling(page);await reloadPage(page);
+  await page.locator('[data-action=details]').click();await page.locator('#agent-subscriptions summary').click();await page.locator('[data-cancel-subscription="1"]').waitFor();
+  const held=await holdRequest(page,url=>url.pathname==='/subscriptions/1/cancel'&&url.searchParams.get('project')===projectId(1));
+  try {
+    await page.locator('[data-cancel-subscription="1"]').click();await held.started;
+    await page.locator('#agent-dialog .dialog-close').click();await page.locator('#project-select').selectOption(projectId(2));
+    await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+    await page.locator('[data-action=details]').click();await page.locator('#agent-subscriptions summary').click();await page.locator('[data-cancel-subscription="1"]').waitFor();
+    assert.equal(await page.locator('[data-cancel-subscription="1"]').isEnabled(),true);
+    await page.locator('[data-cancel-subscription="1"]').click();await page.waitForFunction(()=>document.querySelector('[data-subscription="1"]').textContent.includes('canceled'));
+    assert.deepEqual(data.subscriptions.map(item=>item.state),['active','canceled']);
+    held.release();await held.remove();await page.waitForFunction(()=>cancelingSubscriptions.size===0);
+    assert.equal(await page.locator('#agent-title').textContent(),'Second worker · #1');
+    assert.deepEqual(data.subscriptions.map(item=>item.state),['canceled','canceled']);
+    assert.deepEqual(data.wireRequests.filter(request=>request.url.endsWith('/subscriptions/1/cancel')).map(request=>request.url).sort(),[`/p/${projectId(1)}/subscriptions/1/cancel`,`/p/${projectId(2)}/subscriptions/1/cancel`]);
+  } finally {held.release();await held.remove();}
+}));
+
+test('delegated controls are opt-in, validate eligible states and save or revoke only on explicit submission',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'},...['working','paused'].map((state,index)=>({id:index+2,project:projectId(1),name:`Worker ${index+2}`,state}))];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-id="1"][data-action=details]').click();
+  assert.equal(data.getRequests.filter(url=>url.includes('/permissions')).length,0);
+  await page.locator('#agent-permissions > summary').click();await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+  assert.equal(await page.locator('[data-permission-rule]').count(),0);
+  assert.equal(await page.locator('#permission-save').isDisabled(),true);
+  await page.locator('#permission-add').click();
+  assert.equal(await page.locator('#permission-action-0').inputValue(),'');
+  assert.equal(await page.locator('#permission-scope-0').inputValue(),'');
+  await page.locator('#permission-action-0').selectOption('pause');await page.locator('#permission-scope-0').selectOption('selected');
+  assert.deepEqual(await page.locator('[data-permission-state]').evaluateAll(nodes=>nodes.map(node=>node.dataset.permissionState)),['working','idle','done']);
+  await page.locator('#permission-state-0-idle').check();
+  for(const targets of ['', '0', '-1','1','2, invalid']) {await page.locator('#permission-targets-0').fill(targets);assert.equal(await page.locator('#permission-save').isDisabled(),true,targets);}
+  await page.locator('#permission-targets-0').fill('2, 3');assert.equal(await page.locator('#permission-save').isEnabled(),true);
+  await page.locator('#permission-targets-0').press('Enter');assert.equal(await page.locator('#agent-dialog').isVisible(),true,'Enter in an editor input cannot submit the dialog’s Close form');
+  await page.locator('.permission-rule details > summary').click();await page.locator('[data-permission-search]').fill('Worker 3');
+  assert.equal(await page.locator('[data-permission-candidate]:visible').count(),1);
+  assert.equal(await page.locator('[data-permission-target="1"]').count(),0,'self cannot be selected');
+  assert.equal(data.requests.length,0,'editing permissions never autosaves');
+  await page.locator('#permission-save').click();await page.waitForFunction(()=>!permissionEntry().saving&&!permissionDirty(permissionEntry()));
+  assert.deepEqual(data.permissionGrants[`${projectId(1)}:1`],[{action:'pause',scope:'selected',states:['idle'],agents:[2,3]}]);
+  assert.equal(data.requests[0].method,'PUT');assert.equal(typeof data.requests[0].body.version,'string');
+  await page.locator('#permission-revoke').click();assert.equal(data.requests.length,1);assert.equal(data.permissionGrants[`${projectId(1)}:1`].length,1);
+  await page.locator('#permission-save').click();await page.waitForFunction(()=>!permissionEntry().saving&&!permissionDirty(permissionEntry()));
+  assert.deepEqual(data.permissionGrants[`${projectId(1)}:1`],[]);
+}));
+
+test('permission drafts preserve focus across polling and selection, then reject stale writes without restoring revoked rights',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'},{id:2,project:projectId(1),name:'Worker',state:'idle'}];
+  const key=`${projectId(1)}:1`;
+  data.permissionGrants={[key]:[{action:'pause',scope:'project',states:['idle']}]};
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-id="1"][data-action=details]').click();await page.locator('#agent-permissions > summary').click();
+  await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+  await page.locator('#permission-state-0-working').check();await page.locator('#permission-action-0').focus();
+  const input=await page.locator('#permission-action-0').elementHandle();await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#permission-action-0').evaluate((node,old)=>node===old&&document.activeElement===node,input),true);
+  await page.locator('#agent-dialog .dialog-close').click();await page.locator('[data-id="2"][data-action=details]').click();await page.locator('#agent-dialog .dialog-close').click();
+  await page.locator('[data-id="1"][data-action=details]').click();await page.locator('#agent-permissions > summary').click();
+  assert.equal(await page.locator('#permission-state-0-working').isChecked(),true);
+  await page.waitForFunction(()=>!permissionEntry().loading);
+  data.permissionGrants[key]=[];
+  await page.locator('#permission-save').click();await page.waitForFunction(()=>permissionEntry().conflict&&!permissionEntry().saving);
+  assert.equal(await page.locator('#permission-state-0-working').isChecked(),true,'a rejected save retains its draft');
+  assert.deepEqual(data.permissionGrants[key],[],'a stale version cannot restore permissions');
+  assert.equal(await page.locator('#permission-save').isDisabled(),true);await page.evaluate(()=>refresh());
+  assert.equal(data.requests.length,1,'polling does not retry a rejected write');
+  await page.locator('#permission-reset').click();await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+  assert.equal(await page.locator('[data-permission-rule]').count(),0);
+  assert.equal(await page.locator('#permission-save').isDisabled(),true);
+}));
+
+test('permission saves retain the original project and agent while another project edits the same local ID',async()=>fixture(async(page,data)=>{
+  data.agents=[1,2].map(project=>({id:1,project:projectId(project),name:`Coordinator ${project}`,state:'idle'}));
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();await page.locator('#agent-permissions > summary').click();await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+  await page.locator('#permission-add').click();await page.locator('#permission-action-0').selectOption('resume');await page.locator('#permission-scope-0').selectOption('launched');await page.locator('#permission-state-0-paused').check();
+  const held=await holdRequest(page,url=>url.pathname==='/agents/1/permissions'&&url.searchParams.get('project')===projectId(1),'PUT');
+  try {
+    await page.locator('#permission-save').click();await held.started;
+    await page.locator('#permission-save').dispatchEvent('click');
+    await page.locator('#agent-dialog .dialog-close').click();await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+    await page.locator('[data-action=details]').click();await page.locator('#agent-permissions > summary').click();await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+    await page.locator('#permission-add').click();await page.locator('#permission-action-0').selectOption('close');await page.locator('#permission-scope-0').selectOption('project');await page.locator('#permission-state-0-idle').check();
+    held.release();await held.remove();await page.waitForFunction(()=>!permissionDrafts.get(localKey(1,projectId(1))).saving);
+    assert.equal(await page.locator('#permission-action-0').inputValue(),'close');
+    assert.equal(await page.locator('#permission-save').isEnabled(),true);
+    assert.deepEqual(data.permissionGrants[`${projectId(1)}:1`],[{action:'resume',scope:'launched',states:['paused']}]);
+    assert.equal(data.permissionGrants[`${projectId(2)}:1`],undefined);
+    assert.equal(data.requests.filter(request=>request.method==='PUT').length,1);
+  } finally {held.release();await held.remove();}
+}));
+
+test('selected stale permission rows cannot remove a different current rule after an external edit',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'}];const key=`${projectId(1)}:1`;
+  data.permissionGrants={[key]:[{action:'pause',scope:'project',states:['idle']}]};
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();await page.locator('#agent-permissions > summary').click();await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+  await selectText(page,'[data-permission-rule="0"] legend');
+  data.permissionGrants[key]=[{action:'resume',scope:'launched',states:['paused']}];await page.evaluate(()=>refresh());
+  await page.locator('[data-permission-remove="0"]').dispatchEvent('click');
+  assert.equal(await page.evaluate(()=>permissionEntry().rules[0]?.action),'resume');
+  assert.equal(await page.evaluate(()=>permissionDirty(permissionEntry())),false);assert.equal(data.requests.length,0);
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('#permission-action-0').inputValue(),'resume');
+}));
+
+test('replaced agents have read-only delegated controls and failed permission writes are never retried',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'}];
+  data.permissionGrants={[`${projectId(1)}:1`]:[{action:'pause',scope:'project',states:['idle']}]};
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();await page.locator('#agent-permissions > summary').click();await page.waitForFunction(()=>permissionEntry().loaded&&!permissionEntry().loading);
+  await page.locator('#permission-state-0-working').check();data.permissionsWriteError='Permission storage unavailable';
+  await page.locator('#permission-save').click();await page.waitForFunction(()=>!!permissionEntry().error&&!permissionEntry().saving);
+  await page.evaluate(()=>refresh());assert.equal(data.requests.length,1);assert.equal(await page.locator('#permission-state-0-working').isChecked(),true);
+  data.agents[0].state='replaced';await page.evaluate(()=>refresh());
+  for(const selector of ['#permission-add','#permission-revoke','#permission-save','#permission-action-0'])assert.equal(await page.locator(selector).isDisabled(),true,selector);
+  assert.match(await page.locator('#permission-status').textContent(),/Replaced agents/);
+}));
+
+test('history panels load only on demand and keep project, agent and account request scopes distinct',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'History worker',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);
+  assert.equal(data.wireRequests.filter(request=>/^\/(?:p\/[^/]+\/)?metrics(?:\?|\/)/.test(request.url)).length,0);
+  const overview=page.locator('#overview-history-host');
+  await overview.locator(':scope > details > summary').click();await overview.getByRole('status').filter({hasText:'stored envelopes loaded'}).waitFor();
+  const projectRequest=data.wireRequests.find(request=>request.url.startsWith('/metrics/projects?'));
+  assert.equal(new URL(projectRequest.url,'http://test').searchParams.get('projects'),projectId(1));
+  assert.equal(new URL(projectRequest.url,'http://test').searchParams.get('scope'),'recorded_here');
+  await overview.getByLabel('Source',{exact:true}).selectOption('account');await overview.getByRole('status').filter({hasText:'stored envelopes loaded'}).waitFor();
+  assert.ok(data.wireRequests.some(request=>request.url.startsWith('/metrics/series?')));
+  assert.ok(data.wireRequests.some(request=>request.url.startsWith('/metrics?')&&new URL(request.url,'http://test').searchParams.get('entity')==='account:claude:five_hour'));
+  await page.locator('[data-action=details]').click();const agent=page.locator('#agent-history-host');
+  await agent.locator(':scope > details > summary').click();await agent.getByRole('status').filter({hasText:'stored envelopes loaded'}).waitFor();
+  assert.ok(data.wireRequests.some(request=>request.url.startsWith(`/p/${projectId(1)}/metrics?`)&&new URL(request.url,'http://test').searchParams.get('entity')==='agent:1'));
+  assert.equal(data.wireRequests.some(request=>request.url.startsWith(`/p/${projectId(1)}/metrics/projects`)),false,'global project aggregation is not implicitly retargeted');
+  assert.equal(data.requests.length,0,'reading charts does not modify saved data');
+}));
+
+test('project archive controls stay manual, preserve per-project drafts and use explicit global paths',async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
+  const panel=page.locator('#project-data-host');await panel.getByText('Project archives and captured files',{exact:true}).click();
+  assert.equal(data.requests.length,0,'opening Settings and archive controls performs no archive work');
+  await panel.getByLabel('Archive destination',{exact:true}).fill('/archives/example.tar');
+  await page.evaluate(()=>{const node=document.querySelector('#project-data-host details > p'),range=document.createRange();range.selectNodeContents(node);getSelection().removeAllRanges();getSelection().addRange(range);});
+  const selected=await page.evaluate(()=>getSelection().toString());await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected,'polling keeps selected project identity text');
+  assert.equal(await panel.getByLabel('Archive destination',{exact:true}).inputValue(),'/archives/example.tar');
+  await page.evaluate(()=>getSelection().removeAllRanges());await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+  assert.equal(await panel.getByLabel('Archive destination',{exact:true}).inputValue(),'');
+  await panel.getByLabel('Archive destination',{exact:true}).fill('/archives/other.tar');
+  await page.locator('#project-select').selectOption(projectId(1));await page.waitForFunction(()=>state.selectedProject===projectId(1)&&refreshPending===0);
+  assert.equal(await panel.getByLabel('Archive destination',{exact:true}).inputValue(),'/archives/example.tar');
+  await panel.getByRole('button',{name:'Export snapshot',exact:true}).click();await panel.getByRole('status').filter({hasText:'Snapshot exported'}).waitFor();
+  assert.deepEqual(data.requests,[{url:`/projects/${projectId(1)}/export`,method:'POST',body:{destination:'/archives/example.tar',logs:false,native:false}}]);
+  assert.equal(data.wireRequests.some(request=>request.url.includes(`/p/${projectId(1)}/projects/`)),false);
+  assert.equal(data.getRequests.some(url=>url.startsWith('/storage')),false,'archive controls never trigger a disk scan');
+}));
+
+test('project export waits for accepted local draft saves and refuses unresolved draft conflicts',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([])];await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();await page.waitForFunction(()=>draftEntry(state.selectedProject,1).loaded);
+  const held=await holdRequest(page,url=>url.pathname==='/threads/1/draft','PUT');
+  try {
+    await page.locator('#message-form textarea').fill('Include this accepted draft');await held.started;
+    await page.locator('[data-page=settings]').click();const panel=page.locator('#project-data-host');await panel.getByText('Project archives and captured files',{exact:true}).click();await panel.getByLabel('Archive destination',{exact:true}).fill('/archives/with-draft.tar');
+    await panel.getByRole('button',{name:'Export snapshot',exact:true}).click();await panel.getByRole('status').filter({hasText:'Exporting snapshot'}).waitFor();
+    assert.equal(data.requests.length,0,'the archive request cannot race a pending local save');
+    held.release();await held.remove();await panel.getByRole('status').filter({hasText:'Snapshot exported'}).waitFor();
+    assert.equal(data.serverDrafts[`${projectId(1)}:1`].text,'Include this accepted draft');assert.equal(data.requests.length,1);
+    data.serverDrafts[`${projectId(1)}:1`]={thread:1,text:'Another saved draft',version:'another-version',updated_at:2};
+    await page.locator('[data-page=threads]').click();await page.locator('#message-form textarea').fill('Do not overwrite the conflict');await page.waitForFunction(()=>draftEntry(state.selectedProject,1).conflict&&!draftEntry(state.selectedProject,1).pending);
+    await page.locator('[data-page=settings]').click();await panel.getByRole('button',{name:'Export snapshot',exact:true}).click();await panel.getByRole('status').filter({hasText:'Resolve its sync status before exporting'}).waitFor();
+    assert.equal(data.requests.length,1,'a conflict is never overwritten or exported as if synchronized');
+    assert.equal(data.serverDrafts[`${projectId(1)}:1`].text,'Another saved draft');
+  } finally {held.release();await held.remove();}
+}));
+
 test('disk usage is calculated only on demand and stays independent of project settings', async () => fixture(async (page,data) => {
-  data.projects[0].config=1;
+  data.projects[0].config=configId(1);
   await manualPolling(page); await reloadPage(page);
   assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,0);
   await page.locator('[data-page=settings]').click();
@@ -498,7 +990,7 @@ test('disk usage is calculated only on demand and stays independent of project s
   await page.locator('#storage-calculate').click();
   await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
   assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1);
-  assert.equal(data.getRequests.find(url=>url.startsWith('/storage')),'/storage?project=1');
+  assert.equal(data.getRequests.find(url=>url.startsWith('/storage')),`/storage?project=${projectId(1)}`);
   assert.match(await page.locator('#storage-project').textContent(),/^0\s*(?:B|bytes)$/);
   assert.match(await page.locator('#storage-total').textContent(),/16.*KiB/);
   assert.match(await page.locator('#storage-scanned').textContent(),/\d/);
@@ -521,14 +1013,14 @@ test('disk usage remains single-flight and rejects stale results after project A
     assert.equal(await page.locator('#storage-calculate').isDisabled(),true);
     assert.equal(await page.locator('#storage-panel').getAttribute('aria-busy'),'true');
     await page.locator('#storage-calculate').dispatchEvent('click');await page.evaluate(()=>refresh());
-    await page.locator('#project-select').selectOption('2');
-    await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
-    assert.match(await page.locator('#storage-scope').textContent(),/Project #2.*other/);
+    await page.locator('#project-select').selectOption(projectId(2));
+    await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+    assert.match(await page.locator('#storage-scope').textContent(),new RegExp(`Project #${projectId(2)}.*other`));
     assert.equal(await page.locator('#storage-report').isHidden(),true);
     assert.match(await page.locator('#storage-status').textContent(),/previous selection/i);
     await page.locator('#storage-calculate').dispatchEvent('click');
-    await page.locator('#project-select').selectOption('1');
-    await page.waitForFunction(()=>state.selectedProject===1&&refreshPending===0);
+    await page.locator('#project-select').selectOption(projectId(1));
+    await page.waitForFunction(()=>state.selectedProject===projectId(1)&&refreshPending===0);
     held.release();await held.remove();
     await page.waitForFunction(()=>!document.querySelector('#storage-calculate').disabled);
     assert.equal(data.getRequests.filter(url=>url.startsWith('/storage')).length,1);
@@ -542,17 +1034,17 @@ test('disk usage remains single-flight and rejects stale results after project A
 
 test('disk usage invalidates asynchronous project selection before its first render', async () => fixture(async page => {
   await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
-  const scan=await holdRequest(page,'**/storage*','GET'),overview=await holdRequest(page,/\/overview\?project=3(?:&|$)/,'GET');
+  const scan=await holdRequest(page,'**/storage*','GET'),overview=await holdRequest(page,new RegExp(`/overview\\?project=${projectId(3)}(?:&|$)`),'GET');
   try {
     await page.locator('#storage-calculate').click();await scan.started;
     await page.locator('[data-open=project-dialog]').click();
     await page.locator('#project-form [name=path]').fill('/projects/third');
     await page.locator('#project-form button.primary').click();await overview.started;
-    assert.equal(await page.evaluate(()=>state.selectedProject),3,'selection changes before the new overview renders');
+    assert.equal(await page.evaluate(()=>state.selectedProject),projectId(3),'selection changes before the new overview renders');
     await page.locator('[data-close=project-dialog]:not(.dialog-close)').click();
     // Exercise the selection handler even while the DOM still displays its prior value.
-    await page.locator('#project-select').selectOption('1');
-    await page.waitForFunction(()=>state.selectedProject===1);
+    await page.locator('#project-select').selectOption(projectId(1));
+    await page.waitForFunction(()=>state.selectedProject===projectId(1));
     scan.release();await scan.remove();
     await page.waitForFunction(()=>!document.querySelector('#storage-calculate').disabled);
     assert.equal(await page.locator('#storage-report').isHidden(),true,'an intervening unrendered selection also invalidates the earlier calculation');
@@ -562,7 +1054,7 @@ test('disk usage invalidates asynchronous project selection before its first ren
 
 test('disk usage labels partial lower bounds, escapes paths and preserves selected values through polling', async () => fixture(async (page,data) => {
   const home='/home/<img src=x onerror="window.storageInjection=true">/.acom';
-  data.storageReports={1:{home,project:1,started_at:1720000000,completed_at:1720000001,complete:false,limited:true,entries:50,skipped:3,bytes:{project_logs:0,all_project_logs:4096,database:8192,other:4096,total:16384}}};
+  data.storageReports={[projectId(1)]:{home,project:projectId(1),started_at:1720000000,completed_at:1720000001,complete:false,limited:true,entries:50,skipped:3,bytes:{project:0,project_core:0,project_logs:0,project_metrics:0,project_native:0,all_project_logs:4096,database:8192,metrics:0,native:0,trash:0,other:4096,total:16384}}};
   await manualPolling(page);await reloadPage(page);await page.locator('[data-page=settings]').click();
   await page.locator('#storage-calculate').click();await page.waitForFunction(()=>!document.querySelector('#storage-report').hidden);
   assert.match(await page.locator('#storage-status').textContent(),/Partial.*scan limit reached.*lower bounds.*3.*skipped/i);
@@ -586,13 +1078,13 @@ test('disk usage errors retain only the current scope result and invalid values 
   assert.match(await page.locator('#storage-status').textContent(),/Previous result retained/);
   assert.equal(await page.locator('#storage-total').textContent(),total);assert.equal(await page.locator('#storage-scanned').textContent(),scanned);
   assert.equal(await page.locator('#storage-status script').count(),0);assert.equal(await page.evaluate(()=>window.storageInjection),undefined);
-  await page.locator('#project-select').selectOption('2');await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
   assert.equal(await page.locator('#storage-report').isHidden(),true);assert.match(await page.locator('#storage-status').textContent(),/not calculated/i);
   await page.locator('#storage-calculate').click();await page.waitForFunction(()=>document.querySelector('#storage-status').textContent.includes('Calculation failed'));
   assert.equal(await page.locator('#storage-report').isHidden(),true,'another project never inherits the prior result');
   data.storageError=null;
   for(const invalid of [null,-1,'0']) {
-    data.storageReports={2:{home:'/tmp/acom',project:2,started_at:1720000000,completed_at:1720000001,complete:true,limited:false,entries:0,skipped:0,bytes:{project_logs:invalid,all_project_logs:4096,database:8192,other:4096,total:16384}}};
+    data.storageReports={[projectId(2)]:{home:'/tmp/acom',project:projectId(2),started_at:1720000000,completed_at:1720000001,complete:true,limited:false,entries:0,skipped:0,bytes:{project:0,project_core:0,project_logs:invalid,project_metrics:0,project_native:0,all_project_logs:4096,database:8192,metrics:0,native:0,trash:0,other:4096,total:16384}}};
     await page.locator('#storage-calculate').click();
     await page.waitForFunction(()=>!document.querySelector('#storage-calculate').disabled);
     assert.match(await page.locator('#storage-status').textContent(),/Invalid disk usage response/);
@@ -614,7 +1106,7 @@ test('disk usage supports all-project totals without requiring a selected projec
 
 for (const viewport of [{width:1280,height:900,header:95,messages:400},{width:390,height:844,header:120,messages:350},{width:320,height:568,header:120,messages:250}]) {
   test(`compact thread header leaves reading space with many members at ${viewport.width}px`, async () => fixture(async (page,data) => {
-    data.agents=Array.from({length:36},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
+    data.agents=Array.from({length:36},(_,i)=>({id:i+1,project:projectId(1),name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
     const title='A long discussion title about reviewing the complete project and coordinating detailed follow-up work '.repeat(3);
     data.threads=[conversation([incoming(1,'A useful message remains easy to read.')],{title,members:[0,...data.agents.map(agent=>agent.id)],private:true,joinable:false,owner:1})];
     await manualPolling(page); await page.setViewportSize({width:viewport.width,height:viewport.height}); await reloadPage(page);
@@ -654,7 +1146,7 @@ for (const viewport of [{width:1280,height:900,header:95,messages:400},{width:39
 
 test('expanded thread details add controls and metadata without repeating the visible title or summary', async () => fixture(async (page,data) => {
   const title='One compact conversation';
-  data.agents=[{id:1,project:1,name:'Reviewer',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Reviewer',state:'idle'}];
   data.threads=[conversation([],{title,owner:1,watch:['working','idle'],events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'acom',details:{reason:'Review started'}}]})];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   const summary=await page.locator('#thread-summary').textContent();
@@ -704,7 +1196,7 @@ test('thread details preserve disclosure, selected metadata, draft and scroll ac
 }));
 
 test('thread disclosure resizing keeps latest readers at the bottom and does not move selected earlier messages', async () => fixture(async (page,data) => {
-  data.agents=Array.from({length:12},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
+  data.agents=Array.from({length:12},(_,i)=>({id:i+1,project:projectId(1),name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
   data.threads=[conversation(Array.from({length:30},(_,i)=>incoming(i+1,`Reply ${i+1}. ${'Detailed project update. '.repeat(8)}`)),{
     members:[0,...data.agents.map(agent=>agent.id)],
     events:Array.from({length:8},(_,i)=>({id:i+1,at:i+1,kind:'thread.joined',agent:i+1,actor:'acom',details:{reason:'Review group matched'}})),
@@ -823,27 +1315,27 @@ test('custom launch uses the full ID without mutating settings', async () => fix
 }));
 
 test('project switching isolates threads; launch can target a different project', async () => fixture(async (page, data) => {
-  data.threads.push({ id: 1, project: 1, title: 'First project', members: [], messages: [] });
+  data.threads.push({ id: 1, project:projectId(1), title: 'First project', members: [], messages: [] });
   await reloadPage(page);
   await page.locator('[data-page="threads"]').click();
   await page.locator('[data-thread-filter=all]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form').waitFor();
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/other');
-  assert.equal(new URL(page.url()).searchParams.get('project'), '2');
+  assert.equal(new URL(page.url()).searchParams.get('project'), projectId(2));
   assert.equal(await page.locator('#thread-list [data-thread]').count(), 0);
   assert.equal(await page.locator('#message-form').count(), 0);
   await openLaunch(page);
-  assert.equal(await page.locator('#launch-project-select').inputValue(), '2');
-  await page.locator('#launch-project-select').selectOption('1');
+  assert.equal(await page.locator('#launch-project-select').inputValue(), projectId(2));
+  await page.locator('#launch-project-select').selectOption(projectId(1));
   assert.match(await page.locator('#launch-project').textContent(), /\/projects\/example/);
   await page.locator('#launch-form [name=task]').fill('Different project');
   await page.locator('#launch-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#launch-dialog').open);
-  assert.equal(data.requests.at(-1).body.project, 1);
+  assert.equal(data.requests.at(-1).body.project, projectId(1));
   await reloadPage(page);
-  await page.waitForFunction(() => document.querySelector('#project-select').value === '2');
+  await page.waitForFunction(() => document.querySelector('#project-select').value === projectId(2));
   assert.equal(await page.locator('#project-path').textContent(), '/projects/other');
 }));
 
@@ -864,28 +1356,28 @@ test('empty project list prompts for a folder; add and remove never delete files
   page.once('dialog', dialog => dialog.accept());
   await page.locator('#remove-project').click();
   await page.waitForFunction(() => document.querySelector('#project-select').disabled);
-  assert.equal(data.requests.at(-1).url, '/projects/1/remove');
+  assert.equal(data.requests.at(-1).url, `/projects/${projectId(3)}/remove`);
 }));
 
 test('a delayed project removal preserves another project selection and unsaved settings', async () => fixture(async (page, data) => {
   let release, started;
   const gate = new Promise(resolve => { release = resolve; });
   const pending = new Promise(resolve => { started = resolve; });
-  await page.route('**/projects/1/remove', async route => { started(); await gate; await route.continue(); });
+  await page.route(`**/projects/${projectId(1)}/remove`, async route => { started(); await gate; await route.continue(); });
   try {
     await page.locator('#remove-project').click();
     await pending;
-    await page.locator('#project-select').selectOption('2');
+    await page.locator('#project-select').selectOption(projectId(2));
     await page.locator('[data-page=settings]').click();
     await page.locator('[name=max_lock_ttl_secs]').fill('777');
-    const response = page.waitForResponse(response => response.url().endsWith('/projects/1/remove'));
+    const response = page.waitForResponse(response => response.url().endsWith(`/projects/${projectId(1)}/remove`));
     release();
     await response;
-    await page.waitForFunction(() => !state.projects.some(project => project.id === 1) && refreshPending === 0);
-    assert.equal(await page.locator('#project-select').inputValue(), '2');
+    await page.waitForFunction(() => !state.projects.some(project => project.id === projectId(1)) && refreshPending === 0);
+    assert.equal(await page.locator('#project-select').inputValue(), projectId(2));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(), '777');
     assert.equal(await page.locator('#settings-save-state').textContent(), 'Unsaved changes');
-    assert.deepEqual(data.requests.map(request => request.url), ['/projects/1/remove']);
+    assert.deepEqual(data.requests.map(request => request.url), [`/projects/${projectId(1)}/remove`]);
   } finally { release(); }
 }));
 
@@ -894,7 +1386,7 @@ test('project removal remains single-flight through polling and unlocks after fa
   const gate = new Promise(resolve => { release = resolve; });
   const pending = new Promise(resolve => { started = resolve; });
   let attempts = 0;
-  await page.route('**/projects/1/remove', async route => {
+  await page.route(`**/projects/${projectId(1)}/remove`, async route => {
     attempts++; started(); await gate;
     await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Project changed; try again after inspecting it'})});
   });
@@ -908,7 +1400,7 @@ test('project removal remains single-flight through polling and unlocks after fa
     release();
     await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Project changed'));
     assert.equal(await page.locator('#remove-project').isEnabled(), true);
-    assert.equal(await page.locator('#project-select').inputValue(), '1');
+    assert.equal(await page.locator('#project-select').inputValue(), projectId(1));
     assert.equal(data.projects.length, 2);
   } finally { release(); }
 }));
@@ -916,11 +1408,11 @@ test('project removal remains single-flight through polling and unlocks after fa
 test('shared-lock and thread-message counts use singular only for one item', async () => fixture(async (page, data) => {
   await manualPolling(page); await reloadPage(page);
   for (const count of [0,1,2]) {
-    data.locks = Array.from({length:count}, (_, index) => ({project:1,name:`lock-${index}`,holder:null}));
+    data.locks = Array.from({length:count}, (_, index) => ({project:projectId(1),name:`lock-${index}`,holder:null}));
     data.threads = [conversation(Array.from({length:count}, (_, index) => ({id:index+1,sender:0,at:1700000000,text:'Sample'})))];
     await page.evaluate(() => refresh());
     assert.equal(await page.locator('#workspace-stats .stat').last().locator('.stat-note').textContent(), `${count} shared lock${count === 1 ? '' : 's'}`);
-    assert.ok((await page.locator('[data-thread="1"] .meta').textContent()).includes(`· ${count} message${count === 1 ? '' : 's'} ·`));
+    assert.ok((await page.locator('[data-thread="1"] [data-part=summary]').textContent()).includes(`· ${count} message${count === 1 ? '' : 's'} ·`));
   }
   assert.equal(data.requests.length, 0);
 }));
@@ -957,13 +1449,32 @@ test('settings preserve quoted argument boundaries and reject unclosed quotes', 
 }));
 
 test('an older overview response cannot switch the UI back to another project', async () => fixture(async (page, data) => {
-  data.delays = { 1: 350 };
-  await page.locator('#project-select').selectOption('2');
-  await page.locator('#project-select').selectOption('1');
-  await page.locator('#project-select').selectOption('2');
+  data.delays = { [projectId(1)]: 350 };
+  await page.locator('#project-select').selectOption(projectId(2));
+  await page.locator('#project-select').selectOption(projectId(1));
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForTimeout(450);
   assert.equal(await page.locator('#project-path').textContent(), '/projects/other');
-  assert.equal(await page.locator('#project-select').inputValue(), '2');
+  assert.equal(await page.locator('#project-select').inputValue(), projectId(2));
+}));
+
+test('late project record hydration cannot overwrite the committed overview after switching projects',async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await reloadPage(page);
+  const held=await holdRequest(page,url=>url.pathname===`/projects/${projectId(1)}`,'GET');
+  await page.route('**/overview*',async route=>{
+    const url=new URL(route.request().url());
+    if(url.searchParams.get('project')!==projectId(1))return route.continue();
+    const response=await route.fetch(),body=await response.json();
+    if(body.project)body.project={id:projectId(1),truncated:true};
+    await route.fulfill({response,json:body});
+  });
+  try {
+    await page.evaluate(()=>{state.overviewRevision=null;window.oldOverview=refresh();});await held.started;
+    await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&state.project?.id===projectId(2));
+    held.release();await held.remove();await page.evaluate(()=>window.oldOverview);
+    assert.equal(await page.evaluate(()=>state.project.id),projectId(2));
+    assert.equal(await page.locator('#project-path').textContent(),'/projects/other');
+  } finally {held.release();await held.remove();}
 }));
 
 test('project and model strings are text, not injected markup', async () => fixture(async (page, data) => {
@@ -982,9 +1493,9 @@ test('project and model strings are text, not injected markup', async () => fixt
 
 test('replacement, limit and crash reasons remain visible with matching controls', async () => fixture(async (page, data) => {
   data.agents = [
-    { id: 1, name: 'Replaced agent', project: 1, state: 'replaced', problem: 'Prior stream failure <example>', harness: 'codex', model: 'gpt-6.1-sol', effort: 'medium' },
-    { id: 2, name: 'Limit agent', project: 1, state: 'paused', pause_reason: 'limit', problem: 'Usage limit reached' },
-    { id: 3, name: 'Crash agent', project: 1, state: 'crashed', problem: 'Stream disconnected' },
+    { id: 1, name: 'Replaced agent', project:projectId(1), state: 'replaced', problem: 'Prior stream failure <example>', harness: 'codex', model: 'gpt-6.1-sol', effort: 'medium' },
+    { id: 2, name: 'Limit agent', project:projectId(1), state: 'paused', pause_reason: 'limit', problem: 'Usage limit reached' },
+    { id: 3, name: 'Crash agent', project:projectId(1), state: 'crashed', problem: 'Stream disconnected' },
   ];
   await reloadPage(page);
   await page.locator('[data-agent="1"]').waitFor();
@@ -1011,11 +1522,11 @@ test('project identity and settings fit a narrow screen', async () => fixture(as
 
 test('shared edits name affected projects; Custom starts from Default and stays isolated', async () => fixture(async (page, data) => {
   await page.locator('[data-page=settings]').click();
-  assert.match(await page.locator('#config-scope').textContent(), /example \(#1\), other \(#2\)/);
+  assert.ok((await page.locator('#config-scope').textContent()).includes(`example (#${projectId(1)}), other (#${projectId(2)})`));
   await page.locator('[data-limit=active] [name=hard]').fill('10');
   await saveSettings(page);
   assert.equal(data.settings.limits.active.hard, 10);
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('[data-limit=active] [name=hard]')?.value === '10');
   await page.locator('#config-select').selectOption('custom');
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '8');
@@ -1028,8 +1539,8 @@ test('shared edits name affected projects; Custom starts from Default and stays 
   await reloadPage(page); await page.locator('[data-page=settings]').click();
   await page.waitForFunction(() => document.querySelector('#config-select')?.value === 'custom');
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '2');
-  await page.locator('#project-select').selectOption('1');
-  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '2');
+  await page.locator('#project-select').selectOption(projectId(1));
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === configId(2));
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '10');
   assert.doesNotMatch(await page.locator('#config-scope').textContent(), /other/);
 }));
@@ -1047,28 +1558,28 @@ test('named configs can be saved, reused, renamed and removed only when unused',
   await page.locator('#config-form [name=name]').fill('Large jobs');
   await page.locator('#config-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
-  assert.equal(data.projects[0].config, 3);
+  assert.equal(data.projects[0].config, configId(3));
   assert.equal(data.configs[2].settings.limits.active.hard, 12);
   assert.equal(data.settings.limits.active.hard, 8);
   assert.equal(await page.locator('#remove-config').isDisabled(), true);
-  await page.locator('#project-select').selectOption('2');
-  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '2');
-  await page.locator('#config-select').selectOption('3');
+  await page.locator('#project-select').selectOption(projectId(2));
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === configId(2));
+  await page.locator('#config-select').selectOption(configId(3));
   await saveSettings(page);
-  assert.deepEqual(data.projects.map(p => p.config), [3, 3]);
+  assert.deepEqual(data.projects.map(p => p.config), [configId(3),configId(3)]);
   await page.locator('[name=config_name]').fill('Bigger jobs');
   await saveSettings(page);
   assert.equal(data.configs[2].name, 'Bigger jobs');
-  for (const project of ['1', '2']) {
+  for (const project of [projectId(1),projectId(2)]) {
     await page.locator('#project-select').selectOption(project);
     await page.waitForFunction(() => !!document.querySelector('#config-select'));
-    await page.locator('#config-select').selectOption('1');
+    await page.locator('#config-select').selectOption(configId(1));
     await saveSettings(page);
   }
-  await page.locator('#config-select').selectOption('3');
+  await page.locator('#config-select').selectOption(configId(3));
   assert.equal(await page.locator('#remove-config').isEnabled(), true);
   page.once('dialog', d => d.accept()); await page.locator('#remove-config').click();
-  await page.waitForFunction(() => !document.querySelector('#config-select option[value="3"]'));
+  await page.waitForFunction(() => !document.querySelector(`#config-select option[value="${configId(3)}"]`));
   assert.equal(data.configs.length, 2);
   assert.equal(await page.locator('#remove-config').count(), 0);
 }));
@@ -1084,7 +1595,7 @@ test('duplicate config names keep the draft and dialog for correction', async ()
   assert.equal(await page.locator('#config-form button.primary').isEnabled(), true);
   assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '9');
   assert.equal(data.configs.length, 2);
-  assert.equal(data.projects[0].config, 2);
+  assert.equal(data.projects[0].config, configId(2));
 }));
 
 test('project/config switches ask before discarding drafts, and cancelled switches keep them', async () => fixture(async page => {
@@ -1092,12 +1603,12 @@ test('project/config switches ask before discarding drafts, and cancelled switch
   await page.locator('[data-limit=active] [name=hard]').fill('9');
   for (const selector of ['#project-select', '#config-select']) {
     page.once('dialog', d => d.dismiss());
-    await page.locator(selector).selectOption(selector === '#project-select' ? '2' : 'custom');
-    assert.equal(await page.locator(selector).inputValue(), selector === '#project-select' ? '1' : '2');
+    await page.locator(selector).selectOption(selector === '#project-select' ? projectId(2) : 'custom');
+    assert.equal(await page.locator(selector).inputValue(), selector === '#project-select' ? projectId(1) : configId(2));
     assert.equal(await page.locator('[data-limit=active] [name=hard]').inputValue(), '9');
   }
   page.once('dialog', d => d.accept());
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('[data-limit=active] [name=hard]')?.value === '8');
 }));
 
@@ -1105,7 +1616,7 @@ test('config selection alone survives polling and switches without discard confi
   let dialogs = 0;
   page.on('dialog', dialog => { dialogs++; dialog.dismiss(); });
   await page.locator('[data-page=settings]').click();
-  for (const config of ['1','2','1','2','1']) {
+  for (const config of [1,2,1,2,1].map(configId)) {
     await page.locator('#config-select').selectOption(config);
     await page.evaluate(() => refresh());
     assert.equal(await page.locator('#config-select').inputValue(), config);
@@ -1115,11 +1626,11 @@ test('config selection alone survives polling and switches without discard confi
   assert.equal(data.requests.length, 0, 'selection requires explicit Save to apply');
   assert.equal(await page.locator('[form=settings-form]').isEnabled(), true);
   await saveSettings(page);
-  assert.equal(data.projects[0].config, 1);
-  assert.deepEqual(data.requests, [{url:'/projects/1/config',method:'PUT',body:{config:1}}]);
+  assert.equal(data.projects[0].config, configId(1));
+  assert.deepEqual(data.requests, [{url:`/projects/${projectId(1)}/config`,method:'PUT',body:{config:configId(1)}}]);
   assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
-  await page.locator('#config-select').selectOption('2');
-  await page.locator('#config-select').selectOption('1');
+  await page.locator('#config-select').selectOption(configId(2));
+  await page.locator('#config-select').selectOption(configId(1));
   assert.equal(dialogs, 0);
   assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
 }));
@@ -1127,11 +1638,11 @@ test('config selection alone survives polling and switches without discard confi
 test('loading a configuration locks dependent editing and survives polling without saving the previous shared config', async () => fixture(async (page, data) => {
   await manualPolling(page);
   const next=settings(); next.prompts.launch='x'.repeat(20000); next.max_lock_ttl_secs=1234;
-  data.configs.push({id:3,name:'Large config',settings:next});
+  data.configs.push({id:configId(3),name:'Large config',settings:next});
   await reloadPage(page); await page.locator('[data-page=settings]').click();
-  const pending=await holdRequest(page,'**/configs/3*','GET');
+  const pending=await holdRequest(page,`**/configs/${configId(3)}*`,'GET');
   try {
-    await page.locator('#config-select').selectOption('3'); await pending.started;
+    await page.locator('#config-select').selectOption(configId(3)); await pending.started;
     assert.match(await page.locator('#settings-save-state').textContent(),/loading.*config/i);
     for(const selector of ['[name=max_lock_ttl_secs]','[name=config_name]','#save-config-as','#remove-config','[form=settings-form]'])assert.equal(await page.locator(selector).isDisabled(),true,selector);
     assert.equal(await page.locator('#config-select').isEnabled(),true);
@@ -1148,126 +1659,127 @@ test('loading a configuration locks dependent editing and survives polling witho
     assert.equal(await page.locator('#config-dialog').isVisible(),false);
     assert.deepEqual(data.requests,[],'forced events cannot mutate the previous config');
     pending.release(); await pending.remove();
-    await page.waitForFunction(()=>state.editor.config===3);
+    await page.waitForFunction(()=>state.editor.config===configId(3));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'1234');
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
     await page.locator('[name=max_lock_ttl_secs]').fill('777'); await saveSettings(page);
-    assert.equal(data.configs.find(config=>config.id===2).settings.max_lock_ttl_secs,900);
-    assert.equal(data.configs.find(config=>config.id===3).settings.max_lock_ttl_secs,777);
-    assert.equal(data.projects[0].config,3);
+    assert.equal(data.configs.find(config=>config.id===configId(2)).settings.max_lock_ttl_secs,900);
+    assert.equal(data.configs.find(config=>config.id===configId(3)).settings.max_lock_ttl_secs,777);
+    assert.equal(data.projects[0].config,configId(3));
   } finally {pending.release();await pending.remove();}
 }));
 
 test('a forced submit during configuration loading never writes the previously selected shared config', async () => fixture(async (page, data) => {
   await manualPolling(page);
   const next=settings();next.prompts.launch='x'.repeat(20000);
-  data.configs.push({id:3,name:'Large config',settings:next});
+  data.configs.push({id:configId(3),name:'Large config',settings:next});
   await reloadPage(page);await page.locator('[data-page=settings]').click();
-  const pending=await holdRequest(page,'**/configs/3*','GET');
+  const pending=await holdRequest(page,`**/configs/${configId(3)}*`,'GET');
   try {
-    await page.locator('#config-select').selectOption('3');await pending.started;
+    await page.locator('#config-select').selectOption(configId(3));await pending.started;
     await page.locator('[name=max_lock_ttl_secs]').evaluate(input=>{input.value='777';input.dispatchEvent(new Event('input',{bubbles:true}));});
     await page.locator('#settings-form').dispatchEvent('submit');
     await page.waitForTimeout(100);
     assert.deepEqual(data.requests,[]);
-    assert.equal(data.configs.find(config=>config.id===2).settings.max_lock_ttl_secs,900);
+    assert.equal(data.configs.find(config=>config.id===configId(2)).settings.max_lock_ttl_secs,900);
     assert.equal(await page.locator('[form=settings-form]').isDisabled(),true);
-    pending.release();await pending.remove();await page.waitForFunction(()=>state.editor.config===3);
+    pending.release();await pending.remove();await page.waitForFunction(()=>state.editor.config===configId(3));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'900');
   } finally {pending.release();await pending.remove();}
 }));
 
 test('late configuration failures cannot reset or unlock a newer pending selection', async () => fixture(async (page, data) => {
   await manualPolling(page);
-  for(const id of [3,4]) {const next=settings();next.prompts.launch='x'.repeat(20000);next.max_lock_ttl_secs=id*100;data.configs.push({id,name:`Large ${id}`,settings:next});}
+  for(const id of [3,4]) {const next=settings();next.prompts.launch='x'.repeat(20000);next.max_lock_ttl_secs=id*100;data.configs.push({id:configId(id),name:`Large ${id}`,settings:next});}
   await reloadPage(page);await page.locator('[data-page=settings]').click();
   while(await page.locator('#settings-form [data-more=configs]').isVisible()) {await page.locator('#settings-form [data-more=configs]').click();await page.waitForFunction(()=>!state.pages.configs.pending);}
   let release,started;
   const gate=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{started=resolve;});
   const reject=async route=>{started();await gate;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Old config unavailable'})});};
-  await page.route('**/configs/3*',reject);
-  const newer=await holdRequest(page,'**/configs/4*','GET');
+  await page.route(`**/configs/${configId(3)}*`,reject);
+  const newer=await holdRequest(page,`**/configs/${configId(4)}*`,'GET');
   try {
-    await page.locator('#config-select').selectOption('3');await entered;
-    await page.locator('#config-select').selectOption('4');await newer.started;
+    await page.locator('#config-select').selectOption(configId(3));await entered;
+    await page.locator('#config-select').selectOption(configId(4));await newer.started;
     release();await page.waitForTimeout(100);
-    assert.equal(await page.locator('#config-select').inputValue(),'4');
+    assert.equal(await page.locator('#config-select').inputValue(),configId(4));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').isDisabled(),true);
     assert.match(await page.locator('#settings-save-state').textContent(),/loading.*config/i);
     assert.doesNotMatch(await page.locator('#toast').textContent(),/Old config unavailable/);
-    newer.release();await newer.remove();await page.waitForFunction(()=>state.editor.config===4);
+    newer.release();await newer.remove();await page.waitForFunction(()=>state.editor.config===configId(4));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'400');
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
     assert.deepEqual(data.requests,[]);
-  } finally {release();newer.release();await newer.remove();await page.unroute('**/configs/3*',reject);}
+  } finally {release();newer.release();await newer.remove();await page.unroute(`**/configs/${configId(3)}*`,reject);}
 }));
 
 test('a failed configuration load restores the previous unsaved draft and selection', async () => fixture(async (page,data)=>{
   await manualPolling(page);
-  const next=settings();next.prompts.launch='x'.repeat(20000);data.configs.push({id:3,name:'Large config',settings:next});
+  const next=settings();next.prompts.launch='x'.repeat(20000);data.configs.push({id:configId(3),name:'Large config',settings:next});
   await reloadPage(page);await page.locator('[data-page=settings]').click();
   await page.locator('[name=max_lock_ttl_secs]').fill('777');
   const reject=route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Config unavailable'})});
-  await page.route('**/configs/3*',reject);
-  await page.locator('#config-select').selectOption('3');
+  await page.route(`**/configs/${configId(3)}*`,reject);
+  await page.locator('#config-select').selectOption(configId(3));
   await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Config unavailable'));
-  assert.equal(await page.locator('#config-select').inputValue(),'2');
+  assert.equal(await page.locator('#config-select').inputValue(),configId(2));
   assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'777');
   assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
   assert.equal(await page.evaluate(()=>state.editor.dirty),true);
   assert.equal(await page.locator('[form=settings-form]').isEnabled(),true);
-  assert.deepEqual(data.requests,[]);await page.unroute('**/configs/3*',reject);
+  assert.deepEqual(data.requests,[]);await page.unroute(`**/configs/${configId(3)}*`,reject);
 }));
 
 test('rapid configuration A to B to A selections accept only the latest load, even before the editor changes', async () => fixture(async (page,data)=>{
   await manualPolling(page);
-  for(const id of [3,4]) {const next=settings();next.prompts.launch='x'.repeat(20000);next.max_lock_ttl_secs=id*100;data.configs.push({id,name:`Large ${id}`,settings:next});}
+  for(const id of [3,4]) {const next=settings();next.prompts.launch='x'.repeat(20000);next.max_lock_ttl_secs=id*100;data.configs.push({id:configId(id),name:`Large ${id}`,settings:next});}
   await reloadPage(page);await page.locator('[data-page=settings]').click();
   while(await page.locator('#settings-form [data-more=configs]').isVisible()) {await page.locator('#settings-form [data-more=configs]').click();await page.waitForFunction(()=>!state.pages.configs.pending);}
   const requests=[];
   const hold=async route=>{
     if(new URL(route.request().url()).searchParams.has('offset'))return route.continue();
-    let release;const gate=new Promise(resolve=>{release=resolve;});requests.push({id:Number(new URL(route.request().url()).pathname.split('/').at(-1)),release});
+    let release;const gate=new Promise(resolve=>{release=resolve;});requests.push({id:new URL(route.request().url()).pathname.split('/').at(-1),release});
     await gate;await route.continue().catch(()=>{});
   };
-  await page.route(/\/configs\/[34](?:\?|$)/,hold);
+  const matcher=new RegExp(`/configs/(${configId(3)}|${configId(4)})(?:\\?|$)`);
+  await page.route(matcher,hold);
   try {
-    for(const [index,id] of [3,4,3].entries()) {await page.locator('#config-select').selectOption(String(id));for(let attempt=0;attempt<100&&requests.length<=index;attempt++)await page.waitForTimeout(20);assert.equal(requests.length,index+1);}
+    for(const [index,id] of [3,4,3].entries()) {await page.locator('#config-select').selectOption(configId(id));for(let attempt=0;attempt<100&&requests.length<=index;attempt++)await page.waitForTimeout(20);assert.equal(requests.length,index+1);}
     for(const index of [0,1]) {
       requests[index].release();await page.waitForTimeout(100);
-      assert.equal(await page.locator('#config-select').inputValue(),'3');
-      assert.equal(await page.evaluate(()=>state.editor.config),2);
+      assert.equal(await page.locator('#config-select').inputValue(),configId(3));
+      assert.equal(await page.evaluate(()=>state.editor.config),configId(2));
       assert.equal(await page.locator('[name=max_lock_ttl_secs]').isDisabled(),true);
-      assert.equal(await page.evaluate(()=>state.configs.find(config=>config.id===3).settings),undefined,'stale hydration does not replace the cache');
+      assert.equal(await page.evaluate(()=>state.configs.find(config=>config.id===configId(3)).settings),undefined,'stale hydration does not replace the cache');
     }
-    requests[2].release();await page.waitForFunction(()=>state.editor.config===3);
+    requests[2].release();await page.waitForFunction(()=>state.editor.config===configId(3));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'300');
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
     assert.deepEqual(data.requests,[]);
-  } finally {requests.forEach(request=>request.release());await page.unroute(/\/configs\/[34](?:\?|$)/,hold);}
+  } finally {requests.forEach(request=>request.release());await page.unroute(matcher,hold);}
 }));
 
 test('configuration load failures from an earlier project selection leave the current draft untouched after switching away and back', async () => fixture(async (page,data)=>{
   await manualPolling(page);
-  const next=settings();next.prompts.launch='x'.repeat(20000);data.configs.push({id:3,name:'Large config',settings:next});
+  const next=settings();next.prompts.launch='x'.repeat(20000);data.configs.push({id:configId(3),name:'Large config',settings:next});
   await reloadPage(page);await page.locator('[data-page=settings]').click();
   let release,started;
   const gate=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{started=resolve;});
   const reject=async route=>{started();await gate;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Obsolete config failure'})});};
-  await page.route('**/configs/3*',reject);
+  await page.route(`**/configs/${configId(3)}*`,reject);
   try {
-    await page.locator('#config-select').selectOption('3');await entered;
-    for(const project of ['2','1']) {await page.locator('#project-select').selectOption(project);await page.waitForFunction(id=>state.selectedProject===id&&refreshPending===0&&!!state.editor,Number(project));}
+    await page.locator('#config-select').selectOption(configId(3));await entered;
+    for(const project of [projectId(2),projectId(1)]) {await page.locator('#project-select').selectOption(project);await page.waitForFunction(id=>state.selectedProject===id&&refreshPending===0&&!!state.editor,project);}
     await page.locator('[name=max_lock_ttl_secs]').fill('777');
     release();await page.waitForTimeout(100);
-    assert.equal(await page.locator('#config-select').inputValue(),'2');
+    assert.equal(await page.locator('#config-select').inputValue(),configId(2));
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'777');
     assert.equal(await page.locator('[name=max_lock_ttl_secs]').isEnabled(),true);
     assert.equal(await page.evaluate(()=>state.editor.dirty),true);
     assert.equal(await page.locator('[form=settings-form]').isEnabled(),true);
     assert.doesNotMatch(await page.locator('#toast').textContent(),/Obsolete config failure/);
     assert.deepEqual(data.requests,[]);
-  } finally {release();await page.unroute('**/configs/3*',reject);}
+  } finally {release();await page.unroute(`**/configs/${configId(3)}*`,reject);}
 }));
 
 test('Save reflects semantic settings, names and bindings; reverted edits leave the applied config unchanged', async () => fixture(async (page, data) => {
@@ -1287,10 +1799,10 @@ test('Save reflects semantic settings, names and bindings; reverted edits leave 
   assert.equal(await save.isEnabled(), true);
   await page.locator('[name=auto_resume]').check();
   assert.equal(await save.isDisabled(), true);
-  await page.locator('#config-select').selectOption('1');
+  await page.locator('#config-select').selectOption(configId(1));
   assert.equal(await save.isEnabled(), true);
   assert.equal(await page.locator('#config-applied').textContent(), 'Applied configuration: Mine');
-  await page.locator('#config-select').selectOption('2');
+  await page.locator('#config-select').selectOption(configId(2));
   assert.equal(await save.isDisabled(), true);
   await page.locator('#add-retry-rule').click();
   assert.equal(await save.isEnabled(), true);
@@ -1298,11 +1810,11 @@ test('Save reflects semantic settings, names and bindings; reverted edits leave 
   assert.equal(await save.isDisabled(), true);
   await page.locator('#config-select').selectOption('custom');
   assert.equal(await save.isEnabled(), true, 'Custom is a real binding change even with matching settings');
-  await page.locator('#config-select').selectOption('2');
+  await page.locator('#config-select').selectOption(configId(2));
   assert.equal(await save.isDisabled(), true);
   assert.deepEqual(data.requests, []);
-  await page.locator('#project-select').selectOption('2');
-  await page.waitForFunction(() => document.querySelector('#config-select')?.value === '2');
+  await page.locator('#project-select').selectOption(projectId(2));
+  await page.waitForFunction(() => document.querySelector('#config-select')?.value === configId(2));
   assert.equal(await save.isDisabled(), true);
 }));
 
@@ -1311,7 +1823,7 @@ test('Default is read-only, copied settings are editable, and busy restoration p
   data.writeDelay = 250;
   const originalDefault = structuredClone(data.configs[0].settings);
   await reloadPage(page); await page.locator('[data-page=settings]').click();
-  await page.locator('#config-select').selectOption('1');
+  await page.locator('#config-select').selectOption(configId(1));
   assert.match(await page.locator('#config-scope').textContent(), /Default is read-only.*Selection is not applied yet/);
   assert.equal(await page.locator('#config-select').isEnabled(), true);
   assert.equal(await page.locator('#save-config-as').isEnabled(), true);
@@ -1327,13 +1839,13 @@ test('Default is read-only, copied settings are editable, and busy restoration p
   await page.locator('#config-form [name=name]').fill('Personal');
   await page.locator('#config-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
-  assert.equal(data.projects[0].config, 3);
+  assert.equal(data.projects[0].config, configId(3));
   assert.equal(await page.locator('[data-limit=active] [name=hard]').isEnabled(), true);
   await page.locator('[data-limit=active] [name=hard]').fill('12'); await saveSettings(page);
   assert.equal(data.configs[2].settings.limits.active.hard, 12);
   assert.deepEqual(data.configs[0].settings, originalDefault);
   assert.equal(data.settings.limits.active.hard, 9, 'Mine persists independently of Default and copies');
-  assert.equal(data.requests.some(request => request.url === '/configs/1'), false);
+  assert.equal(data.requests.some(request => request.url === `/configs/${configId(1)}`), false);
 }));
 
 test('launch loads the target project defaults and ignores stale target responses', async () => fixture(async (page, data) => {
@@ -1341,14 +1853,14 @@ test('launch loads the target project defaults and ignores stale target response
   custom.harnesses.codex.model = 'gpt-6-luna'; custom.harnesses.codex.effort = 'low';
   data.projects[1].config = null; data.projects[1].custom = custom;
   await openLaunch(page);
-  await page.locator('#launch-project-select').selectOption('2');
+  await page.locator('#launch-project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('#launch-model').value === 'gpt-6-luna');
   assert.equal(await page.locator('#launch-harness').inputValue(), 'codex');
   assert.equal(await page.locator('#launch-harness option[value=claude]').count(), 0);
   assert.equal(await page.locator('#launch-effort').inputValue(), 'low');
-  data.delays = { 1: 350 };
-  await page.locator('#launch-project-select').selectOption('1');
-  await page.locator('#launch-project-select').selectOption('2');
+  data.delays = { [projectId(1)]: 350 };
+  await page.locator('#launch-project-select').selectOption(projectId(1));
+  await page.locator('#launch-project-select').selectOption(projectId(2));
   await page.waitForTimeout(450);
   assert.equal(await page.locator('#launch-model').inputValue(), 'gpt-6-luna');
   await page.locator('#launch-form [name=task]').fill('Scoped defaults');
@@ -1356,7 +1868,7 @@ test('launch loads the target project defaults and ignores stale target response
   await page.waitForFunction(() => !document.querySelector('#launch-dialog').open);
   assert.equal(data.requests.at(-1).body.model, 'gpt-6-luna');
   assert.equal(data.requests.at(-1).body.effort, 'low');
-  assert.equal(data.requests.at(-1).body.project, 2);
+  assert.equal(data.requests.at(-1).body.project, projectId(2));
 }));
 
 test('without projects Default is read-only while Mine and copied configs remain editable', async () => fixture(async (page, data) => {
@@ -1364,7 +1876,7 @@ test('without projects Default is read-only while Mine and copied configs remain
   await page.locator('[data-page=settings]').click();
   assert.equal(await page.locator('[data-limit=active] [name=hard]').isDisabled(), true);
   assert.equal(await page.locator('[form=settings-form]').isDisabled(), true);
-  await page.locator('#config-select').selectOption('2');
+  await page.locator('#config-select').selectOption(configId(2));
   await page.locator('[data-limit=active] [name=hard]').fill('9');
   await saveSettings(page);
   assert.equal(data.settings.limits.active.hard, 9);
@@ -1372,7 +1884,7 @@ test('without projects Default is read-only while Mine and copied configs remain
   await page.locator('#config-form [name=name]').fill('Unused');
   await page.locator('#config-form button.primary').click();
   await page.waitForFunction(() => !document.querySelector('#config-dialog').open);
-  assert.equal(await page.locator('#config-select').inputValue(), '3');
+  assert.equal(await page.locator('#config-select').inputValue(), configId(3));
   assert.equal(data.projects.length, 0);
   assert.equal(data.requests.some(r => r.url.startsWith('/projects')), false);
 }));
@@ -1382,7 +1894,7 @@ test('a project with no enabled harness cannot launch', async () => fixture(asyn
   for (const h of Object.values(custom.harnesses)) h.enabled = false;
   data.projects[1].config = null; data.projects[1].custom = custom;
   await openLaunch(page);
-  await page.locator('#launch-project-select').selectOption('2');
+  await page.locator('#launch-project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('No harnesses are enabled'));
   assert.equal(await page.locator('#launch-form button.primary').isDisabled(), true);
   await page.locator('[data-close=launch-dialog]:not(.dialog-close)').click();
@@ -1401,7 +1913,7 @@ test('polling cannot unlock project controls during a settings save', async () =
   }
   await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Settings saved');
   assert.equal(await page.locator('#project-select').isEnabled(), true);
-  assert.equal(data.projects[0].config, 2);
+  assert.equal(data.projects[0].config, configId(2));
   assert.equal(data.settings.limits.active.hard, 9);
 }));
 
@@ -1426,7 +1938,7 @@ test('folder browsing starts at home, navigates, creates and chooses a new folde
 }));
 
 test('thread member picker is searchable and supports active/all selections without typing IDs',async()=>fixture(async(page,data)=> {
-  data.agents=[{id:1,project:1,name:'Reviewer',state:'working',harness:'codex',model:'gpt-6-luna'}, {id:2,project:1,name:'Writer',state:'paused',harness:'claude',model:'claude-sonnet-5-5'}];
+  data.agents=[{id:1,project:projectId(1),name:'Reviewer',state:'working',harness:'codex',model:'gpt-6-luna'}, {id:2,project:projectId(1),name:'Writer',state:'paused',harness:'claude',model:'claude-sonnet-5-5'}];
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-form [name=title]').fill('Easy members');
@@ -1443,8 +1955,8 @@ test('thread member picker is searchable and supports active/all selections with
 }));
 
 test('thread filters distinguish participation; joining, leaving and adding members work',async()=>fixture(async(page,data)=> {
-  data.agents=[{id:1,project:1,name:'One',state:'idle'},{id:2,project:1,name:'Two',state:'paused'}];
-  data.threads=[{id:1,project:1,title:'Mine',members:[0,1],messages:[]},{id:2,project:1,title:'Agents talking',members:[1],messages:[]}];
+  data.agents=[{id:1,project:projectId(1),name:'One',state:'idle'},{id:2,project:projectId(1),name:'Two',state:'paused'}];
+  data.threads=[{id:1,project:projectId(1),title:'Mine',members:[0,1],messages:[]},{id:2,project:projectId(1),title:'Agents talking',members:[1],messages:[]}];
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('[data-thread]').count(),1);
   await page.locator('[data-thread-filter=all]').click();
@@ -1512,7 +2024,7 @@ test('empty live filters are rejected locally and switching back to fixed member
   await page.locator('#thread-mode').selectOption('fixed');
   await page.locator('#thread-form button.primary').click();
   await page.locator('#message-form').waitFor();
-  assert.deepEqual(data.requests.find(r => r.url === '/threads').body, {project:1,title:'Chosen members',members:[],include_user:true,private:false,joinable:true});
+  assert.deepEqual(data.requests.find(r => r.url === '/threads').body, {project:projectId(1),title:'Chosen members',members:[],include_user:true,private:false,joinable:true});
 }));
 
 test('thread creation distinguishes public open, public no-self-join and private access', async () => fixture(async (page, data) => {
@@ -1533,14 +2045,14 @@ test('thread creation distinguishes public open, public no-self-join and private
     assert.equal(Object.hasOwn(body,'watch'), false);
     const label=access === 'private' ? 'Private · members only' : access === 'invite' ? 'Public · no self-join' : 'Public · open to join';
     assert.ok((await page.locator('#thread-summary').textContent()).includes(label));
-    assert.ok((await page.locator(`[data-thread="${index+1}"] .meta`).textContent()).includes(label));
+    assert.ok((await page.locator(`[data-thread="${index+1}"] [data-part=summary]`).textContent()).includes(label));
     assert.equal(await page.locator('#thread-access').inputValue(), 'open', 'successful creation resets access for the next thread');
   }
   assert.equal(data.threads.at(-1).members.includes(0), false, 'not including the user does not hide the administrative thread view');
 }));
 
 test('no-self-join access switches live membership to fixed without discarding its filter selections', async () => fixture(async (page, data) => {
-  data.agents=[{id:1,project:1,name:'Reviewer',state:'working'}];
+  data.agents=[{id:1,project:projectId(1),name:'Reviewer',state:'working'}];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-member-picker [name=member][value="1"]').check();
   await page.locator('#thread-mode').selectOption('live');
@@ -1562,7 +2074,7 @@ test('no-self-join access switches live membership to fixed without discarding i
 }));
 
 test('user removal includes members absent from the bounded agent preview and preserves messages and history', async () => fixture(async (page, data) => {
-  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:projectId(1),name:`Worker ${id}`,state:'idle'}));
   data.threads=[conversation([incoming(1,'Existing conversation')],{members:[0,1,3],private:true,joinable:false})]; data.reads[1]=1;
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   await openThreadDetails(page); await page.locator('#remove-thread-members').click();
@@ -1622,7 +2134,7 @@ test('failed and empty member removals retain the dialog selection and do not re
 }));
 
 test('ownership can transfer directly to an off-page agent without changing membership or creator', async () => fixture(async (page, data) => {
-  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:projectId(1),name:`Worker ${id}`,state:'idle'}));
   data.threads=[conversation([],{created_by:0,owner:0,private:true,joinable:false})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   assert.match(await page.locator('#thread-metadata').textContent(), /Owner: you/);
@@ -1643,9 +2155,9 @@ test('ownership can transfer directly to an off-page agent without changing memb
 }));
 
 test('owner selection loads suggestions without clearing explicit IDs and rejects user or foreign-agent targets', async () => fixture(async (page, data) => {
-  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:['closed','paused','crashed'][id-1]}));
-  data.agents.push({id:4,project:2,name:'Other project agent',state:'idle'});
-  data.agents.push({id:5,project:1,name:'Replaced agent',state:'replaced'});
+  data.pageLimit=1; data.agents=[1,2,3].map(id=>({id,project:projectId(1),name:`Worker ${id}`,state:['closed','paused','crashed'][id-1]}));
+  data.agents.push({id:4,project:projectId(2),name:'Other project agent',state:'idle'});
+  data.agents.push({id:5,project:projectId(1),name:'Replaced agent',state:'replaced'});
   data.threads=[conversation([],{created_by:1})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #1/);
@@ -1668,7 +2180,7 @@ test('owner selection loads suggestions without clearing explicit IDs and reject
 }));
 
 test('ownership errors retain input without retrying and transfers remain single-flight during polling', async () => fixture(async (page, data) => {
-  data.agents=[{id:2,project:1,name:'Target',state:'idle'}]; data.threads=[conversation([])]; data.ownerFailure=true;
+  data.agents=[{id:2,project:projectId(1),name:'Target',state:'idle'}]; data.threads=[conversation([])]; data.ownerFailure=true;
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
   await page.locator('#thread-owner-form button.primary').click();
@@ -1688,7 +2200,7 @@ test('ownership errors retain input without retrying and transfers remain single
 }));
 
 test('ownership history and names are escaped and selected ownership details survive polling', async () => fixture(async (page, data) => {
-  data.agents=[{id:1,project:1,name:'<img src=x onerror="window.ownerUnsafe=true">',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'<img src=x onerror="window.ownerUnsafe=true">',state:'idle'}];
   data.threads=[conversation([],{owner:1,events:[{id:1,at:1,kind:'thread.owner-changed',agent:1,actor:'<script>bad()</script>',details:{from:0,to:1,reason:'<b>new owner</b>'}}]})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   assert.match(await page.locator('#thread-metadata').textContent(),/Owner: #1 <img/);
@@ -1720,7 +2232,7 @@ test('missing owner metadata never implies that the original creator or user sti
 }));
 
 test('live threads expose escaped membership history and mark outside-membership messages without counting them unread', async () => fixture(async (page, data) => {
-  data.threads = [conversation([{...incoming(1,'Before you joined'),outside_membership:true},{...incoming(2,`Current reply\n${'Retained conversation context.\n'.repeat(30)}`),membership_unknown:true}], {
+  data.threads = [conversation([{...incoming(1,'Before you joined'),outside_membership:true},incoming(2,`Current reply\n${'Retained conversation context.\n'.repeat(30)}`)], {
     watch:['working','idle','group:review'],events_more:true,
     events:[{id:1,at:1,kind:'thread.joined',agent:1,actor:'user',details:{reason:'group <review> matched'}}],
   })];
@@ -1732,7 +2244,6 @@ test('live threads expose escaped membership history and mark outside-membership
   assert.equal(await page.locator('#thread-membership').textContent(), 'Leave thread');
   await page.locator('#thread-older').click();
   assert.equal(await page.locator('[data-message="1"] .pill').textContent(), 'Outside your membership');
-  assert.match(await page.locator('[data-message="2"] .message-head').textContent(), /Membership at send time unknown/);
   assert.equal(await page.locator('[data-message="2"] .pill').count(), 0);
   assert.match(await page.locator('#unread-total').textContent(), /1 unread/);
   await openThreadDetails(page); await page.locator('#thread-history summary').click();
@@ -1756,18 +2267,17 @@ test('live threads expose escaped membership history and mark outside-membership
   assert.equal(await page.locator('#add-thread-members').isHidden(), true);
 }));
 
-test('prompt guidance is literal and polling/recovery settings persist in configs',async()=>fixture(async(page,data)=> {
+test('prompt guidance is literal and recovery settings persist independently of server settings',async()=>fixture(async(page,data)=> {
   await page.locator('[data-page=settings]').click();
   await page.locator('[data-prompt-editor] summary').click();
   const text='Keep {task}, {updates}, $HOME and <tag> literal.';
   await page.locator('[name=prompt_resume]').fill(text);
-  await page.locator('[name=usage_poll_secs]').fill('45');
   await page.locator('[name=auto_resume]').uncheck();
   await saveSettings(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
   await page.locator('[data-prompt-editor] summary').click();
   assert.equal(await page.locator('[name=prompt_resume]').inputValue(),text);
   assert.equal(data.settings.prompts.resume,text);
-  assert.equal(await page.locator('[name=usage_poll_secs]').inputValue(),'45');
+  assert.equal(await page.locator('[name=usage_poll_secs]').inputValue(),'120');
   assert.equal(await page.locator('[name=auto_resume]').isChecked(),false);
 }));
 
@@ -1784,7 +2294,7 @@ test('usage details show expired readings as unconfirmed and offer a status chec
 }));
 
 test('a previously rejected model has an explicit warning and no silent replacement',async()=>fixture(async(page,data)=> {
-  data.agents=[{id:1,project:1,state:'crashed',harness:'codex',model:'gpt-6.1-sol',problem:'Model not supported with this account'}];
+  data.agents=[{id:1,project:projectId(1),state:'crashed',harness:'codex',model:'gpt-6.1-sol',problem:'Model not supported with this account'}];
   await reloadPage(page); await openLaunch(page); await page.locator('#launch-harness').selectOption('codex');
   assert.equal(await page.locator('#launch-model').inputValue(),'gpt-6.1-sol');
   assert.match(await page.locator('#launch-model-warning').textContent(),/previous launch rejected/);
@@ -1794,7 +2304,7 @@ test('a previously rejected model has an explicit warning and no silent replacem
 }));
 
 test('model errors offer an explicit alternative launch while retaining the original agent',async()=>fixture(async(page,data)=> {
-  data.agents=[{id:1,project:1,name:'Unavailable',state:'crashed',harness:'codex',model:'gpt-6.1-sol',task:'Original task',problem:'Model not supported with this account'}];
+  data.agents=[{id:1,project:projectId(1),name:'Unavailable',state:'crashed',harness:'codex',model:'gpt-6.1-sol',task:'Original task',problem:'Model not supported with this account'}];
   await reloadPage(page);
   assert.equal(await page.locator('[data-action=resume]').textContent(),'Retry same model');
   await page.locator('[data-action=another-model]').click();
@@ -1810,9 +2320,9 @@ test('model errors offer an explicit alternative launch while retaining the orig
 
 test('generic crashed turns offer same-model retry and explicit alternative without changing paused controls', async () => fixture(async (page, data) => {
   data.agents = [
-    {id:1,project:1,name:'Failed turn',state:'crashed',harness:'codex',model:'gpt-6.1-sol',effort:'high',task:'Continue the original task',problem:'Stream failed: cyber-risk error'},
-    {id:2,project:1,name:'Quota pause',state:'paused',pause_reason:'limit',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
-    {id:3,project:1,name:'Manual pause',state:'paused',pause_reason:'user',harness:'claude',model:'claude-opus-5-5',effort:'medium'},
+    {id:1,project:projectId(1),name:'Failed turn',state:'crashed',harness:'codex',model:'gpt-6.1-sol',effort:'high',task:'Continue the original task',problem:'Stream failed: cyber-risk error'},
+    {id:2,project:projectId(1),name:'Quota pause',state:'paused',pause_reason:'limit',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
+    {id:3,project:projectId(1),name:'Manual pause',state:'paused',pause_reason:'user',harness:'claude',model:'claude-opus-5-5',effort:'medium'},
   ];
   await reloadPage(page);
   const crash = page.locator('[data-agent="1"]');
@@ -1833,7 +2343,7 @@ test('generic crashed turns offer same-model retry and explicit alternative with
 }));
 
 test('cancelling member selection preserves a draft only within its project',async()=>fixture(async(page,data)=> {
-  data.agents=[{id:1,project:1,name:'First',state:'working'},{id:2,project:2,name:'Second',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'First',state:'working'},{id:2,project:projectId(2),name:'Second',state:'idle'}];
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('[name=member][value="1"]').check();
@@ -1843,7 +2353,7 @@ test('cancelling member selection preserves a draft only within its project',asy
   assert.equal(await page.locator('[name=member][value="1"]').isChecked(),true);
   assert.equal(await page.locator('[name=include_user]').isChecked(),false);
   await page.locator('[data-close=thread-dialog]:not(.dialog-close)').click();
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
   await page.locator('[data-open=thread-dialog]').click();
   assert.equal(await page.locator('[name=member][value="2"]').isChecked(),false);
@@ -1851,12 +2361,12 @@ test('cancelling member selection preserves a draft only within its project',asy
 }));
 
 const incoming = (id, text = `Message ${id}`) => ({ id, sender: 1, text, at: 1 });
-const conversation = (messages, extra = {}) => ({ id: 1, project: 1, title: 'Review', members: [0, 1], messages, ...extra });
+const conversation = (messages, extra = {}) => ({ id: 1, project:projectId(1), title: 'Review', members: [0, 1], messages, ...extra });
 
 test('unread badges span projects, exclude own and agent-only messages, and persist across reloads', async () => fixture(async (page, data) => {
   data.threads = [
     conversation([incoming(1), { ...incoming(2), sender: 0 }]),
-    conversation([incoming(3)], { id: 2, project: 2 }),
+    conversation([incoming(3)], { id: 2, project:projectId(2) }),
     conversation([incoming(4)], { id: 3, members: [1] }),
   ];
   await reloadPage(page);
@@ -1864,7 +2374,7 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
   await page.setViewportSize({width:375,height:800});
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   assert.match(await page.title(), /^\(2\)/);
-  assert.match(await page.locator('#project-select option[value="2"]').textContent(), /1 unread/);
+  assert.match(await page.locator(`#project-select option[value="${projectId(2)}"]`).textContent(), /1 unread/);
   await openSidebar(page);
   await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread-filter=unread]').click();
@@ -1879,7 +2389,7 @@ test('unread badges span projects, exclude own and agent-only messages, and pers
   assert.equal(await page.locator('.thread-row').count(), 0);
   assert.equal(data.reads[2], undefined);
   await openSidebar(page);
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.locator('[data-thread="2"]').waitFor();
   await page.locator('[data-thread="2"]').click();
   await page.waitForFunction(() => document.querySelector('#unread-total').hidden);
@@ -1914,7 +2424,7 @@ test('closing a thread keeps membership and read history while future messages s
 }));
 
 test('X dismissal preserves separate thread and project drafts across switching and reload without confirmation', async () => fixture(async (page, data) => {
-  data.threads = [conversation([]), conversation([], {id:2,title:'Other thread'}), conversation([], {id:3,project:2,title:'Other project'})];
+  data.threads = [conversation([]), conversation([], {id:2,title:'Other thread'}), conversation([], {id:3,project:projectId(2),title:'Other project'})];
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Keep my draft');
@@ -1929,14 +2439,14 @@ test('X dismissal preserves separate thread and project drafts across switching 
   assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.locator('[data-thread="3"]').click();
   await page.locator('#message-form textarea').fill('Other project draft');
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
   await page.locator('[data-thread="3"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Other project draft');
-  await page.locator('#project-select').selectOption('1');
+  await page.locator('#project-select').selectOption(projectId(1));
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Keep my draft');
   await page.locator('[data-thread="2"]').click();
@@ -1971,7 +2481,7 @@ test('a delayed successful send preserves newer text even when the pane is close
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('Submitted snapshot');
-  const response = page.waitForResponse(r => new URL(r.url()).pathname === '/messages');
+  const response = page.waitForResponse(r => new URL(r.url()).pathname.endsWith('/messages'));
   await page.locator('#message-form button').click();
   await page.locator('#message-form textarea').fill('Newer draft');
   await page.locator('#close-thread').click();
@@ -1982,7 +2492,7 @@ test('a delayed successful send preserves newer text even when the pane is close
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'Newer draft');
   assert.deepEqual(data.threads[0].messages.map(m => m.text), ['Submitted snapshot']);
-  const secondResponse = page.waitForResponse(r => new URL(r.url()).pathname === '/messages');
+  const secondResponse = page.waitForResponse(r => new URL(r.url()).pathname.endsWith('/messages'));
   await page.locator('#message-form button').click();
   await page.locator('#message-form textarea').fill('');
   await page.locator('#message-form textarea').fill('Newer draft');
@@ -1997,7 +2507,7 @@ test('unavailable browser storage keeps drafts in-tab and reports the persistenc
   await reloadPage(page); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click();
   await page.locator('#message-form textarea').fill('In-tab draft');
-  assert.match(await page.locator('#toast').textContent(), /browser storage is unavailable/);
+  assert.match(await page.locator('#toast').textContent(), /browser storage is unavailable/i);
   await page.locator('#close-thread').click();
   await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('#message-form textarea').inputValue(), 'In-tab draft');
@@ -2015,7 +2525,7 @@ test('a pending thread fetch cannot reopen or auto-read a thread after Close', a
   const threadPattern = /\/threads\/1\/messages(?:\?|$)/;
   await page.route(threadPattern, async route => { await gate; await route.continue(); });
   data.threads[0].messages.push(incoming(2, 'While fetch was pending'));
-  const pending = page.waitForRequest(r => new URL(r.url()).pathname === '/threads/1/messages');
+  const pending = page.waitForRequest(r => new URL(r.url()).pathname.endsWith('/threads/1/messages'));
   await page.evaluate(() => { window.pendingThread = refreshThread(); });
   await pending;
   await page.locator('#close-thread').click();
@@ -2119,8 +2629,8 @@ test('a delayed read acknowledgement cannot clear a reply absent from its snapsh
 
 test('agent tokens distinguish unreported counts from measured zero in Overview and Details', async () => fixture(async (page,data) => {
   data.agents=[
-    {id:1,project:1,name:'Starting worker',state:'working',token_usage_state:'unknown',total_tokens:null,fresh_in:null,cache_write:null,cache_read:null,output:null,token_usage_updated_at:null},
-    {id:2,project:1,name:'Zero usage',state:'idle',token_usage_state:'final',total_tokens:0,fresh_in:0,cache_write:0,cache_read:0,output:0,token_usage_updated_at:1720000000},
+    {id:1,project:projectId(1),name:'Starting worker',state:'working',token_usage_state:'unknown',total_tokens:null,fresh_in:null,cache_write:null,cache_read:null,output:null,token_usage_updated_at:null},
+    {id:2,project:projectId(1),name:'Zero usage',state:'idle',token_usage_state:'final',total_tokens:0,fresh_in:0,cache_write:0,cache_read:0,output:0,token_usage_updated_at:1720000000},
   ];
   await manualPolling(page); await reloadPage(page);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: —.*Not reported/);
@@ -2141,7 +2651,7 @@ test('agent tokens distinguish unreported counts from measured zero in Overview 
 
 test('live token counts reconcile to reported totals and retain partial status without resetting selections', async () => fixture(async (page,data) => {
   const task='Review the synthetic example without replacing this selected task.';
-  data.agents=[{id:1,project:1,name:'Worker',state:'working',task,token_usage_state:'provisional',total_tokens:null,fresh_in:1000,cache_write:2000,cache_read:3000,output:null,token_usage_updated_at:1720000000}];
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'working',task,token_usage_state:'provisional',total_tokens:null,fresh_in:1000,cache_write:2000,cache_read:3000,output:null,token_usage_updated_at:1720000000}];
   await manualPolling(page); await reloadPage(page);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: —.*In progress \(provisional\)/,'known input alone does not invent a total');
   await page.locator('[data-agent="1"] [data-action=details]').click();
@@ -2169,7 +2679,7 @@ test('live token counts reconcile to reported totals and retain partial status w
 }));
 
 test('absent token metadata never invents a total from an incomplete breakdown', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Incomplete worker',state:'paused',fresh_in:7,cache_write:0,output:3}];
+  data.agents=[{id:1,project:projectId(1),name:'Incomplete worker',state:'paused',fresh_in:7,cache_write:0,output:3}];
   await manualPolling(page); await reloadPage(page);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: —.*Not reported/);
   await page.locator('[data-agent="1"] [data-action=details]').click(); await page.locator('#agent-field-total_tokens').waitFor();
@@ -2179,31 +2689,50 @@ test('absent token metadata never invents a total from an incomplete breakdown',
   assert.equal(await page.locator('#agent-field-cache_read').textContent(),'—');
 }));
 
+test('per-field token evidence preserves zero and partial snapshots without inventing missing counts',async()=>fixture(async(page,data)=>{
+  const evidence={total_tokens:tokenFieldReport(35,true),fresh_in:tokenFieldReport(0,true),cache_write:tokenFieldReport(0),cache_read:tokenFieldReport(null,true),output:tokenFieldReport(3,true)};
+  data.agents=[{id:1,project:projectId(1),name:'Partial token worker',state:'working',task:'Synthetic task',token_usage_state:'partial',total_tokens:null,fresh_in:null,cache_write:0,cache_read:null,output:3,token_usage_last_total:{tokens:999,at:1720000000},token_usage_fields:evidence}];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-action=details]').click();await page.locator('#agent-field-fresh_in').waitFor();
+  assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Partial (incomplete)');
+  for(const [key,value]of Object.entries({total_tokens:'35',fresh_in:'0',cache_write:'0',cache_read:'—',output:'3'}))assert.equal(await page.locator(`#agent-field-${key}`).textContent(),value,key);
+  assert.equal(await page.locator('#agent-field-fresh_in .last-known.refreshing').textContent(),'0');
+  assert.match(await page.locator('#agent-field-fresh_in .token-value').getAttribute('aria-label'),/Last known fresh input.*Awaiting update/);
+  assert.equal(await page.locator('#agent-field-output .refreshing:not(.last-known)').textContent(),'3','an observed current count can be awaiting a later update without being incomplete');
+  assert.equal(await page.locator('#agent-field-cache_read .refreshing').count(),0,'a missing observation is not fabricated as a loading zero');
+  assert.equal(await page.locator('#agent-field-cache_write .refreshing').count(),0,'freshness follows this field rather than the agent state');
+  assert.doesNotMatch(await page.locator('#agent-field-total_tokens').textContent(),/999/,'obsolete aggregate metadata cannot override per-field evidence');
+  data.agents[0].state='idle';for(const field of Object.values(evidence))field.awaiting_update=false;
+  Object.assign(data.agents[0],{fresh_in:5,output:null});evidence.fresh_in=tokenFieldReport(5,false,1720000010);evidence.output=tokenFieldReport(7,false,1720000010);
+  await page.evaluate(()=>refresh());assert.equal(await page.locator('#agent-field-fresh_in').textContent(),'5');assert.equal(await page.locator('#agent-field-output .last-known').textContent(),'7');assert.equal(await page.locator('#agent-details .refreshing').count(),0);
+}));
+
 test('last known token totals remain visible while a newer report is incomplete', async () => fixture(async (page,data) => {
   const task='Keep this synthetic task selected while token reports update.';
-  data.agents=[{id:1,project:1,name:'Worker',state:'idle',task,token_usage_state:'final',total_tokens:1000,fresh_in:900,cache_write:0,cache_read:0,output:100,token_usage_last_total:{tokens:1000,at:1720000000}}];
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'idle',task,token_usage_state:'final',total_tokens:1000,fresh_in:900,cache_write:0,cache_read:0,output:100,token_usage_fields:{total_tokens:tokenFieldReport(1000)}}];
   await manualPolling(page); await reloadPage(page);
   await page.locator('[data-agent="1"] [data-action=details]').click();
   await page.locator('#agent-field-total_tokens').waitFor();
   const selected=await selectText(page,'#agent-field-task');
-  Object.assign(data.agents[0],{state:'working',token_usage_state:'provisional',total_tokens:null,fresh_in:1100,output:null});
+  Object.assign(data.agents[0],{state:'working',token_usage_state:'provisional',total_tokens:null,fresh_in:1100,output:null,token_usage_fields:{total_tokens:tokenFieldReport(1000,true)}});
   await page.evaluate(()=>refresh());
-  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 1,000.*Last known.*Awaiting update/,'a missing current total does not erase the latest observed total');
-  assert.match(await page.locator('#agent-field-total_tokens').textContent(),/1,000.*Last known.*Awaiting update/);
-  assert.equal(await page.locator('#agent-field-output').textContent(),'—','fallback applies to the total, not unreported breakdowns');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 1,000/,'a missing current total does not erase the latest observed total');
+  assert.equal(await page.locator('[data-agent="1"] .token-value.refreshing').textContent(),'1,000');
+  assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'1,000');
+  assert.match(await page.locator('#agent-field-total_tokens .token-value').getAttribute('aria-label'),/Last known.*Awaiting update/);
+  assert.equal(await page.locator('#agent-field-output').textContent(),'—','a field without an observed snapshot remains unavailable');
   assert.equal(await page.locator('#agent-field-fresh_in').textContent(),'1,100');
   assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
   assert.equal(await page.evaluate(()=>document.querySelector('#agent-field-task')===window.selectedNode),true);
   await reloadPage(page);
-  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 1,000.*Last known.*Awaiting update/,'the snapshot comes from the API, not an ephemeral page cache');
+  assert.equal(await page.locator('[data-agent="1"] .token-value.refreshing').textContent(),'1,000','the snapshot comes from the API, not an ephemeral page cache');
   await page.locator('[data-agent="1"] [data-action=details]').click();
   await page.locator('#agent-field-total_tokens').waitFor();
   await selectText(page,'#agent-field-task');
-  Object.assign(data.agents[0],{total_tokens:1204,output:104,token_usage_last_total:{tokens:1204,at:1720000010}});
+  Object.assign(data.agents[0],{total_tokens:1204,output:104,token_usage_fields:{total_tokens:tokenFieldReport(1204,true,1720000010)}});
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'1,204');
   assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Last known|Awaiting update/,'a live numeric report replaces the fallback');
-  Object.assign(data.agents[0],{state:'idle',token_usage_state:'final',total_tokens:900,fresh_in:800,output:100,token_usage_last_total:{tokens:900,at:1720000020}});
+  Object.assign(data.agents[0],{state:'idle',token_usage_state:'final',total_tokens:900,fresh_in:800,output:100,token_usage_fields:{total_tokens:tokenFieldReport(900,false,1720000020)}});
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'900','a lower authoritative total is not clamped to an earlier provisional snapshot');
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 900.*Finalised/);
@@ -2211,55 +2740,57 @@ test('last known token totals remain visible while a newer report is incomplete'
 }));
 
 test('last known zero totals survive compact previews without implying paused agents are loading', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Large synthetic worker '.repeat(1500),state:'working',task:'Synthetic task',token_usage_state:'partial',total_tokens:null,fresh_in:50,cache_write:null,cache_read:null,output:null,token_usage_last_total:{tokens:0,at:null}}];
+  data.agents=[{id:1,project:projectId(1),name:'Large synthetic worker '.repeat(1500),state:'working',task:'Synthetic task',token_usage_state:'partial',total_tokens:null,fresh_in:50,cache_write:null,cache_read:null,output:null,token_usage_fields:{total_tokens:tokenFieldReport(0,true)}}];
   await manualPolling(page); await reloadPage(page);
-  assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 0.*Last known.*Awaiting update/,'the bounded preview retains an explicitly observed zero snapshot');
+  assert.equal(await page.locator('[data-agent="1"] .token-value.refreshing').textContent(),'0','the bounded preview retains an explicitly observed zero snapshot');
   assert.equal(data.detailRequests.length,0,'showing the snapshot does not hydrate the full record');
   await page.locator('[data-agent="1"] [data-action=details]').click();
   await page.locator('#agent-field-total_tokens').waitFor();
-  assert.match(await page.locator('#agent-field-total_tokens').textContent(),/0.*Last known.*Awaiting update/);
+  assert.equal(await page.locator('#agent-field-total_tokens .token-value.refreshing').textContent(),'0');
   assert.equal(await page.locator('#agent-field-token_usage').textContent(),'Partial (incomplete)','last known is not a claim of complete accounting');
   for(const key of ['cache_write','cache_read','output'])assert.equal(await page.locator(`#agent-field-${key}`).textContent(),'—',`${key} is not fabricated from the snapshot`);
-  Object.assign(data.agents[0],{total_tokens:10,token_usage_last_total:{tokens:30,at:1720000010}});
+  Object.assign(data.agents[0],{total_tokens:10,token_usage_fields:{total_tokens:tokenFieldReport(30,false,1720000010)}});
   for(const state of ['paused','crashed','idle']) {
     data.agents[0].state=state; await page.evaluate(()=>refresh());
-    assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 30.*Last known/,'a folded partial count does not erase a more recent observed total');
-    assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Awaiting update/,`${state} is not shown as actively awaiting a report`);
-    assert.match(await page.locator('#agent-field-total_tokens').textContent(),/30.*Last known/);
-    assert.doesNotMatch(await page.locator('#agent-field-total_tokens').textContent(),/Awaiting update/);
+    assert.equal(await page.locator('[data-agent="1"] .token-value.last-known').textContent(),'30','a folded partial count does not erase a more recent observed total');
+    assert.equal(await page.locator('[data-agent="1"] .token-value.refreshing').count(),0,`${state} is not shown as actively awaiting a report`);
+    assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'30');
+    assert.equal(await page.locator('#agent-field-total_tokens .refreshing').count(),0);
   }
-  Object.assign(data.agents[0],{state:'working',total_tokens:0,token_usage_last_total:{tokens:0,at:1720000020}}); await page.evaluate(()=>refresh());
+  Object.assign(data.agents[0],{state:'working',total_tokens:0,token_usage_fields:{total_tokens:tokenFieldReport(0,true,1720000020)}}); await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#agent-field-total_tokens').textContent(),'0','an actual zero takes precedence over a fallback snapshot');
   assert.doesNotMatch(await page.locator('[data-agent="1"]').textContent(),/Last known|Awaiting update/);
 }));
 
 for(const width of [375,320])test(`last known token totals and their update cue stay visible at ${width}px`, async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Worker',state:'working',task:'Synthetic task',token_usage_state:'provisional',total_tokens:null,token_usage_last_total:{tokens:1000,at:1720000000}}];
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'working',task:'Synthetic task',token_usage_state:'provisional',total_tokens:null,token_usage_fields:{total_tokens:tokenFieldReport(1000,true)}}];
   await manualPolling(page); await page.setViewportSize({width,height:812}); await reloadPage(page);
   const row=page.locator('[data-agent="1"]'); await row.scrollIntoViewIfNeeded();
   const geometry=await row.evaluate(row=>{
     const meta=[...row.querySelectorAll('.meta')].find(el=>el.textContent.startsWith('Total tokens:'));
-    const note=meta.querySelector('.pill'),number=document.createRange(); number.selectNode(meta.firstChild);
+    const note=meta.querySelector('.token-value'),number=document.createRange(); number.selectNodeContents(note);
     const rect=el=>{const r=el.getBoundingClientRect(); return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};};
     return {meta:rect(meta),number:rect(number),note:rect(note),text:meta.textContent,title:note.title,pageWidth:document.documentElement.scrollWidth};
   });
-  assert.match(geometry.text,/Total tokens: 1,000.*Last known.*Awaiting update/);
+  assert.match(geometry.text,/Total tokens: 1,000/);
   assert.match(geometry.title,/Last known total at/,'the observed timestamp is available without widening the card');
   for(const key of ['number','note']) {
     assert.ok(geometry[key].left>=geometry.meta.left-1&&geometry[key].right<=geometry.meta.right+1,`${key} is not horizontally clipped`);
     assert.ok(geometry[key].top>=geometry.meta.top-1&&geometry[key].bottom<=geometry.meta.bottom+1,`${key} is not vertically clipped`);
   }
   assert.ok(geometry.pageWidth<=width,'the total and cue do not widen the page');
+  await page.emulateMedia({reducedMotion:'reduce'});
+  assert.equal(await row.locator('.token-value').evaluate(node=>getComputedStyle(node).animationName),'none','reduced-motion users retain a static freshness cue');
 }));
 
 test('open details update status and logs, preserve history scroll and recover from errors', async () => fixture(async (page, data) => {
-  data.agents = [{ id: 1, project: 1, name: 'Worker', state: 'working', status: 'Starting', locks: [], lost_locks: [] }];
+  data.agents = [{ id: 1, project:projectId(1), name: 'Worker', state: 'working', status: 'Starting', locks: [], lost_locks: [] }];
   data.agentLogs[1] = Array.from({ length: 80 }, (_, i) => `Line ${i}`);
   await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.waitForFunction(() => document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
   assert.equal(await page.locator('#agent-log').evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight < 20), true);
   await page.locator('#agent-log').evaluate(el => { el.scrollTop = 35; });
-  data.delays = {1:3000}; // Details must not wait for a slow overview response.
+  data.delays = {[projectId(1)]:3000}; // Details must not wait for a slow overview response.
   data.agents[0].status = 'Running tests'; data.agents[0].state = 'idle';
   data.agentLogs[1].push('<img src=x onerror=unsafe()>');
   await page.waitForFunction(() => document.querySelector('#agent-log').textContent.includes('<img'));
@@ -2281,7 +2812,7 @@ test('open details update status and logs, preserve history scroll and recover f
 }));
 
 test('closing pending details and opening another agent ignores old responses', async () => fixture(async (page, data) => {
-  data.agents = [1, 2].map(id => ({ id, project: 1, name: `Worker ${id}`, state: 'working' }));
+  data.agents = [1, 2].map(id => ({ id, project:projectId(1), name: `Worker ${id}`, state: 'working' }));
   data.agentLogs = { 1: ['Old log'], 2: ['New log'] };
   await reloadPage(page); data.detailDelay = 1000;
   await page.locator('[data-action=details][data-id="1"]').click();
@@ -2301,8 +2832,9 @@ test('closing pending details and opening another agent ignores old responses', 
   assert.equal(await page.locator('#agent-dialog').isVisible(), false);
 }));
 
-test('Claude windows display and save independent thresholds, including older saved configs', async () => fixture(async (page, data) => {
-  data.settings.limits.usage.claude = {soft:50,hard:90};
+test('Claude windows display and save independent canonical thresholds', async () => fixture(async (page, data) => {
+  data.settings.limits.usage.claude_five_hour = {soft:50,hard:90};
+  data.settings.limits.usage.claude_seven_day = {soft:60,hard:90};
   data.usage = [{provider:'claude',win:'five_hour',used_pct:60,resets_at:Date.now()/1000+3600},{provider:'claude',win:'seven_day',used_pct:95,resets_at:Date.now()/1000+86400}];
   await reloadPage(page);
   assert.match(await page.locator('[data-window=five_hour] .meter-label').textContent(), /5-hour.*60%/);
@@ -2330,8 +2862,7 @@ test('Claude windows display and save independent thresholds, including older sa
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 }));
 
-test('maximum lock TTL is required, positive and persists; older settings get a finite default', async () => fixture(async (page, data) => {
-  delete data.settings.max_lock_ttl_secs;
+test('maximum lock TTL is required, positive and persists', async () => fixture(async (page, data) => {
   await reloadPage(page);
   await page.locator('[data-page=settings]').click();
   const ttl = page.locator('[name=max_lock_ttl_secs]');
@@ -2493,8 +3024,8 @@ test('retry rules support custom IDs and reject duplicate source models without 
   assert.equal(data.requests.length, writes);
 }));
 
-test('Fable weekly usage has an independent meter and no inherited legacy threshold', async () => fixture(async (page, data) => {
-  data.settings.limits.usage.claude = {soft:50,hard:90};
+test('Fable weekly usage has an independent meter and threshold', async () => fixture(async (page, data) => {
+  data.settings.limits.usage.claude_seven_day = {soft:50,hard:90};
   data.usage = [{provider:'claude',win:'seven_day_fable',used_pct:80,resets_at:Date.now()/1000+86400}];
   await reloadPage(page);
   assert.match(await page.locator('[data-window=seven_day_fable] .meter-label').textContent(), /Fable weekly.*80%/);
@@ -2516,7 +3047,7 @@ test('Fable weekly usage has an independent meter and no inherited legacy thresh
 }));
 
 test('agent details preserve model drafts while polling and save provider-fixed next-turn changes', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'ultra'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'ultra'}];
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
@@ -2540,7 +3071,7 @@ test('agent details preserve model drafts while polling and save provider-fixed 
 }));
 
 test('details distinguish the actual running configuration from next-turn choices without clearing selections', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6-luna',effort:'max',running_configuration:{model:'gpt-6.1-sol',effort:'ultra'}}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6-luna',effort:'max',running_configuration:{model:'gpt-6.1-sol',effort:'ultra'}}];
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const details = page.locator('#agent-details');
   const current = details.locator('dt[data-key=running_configuration] + dd');
@@ -2571,7 +3102,7 @@ test('details distinguish the actual running configuration from next-turn choice
 }));
 
 test('continuation is an explicit working-agent opt-in and its pending instruction and blocked reason are visible safely', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
@@ -2613,7 +3144,7 @@ test('continuation is an explicit working-agent opt-in and its pending instructi
 }));
 
 test('a delayed configuration save keeps newer continuation drafts and rejects continuation after the turn stops', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   data.agentConfigDelay = 500;
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
@@ -2638,7 +3169,7 @@ test('a delayed configuration save keeps newer continuation drafts and rejects c
 }));
 
 test('own-history crash warnings require explicit confirmation before a single acknowledged configure retry', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   data.agentConfigError = {status:409,message:'Previous crashes for gpt-6-luna in your own agent history/replacement lineage: agent 1, history /history/1.jsonl. Review before acknowledging.'};
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
@@ -2666,7 +3197,7 @@ test('own-history crash warnings require explicit confirmation before a single a
 }));
 
 test('configure errors outside the specific HTTP409 prior-crash warning never prompt or retry', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const config = page.locator('#agent-config');
   await config.locator('#save-agent-config').waitFor();
@@ -2684,7 +3215,7 @@ test('configure errors outside the specific HTTP409 prior-crash warning never pr
 }));
 
 test('agent details expose pending, blocked and replacement retry status safely', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'crashed',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null,same_model_attempts:1,effort:'medium',eligible_at:Date.now()/1000+120}}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'crashed',harness:'claude',model:'claude-opus-5-5',effort:'medium',retry:{source:'claude-opus-5-5',handled:0,replacement:null,blocked:null,same_model_attempts:1,effort:'medium',eligible_at:Date.now()/1000+120}}];
   await reloadPage(page); await page.locator('[data-action=details]').click();
   const details = page.locator('#agent-details');
   await details.locator('dt[data-key=retry]').waitFor();
@@ -2711,9 +3242,9 @@ test('agent details expose pending, blocked and replacement retry status safely'
 
 test('details show queued cross-provider replacements and link the explicit successor', async () => fixture(async (page, data) => {
   data.agents = [
-    {id:1,project:1,name:'Predecessor',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:null}},
-    {id:2,project:1,name:'Old recovery target',state:'closed',harness:'claude',model:'claude-haiku-5-5',effort:'medium'},
-    {id:3,project:1,name:'Successor',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
+    {id:1,project:projectId(1),name:'Predecessor',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:null}},
+    {id:2,project:projectId(1),name:'Old recovery target',state:'closed',harness:'claude',model:'claude-haiku-5-5',effort:'medium'},
+    {id:3,project:projectId(1),name:'Successor',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
   ];
   await reloadPage(page); await page.locator('[data-agent="1"] [data-action=details]').click();
   const details = page.locator('#agent-details');
@@ -2740,8 +3271,8 @@ test('details show queued cross-provider replacements and link the explicit succ
 
 test('replaced agents expose history and replacement details without restart or configure controls', async () => fixture(async (page, data) => {
   data.agents = [
-    {id:1,project:1,name:'Predecessor',state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',conversation_history:'/history/old.jsonl',output_log:'/logs/old.jsonl',retry:{source:'gpt-6.1-sol',handled:1,replacement:2,blocked:null,same_model_attempts:0,effort:'high'}},
-    {id:2,project:1,name:'Replacement',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
+    {id:1,project:projectId(1),name:'Predecessor',state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',conversation_history:'/history/old.jsonl',output_log:'/logs/old.jsonl',retry:{source:'gpt-6.1-sol',handled:1,replacement:2,blocked:null,same_model_attempts:0,effort:'high'}},
+    {id:2,project:projectId(1),name:'Replacement',state:'working',harness:'claude',model:'claude-sonnet-5-5',effort:'high'},
   ];
   data.agentLogs[1] = ['Retained predecessor history'];
   await reloadPage(page);
@@ -2767,7 +3298,7 @@ test('replaced agents expose history and replacement details without restart or 
 
 test('details polling preserves selected task text and defers selected log updates', async () => fixture(async (page, data) => {
   const task = `Don't replace this "task" <text> while counters change.`;
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',task,fresh_in:1}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',task,fresh_in:1}];
   data.agentLogs[1] = Array.from({length:80}, (_,i) => `Line ${i}`);
   await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.locator('#agent-config [name=agent_model]').selectOption('gpt-6-luna');
@@ -2811,7 +3342,7 @@ const selectText = async (page, selector) => page.evaluate(selector => {
 
 test('polling preserves project-path selection and unchanged overview nodes while unrelated activity stays live', async () => fixture(async (page, data) => {
   data.projects[0].path = '/projects/example with "quotes" & spaces';
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',task:'Review "quotes" & escapes',status:'Starting'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',task:'Review "quotes" & escapes',status:'Starting'}];
   data.locks = [{name:'src/<file>',about:'Edit "quotes"',holder:1,holder_name:'Worker',acquired_at:1}];
   data.activity = [{at:1,actor:'user',what:'Initial activity'}];
   await reloadPage(page);
@@ -2840,13 +3371,13 @@ test('polling preserves project-path selection and unchanged overview nodes whil
   assert.equal(await page.locator('#project-path').textContent(), '/projects/new path', 'reverted updates must cancel stale deferred values');
   await selectText(page, '#project-path');
   data.projects[0].path = '/projects/queued old project'; await page.evaluate(() => refresh());
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/other');
-  assert.equal(await page.locator('#project-select').inputValue(), '2', 'explicit navigation does not retain stale selected-project content');
+  assert.equal(await page.locator('#project-select').inputValue(), projectId(2), 'explicit navigation does not retain stale selected-project content');
 }));
 
 test('selected agent, lock and activity regions defer only their changes and flush the latest value on deselection', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',status:'Initial status'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',status:'Initial status'}];
   data.locks = [{name:'src/main',about:'Initial purpose',holder:1,acquired_at:1}];
   data.activity = [{at:1,actor:'user',what:'Initial activity'}];
   await reloadPage(page);
@@ -2949,7 +3480,7 @@ test('mobile sidebar defaults closed and navigation gives the conversation the v
 test('copy controls preserve exact project paths and agent detail values across polling', async () => fixture(async (page, data) => {
   const task = 'Review "quoted" paths & <tags>\nKeep this second line.';
   data.projects[0].path = '/projects/example with "quotes" & spaces';
-  data.agents = [{id:1,project:1,name:'Reviewer',state:'paused',pause_reason:'limit',task,status:'Waiting for usage',history_path:'/sessions/a "review".jsonl'}];
+  data.agents = [{id:1,project:projectId(1),name:'Reviewer',state:'paused',pause_reason:'limit',task,status:'Waiting for usage',history_path:'/sessions/a "review".jsonl'}];
   await reloadPage(page); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   assert.equal(await page.locator('[data-copy-target="project-path"]').count(),1);
   await page.locator('[data-copy-target="project-path"]').click();
@@ -2980,8 +3511,8 @@ test('copy controls preserve exact project paths and agent detail values across 
 
 test('agent previews label descriptive status separately from launch tasks and lifecycle state', async () => fixture(async (page,data) => {
   data.agents=[
-    {id:1,project:1,name:'Status reporter',state:'paused',pause_reason:'limit',task:'Original review assignment',status:'Phase 4 complete. Idle until review.'},
-    {id:2,project:1,name:'Task fallback',state:'paused',pause_reason:'limit',task:'Original second assignment',status:null},
+    {id:1,project:projectId(1),name:'Status reporter',state:'paused',pause_reason:'limit',task:'Original review assignment',status:'Phase 4 complete. Idle until review.'},
+    {id:2,project:projectId(1),name:'Task fallback',state:'paused',pause_reason:'limit',task:'Original second assignment',status:null},
   ];
   await reloadPage(page);
   assert.equal(await page.locator('[data-agent="1"] .agent-task').textContent(),'Status: Phase 4 complete. Idle until review.');
@@ -2994,7 +3525,7 @@ test('thread identifiers are visible and copyable for references in another conv
   data.threads = [conversation([]),conversation([], {id:2,title:'Follow-up'})];
   await reloadPage(page); await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   await page.locator('[data-page=threads]').click();
-  assert.match(await page.locator('[data-thread="1"] .meta').textContent(), /Thread #1/);
+  assert.match(await page.locator('[data-thread="1"] [data-part=summary]').textContent(), /Thread #1/);
   await page.locator('[data-thread="1"]').click();
   assert.match(await page.locator('#thread-summary').textContent(), /Thread #1/);
   await openThreadDetails(page); await page.locator('#copy-thread').click();
@@ -3008,7 +3539,7 @@ test('thread identifiers are visible and copyable for references in another conv
 }));
 
 test('agent details expose native history and output paths; closed behavior is explained', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'closed',harness:'claude',conversation_history:'/home/example/.claude/projects/-work/session.jsonl',output_log:'/home/example/.acom/logs/1.jsonl'}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'closed',harness:'claude',conversation_history:'/home/example/.claude/projects/-work/session.jsonl',output_log:'/home/example/.acom/logs/1.jsonl'}];
   await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.waitForFunction(() => document.querySelector('#agent-details').textContent.includes('conversation history'));
   assert.match(await page.locator('#agent-details').textContent(), /\/home\/example\/\.claude\/projects\/-work\/session.jsonl/);
@@ -3027,12 +3558,17 @@ async function holdRequest(page, pattern, method = 'POST') {
     entered(); await gate;
     await route.continue().catch(() => {}); // A bounded GET may already be aborted.
   };
-  await page.route(pattern, handler);
-  return { started, release, remove: () => page.unroute(pattern, handler) };
+  const matcher=typeof pattern==='function' ? url=>{
+    const normalized=new URL(url),scope=/^\/p\/([^/]+)(\/.*)$/.exec(normalized.pathname);
+    if(scope){normalized.pathname=scope[2];normalized.searchParams.set('project',decodeURIComponent(scope[1]));}
+    return pattern(normalized);
+  } : pattern;
+  await page.route(matcher, handler);
+  return { started, release, remove: () => page.unroute(matcher, handler) };
 }
 
 test('slow overview requests commit without overlapping polls discarding every response', async () => fixture(async (page, data) => {
-  data.delays = {1:2400};
+  data.delays = {[projectId(1)]:2400};
   await reloadPage(page);
   await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live', null, {timeout:6000});
   assert.equal(await page.locator('#project-path').textContent(), '/projects/example');
@@ -3082,7 +3618,7 @@ test('switching threads removes old controls immediately and closing the loading
 }));
 
 test('polling restores focus to updated controls and removes actions that no longer apply', async () => fixture(async (page, data) => {
-  data.agents = [{id:1,project:1,name:'Worker',state:'working',status:'Starting',locks:[]}];
+  data.agents = [{id:1,project:projectId(1),name:'Worker',state:'working',status:'Starting',locks:[]}];
   await reloadPage(page); await page.locator('[data-action=details]').focus();
   data.agents[0].state = 'idle'; data.agents[0].status = 'Finished this turn';
   await page.waitForFunction(() => document.querySelector('#agents').textContent.includes('Finished this turn'));
@@ -3102,13 +3638,13 @@ test('late thread creation keeps reopened drafts and cannot open another project
   await page.locator('#thread-form [name=title]').fill('Created in first');
   await page.locator('#thread-form button.primary').click(); await pending.started;
   await page.locator('[data-close=thread-dialog]:not(.dialog-close)').click();
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(() => document.querySelector('#project-path').textContent === '/projects/other');
   await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-form [name=title]').fill('New draft in second');
   pending.release(); await pending.remove();
   await page.waitForFunction(() => !document.querySelector('#thread-form button.primary').disabled);
-  assert.equal(data.threads[0].project, 1);
+  assert.equal(data.threads[0].project, projectId(1));
   assert.equal(await page.locator('#thread-dialog').isVisible(), true);
   assert.equal(await page.locator('#thread-form [name=title]').inputValue(), 'New draft in second');
   assert.equal(await page.locator('#thread-main .empty strong').textContent(), 'Select a thread');
@@ -3192,7 +3728,7 @@ test('late config and member saves preserve newer dialog input', async () => fix
   assert.equal(await page.locator('#config-dialog').isVisible(), true);
   assert.equal(await page.locator('#config-form [name=name]').inputValue(), 'Next copy draft');
   await page.locator('[data-close=config-dialog]:not(.dialog-close)').click();
-  data.agents = [1,2].map(id => ({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.agents = [1,2].map(id => ({id,project:projectId(1),name:`Worker ${id}`,state:'idle'}));
   data.threads = [conversation([], {members:[0]})];
   await page.evaluate(() => refresh()); await page.locator('[data-page=threads]').click();
   await page.locator('[data-thread="1"]').click(); await openThreadDetails(page); await page.locator('#add-thread-members').click();
@@ -3231,7 +3767,7 @@ test('late removal keeps reopened selections and never removes members from a di
 }));
 
 test('late ownership transfers preserve edited or reopened owner drafts and never target another thread', async () => fixture(async (page, data) => {
-  data.agents=[2,3].map(id=>({id,project:1,name:`Worker ${id}`,state:'idle'}));
+  data.agents=[2,3].map(id=>({id,project:projectId(1),name:`Worker ${id}`,state:'idle'}));
   data.threads=[conversation([],{owner:0}),conversation([],{id:2,title:'Second',owner:0})];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
@@ -3258,10 +3794,10 @@ test('late ownership transfers preserve edited or reopened owner drafts and neve
 }));
 
 test('project switching invalidates ownership dialogs and prevents stale owner form submissions', async () => fixture(async (page, data) => {
-  data.agents=[{id:2,project:1,name:'Target',state:'idle'}]; data.threads=[conversation([])];
+  data.agents=[{id:2,project:projectId(1),name:'Target',state:'idle'}]; data.threads=[conversation([])];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   await openThreadDetails(page); await page.locator('#change-thread-owner').click(); await page.locator('#thread-owner-form [name=owner]').fill('2');
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
   assert.equal(await page.locator('#thread-owner-dialog').isVisible(),false);
   await page.evaluate(()=>document.querySelector('#thread-owner-form').dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true})));
@@ -3270,25 +3806,25 @@ test('project switching invalidates ownership dialogs and prevents stale owner f
 }));
 
 test('switching projects invalidates open add and removal dialogs before a stale form can submit', async () => fixture(async (page, data) => {
-  data.agents=[{id:2,project:1,name:'Additional',state:'idle'}]; data.threads=[conversation([])];
+  data.agents=[{id:2,project:projectId(1),name:'Additional',state:'idle'}]; data.threads=[conversation([])];
   await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   for(const [control,dialog,form] of [['#add-thread-members','#members-dialog','#members-form'],['#remove-thread-members','#remove-members-dialog','#remove-members-form']]) {
     await openThreadDetails(page);
     await page.locator(control).click();
     await page.locator(`${form} [name=member]`).check();
     const before=data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length;
-    await page.locator('#project-select').selectOption('2');
+    await page.locator('#project-select').selectOption(projectId(2));
     await page.waitForFunction(()=>document.querySelector('#project-path').textContent==='/projects/other');
     assert.equal(await page.locator(dialog).isVisible(),false);
     await page.evaluate(form=>document.querySelector(form).dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true})),form);
     assert.equal(data.requests.filter(r=>/\/members(?:\/remove)?$/.test(r.url)).length,before);
-    await page.locator('#project-select').selectOption('1');
+    await page.locator('#project-select').selectOption(projectId(1));
     await page.locator('[data-thread="1"]').click();
   }
 }));
 
 test('mobile locks can scroll every control into view and dialogs and feedback have accessible names', async () => fixture(async (page, data) => {
-  data.locks = [{name:'write-lock',project:1,about:'Editing important shared content',holder:1,holder_name:'Worker',acquired_at:1,expires_at:Date.now()/1000+600,queue:[2,3]}];
+  data.locks = [{name:'write-lock',project:projectId(1),about:'Editing important shared content',holder:1,holder_name:'Worker',acquired_at:1,expires_at:Date.now()/1000+600,queue:[2,3]}];
   await page.setViewportSize({width:390,height:844}); await reloadPage(page); await page.locator('[data-action=free-lock]').waitFor();
   assert.equal(await page.locator('#locks').evaluate(el => getComputedStyle(el).overflowX), 'auto');
   await page.locator('#locks').evaluate(el => { el.scrollLeft = el.scrollWidth; });
@@ -3414,16 +3950,16 @@ test('an old incremental page cannot replace a newly selected conversation or it
 
 test('paged project, config and member selectors expose omitted choices and All means every agent', async () => fixture(async (page,data) => {
   data.pageLimit=2;
-  data.projects=Array.from({length:6},(_,i)=>({id:i+1,name:`Project ${i+1}`,path:`/projects/${i+1}`,config:2}));
-  data.configs.push(...[3,4,5,6].map(id=>({id,name:`Config ${id}`,settings:settings()})));
-  data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:`Agent ${i+1}`,state:i%2?'closed':'working'}));
+  data.projects=Array.from({length:6},(_,i)=>({id:projectId(i+1),name:`Project ${i+1}`,path:`/projects/${i+1}`,config:configId(2)}));
+  data.configs.push(...[3,4,5,6].map(id=>({id:configId(id),name:`Config ${id}`,settings:settings()})));
+  data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:projectId(1),name:`Agent ${i+1}`,state:i%2?'closed':'working'}));
   await manualPolling(page); await reloadPage(page);
-  assert.equal(await page.locator('#project-select').inputValue(),'1','the selected project stays reachable outside the first page');
+  assert.equal(await page.locator('#project-select').inputValue(),projectId(1),'the selected project stays reachable outside the first page');
   while(await page.locator('.project-banner [data-more=projects]').isVisible()) {await page.locator('.project-banner [data-more=projects]').click();await page.waitForFunction(()=>!state.pages.projects.pending);}
   assert.equal(await page.locator('#project-select option').count(),6);
   await page.locator('[data-page=settings]').click();
   while(await page.locator('#settings-form [data-more=configs]').isVisible()) {await page.locator('#settings-form [data-more=configs]').click();await page.waitForFunction(()=>!state.pages.configs.pending);}
-  await page.locator('#config-select').selectOption('3'); await page.waitForFunction(()=>state.editor.config===3);
+  await page.locator('#config-select').selectOption(configId(3)); await page.waitForFunction(()=>state.editor.config===configId(3));
   assert.equal(await page.locator('[name=config_name]').inputValue(),'Config 3');
   await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
   await page.locator('#thread-member-picker [data-member-pick=all]').click();
@@ -3433,7 +3969,7 @@ test('paged project, config and member selectors expose omitted choices and All 
 }));
 
 test('a mutable collection changing during Load more restarts a consistent window without stale or duplicate rows', async () => fixture(async (page,data) => {
-  data.pageLimit=2; data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:`Agent ${i+1}`,state:'working'}));
+  data.pageLimit=2; data.agents=Array.from({length:6},(_,i)=>({id:i+1,project:projectId(1),name:`Agent ${i+1}`,state:'working'}));
   await manualPolling(page); await reloadPage(page);
   const pending=await holdRequest(page,url=>url.pathname==='/agents'&&url.searchParams.get('before')==='5','GET');
   await page.locator('#page-overview [data-more=agentBrowser]').click(); await pending.started;
@@ -3460,7 +3996,7 @@ test('oversized UTF-8 message and config chunks stay lossless and incomplete tex
   await page.waitForFunction(()=>state.thread?.last_read===1);
   assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),text);
   assert.equal(await page.locator('[data-message]').count(),1);
-  assert.ok(data.getRequests.some(url=>url.startsWith('/configs/2?offset=')));
+  assert.ok(data.getRequests.some(url=>url.startsWith(`/configs/${configId(2)}?offset=`)));
   assert.ok(data.getRequests.some(url=>url.startsWith('/messages/1?agent=0&offset=')));
 }));
 
@@ -3483,7 +4019,7 @@ test('unchanged polls use only slim Overview and message deltas; activity update
   assert.equal(data.getRequests.filter(url=>url==='/catalog').length,catalogs);
   await openLaunch(page);
   await page.waitForFunction(()=>!document.querySelector('#launch-form button.primary').disabled);
-  assert.ok(data.getRequests.at(-1).startsWith('/settings?project=1'));
+  assert.ok(data.getRequests.at(-1).startsWith(`/settings?project=${projectId(1)}`));
 }));
 
 test('a large disconnected activity burst fetches only the retained latest window and keeps older history reachable', async () => fixture(async (page,data) => {
@@ -3500,9 +4036,9 @@ test('a large disconnected activity burst fetches only the retained latest windo
 }));
 
 test('selected configs outside the current page refresh external edits without clearing an unsaved editor', async () => fixture(async (page,data) => {
-  data.pageLimit=2; data.configs.push(...[3,4,5,6,7,8].map(id=>({id,name:`Config ${id}`,settings:settings()})));
+  data.pageLimit=2; data.configs.push(...[3,4,5,6,7,8].map(id=>({id:configId(id),name:`Config ${id}`,settings:settings()})));
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
-  assert.equal(await page.locator('#config-select').inputValue(),'2');
+  assert.equal(await page.locator('#config-select').inputValue(),configId(2));
   data.settings.max_lock_ttl_secs=1234; await page.evaluate(()=>refresh());
   assert.equal(await page.locator('[name=max_lock_ttl_secs]').inputValue(),'1234');
   await page.locator('[name=max_lock_ttl_secs]').fill('4321');
@@ -3515,7 +4051,7 @@ test('changed record versions restart chunk hydration instead of stitching old a
   const old='Old ☃ instruction\n'.repeat(2000),fresh='New 😀 instruction\n'.repeat(2000);
   data.settings.prompts.launch=old;
   let changed=false;
-  await page.route(url=>url.pathname==='/configs/2'&&Number(url.searchParams.get('offset'))>0,async route=>{
+  await page.route(url=>url.pathname===`/configs/${configId(2)}`&&Number(url.searchParams.get('offset'))>0,async route=>{
     if(!changed) {changed=true;data.settings.prompts.launch=fresh;}
     await route.continue();
   });
@@ -3540,7 +4076,7 @@ test('folder paging reaches every entry and restarts when the listing changes du
 }));
 
 test('bounded log tails load older content, append deltas once and recover from rotation', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Worker',state:'working'}];
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'working'}];
   data.agentLogs[1]=Array.from({length:300},(_,i)=>`Log line ${i}`);
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.waitForFunction(()=>document.querySelector('#agent-detail-status').textContent.startsWith('Live'));
@@ -3560,12 +4096,12 @@ test('bounded log tails load older content, append deltas once and recover from 
 
 test('truncated mutation results expose lossless receipts and receipt failures remain completed actions', async () => fixture(async (page,data) => {
   const warnings=Array.from({length:100},(_,i)=>`Warning ${i}: ${'Detailed reason '.repeat(30)}`);
-  data.launchResult={id:1,result_truncated:true,counts:{warnings:100},warnings:warnings.slice(0,1),receipt_event:7};
+  data.launchResult={id:1,result_truncated:true,counts:{warnings:100},warnings:warnings.slice(0,1),receipt_path:`/p/${projectId(1)}/receipts/7`};
   data.receipts={7:{id:7,details:{response:{id:1,warnings}}}};
   await manualPolling(page); await reloadPage(page); await openLaunch(page); await page.locator('#launch-form [name=task]').fill('Launch once');
   await page.locator('#launch-form button.primary').click(); await page.waitForFunction(()=>!document.querySelector('#launch-dialog').open);
   assert.match(await page.locator('#result-notice').textContent(),/Action completed.*warnings: 100/);
-  await page.locator('#result-notice [data-record=receipts]').click();
+  await page.locator('#result-notice [data-record-path]').click();
   await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('Warning 99:'));
   const receipt=JSON.parse(await page.locator('#record-content').textContent());
   assert.deepEqual(receipt.details.response.warnings,warnings);
@@ -3575,6 +4111,34 @@ test('truncated mutation results expose lossless receipts and receipt failures r
   await page.locator('#launch-form button.primary').click(); await page.waitForFunction(()=>!document.querySelector('#launch-dialog').open);
   assert.match(await page.locator('#result-notice').textContent(),/Action completed.*Inspect current state before retrying/);
   assert.equal(data.requests.filter(r=>r.url==='/agents').length,2,'no automatic mutation retry');
+  assert.ok(data.wireRequests.some(request=>request.url.startsWith(`/p/${projectId(1)}/receipts/7`)),'scoped receipts follow their exact supplied path');
+}));
+
+test('completed-action receipts retain their exact original scope and reject nonlocal or malformed paths',async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await reloadPage(page);
+  const path=`/p/${projectId(1)}/receipts/7`;
+  data.receipts={7:{details:{response:{note:'Original project result'}}}};
+  data.launchResult={id:1,result_truncated:true,counts:{warnings:1},receipt_path:path};
+  const held=await holdRequest(page,url=>url.pathname==='/agents'&&url.searchParams.get('project')===projectId(1));
+  try {
+    await page.evaluate(()=>{window.pendingReceipt=api('/agents',{method:'POST',body:JSON.stringify({task:'Synthetic action'})});});
+    await held.started;
+    await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
+    held.release();await held.remove();await page.evaluate(()=>window.pendingReceipt);
+    assert.equal(await page.locator('#result-notice [data-record-path]').getAttribute('data-record-path'),path);
+    await page.locator('#result-notice [data-record-path]').click();await page.locator('#record-content').filter({hasText:'Original project result'}).waitFor();
+    await page.locator('#record-dialog .dialog-close').click();
+    assert.ok(data.wireRequests.some(request=>request.url.startsWith(path)));
+    assert.equal(data.wireRequests.some(request=>request.url.startsWith(`/p/${projectId(2)}/receipts/7`)),false);
+  } finally {held.release();await held.remove();}
+  for(const receipt_path of ['https://example.invalid/receipts/7','//example.invalid/receipts/7','/receipts/7','/receipts/7?redirect=1','/p/invalid/not-receipts/7',null]) {
+    const handler=route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({result_truncated:true,counts:{warnings:1},receipt_event:7,receipt_path})});
+    await page.route('**/usage/check',handler);
+    await page.evaluate(()=>api('/usage/check',{method:'POST',body:'{}'}));
+    assert.equal(await page.locator('#result-notice [data-record-path]').count(),0);
+    assert.match(await page.locator('#result-notice').textContent(),/Action completed.*Inspect current state before retrying/);
+    await page.unroute('**/usage/check',handler);
+  }
 }));
 
 test('malformed success responses retain the conversation and its cursor until a valid page arrives', async () => fixture(async (page,data) => {
@@ -3685,9 +4249,9 @@ test('rejoining backfills earlier unread messages in order and a failed middle p
 }));
 
 test('Resume is a single agent action without reading or freeing other agents paged locks', async () => fixture(async (page,data) => {
-  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Resume worker',state:'paused'}];
+  data.pageLimit=2; data.agents=[{id:1,project:projectId(1),name:'Resume worker',state:'paused'}];
   const longName='Older active lock ☃ '.repeat(1300);
-  data.locks=Array.from({length:6},(_,i)=>({id:i+1,project:1,name:i===0?longName:`lock${i+1}`,holder:2,about:'Another worker owns this lease',expires_at:Date.now()/1000+60}));
+  data.locks=Array.from({length:6},(_,i)=>({id:i+1,project:projectId(1),name:i===0?longName:`lock${i+1}`,holder:2,about:'Another worker owns this lease',expires_at:Date.now()/1000+60}));
   await manualPolling(page); await reloadPage(page);
   assert.deepEqual(await page.evaluate(()=>state.locks.map(lock=>lock.id)),[6,5]);
   assert.equal(data.getRequests.filter(url=>url.startsWith('/locks?')&&url.includes('before=')).length,0);
@@ -3701,8 +4265,8 @@ test('Resume is a single agent action without reading or freeing other agents pa
 }));
 
 test('Pause retains leases only while verified process cleanup is still stopping and blocks overlapping actions', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Worker',state:'working',locks:['held lease']}];
-  data.locks=[{id:1,project:1,name:'held lease',holder:1,about:'Still being written',expires_at:Date.now()/1000+60}];
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'working',locks:['held lease']}];
+  data.locks=[{id:1,project:projectId(1),name:'held lease',holder:1,about:'Still being written',expires_at:Date.now()/1000+60}];
   data.pauseStopping=true;
   await manualPolling(page); await reloadPage(page);
   await page.locator('[data-action=pause]').click();
@@ -3730,21 +4294,21 @@ test('Pause retains leases only while verified process cleanup is still stopping
 }));
 
 test('explicit Free uses a plain lease and never sends obsolete paused-lock flags', async () => fixture(async (page,data) => {
-  data.locks=[{id:1,project:1,name:'shared',holder:2,holder_name:'Active worker',acquired_at:1,expires_at:Date.now()/1000+60}];
+  data.locks=[{id:1,project:projectId(1),name:'shared',holder:2,holder_name:'Active worker',acquired_at:1,expires_at:Date.now()/1000+60}];
   await manualPolling(page); await reloadPage(page);
   assert.doesNotMatch(await page.locator('#locks').textContent(),/frozen|no TTL/i);
   page.once('dialog',dialog=>dialog.accept());
   await page.locator('[data-action=free-lock]').click();
   await page.waitForFunction(()=>state.locks[0]?.holder===null);
-  assert.deepEqual(data.requests,[{url:'/locks/free',method:'POST',body:{project:1,name:'shared'}}]);
+  assert.deepEqual(data.requests,[{url:'/locks/free',method:'POST',body:{project:projectId(1),name:'shared'}}]);
   await page.evaluate(()=>refresh());
   assert.equal(data.requests.length,1);
 }));
 
 test('stopping lock holders outside the agent page block Free even through selected stale rows and oversized previews', async () => fixture(async (page,data) => {
   data.pageLimit=1;
-  data.agents=[{id:1,project:1,name:'Older holder',state:'paused',stopping:true},{id:2,project:1,name:'Newer worker',state:'working'}];
-  data.locks=[{id:1,project:1,name:'protected',holder:1,expires_at:1}];
+  data.agents=[{id:1,project:projectId(1),name:'Older holder',state:'paused',stopping:true},{id:2,project:projectId(1),name:'Newer worker',state:'working'}];
+  data.locks=[{id:1,project:projectId(1),name:'protected',holder:1,expires_at:1}];
   await manualPolling(page); await reloadPage(page);
   let confirmations=0;
   page.on('dialog',dialog=>{confirmations++;return dialog.accept();});
@@ -3774,8 +4338,8 @@ test('stopping lock holders outside the agent page block Free even through selec
 }));
 
 test('Free reports a holder that started stopping after confirmation without releasing or automatically retrying', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Holder',state:'working'}];
-  data.locks=[{id:1,project:1,name:'racing lease',holder:1,expires_at:Date.now()/1000+60}];
+  data.agents=[{id:1,project:projectId(1),name:'Holder',state:'working'}];
+  data.locks=[{id:1,project:projectId(1),name:'racing lease',holder:1,expires_at:Date.now()/1000+60}];
   await manualPolling(page); await reloadPage(page);
   const held=await holdRequest(page,'**/locks/free');
   page.once('dialog',dialog=>dialog.accept());
@@ -3784,30 +4348,30 @@ test('Free reports a holder that started stopping after confirmation without rel
   held.release(); await held.remove();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Lock holder is still stopping');
   assert.equal(data.locks[0].holder,1);
-  assert.deepEqual(data.requests,[{url:'/locks/free',method:'POST',body:{project:1,name:'racing lease'}}]);
+  assert.deepEqual(data.requests,[{url:'/locks/free',method:'POST',body:{project:projectId(1),name:'racing lease'}}]);
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('[data-action=free-lock]').isDisabled(),true);
   assert.equal(data.requests.length,1);
 }));
 
 test('Pause is a single empty-payload action, preserves the current project after a delayed response and never retries errors', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'First worker',state:'working',locks:['first hold']},{id:2,project:2,name:'Other worker',state:'working',locks:['other hold']}];
-  data.locks=[{id:1,project:1,name:'first hold',holder:1},{id:2,project:2,name:'other hold',holder:2}];
+  data.agents=[{id:1,project:projectId(1),name:'First worker',state:'working',locks:['first hold']},{id:2,project:projectId(2),name:'Other worker',state:'working',locks:['other hold']}];
+  data.locks=[{id:1,project:projectId(1),name:'first hold',holder:1},{id:2,project:projectId(2),name:'other hold',holder:2}];
   await manualPolling(page); await reloadPage(page);
   const held=await holdRequest(page,'**/agents/1/pause');
   await page.locator('[data-action=pause]').click(); await held.started;
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('[data-action=pause]').isDisabled(),true);
   await page.evaluate(()=>document.querySelector('[data-action=pause]').click());
-  await page.locator('#project-select').selectOption('2');
+  await page.locator('#project-select').selectOption(projectId(2));
   held.release(); await held.remove();
-  await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0&&agentTransitions.size===0);
+  await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0&&agentTransitions.size===0);
   assert.deepEqual(data.requests,[{url:'/agents/1/pause',method:'POST',body:{}}]);
   assert.deepEqual(data.locks.map(lock=>lock.holder),[null,2]);
   assert.equal(data.agents[1].state,'working');
   assert.equal(data.detailRequests.length,0,'Pause no longer fetches holds before a choice');
   data.agents[0].state='working'; data.pauseError='Stop cleanup unavailable';
-  await page.locator('#project-select').selectOption('1'); await page.waitForFunction(()=>state.selectedProject===1&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(1)); await page.waitForFunction(()=>state.selectedProject===projectId(1)&&refreshPending===0);
   await page.locator('[data-action=pause]').click(); await page.waitForFunction(()=>document.querySelector('#toast').textContent==='Stop cleanup unavailable');
   await page.evaluate(()=>refresh());
   assert.equal(data.requests.filter(request=>request.url==='/agents/1/pause').length,2,'one explicit retry is not repeated automatically');
@@ -3815,8 +4379,8 @@ test('Pause is a single empty-payload action, preserves the current project afte
 }));
 
 test('Pause all confirms stop-and-release scope, can be cancelled and stays single-flight through polling', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Working',state:'working'},{id:2,project:2,name:'Idle elsewhere',state:'idle'},{id:3,project:1,name:'Already paused',state:'paused',pause_reason:'user'}];
-  data.locks=[{id:1,project:1,name:'first',holder:1},{id:2,project:2,name:'second',holder:2}];
+  data.agents=[{id:1,project:projectId(1),name:'Working',state:'working'},{id:2,project:projectId(2),name:'Idle elsewhere',state:'idle'},{id:3,project:projectId(1),name:'Already paused',state:'paused',pause_reason:'user'}];
+  data.locks=[{id:1,project:projectId(1),name:'first',holder:1},{id:2,project:projectId(2),name:'second',holder:2}];
   await manualPolling(page); await reloadPage(page);
   await openGlobalActions(page);
   const confirmations=[];
@@ -3845,7 +4409,7 @@ test('Pause all confirms stop-and-release scope, can be cancelled and stays sing
 }));
 
 test('bounded stopping previews keep cleanup visible and Details available without restart actions', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Huge worker name '.repeat(2500),state:'paused',pause_reason:'user',stopping:true}];
+  data.agents=[{id:1,project:projectId(1),name:'Huge worker name '.repeat(2500),state:'paused',pause_reason:'user',stopping:true}];
   await manualPolling(page); await reloadPage(page);
   assert.equal(await page.locator('[data-action=resume],[data-action=close]').count(),0);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Stopping.*before releasing locks/s);
@@ -3856,7 +4420,7 @@ test('bounded stopping previews keep cleanup visible and Details available witho
 }));
 
 test('explicit Details hydration restores the action controls of an oversized agent preview without replacing config drafts', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Large agent name ☃ '.repeat(1500),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',task:'Full task',locks:[],token_usage_state:'partial',total_tokens:123,fresh_in:100,cache_write:0,cache_read:20,output:3}];
+  data.agents=[{id:1,project:projectId(1),name:'Large agent name ☃ '.repeat(1500),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',task:'Full task',locks:[],token_usage_state:'partial',total_tokens:123,fresh_in:100,cache_write:0,cache_read:20,output:3}];
   await manualPolling(page); await reloadPage(page);
   assert.equal(await page.locator('[data-action=pause]').count(),0);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Total tokens: 123.*Partial \(incomplete\)/,'a bounded stub uses its explicit total and completeness status');
@@ -3876,15 +4440,15 @@ test('explicit Details hydration restores the action controls of an oversized ag
 test('oversized selector previews retain unique ID labels and hydrate only the chosen config or project', async () => fixture(async (page,data) => {
   const large='Long preview ☃ '.repeat(1800);
   const custom=settings(); custom.prompts.launch=large;
-  data.configs.push({id:3,name:'Large config',settings:custom});
-  data.projects.push({id:3,name:large,path:'/projects/large',config:2});
-  data.agents=[{id:1,project:1,name:large,state:'working',harness:'codex',model:'gpt-6.1-sol'}];
+  data.configs.push({id:configId(3),name:'Large config',settings:custom});
+  data.projects.push({id:projectId(3),name:large,path:'/projects/large',config:configId(2)});
+  data.agents=[{id:1,project:projectId(1),name:large,state:'working',harness:'codex',model:'gpt-6.1-sol'}];
   await manualPolling(page); await reloadPage(page);
-  assert.match(await page.locator('#project-select option[value="3"]').textContent(),/^Project #3/);
-  assert.equal(data.getRequests.filter(url=>url.startsWith('/projects/3')||url.startsWith('/configs/3')).length,0);
+  assert.equal(await page.locator(`#project-select option[value="${projectId(3)}"]`).textContent(),`Project #${projectId(3)}`);
+  assert.equal(data.getRequests.filter(url=>url.startsWith(`/projects/${projectId(3)}`)||url.startsWith(`/configs/${configId(3)}`)).length,0);
   await page.locator('[data-page=settings]').click();
-  assert.equal(await page.locator('#config-select option[value="3"]').textContent(),'Config #3');
-  await page.locator('#config-select').selectOption('3'); await page.waitForFunction(()=>state.editor.config===3);
+  assert.equal(await page.locator(`#config-select option[value="${configId(3)}"]`).textContent(),`Config #${configId(3)}`);
+  await page.locator('#config-select').selectOption(configId(3)); await page.waitForFunction(()=>state.editor.config===configId(3));
   assert.equal(await page.locator('[name=config_name]').inputValue(),'Large config');
   assert.equal(await page.locator('[name=prompt_launch]').inputValue(),large);
   await page.locator('[data-page=threads]').click(); await page.locator('[data-open=thread-dialog]').click();
@@ -3892,14 +4456,14 @@ test('oversized selector previews retain unique ID labels and hydrate only the c
   assert.doesNotMatch(await page.locator('#thread-member-picker').textContent(),/undefined/);
   await page.locator('#thread-dialog [data-close=thread-dialog]:not(.dialog-close)').click();
   page.once('dialog',dialog=>dialog.accept());
-  await page.locator('#project-select').selectOption('3');
-  await page.waitForFunction(()=>state.selectedProject===3&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(3));
+  await page.waitForFunction(()=>state.selectedProject===projectId(3)&&refreshPending===0);
   assert.equal(await page.locator('#project-path').textContent(),'/projects/large');
-  assert.ok(data.getRequests.some(url=>url.startsWith('/projects/3?offset=')||url.startsWith('/overview?project=3&offset=')));
+  assert.ok(data.getRequests.some(url=>url.startsWith(`/projects/${projectId(3)}?offset=`)||url.startsWith(`/overview?project=${projectId(3)}&offset=`)));
 }));
 
 test('Overview exposes a pending replacement, preserves selected text and permanently links the committed successor', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Original worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:null}}];
+  data.agents=[{id:1,project:projectId(1),name:'Original worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:null}}];
   await manualPolling(page); await reloadPage(page);
   const source=page.locator('[data-agent="1"]');
   assert.match(await source.textContent(),/Replacement pending.*claude \/ claude-sonnet-5-5.*current turn exits/s);
@@ -3914,7 +4478,7 @@ test('Overview exposes a pending replacement, preserves selected text and perman
   await page.waitForFunction(()=>document.querySelector('[data-agent="1"]').textContent.includes('Target limit <waiting> & retry later'));
   assert.equal(await source.locator('waiting').count(),0);
   Object.assign(data.agents[0],{state:'replaced',replacement_request:null,replacement:2});
-  data.agents.push({id:2,project:1,name:'New owner',state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'high',replacement_start:{predecessor:1,blocked:'Hard target limit',attempted:0},wake_queued_at:1,wake_reason:'Ordinary wake reason'});
+  data.agents.push({id:2,project:projectId(1),name:'New owner',state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'high',replacement_start:{predecessor:1,blocked:'Hard target limit',attempted:0},wake_queued_at:1,wake_reason:'Ordinary wake reason'});
   await page.evaluate(()=>refresh());
   assert.doesNotMatch(await source.textContent(),/Replacement pending/);
   assert.equal(await source.locator('[data-action=details][data-id="2"]').textContent(),'Replacement agent #2');
@@ -3932,7 +4496,7 @@ test('Overview exposes a pending replacement, preserves selected text and perman
 }));
 
 test('pending first startup uses replacement-specific suspended actions and allows configuration but not continuation', async () => fixture(async (page,data) => {
-  data.agents=[{id:2,project:1,name:'Waiting successor',state:'done',harness:'codex',model:'gpt-6.1-sol',effort:'medium',pause_reason:'limit',wake_queued_at:1,wake_reason:'Do not show normal wake',replacement_pending:false,replacement_start_pending:true,replacement_start:{predecessor:1,blocked:'Usage <hard> limit',attempted:0}}];
+  data.agents=[{id:2,project:projectId(1),name:'Waiting successor',state:'done',harness:'codex',model:'gpt-6.1-sol',effort:'medium',pause_reason:'limit',wake_queued_at:1,wake_reason:'Do not show normal wake',replacement_pending:false,replacement_start_pending:true,replacement_start:{predecessor:1,blocked:'Usage <hard> limit',attempted:0}}];
   await manualPolling(page); await reloadPage(page);
   const target=page.locator('[data-agent="2"]');
   assert.equal(await target.locator('[data-action=pause]').textContent(),'Pause replacement');
@@ -3973,9 +4537,9 @@ test('pending first startup uses replacement-specific suspended actions and allo
 test('bounded agent stubs retain replacement badges and links and Details hydrates the startup reason', async () => fixture(async (page,data) => {
   const large='Large preview name ☃ '.repeat(1500);
   data.agents=[
-    {id:1,project:1,name:large,state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:'Pending target reason'}},
-    {id:2,project:1,name:large,state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'high',replacement_start:{predecessor:3,blocked:'Exact <first start> reason',attempted:0}},
-    {id:3,project:1,name:large,state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement:2},
+    {id:1,project:projectId(1),name:large,state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement_request:{harness:'claude',model:'claude-sonnet-5-5',blocked:'Pending target reason'}},
+    {id:2,project:projectId(1),name:large,state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'high',replacement_start:{predecessor:3,blocked:'Exact <first start> reason',attempted:0}},
+    {id:3,project:projectId(1),name:large,state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'high',replacement:2},
   ];
   await manualPolling(page); await reloadPage(page);
   while(await page.locator('#page-overview [data-more=agentBrowser]').isVisible()) {await page.locator('#page-overview [data-more=agentBrowser]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending);}
@@ -3993,7 +4557,7 @@ test('bounded agent stubs retain replacement badges and links and Details hydrat
 }));
 
 test('a pending source replacement locks configuration without discarding drafts and cancellation restores editing', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Original worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},{id:2,project:1,name:'Other worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents=[{id:1,project:projectId(1),name:'Original worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},{id:2,project:projectId(1),name:'Other worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-agent="1"] [data-action=details][data-id="1"]').click();
   await page.locator('#save-agent-config').waitFor();
   const model=page.locator('#agent-config [name=agent_model]');
@@ -4035,12 +4599,12 @@ test('a pending source replacement locks configuration without discarding drafts
 test('Resume restart-paused uses an exact all-project count and leaves manual and limit pauses unchanged', async () => fixture(async (page,data) => {
   data.pageLimit=1;
   data.agents=[
-    {id:1,project:1,name:'Manual pause',state:'paused',pause_reason:'user'},
-    {id:2,project:1,name:'Usage pause',state:'paused',pause_reason:'limit'},
-    {id:3,project:2,name:'Restart one',state:'paused',pause_reason:'restart'},
-    {id:4,project:2,name:'Restart two',state:'paused',pause_reason:'restart'},
-    {id:5,project:1,name:'Already crashed',state:'crashed',pause_reason:'restart'},
-    {id:6,project:1,name:'Already done',state:'done',pause_reason:'restart'},
+    {id:1,project:projectId(1),name:'Manual pause',state:'paused',pause_reason:'user'},
+    {id:2,project:projectId(1),name:'Usage pause',state:'paused',pause_reason:'limit'},
+    {id:3,project:projectId(2),name:'Restart one',state:'paused',pause_reason:'restart'},
+    {id:4,project:projectId(2),name:'Restart two',state:'paused',pause_reason:'restart'},
+    {id:5,project:projectId(1),name:'Already crashed',state:'crashed',pause_reason:'restart'},
+    {id:6,project:projectId(1),name:'Already done',state:'done',pause_reason:'restart'},
   ];
   await manualPolling(page); await reloadPage(page);
   await openGlobalActions(page);
@@ -4055,12 +4619,12 @@ test('Resume restart-paused uses an exact all-project count and leaves manual an
   assert.deepEqual(data.agents.map(a=>[a.id,a.state,a.pause_reason]),[[1,'paused','user'],[2,'paused','limit'],[3,'working',null],[4,'working',null],[5,'crashed','restart'],[6,'done','restart']]);
   assert.equal(await button.textContent(),'Resume restart-paused (0 · all projects)');
   assert.equal(await button.isDisabled(),true);
-  assert.equal(await page.locator('#project-select').inputValue(),'1','global resume does not change the selected project');
+  assert.equal(await page.locator('#project-select').inputValue(),projectId(1),'global resume does not change the selected project');
   assert.equal(await page.locator('#resume-all').textContent(),'Resume all (2 · all projects)');
 }));
 
 test('restart-paused counts refresh across projects without disturbing selected text and disable an empty action', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Selected manual pause',state:'paused',pause_reason:'user'},{id:2,project:2,name:'Other project restart',state:'paused',pause_reason:'restart'}];
+  data.agents=[{id:1,project:projectId(1),name:'Selected manual pause',state:'paused',pause_reason:'user'},{id:2,project:projectId(2),name:'Other project restart',state:'paused',pause_reason:'restart'}];
   await manualPolling(page); await reloadPage(page);
   const selected=await selectText(page,'[data-agent="1"] .agent-name span');
   data.agents[1].pause_reason='limit'; await page.evaluate(()=>refresh());
@@ -4084,7 +4648,7 @@ test('restart-paused counts refresh across projects without disturbing selected 
 }));
 
 test('restart-paused resume stays disabled during polling and reports request errors without retrying', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Restart pause',state:'paused',pause_reason:'restart'}];
+  data.agents=[{id:1,project:projectId(1),name:'Restart pause',state:'paused',pause_reason:'restart'}];
   data.resumeRestartError='Cannot resume restart-paused agents';
   await manualPolling(page); await reloadPage(page);
   await openGlobalActions(page);
@@ -4104,14 +4668,14 @@ test('restart-paused resume stays disabled during polling and reports request er
 }));
 
 test('restart-paused resume exposes partial failures and warnings while retaining unsuccessful agents', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Restart success',state:'paused',pause_reason:'restart'},{id:2,project:2,name:'Restart blocked',state:'paused',pause_reason:'restart'},{id:3,project:1,name:'Manual pause',state:'paused',pause_reason:'user'}];
+  data.agents=[{id:1,project:projectId(1),name:'Restart success',state:'paused',pause_reason:'restart'},{id:2,project:projectId(2),name:'Restart blocked',state:'paused',pause_reason:'restart'},{id:3,project:projectId(1),name:'Manual pause',state:'paused',pause_reason:'user'}];
   data.resumeRestartWarnings=['Agent 1 is waiting for an active slot'];
   data.resumeRestartFailures={2:'Agent 2: requested model is disabled'};
   await manualPolling(page); await reloadPage(page);
   await openGlobalActions(page);
   await page.locator('#resume-restart').click();
   await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Agent 2: requested model is disabled'));
-  assert.equal(await page.locator('#toast').textContent(),'Resumed 1 restart-paused agents across all projects.\nAgent 1 is waiting for an active slot\nAgent 2: requested model is disabled');
+  assert.equal(await page.locator('#toast').textContent(),`Resumed 1 restart-paused agents across all projects. 1 error.\nProject “example” (#${projectId(1)}): Agent 1 is waiting for an active slot\nProject “other” (#${projectId(2)}): Agent 2: requested model is disabled`);
   assert.equal(await page.locator('#toast').evaluate(el=>el.classList.contains('error')),true);
   assert.deepEqual(data.agents.map(a=>[a.state,a.pause_reason]),[['working',null],['paused','restart'],['paused','user']]);
   assert.equal(await page.locator('#restart-paused-count').textContent(),'(1 · all projects)');
@@ -4120,38 +4684,56 @@ test('restart-paused resume exposes partial failures and warnings while retainin
 }));
 
 test('truncated restart-paused results report full failure counts even when the error sample is empty', async () => fixture(async (page,data) => {
-  data.agents=[1,2,3].map(id=>({id,project:1,name:`Restart ${id}`,state:'paused',pause_reason:'restart'}));
+  data.agents=[1,2,3].map(id=>({id,project:projectId(1),name:`Restart ${id}`,state:'paused',pause_reason:'restart'}));
   const error='Agent 3: disabled model '.repeat(100);
   data.resumeRestartFailures={3:error};
-  data.resumeRestartResult={result_truncated:true,counts:{ids:2,errors:1,warnings:0},ids:[1],errors:[],warnings:[],receipt_event:11};
+  data.resumeRestartResult={result_truncated:true,counts:{ids:2,errors:1,warnings:0},ids:[1],errors:[],warnings:[],receipt_path:'/global-receipts/11'};
   data.receipts={11:{details:{response:{ids:[1,2],errors:[error],warnings:[]}}}};
   await manualPolling(page); await reloadPage(page);
   await openGlobalActions(page);
   await page.locator('#resume-restart').click();
-  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('2 resumed, 1 failed'));
-  assert.equal(await page.locator('#toast').textContent(),'Restart-paused agents across all projects: 2 resumed, 1 failed. See the completed-action result below.');
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('2 resumed, 1 error'));
+  assert.equal(await page.locator('#toast').textContent(),'Restart-paused agents across all projects: 2 resumed, 1 error. See the completed-action result below.');
   assert.equal(await page.locator('#toast').evaluate(el=>el.classList.contains('error')),true);
   assert.match(await page.locator('#result-notice').textContent(),/ids: 2.*errors: 1.*Result details/);
-  await page.locator('#result-notice [data-record=receipts]').click();
+  await page.locator('#result-notice [data-record-path]').click();
   await page.waitForFunction(()=>document.querySelector('#record-content').textContent.includes('Agent 3: disabled model'));
   assert.deepEqual(JSON.parse(await page.locator('#record-content').textContent()).details.response.errors,[error]);
+  assert.ok(data.wireRequests.some(request=>request.url.startsWith('/global-receipts/11')),'global receipts are never inferred from the selected project');
   await page.locator('#record-dialog').getByRole('button',{name:'Close',exact:true}).click();
   await page.evaluate(()=>refresh());
   assert.equal(data.requests.filter(r=>r.url==='/resume-restart').length,1,'reading the receipt and polling do not repeat a partially completed action');
   assert.deepEqual(data.agents.map(a=>a.state),['working','working','paused']);
 }));
 
+test('every bulk action reports project-qualified nested issues and top-level project failures truthfully',async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await reloadPage(page);
+  for(const [button,resultKey,initial]of [['pause-all','pauseAllResult','idle'],['resume-all','resumeAllResult','paused'],['resume-restart','resumeRestartResult','paused']]) {
+    data.agents=[{id:1,project:projectId(1),name:'Worker',state:initial,pause_reason:'restart'}];
+    data[resultKey]={results:[{project:projectId(1),ids:[1],warnings:['Waiting for a slot'],errors:['One agent could not start']}],errors:[{project:projectId(2),status:503,error:'Project unavailable'}],counts:{ids:1,warnings:1,errors:2}};
+    await page.evaluate(()=>refresh());await openGlobalActions(page);const before=data.requests.length;
+    await page.locator(`#${button}`).click();await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
+    const text=await page.locator('#toast').textContent();
+    assert.match(text,/1 .*agents across all projects\. 2 errors\./);
+    assert.ok(text.includes(`Project “example” (#${projectId(1)}): Waiting for a slot`));
+    assert.ok(text.includes(`Project “example” (#${projectId(1)}): One agent could not start`));
+    assert.ok(text.includes(`Project “other” (#${projectId(2)}): Project unavailable`));
+    assert.doesNotMatch(text,/\[object Object\]/);assert.equal(await page.locator('#toast').evaluate(node=>node.classList.contains('error')),true);
+    await page.evaluate(()=>refresh());assert.equal(data.requests.length,before+1,'partial outcomes are not retried');
+  }
+}));
+
 test('workspace agent search combines with accessible state filters and preserves the query through polling', async () => fixture(async (page,data) => {
   data.agents=[
-    {id:1,project:1,name:'Alpha review',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
-    {id:2,project:1,name:'Beta review',state:'paused',harness:'codex',model:'gpt-6.1-sol',effort:'high',pause_reason:'user'},
-    {id:3,project:1,name:'Review complete',state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'medium'},
-    {id:4,project:1,name:'Available worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},
-    {id:5,project:1,name:'Broken worker',state:'crashed',harness:'claude',model:'claude-sonnet-5-5',effort:'medium'},
-    {id:6,project:1,name:'Waiting replacement',state:'done',harness:'codex',model:'gpt-6.1-sol',effort:'medium',replacement_start:{predecessor:3,blocked:'Capacity is full',attempted:0}},
-    {id:7,project:1,name:'Stopping worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',stopping:true},
-    {id:8,project:1,name:'Closed worker',state:'closed',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},
-    {id:9,project:1,name:'Replaced worker',state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'medium',replacement:6},
+    {id:1,project:projectId(1),name:'Alpha review',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'high'},
+    {id:2,project:projectId(1),name:'Beta review',state:'paused',harness:'codex',model:'gpt-6.1-sol',effort:'high',pause_reason:'user'},
+    {id:3,project:projectId(1),name:'Review complete',state:'done',harness:'claude',model:'claude-sonnet-5-5',effort:'medium'},
+    {id:4,project:projectId(1),name:'Available worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},
+    {id:5,project:projectId(1),name:'Broken worker',state:'crashed',harness:'claude',model:'claude-sonnet-5-5',effort:'medium'},
+    {id:6,project:projectId(1),name:'Waiting replacement',state:'done',harness:'codex',model:'gpt-6.1-sol',effort:'medium',replacement_start:{predecessor:3,blocked:'Capacity is full',attempted:0}},
+    {id:7,project:projectId(1),name:'Stopping worker',state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',stopping:true},
+    {id:8,project:projectId(1),name:'Closed worker',state:'closed',harness:'codex',model:'gpt-6.1-sol',effort:'medium'},
+    {id:9,project:projectId(1),name:'Replaced worker',state:'replaced',harness:'codex',model:'gpt-6.1-sol',effort:'medium',replacement:6},
   ];
   await manualPolling(page); await reloadPage(page);
   const ids=()=>page.locator('#agents [data-agent]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.agent)).sort((a,b)=>a-b));
@@ -4192,7 +4774,7 @@ test('workspace agent search combines with accessible state filters and preserve
 
 test('server facets and search include off-page agents and full tasks while pickers keep their unfiltered scope', async () => fixture(async (page,data) => {
   data.pageLimit=1;
-  data.agents=Array.from({length:30},(_,i)=>({id:i+1,project:1,name:`Worker ${i+1}`,state:'closed'}));
+  data.agents=Array.from({length:30},(_,i)=>({id:i+1,project:projectId(1),name:`Worker ${i+1}`,state:'closed'}));
   for(const [id,state] of [[1,'working'],[2,'idle'],[3,'paused'],[4,'crashed'],[5,'done'],[6,'replaced'],[8,'working'],[9,'idle'],[10,'done']])data.agents[id-1].state=state;
   data.agents[0].task='Earlier task content. '.repeat(30)+'Deep NeedLe%_ result';
   data.agents[7].stopping=true; data.agents[8].wake_queued_at=1;
@@ -4220,13 +4802,13 @@ test('server facets and search include off-page agents and full tasks while pick
 }));
 
 test('debounced searches discard old pages after query and project switches without fetching every agent', async () => fixture(async (page,data) => {
-  data.pageLimit=1; data.agents=[{id:1,project:1,name:'Old target',state:'idle'},{id:2,project:1,name:'New target',state:'idle'},{id:3,project:2,name:'New elsewhere',state:'idle'}];
+  data.pageLimit=1; data.agents=[{id:1,project:projectId(1),name:'Old target',state:'idle'},{id:2,project:projectId(1),name:'New target',state:'idle'},{id:3,project:projectId(2),name:'New elsewhere',state:'idle'}];
   await manualPolling(page); await reloadPage(page);
   const pending=await holdRequest(page,url=>url.pathname==='/agents'&&url.searchParams.get('search')==='old','GET');
   await page.locator('#agent-search').fill('o'); await page.locator('#agent-search').fill('ol'); await page.locator('#agent-search').fill('old'); await pending.started;
   await page.locator('#agent-search').fill('new');
   await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===2&&!state.pages.agentBrowser.pending);
-  await page.locator('#project-select').selectOption('2'); await page.locator('#agents [data-agent="3"]').waitFor();
+  await page.locator('#project-select').selectOption(projectId(2)); await page.locator('#agents [data-agent="3"]').waitFor();
   pending.release(); await pending.remove(); await page.waitForTimeout(100);
   assert.deepEqual(await page.locator('#agents [data-agent]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.agent))),[3]);
   assert.equal(await page.locator('#agent-search').inputValue(),'new');
@@ -4239,7 +4821,7 @@ test('debounced searches discard old pages after query and project switches with
 
 test('server-classified oversized agents stay in filtered results and expose waiting without eager detail hydration', async () => fixture(async (page,data) => {
   const now=Math.floor(Date.now()/1000);
-  data.agents=[{id:1,project:1,name:'Large queued '.repeat(1800),state:'idle',wake_queued_at:1},{id:2,project:1,name:'Large waiting '.repeat(1800),state:'working',waiting:{started_at:now,expires_at:now+30,remaining_secs:30,agents:'all',states:['idle'],status_text:true}}];
+  data.agents=[{id:1,project:projectId(1),name:'Large queued '.repeat(1800),state:'idle',wake_queued_at:1},{id:2,project:projectId(1),name:'Large waiting '.repeat(1800),state:'working',waiting:{started_at:now,expires_at:now+30,remaining_secs:30,agents:'all',states:['idle'],status_text:true}}];
   await manualPolling(page); await reloadPage(page);
   assert.match(await page.locator('#agents [data-agent="2"]').textContent(),/Waiting for notifications.*See Details/);
   assert.equal(data.detailRequests.length,0);
@@ -4254,7 +4836,7 @@ test('server-classified oversized agents stay in filtered results and expose wai
 }));
 
 test('notification waits retain working state and use a monotonic selection-safe countdown', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Watching',state:'working',waiting:{started_at:100,expires_at:200,remaining_secs:5,agents:[2],states:['idle','crashed'],status_text:true,usage:{provider:'claude',window:'five_hour',condition:'below',percent:80}}},{id:2,project:1,name:'Watched',state:'closed'}];
+  data.agents=[{id:1,project:projectId(1),name:'Watching',state:'working',waiting:{started_at:100,expires_at:200,remaining_secs:5,agents:[2],states:['idle','crashed'],status_text:true,usage:{provider:'claude',window:'five_hour',condition:'below',percent:80}}},{id:2,project:projectId(1),name:'Watched',state:'closed'}];
   await manualPolling(page); await reloadPage(page);
   const wait=page.locator('#agents [data-agent="1"] .agent-wait');
   assert.match(await wait.textContent(),/5s left.*agents #2.*states: idle, crashed.*status changes/);
@@ -4281,9 +4863,9 @@ test('notification waits retain working state and use a monotonic selection-safe
 
 test('slow chunked waiting details stay version-stable and calibrate their timeout from HTTP Date rather than the browser clock', async () => fixture(async (page,data) => {
   const now=Math.floor(Date.now()/1000);
-  data.agents=[{id:1,project:1,name:'Oversized waiting agent '.repeat(2000),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',waiting:{started_at:now,expires_at:now+30,remaining_secs:30,agents:'all',states:['idle'],status_text:true}}];
+  data.agents=[{id:1,project:projectId(1),name:'Oversized waiting agent '.repeat(2000),state:'working',harness:'codex',model:'gpt-6.1-sol',effort:'medium',waiting:{started_at:now,expires_at:now+30,remaining_secs:30,agents:'all',states:['idle'],status_text:true}}];
   await manualPolling(page); await page.addInitScript(()=>{const original=Date.now;Date.now=()=>original()+864000000;}); await reloadPage(page);
-  assert.equal(await page.evaluate(()=>waitingClocks.has(1)),false,'the bounded list preview carries only is_waiting');
+  assert.equal(await page.evaluate(()=>waitingClocks.has(localKey(1))),false,'the bounded list preview carries only is_waiting');
   const pending=await holdRequest(page,url=>url.pathname==='/agents/1'&&url.searchParams.get('offset')==='0','GET');
   await page.locator('[data-action=details]').click(); await pending.started;
   data.agents[0].waiting.remaining_secs=28; await page.waitForTimeout(1100);
@@ -4291,14 +4873,14 @@ test('slow chunked waiting details stay version-stable and calibrate their timeo
   await page.waitForFunction(()=>document.querySelector('#agent-details dd [data-wait-agent="1"]'));
   const text=await page.locator('#agent-details dd [data-wait-agent="1"]').textContent(), remaining=Number.parseInt(text,10);
   assert.ok(remaining>10&&remaining<=30,`server-calibrated timeout, got ${text}`);
-  assert.equal(await page.evaluate(()=>waitingClocks.get(1).waiting.remaining_secs),undefined,'chunkable details contain only stable absolute fields');
-  assert.equal(data.detailRequests.filter(url=>url==='/agents/1').length,1,'there was no version-change restart');
+  assert.equal(await page.evaluate(()=>waitingClocks.get(localKey(1)).waiting.remaining_secs),undefined,'chunkable details contain only stable absolute fields');
+  assert.equal(data.detailRequests.filter(url=>new URL(url,'http://test').pathname==='/agents/1'&&!new URL(url,'http://test').searchParams.has('offset')).length,1,'there was no version-change restart');
   assert.ok(data.detailRequests.some(url=>url.startsWith('/agents/1?offset=')));
   assert.equal(data.requests.length,0);
 }));
 
 test('typed log timestamps render locally while raw bytes, multiline chunks and selections remain intact', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Logged',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Logged',state:'idle'}];
   data.agentLogs[1]=Array.from({length:30},(_,i)=>`[2026-10-15T12:34:${String(i).padStart(2,'0')}Z] [${i%2?'tool':'message'}] Entry ${i} ${'☃ text '.repeat(130)}\nContinuation ${i}`);
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click(); await page.locator('#agent-log').filter({hasText:'Entry 29'}).waitFor();
   while(await page.locator('#log-older').isVisible()) {await page.locator('#log-older').click();await page.waitForFunction(()=>!logLoading&&!document.querySelector('#log-older').disabled);}
@@ -4319,7 +4901,7 @@ test('typed log timestamps render locally while raw bytes, multiline chunks and 
 
 test('current-project bulk counts ignore search and paging, reset on project switches, and disable unknown or zero totals', async () => fixture(async (page,data) => {
   data.pageLimit=1;
-  data.agents=[{id:1,project:1,state:'working'},{id:2,project:1,state:'done'},{id:3,project:1,state:'paused',pause_reason:'restart'},{id:4,project:1,state:'paused',pause_reason:'user'},{id:5,project:2,state:'idle'},{id:6,project:2,state:'paused',pause_reason:'limit'}];
+  data.agents=[{id:1,project:projectId(1),state:'working'},{id:2,project:projectId(1),state:'done'},{id:3,project:projectId(1),state:'paused',pause_reason:'restart'},{id:4,project:projectId(1),state:'paused',pause_reason:'user'},{id:5,project:projectId(2),state:'idle'},{id:6,project:projectId(2),state:'paused',pause_reason:'limit'}];
   await manualPolling(page); await reloadPage(page);
   assert.equal(await page.locator('#system-menu').evaluate(menu=>menu.open),false,'global controls start collapsed');
   assert.equal(await page.locator('#pause-all').isVisible(),false);
@@ -4329,20 +4911,20 @@ test('current-project bulk counts ignore search and paging, reset on project swi
   await page.locator('#agent-search').fill('no matching agents');
   await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser?.pending);
   assert.deepEqual(await counts(),['(2)','(2)','(1)'],'bulk eligibility is not the loaded or searched agent count');
-  const pending=await holdRequest(page,'**/overview?project=2*','GET');
-  await page.locator('#project-select').selectOption('2'); await pending.started;
+  const pending=await holdRequest(page,`**/overview?project=${projectId(2)}*`,'GET');
+  await page.locator('#project-select').selectOption(projectId(2)); await pending.started;
   for(const id of ['pause-project','resume-project','resume-project-restart'])assert.equal(await page.locator(`#${id}`).isDisabled(),true);
   assert.deepEqual(await counts(),['(checking)','(checking)','(checking)']);
   await page.locator('#pause-project').dispatchEvent('click');
   pending.release(); await pending.remove();
-  await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
   assert.deepEqual(await counts(),['(1)','(1)','(0)']);
   assert.equal(await page.locator('#resume-project-restart').isDisabled(),true);
-  assert.equal(await page.locator('#pause-project').getAttribute('title'),'Project “other” (#2) only');
+  assert.equal(await page.locator('#pause-project').getAttribute('title'),`Project “other” (#${projectId(2)}) only`);
   data.unknownProjectCounts=true; await page.evaluate(()=>refresh());
   assert.deepEqual(await counts(),['(checking)','(checking)','(checking)']);
   for(const id of ['pause-project','resume-project','resume-project-restart']) {assert.equal(await page.locator(`#${id}`).isDisabled(),true);await page.locator(`#${id}`).dispatchEvent('click');}
-  data.unknownProjectCounts=false; data.agents.filter(a=>a.project===2).forEach(a=>a.state='closed'); await page.evaluate(()=>refresh());
+  data.unknownProjectCounts=false; data.agents.filter(a=>a.project===projectId(2)).forEach(a=>a.state='closed'); await page.evaluate(()=>refresh());
   assert.deepEqual(await counts(),['(0)','(0)','(0)']);
   assert.equal(await page.locator('#pause-project').isDisabled(),true);
   assert.equal(await page.locator('#resume-project').isDisabled(),true);
@@ -4360,8 +4942,8 @@ test('current-project bulk counts ignore search and paging, reset on project swi
 }));
 
 test('current-project Pause, Resume and restart-only Resume confirm their project and never affect other projects', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'working'},{id:2,project:2,state:'idle'},{id:3,project:1,state:'done'},{id:4,project:1,state:'paused',pause_reason:'restart'},{id:5,project:1,state:'paused',pause_reason:'user'},{id:6,project:2,state:'paused',pause_reason:'restart'}];
-  data.locks=[{id:1,project:1,name:'mine',holder:1},{id:2,project:2,name:'elsewhere',holder:2}];
+  data.agents=[{id:1,project:projectId(1),state:'working'},{id:2,project:projectId(2),state:'idle'},{id:3,project:projectId(1),state:'done'},{id:4,project:projectId(1),state:'paused',pause_reason:'restart'},{id:5,project:projectId(1),state:'paused',pause_reason:'user'},{id:6,project:projectId(2),state:'paused',pause_reason:'restart'}];
+  data.locks=[{id:1,project:projectId(1),name:'mine',holder:1},{id:2,project:projectId(2),name:'elsewhere',holder:2}];
   await manualPolling(page); await reloadPage(page);
   const confirmations=[];
   page.on('dialog',dialog=>{confirmations.push(dialog.message());return confirmations.length===1?dialog.dismiss():dialog.accept();});
@@ -4375,23 +4957,23 @@ test('current-project Pause, Resume and restart-only Resume confirm their projec
   await page.locator('#resume-project-restart').click();
   await page.waitForFunction(()=>!bulkAction&&state.projectActions.restart_paused===0);
   assert.deepEqual(data.agents.map(a=>a.state),['paused','idle','paused','working','paused','paused']);
-  assert.equal(await page.locator('#toast').textContent(),'Resumed 1 restart-paused agents in project “example” (#1).');
+  assert.equal(await page.locator('#toast').textContent(),`Resumed 1 restart-paused agents in project “example” (#${projectId(1)}).`);
   await page.locator('#resume-project').click();
   await page.waitForFunction(()=>!bulkAction&&state.projectActions.resume_eligible===0);
   assert.deepEqual(data.agents.map(a=>a.state),['working','idle','working','working','working','paused']);
-  assert.deepEqual(data.requests,[{url:'/pause-all',method:'POST',body:{project:1}},{url:'/resume-restart',method:'POST',body:{project:1}},{url:'/resume-all',method:'POST',body:{project:1}}]);
-  assert.deepEqual(confirmations,[...Array(2).fill('Pause 2 eligible agents in project “example” (#1)? This stops their processes and releases their locks.'),'Resume 1 restart-paused agent in project “example” (#1)? This may start work and consume provider quota.','Resume 3 paused agents in project “example” (#1)? This may start work and consume provider quota.']);
+  assert.deepEqual(data.requests,[{url:'/pause-all',method:'POST',body:{project:projectId(1)}},{url:'/resume-restart',method:'POST',body:{project:projectId(1)}},{url:'/resume-all',method:'POST',body:{project:projectId(1)}}]);
+  assert.deepEqual(confirmations,[...Array(2).fill(`Pause 2 eligible agents in project “example” (#${projectId(1)})? This stops their processes and releases their locks.`),`Resume 1 restart-paused agent in project “example” (#${projectId(1)})? This may start work and consume provider quota.`,`Resume 3 paused agents in project “example” (#${projectId(1)})? This may start work and consume provider quota.`]);
 }));
 
 test('project bulk actions capture their scope across project switches and lock both scopes until completion', async () => fixture(async (page,data) => {
   await manualPolling(page); await reloadPage(page);
   page.on('dialog',dialog=>dialog.accept());
   for(const [button,endpoint,initial] of [['pause-project','pause-all','idle'],['resume-project','resume-all','paused'],['resume-project-restart','resume-restart','paused']]) {
-    data.agents=[{id:1,project:1,state:initial,pause_reason:'restart'},{id:2,project:2,state:initial,pause_reason:'restart'}];
-    await page.locator('#project-select').selectOption('1'); await page.waitForFunction(()=>state.selectedProject===1&&refreshPending===0); await page.evaluate(()=>refresh());
+    data.agents=[{id:1,project:projectId(1),state:initial,pause_reason:'restart'},{id:2,project:projectId(2),state:initial,pause_reason:'restart'}];
+    await page.locator('#project-select').selectOption(projectId(1)); await page.waitForFunction(()=>state.selectedProject===projectId(1)&&refreshPending===0); await page.evaluate(()=>refresh());
     const pending=await holdRequest(page,`**/${endpoint}`);
     await page.locator(`#${button}`).click(); await pending.started;
-    await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+    await page.locator('#project-select').selectOption(projectId(2)); await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
     await openGlobalActions(page);
     for(const id of ['pause-project','resume-project','resume-project-restart','pause-all','resume-all','resume-restart']) {
       assert.equal(await page.locator(`#${id}`).isDisabled(),true);
@@ -4399,17 +4981,17 @@ test('project bulk actions capture their scope across project switches and lock 
     }
     pending.release(); await pending.remove();
     await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
-    assert.equal(await page.locator('#project-select').inputValue(),'2');
+    assert.equal(await page.locator('#project-select').inputValue(),projectId(2));
     assert.equal(data.agents[0].state,initial==='idle'?'paused':'working');
     assert.equal(data.agents[1].state,initial);
-    assert.deepEqual(data.requests.at(-1),{url:`/${endpoint}`,method:'POST',body:{project:1}});
-    assert.match(await page.locator('#toast').textContent(),/in project “example” \(#1\)/);
+    assert.deepEqual(data.requests.at(-1),{url:`/${endpoint}`,method:'POST',body:{project:projectId(1)}});
+    assert.ok((await page.locator('#toast').textContent()).includes(`in project “example” (#${projectId(1)})`));
   }
   assert.equal(data.requests.length,3,'cross-scope clicks never issue another mutation');
 }));
 
 test('failed project bulk requests unlock both scopes without retrying or changing agents', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'paused',pause_reason:'restart'},{id:2,project:2,state:'paused',pause_reason:'restart'}];
+  data.agents=[{id:1,project:projectId(1),state:'paused',pause_reason:'restart'},{id:2,project:projectId(2),state:'paused',pause_reason:'restart'}];
   data.resumeRestartError='Scoped resume unavailable';
   await manualPolling(page); await reloadPage(page); await openGlobalActions(page);
   page.on('dialog',dialog=>dialog.accept());
@@ -4418,17 +5000,17 @@ test('failed project bulk requests unlock both scopes without retrying or changi
   await page.evaluate(()=>refresh());
   assert.equal(await page.locator('#resume-project-restart').isEnabled(),true);
   assert.equal(await page.locator('#resume-restart').isEnabled(),true);
-  assert.deepEqual(data.requests,[{url:'/resume-restart',method:'POST',body:{project:1}}]);
+  assert.deepEqual(data.requests,[{url:'/resume-restart',method:'POST',body:{project:projectId(1)}}]);
   assert.ok(data.agents.every(a=>a.state==='paused'));
 }));
 
 test('all-project Pause and Resume counts remain exact across pages and project switches and disable zero or unknown totals', async () => fixture(async (page,data) => {
-  data.pageLimit=1; data.agents=[{id:1,project:1,state:'working'},{id:2,project:2,state:'idle'},{id:3,project:2,state:'done'},{id:4,project:1,state:'paused',pause_reason:'limit'},{id:5,project:2,state:'paused',pause_reason:'restart'},{id:6,project:2,state:'crashed'},{id:7,project:1,state:'closed'},{id:8,project:1,state:'replaced'}];
+  data.pageLimit=1; data.agents=[{id:1,project:projectId(1),state:'working'},{id:2,project:projectId(2),state:'idle'},{id:3,project:projectId(2),state:'done'},{id:4,project:projectId(1),state:'paused',pause_reason:'limit'},{id:5,project:projectId(2),state:'paused',pause_reason:'restart'},{id:6,project:projectId(2),state:'crashed'},{id:7,project:projectId(1),state:'closed'},{id:8,project:projectId(1),state:'replaced'}];
   await manualPolling(page); await reloadPage(page);
   assert.equal(await page.locator('#pause-all-count').textContent(),'(3 · all projects)');
   assert.equal(await page.locator('#resume-all-count').textContent(),'(2 · all projects)');
   assert.equal(await page.locator('#restart-paused-count').textContent(),'(1 · all projects)');
-  await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(2)); await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
   assert.equal(await page.locator('#pause-all-count').textContent(),'(3 · all projects)');
   assert.equal(await page.locator('#resume-all-count').textContent(),'(2 · all projects)');
   data.unknownGlobalCounts=true; await page.evaluate(()=>refresh());
@@ -4442,7 +5024,7 @@ test('all-project Pause and Resume counts remain exact across pages and project 
 }));
 
 test('lifecycle history is on-demand, bounded, deduplicated and keeps state timestamps and selected text', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Lifecycle',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Lifecycle',state:'idle'}];
   const change=id=>({id,agent:1,at:100+id,kind:'agent.state',details:{from:'working',to:'paused'}});
   data.history=Array.from({length:35},(_,i)=>change(i+1));
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click(); await page.locator('#agent-log').waitFor();
@@ -4466,7 +5048,7 @@ test('lifecycle history is on-demand, bounded, deduplicated and keeps state time
 }));
 
 test('lifecycle history restarts a large burst without gaps, recovers from failure and ignores a closed agent pane', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Lifecycle',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Lifecycle',state:'idle'}];
   const change=id=>({id,agent:1,at:id,kind:'agent.state',details:{from:'idle',to:'working'}});
   data.history=[];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click(); await page.locator('#agent-log').waitFor();
@@ -4488,7 +5070,7 @@ test('lifecycle history restarts a large burst without gaps, recovers from failu
 }));
 
 test('event subscriptions are on-demand, bounded and show deferred-wait IDs, conditions and completion reasons', async () => fixture(async (page,data) => {
-  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  data.pageLimit=2; data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'}];
   data.subscriptionPending={1:2};
   data.subscriptions=[
     {id:1,agent:1,mode:'persistent',state:'active',created_at:100,watch:{agents:[2,3],states:['crashed','done'],status_text:true}},
@@ -4511,14 +5093,14 @@ test('event subscriptions are on-demand, bounded and show deferred-wait IDs, con
   assert.equal(await page.locator('#subscriptions-more').isHidden(),true);
   data.subscriptions[3].watch.usage={provider:'claude',window:'five_hour',condition:'reset-due'}; await page.evaluate(()=>refresh());
   assert.match(await page.locator('[data-subscription="4"]').textContent(),/estimated reset due \(unconfirmed\)/);
-  data.subscriptions[3].watch.usage.condition='reset'; await page.evaluate(()=>refresh());
-  assert.match(await page.locator('[data-subscription="4"]').textContent(),/confirmed reset\/recovery/);
+  data.subscriptions[3].watch.usage={provider:'claude',window:'five_hour',condition:'below',percent:80}; await page.evaluate(()=>refresh());
+  assert.match(await page.locator('[data-subscription="4"]').textContent(),/below 80%/);
   assert.ok(data.getRequests.filter(url=>url.startsWith('/subscriptions?')).every(url=>{const q=new URL(url,'http://test').searchParams;return q.get('agent')==='1'&&q.get('limit')==='30'&&q.get('max_bytes')==='16000';}));
   assert.equal(data.requests.length,0);
 }));
 
 test('canceling subscriptions prevents duplicate requests, updates counts and preserves lifecycle and failed actions', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'}];
   data.subscriptions=[{id:1,agent:1,mode:'once',state:'active',created_at:100,deadline:200,watch:{}}];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.locator('#agent-subscriptions summary').click(); await page.locator('[data-cancel-subscription="1"]').waitFor();
@@ -4545,7 +5127,7 @@ test('canceling subscriptions prevents duplicate requests, updates counts and pr
 }));
 
 test('subscription paging restarts changed snapshots without gaps and polling preserves selected conditions', async () => fixture(async (page,data) => {
-  data.pageLimit=2; data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
+  data.pageLimit=2; data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'}];
   const row=id=>({id,agent:1,mode:'persistent',state:'active',created_at:id,watch:{agents:[id+10],states:['done']}});
   data.subscriptions=Array.from({length:5},(_,i)=>row(i+1));
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
@@ -4564,8 +5146,8 @@ test('subscription paging restarts changed snapshots without gaps and polling pr
 }));
 
 test('subscription failures retain the last view, oversized watches load explicitly and closed panes ignore late pages', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Coordinator',state:'idle'}];
-  data.subscriptions=[{id:1,agent:1,mode:'persistent',state:'active',created_at:100,watch:{usage:{provider:'claude',window:'large '.repeat(5000),condition:'reset'}}}];
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator',state:'idle'}];
+  data.subscriptions=[{id:1,agent:1,mode:'persistent',state:'active',created_at:100,watch:{usage:{provider:'claude',window:'large '.repeat(5000),condition:'below',percent:80}}}];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-action=details]').click();
   await page.locator('#agent-subscriptions summary').click(); await page.waitForFunction(()=>agentSubscriptions?.items.length===1&&!subscriptionsLoading);
   assert.equal(await page.locator('[data-subscription="1"] [data-record=subscriptions]').count(),1);
@@ -4590,7 +5172,7 @@ test('subscription failures retain the last view, oversized watches load explici
 
 test('coordination warnings remain advisory, escaped and visible in compact cards and on-demand bounded history', async () => fixture(async (page,data) => {
   const warning=id=>({id,agent:1,at:100+id,kind:'coordination.suspected-loop',details:{summary:'Repeated A → B → A <wake> pattern',agents:[1,2],subscriptions:[3,4],events:[5,6]}});
-  data.agents=[{id:1,project:1,name:'Coordinator '.repeat(1500),state:'idle',has_diagnostics:true,diagnostics:{suspected_loop:true,items:[warning(35)]}}];
+  data.agents=[{id:1,project:projectId(1),name:'Coordinator '.repeat(1500),state:'idle',has_diagnostics:true,diagnostics:{suspected_loop:true,items:[warning(35)]}}];
   data.history=Array.from({length:35},(_,i)=>warning(i+1));
   await manualPolling(page); await reloadPage(page);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Coordination warning/);
@@ -4622,6 +5204,63 @@ test('coordination warnings remain advisory, escaped and visible in compact card
   assert.equal(await page.locator('#agent-diagnostics-items wake').count(),0);
   assert.equal(data.agents[0].state,'idle'); assert.equal(data.requests.length,0);
   assert.ok(data.getRequests.filter(url=>url.startsWith('/history?')).every(url=>{const q=new URL(url,'http://test').searchParams;return q.get('kind')==='coordination.suspected-loop'&&q.get('limit')==='30'&&q.get('max_bytes')==='16000';}));
+}));
+
+test('thread ordering is server-paged, stable across ties and never limited to the currently loaded IDs',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;
+  data.threads=[
+    conversation([incoming(1)],{id:1,title:'Gamma',created_at:1}),
+    conversation([{...incoming(2),at:300}],{id:2,title:'Beta',created_at:2}),
+    conversation([{...incoming(3),at:300}],{id:3,title:'Alpha',created_at:3}),
+    conversation([],{id:4,title:'Delta',created_at:4}),
+    conversation([{...incoming(4),at:400}],{id:5,title:'Epsilon',created_at:5}),
+  ];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();
+  assert.equal(await page.locator('#thread-sort').inputValue(),'latest_message');
+  assert.deepEqual(await page.evaluate(()=>state.threads.map(thread=>thread.id)),[5,3]);
+  await page.locator('[data-more=threads]').click();await page.waitForFunction(()=>state.threads.length===4);
+  await page.locator('[data-more=threads]').click();await page.waitForFunction(()=>state.threads.length===5);
+  assert.deepEqual(await page.evaluate(()=>state.threads.map(thread=>thread.id)),[5,3,2,1,4]);
+  assert.equal(new Set(await page.evaluate(()=>state.threads.map(thread=>thread.id))).size,5);
+  assert.ok(data.getRequests.filter(url=>url.startsWith('/threads?')).some(url=>new URL(url,'http://test').searchParams.has('cursor')));
+  assert.ok(data.getRequests.filter(url=>url.startsWith('/threads?')).every(url=>{const query=new URL(url,'http://test').searchParams;return !query.has('before')&&!query.has('through');}));
+  for(const [sort,expected] of [['newest',[5,4]],['oldest',[1,2]],['title',[3,2]]]) {
+    await page.locator('#thread-sort').selectOption(sort);
+    await page.waitForFunction(expected=>state.pages.threads?.scope===collectionPath('threads')&&state.threads.map(thread=>thread.id).join(',')===expected.join(','),expected);
+  }
+  await reloadPage(page);assert.equal(await page.locator('#thread-sort').inputValue(),'title','the browser retains its chosen order');
+}));
+
+test('changing thread sort preserves an open conversation, its selection, draft and scroll, and rejects stale sort responses',async()=>fixture(async(page,data)=>{
+  data.threads=[conversation([incoming(1,'Retained long message. '.repeat(200))],{id:1,title:'Zeta',created_at:1}),conversation([],{id:2,title:'Alpha',created_at:2})];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();
+  await page.locator('[data-message="1"]').waitFor();await page.locator('#message-form textarea').fill('Retain this draft');
+  await page.locator('#messages').evaluate(node=>node.scrollTop=100);
+  const selected=await selectText(page,'[data-message="1"] .message-text'),scroll=await page.locator('#messages').evaluate(node=>node.scrollTop);
+  const held=await holdRequest(page,url=>url.pathname==='/threads'&&url.searchParams.get('sort')==='oldest','GET');
+  await page.locator('#thread-sort').selectOption('oldest');await held.started;
+  await page.locator('#thread-sort').selectOption('title');
+  await page.waitForFunction(()=>state.pages.threads?.scope===collectionPath('threads')&&state.threads[0]?.id===2);
+  held.release();await held.remove();await page.waitForFunction(()=>!state.pages.threads.pending);
+  assert.equal(await page.locator('#thread-sort').inputValue(),'title');
+  assert.deepEqual(await page.evaluate(()=>state.threads.map(thread=>thread.id)),[2,1]);
+  assert.equal(await page.evaluate(()=>state.selectedThread),1);
+  assert.equal(await page.locator('#message-form textarea').inputValue(),'Retain this draft');
+  assert.equal(await page.locator('#messages').evaluate(node=>node.scrollTop),scroll);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+}));
+
+test('live thread reordering preserves retained row nodes, selected metadata and a scrolled list anchor',async()=>fixture(async(page,data)=>{
+  data.threads=Array.from({length:20},(_,index)=>conversation([incoming(index+1)],{id:index+1,title:`Conversation ${index+1}`}));
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-page=threads]').click();
+  const row=page.locator('[data-thread="10"]');await row.scrollIntoViewIfNeeded();
+  const selected=await selectText(page,'[data-thread="10"] strong'),top=await row.evaluate(node=>node.getBoundingClientRect().top);
+  await page.evaluate(()=>window.retainedThread=document.querySelector('[data-thread="10"]'));
+  data.threads[0].messages.push({...incoming(21),at:500});await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>state.threads[0].id),1,'a new message moves an older thread to the top');
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-thread="10"]')===window.retainedThread),true);
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.ok(Math.abs(await row.evaluate(node=>node.getBoundingClientRect().top)-top)<2,'live ordering does not move the reader’s anchor');
 }));
 
 test('workspace thread search scopes participation filters without discarding an open conversation draft', async () => fixture(async (page,data) => {
@@ -4791,7 +5430,7 @@ test('workspace a pending send stays single-flight after close and reopen and re
 }));
 
 test('workspace Resume all stays single-flight across polling and recovers from failure without retrying', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Paused worker',state:'paused',pause_reason:'user'}];
+  data.agents=[{id:1,project:projectId(1),name:'Paused worker',state:'paused',pause_reason:'user'}];
   await manualPolling(page); await reloadPage(page);
   await openGlobalActions(page);
   const pending=await holdRequest(page,'**/resume-all');
@@ -4815,7 +5454,7 @@ test('workspace Resume all stays single-flight across polling and recovers from 
 }));
 
 test('workspace Close and Reopen lock all lifecycle actions while pending and release them after completion or failure', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Lifecycle worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents=[{id:1,project:projectId(1),name:'Lifecycle worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   await manualPolling(page); await reloadPage(page);
   let confirmations=0;
   page.on('dialog',dialog=>{confirmations++;dialog.accept();});
@@ -4872,7 +5511,7 @@ test('workspace membership and usage scheduling remain single-flight through pan
 test('manual lifecycle actions each confirm once by default and cancellation never mutates', async () => fixture(async (page,data) => {
   await manualPolling(page); await reloadPage(page);
   for (const [initial,action,verb,consequence,problem] of [['working','pause','Pause',/stops its processes and releases its locks/],['paused','resume','Resume',/start work and consume provider quota/],['crashed','resume','Retry',/same model.*consume provider quota/],['paused','resume','Retry',/same model.*consume provider quota/,'Model not available'],['idle','close','Close',/cannot wake until reopened/],['closed','reopen','Reopen',/start work and consume provider quota/]]) {
-    data.agents=[{id:1,project:1,name:'Careful worker',state:initial,pause_reason:'user',problem}]; await page.evaluate(()=>refresh());
+    data.agents=[{id:1,project:projectId(1),name:'Careful worker',state:initial,pause_reason:'user',problem}]; await page.evaluate(()=>refresh());
     const prompts=[];
     page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.dismiss();});
     const before=data.requests.length;
@@ -4890,26 +5529,26 @@ test('all six bulk lifecycle controls confirm captured unfiltered scope once and
   await manualPolling(page); await reloadPage(page);
   for (const button of ['pause-project','resume-project','resume-project-restart','pause-all','resume-all','resume-restart']) {
     const pause=button.startsWith('pause'),scoped=button.includes('project');
-    data.agents=[{id:1,project:1,name:'Visible',state:pause?'working':'paused',pause_reason:'restart'},{id:2,project:1,name:'Hidden by search',state:pause?'idle':'paused',pause_reason:'restart'},{id:3,project:2,state:pause?'done':'paused',pause_reason:'restart'}];
+    data.agents=[{id:1,project:projectId(1),name:'Visible',state:pause?'working':'paused',pause_reason:'restart'},{id:2,project:projectId(1),name:'Hidden by search',state:pause?'idle':'paused',pause_reason:'restart'},{id:3,project:projectId(2),state:pause?'done':'paused',pause_reason:'restart'}];
     await page.evaluate(()=>refresh()); await page.locator('#agent-search').fill('Visible');
     await page.waitForFunction(()=>!agentSearchTimer&&!state.pages.agentBrowser.pending);
     await openGlobalActions(page);
     const prompts=[],before=data.requests.length;
     page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.dismiss();});
     await page.locator(`#${button}`).click(); assert.equal(data.requests.length,before);
-    assert.match(prompts[0],new RegExp(`${scoped?2:3} .*agents ${scoped?'in project “example” \\(#1\\)':'across all projects'}`));
+    assert.match(prompts[0],new RegExp(`${scoped?2:3} .*agents ${scoped?`in project “example” \\(#${projectId(1)}\\)`:'across all projects'}`));
     assert.match(prompts[0],pause?/stops their processes and releases their locks/:/consume provider quota/);
     page.once('dialog',dialog=>{prompts.push(dialog.message());dialog.accept();});
     await page.locator(`#${button}`).click(); await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
     assert.equal(data.requests.length,before+1); assert.deepEqual(prompts,[prompts[0],prompts[0]]);
-    assert.deepEqual(data.requests.at(-1).body,scoped?{project:1}:{});
+    assert.deepEqual(data.requests.at(-1).body,scoped?{project:projectId(1)}:{});
   }
 }));
 
 test('confirmation preference applies immediately across projects, persists independently of Default and leaves other warnings enabled', async () => fixture(async (page,data) => {
-  data.projects[0].config=1;
-  data.agents=[{id:1,project:1,name:'First',state:'working'},{id:2,project:2,name:'Second',state:'paused',pause_reason:'user'}];
-  data.locks=[{id:1,project:1,name:'separate lock',holder:1}];
+  data.projects[0].config=configId(1);
+  data.agents=[{id:1,project:projectId(1),name:'First',state:'working'},{id:2,project:projectId(2),name:'Second',state:'paused',pause_reason:'user'}];
+  data.locks=[{id:1,project:projectId(1),name:'separate lock',holder:1}];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=settings]').click();
   const checkbox=page.locator('#confirm-agent-actions');
   assert.equal(await checkbox.isChecked(),true); assert.equal(await checkbox.isEnabled(),true);
@@ -4923,7 +5562,7 @@ test('confirmation preference applies immediately across projects, persists inde
   page.on('dialog',dialog=>{prompts++;dialog.dismiss();});
   await page.locator('[data-action=free-lock]').click(); assert.equal(prompts,1,'unrelated lock confirmation stays enabled');
   await page.locator('[data-action=pause]').click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0); assert.equal(prompts,1);
-  await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(2)); await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0);
   await page.locator('[data-action=resume]').click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0); assert.equal(prompts,1);
   await reloadPage(page); assert.equal(await checkbox.isChecked(),false);
   await page.locator('[data-page=settings]').click(); await checkbox.check();
@@ -4935,13 +5574,13 @@ test('disabling lifecycle confirmations bypasses each individual and bulk contro
   await page.locator('[data-page=settings]').click(); await page.locator('#confirm-agent-actions').uncheck(); await page.locator('[data-page=overview]').click();
   let prompts=0; page.on('dialog',dialog=>{prompts++;dialog.dismiss();});
   for(const [initial,action] of [['working','pause'],['paused','resume'],['crashed','resume'],['idle','close'],['closed','reopen']]) {
-    data.agents=[{id:1,project:1,state:initial,pause_reason:'user'}]; await page.evaluate(()=>refresh());
+    data.agents=[{id:1,project:projectId(1),state:initial,pause_reason:'user'}]; await page.evaluate(()=>refresh());
     const before=data.requests.length;
     await page.locator(`[data-agent="1"] [data-action=${action}]`).click(); await page.waitForFunction(()=>agentTransitions.size===0&&refreshPending===0);
     assert.equal(data.requests.length,before+1); assert.equal(prompts,0);
   }
   for(const button of ['pause-project','resume-project','resume-project-restart','pause-all','resume-all','resume-restart']) {
-    data.agents=[{id:1,project:1,state:button.startsWith('pause')?'idle':'paused',pause_reason:'restart'}]; await page.evaluate(()=>refresh()); await openGlobalActions(page);
+    data.agents=[{id:1,project:projectId(1),state:button.startsWith('pause')?'idle':'paused',pause_reason:'restart'}]; await page.evaluate(()=>refresh()); await openGlobalActions(page);
     const before=data.requests.length;
     await page.locator(`#${button}`).click(); await page.waitForFunction(()=>!bulkAction&&refreshPending===0);
     assert.equal(data.requests.length,before+1); assert.equal(prompts,0);
@@ -4953,7 +5592,7 @@ test('disabling lifecycle confirmations bypasses each individual and bulk contro
 }));
 
 test('missing or invalid confirmation preferences default to enabled and unavailable storage is reported', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Worker',state:'working'}];
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'working'}];
   await manualPolling(page);
   for(const value of [null,'','0','FALSE',' false ','invalid','true']) {
     await page.evaluate(value=>value===null?localStorage.removeItem('acom:confirm-agent-actions'):localStorage.setItem('acom:confirm-agent-actions',value),value);
@@ -4970,7 +5609,7 @@ test('missing or invalid confirmation preferences default to enabled and unavail
 
 test('visual Boolean filters build idle OR limit without typing query syntax', async () => fixture(async (page,data) => {
   data.pageLimit=1;
-  data.agents=[{id:1,project:1,name:'Idle',state:'idle'},{id:2,project:1,name:'Limit',state:'paused',pause_reason:'limit'},{id:3,project:1,name:'Manual',state:'paused',pause_reason:'user'}];
+  data.agents=[{id:1,project:projectId(1),name:'Idle',state:'idle'},{id:2,project:projectId(1),name:'Limit',state:'paused',pause_reason:'limit'},{id:3,project:projectId(1),name:'Manual',state:'paused',pause_reason:'user'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-filters > summary').click();
   assert.equal(await page.locator('#agent-filter-builder').count(),1,'the filter picker exposes a visual Boolean builder');
   const root=page.locator('[data-filter-root]');
@@ -5042,12 +5681,12 @@ async function pickAgentFilter(page,field,values) {
 }
 
 test('visual groups combine Match all, Match any and Exclude with missing values correctly', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Idle reviewer',group:'Security review',state:'idle',model:'good'},
-    {id:2,project:1,name:'Limit reviewer',group:'Security review',state:'paused',pause_reason:'limit',model:'good'},
-    {id:3,project:1,name:'Manual reviewer',group:'Security review',state:'paused',pause_reason:'user',model:'good'},
-    {id:4,project:1,name:'Closed reviewer',group:'Security review',state:'closed',model:'good'},
-    {id:5,project:1,name:'Bad model',group:'Security review',state:'idle',model:'bad'},
-    {id:6,project:1,name:'Outside',group:'Other',state:'idle',model:'good'}];
+  data.agents=[{id:1,project:projectId(1),name:'Idle reviewer',group:'Security review',state:'idle',model:'good'},
+    {id:2,project:projectId(1),name:'Limit reviewer',group:'Security review',state:'paused',pause_reason:'limit',model:'good'},
+    {id:3,project:projectId(1),name:'Manual reviewer',group:'Security review',state:'paused',pause_reason:'user',model:'good'},
+    {id:4,project:projectId(1),name:'Closed reviewer',group:'Security review',state:'closed',model:'good'},
+    {id:5,project:projectId(1),name:'Bad model',group:'Security review',state:'idle',model:'bad'},
+    {id:6,project:projectId(1),name:'Outside',group:'Other',state:'idle',model:'good'}];
   await manualPolling(page);await reloadPage(page);await openVisualFilters(page);
   const root=page.locator('[data-filter-root]');
   await addVisualCondition(page,root,'group',['Security review']);
@@ -5071,9 +5710,9 @@ test('visual groups combine Match all, Match any and Exclude with missing values
 
 test('visual Text is one literal phrase while exact alternatives, Ungrouped and operators stay literal', async () => fixture(async (page,data) => {
   const group='Team, "Alpha" \\ review',phrase='OR (draft), group:x';
-  data.agents=[{id:1,project:1,name:phrase,state:'idle',group},{id:2,project:1,name:'Second',state:'idle',group:'AND',task:phrase},
-    {id:3,project:1,name:'Ungrouped',state:'idle',group:null,task:phrase},{id:4,project:1,name:'OR (draft),',state:'idle',group:'group:x'},
-    {id:5,project:1,name:phrase,state:'idle',group:'Different'}];
+  data.agents=[{id:1,project:projectId(1),name:phrase,state:'idle',group},{id:2,project:projectId(1),name:'Second',state:'idle',group:'AND',task:phrase},
+    {id:3,project:projectId(1),name:'Ungrouped',state:'idle',group:null,task:phrase},{id:4,project:projectId(1),name:'OR (draft),',state:'idle',group:'group:x'},
+    {id:5,project:projectId(1),name:phrase,state:'idle',group:'Different'}];
   await manualPolling(page);await reloadPage(page);await openVisualFilters(page);
   const root=page.locator('[data-filter-root]');
   const text=await addVisualCondition(page,root,'',[phrase]);
@@ -5088,8 +5727,8 @@ test('visual Text is one literal phrase while exact alternatives, Ungrouped and 
 }));
 
 test('typed advanced expressions import and edit without losing NOT chains or repeated fields', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',group:'Team',model:'good'},{id:2,project:1,state:'paused',pause_reason:'limit',group:'Team',model:'good'},
-    {id:3,project:1,state:'idle',group:'Other',model:'good'},{id:4,project:1,state:'paused',pause_reason:'user',group:'Team',model:'good'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',group:'Team',model:'good'},{id:2,project:projectId(1),state:'paused',pause_reason:'limit',group:'Team',model:'good'},
+    {id:3,project:projectId(1),state:'idle',group:'Other',model:'good'},{id:4,project:projectId(1),state:'paused',pause_reason:'user',group:'Team',model:'good'}];
   await manualPolling(page);await reloadPage(page);
   await page.locator('#agent-search').fill('NOT NOT (state:idle OR pause_reason:limit) AND NOT NOT group:Team AND group:Team AND NOT model:bad');
   await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===2);
@@ -5105,7 +5744,7 @@ test('typed advanced expressions import and edit without losing NOT chains or re
 }));
 
 test('visual limits count exact-field alternatives separately from Text clauses', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',task:'needle',group:'g1'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',task:'needle',group:'g1'}];
   await manualPolling(page);await reloadPage(page);
   const source=Array(63).fill('needle').join(' ')+' group:'+Array.from({length:66},(_,i)=>`g${i}`).join(',');
   await page.locator('#agent-search').fill(source);await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
@@ -5119,7 +5758,7 @@ test('visual limits count exact-field alternatives separately from Text clauses'
 }));
 
 test('Text clause chips focus their own condition rather than the first Text condition', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',task:'first second'},{id:2,project:1,state:'idle',task:'first changed'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',task:'first second'},{id:2,project:projectId(1),state:'idle',task:'first changed'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('first second');
   await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
   await page.locator('[data-edit-agent-clause="1"]').click();
@@ -5133,7 +5772,7 @@ test('Text clause chips focus their own condition rather than the first Text con
 
 test('visual serialization quotes Rust whitespace in exact values and Text phrases', async () => fixture(async (page,data) => {
   const group='A\u0085B',text='Task\u0085phrase';
-  data.agents=[{id:1,project:1,state:'idle',group,task:text},{id:2,project:1,state:'idle',group:'A',task:'B Task phrase'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',group,task:text},{id:2,project:projectId(1),state:'idle',group:'A',task:'B Task phrase'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill(`group:${JSON.stringify(group)} ${JSON.stringify(text)}`);
   await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
   await openVisualFilters(page);
@@ -5145,7 +5784,7 @@ test('visual serialization quotes Rust whitespace in exact values and Text phras
 }));
 
 test('a current filter chip safely opens a builder whose selected older DOM is deferred', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',group:'Old'},{id:2,project:1,state:'idle',group:'New'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',group:'Old'},{id:2,project:projectId(1),state:'idle',group:'New'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('group:Old');
   await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
   await openVisualFilters(page);await selectText(page,'.filter-condition .filter-node-head label');
@@ -5160,7 +5799,7 @@ test('a current filter chip safely opens a builder whose selected older DOM is d
 }));
 
 test('a structural edit cannot replay an old Exclude checkbox after a later real click', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',group:'Team',model:'good'},{id:2,project:1,state:'idle',group:'Other',model:'good'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',group:'Team',model:'good'},{id:2,project:projectId(1),state:'idle',group:'Other',model:'good'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('group:Team model:good');
   await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.agentBrowser[0]?.id===1);
   await openVisualFilters(page);await selectText(page,'[data-filter-root] > .filter-node-head > label:first-child');
@@ -5173,7 +5812,7 @@ test('a structural edit cannot replay an old Exclude checkbox after a later real
 }));
 
 test('typed and visual positive pause filters both preserve the independent category', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle'},{id:2,project:1,state:'paused',pause_reason:'limit'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle'},{id:2,project:projectId(1),state:'paused',pause_reason:'limit'}];
   await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=active]').click();
   await page.locator('#agent-search').fill('pause_reason:limit');
   await page.waitForFunction(()=>!agentSearchTimer&&currentAgentQuery()?.value&&!state.pages.agentBrowser.pending&&state.pages.agentBrowser.total===0);
@@ -5188,7 +5827,7 @@ test('typed and visual positive pause filters both preserve the independent cate
 }));
 
 test('incomplete or rejected visual drafts never change the applied results', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle'},{id:2,project:1,state:'paused',pause_reason:'limit'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle'},{id:2,project:projectId(1),state:'paused',pause_reason:'limit'}];
   await manualPolling(page);await reloadPage(page);await pickAgentFilter(page,'state',['idle']);
   const applied=await page.locator('#agent-search').inputValue(),root=page.locator('[data-filter-root]');
   const leaf=await addVisualCondition(page,root,'model',['']);
@@ -5209,7 +5848,7 @@ test('incomplete or rejected visual drafts never change the applied results', as
 }));
 
 test('dirty visual drafts survive polling, selection, disclosure and page changes but need reset after direct search', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',group:'Applied'},{id:2,project:1,state:'paused',group:'Draft value'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',group:'Applied'},{id:2,project:projectId(1),state:'paused',group:'Draft value'}];
   await manualPolling(page);await reloadPage(page);await pickAgentFilter(page,'group',['Applied']);
   let input=page.locator('[data-filter-value]');await input.fill('Draft value');await input.evaluate(el=>el.setSelectionRange(2,7));
   const handle=await input.elementHandle();await page.evaluate(()=>refresh());
@@ -5227,7 +5866,7 @@ test('dirty visual drafts survive polling, selection, disclosure and page change
 }));
 
 test('delayed visual Apply cannot overwrite newer edits, search or project selection', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,state:'idle',group:'First'},{id:2,project:1,state:'paused',group:'Second'},{id:3,project:2,state:'idle',group:'First'}];
+  data.agents=[{id:1,project:projectId(1),state:'idle',group:'First'},{id:2,project:projectId(1),state:'paused',group:'Second'},{id:3,project:projectId(2),state:'idle',group:'First'}];
   await manualPolling(page);await reloadPage(page);await openVisualFilters(page);
   await addVisualCondition(page,page.locator('[data-filter-root]'),'group',['First']);
   const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search').includes('First'),'GET');
@@ -5245,7 +5884,7 @@ test('delayed visual Apply cannot overwrite newer edits, search or project selec
   await page.locator('#cancel-agent-filter').click();await page.locator('[data-filter-value]').fill('paused');
   const projectRace=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search').includes('paused'),'GET');
   await page.locator('#apply-agent-filter').click();await projectRace.started;
-  await page.locator('#project-select').selectOption('2');await page.waitForFunction(()=>state.selectedProject===2&&refreshPending===0&&state.agentBrowser[0]?.id===3);
+  await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.selectedProject===projectId(2)&&refreshPending===0&&state.agentBrowser[0]?.id===3);
   projectRace.release();await projectRace.remove();await page.waitForFunction(()=>!state.agentFilterDraft.pending);
   assert.equal(await page.locator('#agent-search').inputValue(),'state:idle');assert.equal(await page.locator('[data-filter-value]').inputValue(),'paused');
   assert.equal(await page.locator('#apply-agent-filter').isDisabled(),true,'a draft from another project must be explicitly reset');
@@ -5253,7 +5892,7 @@ test('delayed visual Apply cannot overwrite newer edits, search or project selec
 
 test('exact query filters search all pages, preserve polling and expose editable removable chips', async () => fixture(async (page,data) => {
   data.pageLimit=1;
-  data.agents=[{id:1,project:1,name:'Usage older',state:'paused',pause_reason:'limit',group:'Security review',harness:'codex',model:'model-one',effort:'high',task:'reentrancy'},{id:2,project:1,name:'Manual',state:'paused',pause_reason:'user'},{id:3,project:1,name:'Bulk manual',state:'paused',pause_reason:'all'},{id:4,project:1,name:'Restart',state:'paused',pause_reason:'restart'},{id:5,project:1,name:'Usage newer',state:'paused',pause_reason:'limit',group:'Security review',harness:'claude',model:'model-two',effort:'medium',task:'reentrancy'},...['working','idle','crashed','done','closed','replaced'].map((state,i)=>({id:6+i,project:1,name:state,state,task:'Security review reentrancy'})),{id:12,project:2,state:'paused',pause_reason:'limit'}];
+  data.agents=[{id:1,project:projectId(1),name:'Usage older',state:'paused',pause_reason:'limit',group:'Security review',harness:'codex',model:'model-one',effort:'high',task:'reentrancy'},{id:2,project:projectId(1),name:'Manual',state:'paused',pause_reason:'user'},{id:3,project:projectId(1),name:'Bulk manual',state:'paused',pause_reason:'all'},{id:4,project:projectId(1),name:'Restart',state:'paused',pause_reason:'restart'},{id:5,project:projectId(1),name:'Usage newer',state:'paused',pause_reason:'limit',group:'Security review',harness:'claude',model:'model-two',effort:'medium',task:'reentrancy'},...['working','idle','crashed','done','closed','replaced'].map((state,i)=>({id:6+i,project:projectId(1),name:state,state,task:'Security review reentrancy'})),{id:12,project:projectId(2),state:'paused',pause_reason:'limit'}];
   await manualPolling(page); await reloadPage(page); await page.locator('#agent-filters > summary').click();
   await page.locator('[data-agent-filter=active]').click(); await pickAgentFilter(page,'pause_reason',['limit']);
   assert.equal(await page.locator('[data-agent-filter=active]').getAttribute('aria-pressed'),'true');
@@ -5295,12 +5934,12 @@ test('exact query filters search all pages, preserve polling and expose editable
 }));
 
 test('changing query filters or project discards delayed list responses and clears obsolete cursors', async () => fixture(async (page,data) => {
-  data.pageLimit=1; data.agents=[{id:1,project:1,state:'paused',pause_reason:'limit'},{id:2,project:1,state:'paused',pause_reason:'limit'},{id:3,project:1,state:'paused',pause_reason:'restart'},{id:4,project:2,state:'paused',pause_reason:'restart'}];
+  data.pageLimit=1; data.agents=[{id:1,project:projectId(1),state:'paused',pause_reason:'limit'},{id:2,project:projectId(1),state:'paused',pause_reason:'limit'},{id:3,project:projectId(1),state:'paused',pause_reason:'restart'},{id:4,project:projectId(2),state:'paused',pause_reason:'restart'}];
   await manualPolling(page); await reloadPage(page); await page.locator('#agent-filters > summary').click();
   const pending=await holdRequest(page,'**/agents?*search=pause_reason%3Alimit*','GET');
   await page.locator('#agent-search').fill('pause_reason:limit'); await pending.started;
   await page.locator('#agent-search').fill('pause_reason:restart'); await page.waitForFunction(()=>state.agentBrowser[0]?.id===3&&!state.pages.agentBrowser.pending);
-  await page.locator('#project-select').selectOption('2'); await page.waitForFunction(()=>state.agentBrowser[0]?.id===4&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(2)); await page.waitForFunction(()=>state.agentBrowser[0]?.id===4&&refreshPending===0);
   pending.release(); await pending.remove(); await page.waitForFunction(()=>!state.pages.agentBrowser.pending);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(a=>a.id)),[4]); assert.equal(await page.locator('#agent-search').inputValue(),'pause_reason:restart');
   assert.equal(await page.locator('#agent-count').textContent(),'Showing 1 of 1 matches · 1 total');
@@ -5308,7 +5947,7 @@ test('changing query filters or project discards delayed list responses and clea
 }));
 
 test('invalid queries stay local, hide old results and pagination, and never silently broaden', async () => fixture(async (page,data) => {
-  data.pageLimit=1;data.agents=[{id:1,project:1,name:'First',state:'idle'},{id:2,project:1,name:'Second',state:'paused',pause_reason:'limit'}];
+  data.pageLimit=1;data.agents=[{id:1,project:projectId(1),name:'First',state:'idle'},{id:2,project:projectId(1),name:'Second',state:'paused',pause_reason:'limit'}];
   await manualPolling(page);await reloadPage(page);
   assert.equal(await page.locator('#page-overview [data-more=agentBrowser]').isVisible(),true);
   for(const source of ['unknown:foo','group:','group:"unterminated','state:paused,','provider:made-up','state:idle OR','NOT','()','state:idle AND OR state:paused','(state:idle']) {
@@ -5327,13 +5966,13 @@ test('invalid queries stay local, hide old results and pagination, and never sil
 }));
 
 test('Boolean query precedence, grouped alternatives and NOT include missing pause reasons correctly', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Idle reviewer',group:'Security review',state:'idle'},
-    {id:2,project:1,name:'Limit reviewer',group:'Security review',state:'paused',pause_reason:'limit'},
-    {id:3,project:1,name:'Manual reviewer',group:'Security review',state:'paused',pause_reason:'user'},
-    {id:4,project:1,name:'Outside idle',group:'Other',state:'idle'},
-    {id:5,project:1,name:'Outside limit',group:'Other',state:'paused',pause_reason:'limit'},
-    {id:6,project:1,name:'Closed reviewer',group:'Security review',state:'closed'},
-    {id:7,project:1,name:'Running reviewer',group:'Security review',state:'working',pause_reason:null}];
+  data.agents=[{id:1,project:projectId(1),name:'Idle reviewer',group:'Security review',state:'idle'},
+    {id:2,project:projectId(1),name:'Limit reviewer',group:'Security review',state:'paused',pause_reason:'limit'},
+    {id:3,project:projectId(1),name:'Manual reviewer',group:'Security review',state:'paused',pause_reason:'user'},
+    {id:4,project:projectId(1),name:'Outside idle',group:'Other',state:'idle'},
+    {id:5,project:projectId(1),name:'Outside limit',group:'Other',state:'paused',pause_reason:'limit'},
+    {id:6,project:projectId(1),name:'Closed reviewer',group:'Security review',state:'closed'},
+    {id:7,project:projectId(1),name:'Running reviewer',group:'Security review',state:'working',pause_reason:null}];
   await manualPolling(page);await reloadPage(page);
   const cases=[
     ['state:idle OR pause_reason:limit',[5,4,2,1]],
@@ -5357,10 +5996,10 @@ test('Boolean query precedence, grouped alternatives and NOT include missing pau
 }));
 
 test('advanced query chip opens the grouped visual tree without flattening it or changing category', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Idle reviewer',state:'idle',group:'Security review'},
-    {id:2,project:1,name:'Quota reviewer',state:'paused',pause_reason:'limit',group:'Security review'},
-    {id:3,project:1,name:'Outside idle',state:'idle',group:'Other'},
-    {id:4,project:1,name:'Manual reviewer',state:'paused',pause_reason:'user',group:'Security review'}];
+  data.agents=[{id:1,project:projectId(1),name:'Idle reviewer',state:'idle',group:'Security review'},
+    {id:2,project:projectId(1),name:'Quota reviewer',state:'paused',pause_reason:'limit',group:'Security review'},
+    {id:3,project:projectId(1),name:'Outside idle',state:'idle',group:'Other'},
+    {id:4,project:projectId(1),name:'Manual reviewer',state:'paused',pause_reason:'user',group:'Security review'}];
   await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=active]').click();
   const raw='state:idle OR pause_reason:limit';await page.locator('#agent-search').fill(raw);
   await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===2&&!state.pages.agentBrowser.pending);
@@ -5400,7 +6039,7 @@ test('advanced query chip opens the grouped visual tree without flattening it or
 }));
 
 test('Boolean query pagination and polling show every matching agent exactly once', async () => fixture(async (page,data) => {
-  data.pageLimit=2;data.agents=Array.from({length:8},(_,index)=>({id:index+1,project:1,name:`Agent ${index+1}`,state:index%2?'paused':'idle',pause_reason:index%2?'limit':null}));
+  data.pageLimit=2;data.agents=Array.from({length:8},(_,index)=>({id:index+1,project:projectId(1),name:`Agent ${index+1}`,state:index%2?'paused':'idle',pause_reason:index%2?'limit':null}));
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('state:idle OR pause_reason:limit');
   await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&state.pages.agentBrowser.scope===collectionPath('agentBrowser')&&state.pages.agentBrowser.total===8&&!state.pages.agentBrowser.pending);
   while(await page.locator('#page-overview [data-more=agentBrowser]').isVisible()) {
@@ -5414,9 +6053,9 @@ test('Boolean query pagination and polling show every matching agent exactly onc
 
 test('quoted Boolean words and parentheses remain literal and long expression chips fit mobile', async () => fixture(async (page,data) => {
   const group='OR (draft) <img src=x onerror=alert(1)> '+ 'very-long-value-'.repeat(40);
-  data.agents=[{id:1,project:1,name:'Literal OR (draft)',state:'idle',group},
-    {id:2,project:1,name:'Another',state:'idle',group:'Other'},
-    {id:3,project:1,name:'Literal AND NOT',state:'closed',group:'AND'}];
+  data.agents=[{id:1,project:projectId(1),name:'Literal OR (draft)',state:'idle',group},
+    {id:2,project:projectId(1),name:'Another',state:'idle',group:'Other'},
+    {id:3,project:projectId(1),name:'Literal AND NOT',state:'closed',group:'AND'}];
   await manualPolling(page);await reloadPage(page);await pickAgentFilter(page,'group',[group]);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[1]);
   const query=await page.locator('#agent-search').inputValue();
@@ -5436,7 +6075,7 @@ test('quoted Boolean words and parentheses remain literal and long expression ch
 }));
 
 test('stale advanced chips cannot clear or focus a newer query and malformed expressions recover', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Idle',state:'idle'},{id:2,project:1,name:'Quota',state:'paused',pause_reason:'limit'}];
+  data.agents=[{id:1,project:projectId(1),name:'Idle',state:'idle'},{id:2,project:projectId(1),name:'Quota',state:'paused',pause_reason:'limit'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('state:idle OR pause_reason:limit');
   await page.waitForFunction(()=>!agentSearchTimer&&!!currentAgentQuery()?.value&&!state.pages.agentBrowser.pending);
   await page.locator('#agent-search').blur();await selectText(page,'[data-edit-agent-query]');
@@ -5458,10 +6097,10 @@ test('stale advanced chips cannot clear or focus a newer query and malformed exp
 
 test('literal values, alternatives and free words share one server query without rewriting typed input', async () => fixture(async (page,data) => {
   const group='Team, "Alpha" \\ review';
-  data.agents=[{id:1,project:1,name:'Exact member',state:'crashed',group,harness:'codex',model:'custom:model',effort:'ultra',task:'reentrancy checks'},
-    {id:2,project:1,name:'Task false positive',state:'crashed',group:'Different',harness:'codex',model:'custom:model',effort:'ultra',task:`${group} reentrancy checks`},
-    {id:3,project:1,name:'Literal query text',state:'idle',group:null,task:'group:example reentrancy'},
-    {id:4,project:1,name:'Another alternative',state:'paused',group:'Second team',harness:'claude',model:'other',effort:'high',task:'reentrancy'}];
+  data.agents=[{id:1,project:projectId(1),name:'Exact member',state:'crashed',group,harness:'codex',model:'custom:model',effort:'ultra',task:'reentrancy checks'},
+    {id:2,project:projectId(1),name:'Task false positive',state:'crashed',group:'Different',harness:'codex',model:'custom:model',effort:'ultra',task:`${group} reentrancy checks`},
+    {id:3,project:projectId(1),name:'Literal query text',state:'idle',group:null,task:'group:example reentrancy'},
+    {id:4,project:projectId(1),name:'Another alternative',state:'paused',group:'Second team',harness:'claude',model:'other',effort:'high',task:'reentrancy'}];
   await manualPolling(page);await reloadPage(page);
   await pickAgentFilter(page,'group',[group,'Second team']);await pickAgentFilter(page,'state',['paused','crashed']);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[4,1]);
@@ -5486,19 +6125,19 @@ test('literal values, alternatives and free words share one server query without
 }));
 
 test('delayed query parsing cannot replace newer text, chips or selected-project results', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'First',group:'old',state:'idle'},{id:2,project:1,name:'Second',group:'new',state:'idle'},{id:3,project:2,name:'Elsewhere',group:'new',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'First',group:'old',state:'idle'},{id:2,project:projectId(1),name:'Second',group:'new',state:'idle'},{id:3,project:projectId(2),name:'Elsewhere',group:'new',state:'idle'}];
   await manualPolling(page);await reloadPage(page);
   const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search')==='group:old','GET');
   await page.locator('#agent-search').fill('group:old');await pending.started;
   await page.locator('#agent-search').fill('group:new');await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===2&&!state.pages.agentBrowser.pending);
-  await page.locator('#project-select').selectOption('2');await page.waitForFunction(()=>state.agentBrowser[0]?.id===3&&refreshPending===0);
+  await page.locator('#project-select').selectOption(projectId(2));await page.waitForFunction(()=>state.agentBrowser[0]?.id===3&&refreshPending===0);
   pending.release();await pending.remove();await page.waitForTimeout(50);
   assert.equal(await page.locator('#agent-search').inputValue(),'group:new');assert.match(await page.locator('[data-edit-agent-filter=group]').textContent(),/new/);
   assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3]);
 }));
 
 test('obsolete pause-reason parsing during a newer debounce cannot reset the selected category', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'New worker',state:'idle'},{id:2,project:1,name:'Paused',state:'paused',pause_reason:'limit'}];
+  data.agents=[{id:1,project:projectId(1),name:'New worker',state:'idle'},{id:2,project:projectId(1),name:'Paused',state:'paused',pause_reason:'limit'}];
   await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=active]').click();
   const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search')==='pause_reason:limit','GET');
   await page.locator('#agent-search').fill('pause_reason:limit');await pending.started;
@@ -5508,7 +6147,7 @@ test('obsolete pause-reason parsing during a newer debounce cannot reset the sel
 }));
 
 test('returning to a discarded in-flight query starts a fresh parse instead of remaining stuck', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Group worker',group:'Team',state:'idle'}];await manualPolling(page);await reloadPage(page);
+  data.agents=[{id:1,project:projectId(1),name:'Group worker',group:'Team',state:'idle'}];await manualPolling(page);await reloadPage(page);
   const pending=await holdRequest(page,url=>url.pathname==='/agent-query'&&url.searchParams.get('search')==='group:Team','GET');
   await page.locator('#agent-search').fill('group:Team');await pending.started;
   await page.evaluate(()=>{state.agentSearch='other';document.querySelector('#agent-search').value='other';clearTimeout(agentSearchTimer);agentSearchTimer=null;});
@@ -5519,7 +6158,7 @@ test('returning to a discarded in-flight query starts a fresh parse instead of r
 }));
 
 test('selected stale chips cannot edit or remove a different current query clause', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Group worker',group:'Team',state:'idle'},{id:2,project:1,name:'Other worker',group:'Elsewhere',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Group worker',group:'Team',state:'idle'},{id:2,project:projectId(1),name:'Other worker',group:'Elsewhere',state:'idle'}];
   await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('group:Team');
   await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
   await page.locator('#agent-search').blur();
@@ -5536,7 +6175,7 @@ test('selected stale chips cannot edit or remove a different current query claus
 }));
 
 test('picker quoting preserves literal whitespace accepted by the shared query parser', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Tabbed group',group:'Line\tBreak',state:'idle'}];
+  data.agents=[{id:1,project:projectId(1),name:'Tabbed group',group:'Line\tBreak',state:'idle'}];
   await manualPolling(page);await reloadPage(page);
   await page.locator('#agent-search').fill('group:"Line\tBreak"');
   await page.waitForFunction(()=>!agentSearchTimer&&state.agentBrowser[0]?.id===1&&!state.pages.agentBrowser.pending);
@@ -5550,8 +6189,210 @@ test('picker quoting preserves literal whitespace accepted by the shared query p
   assert.equal(agentQueryFixture(`group:${quoted}`).clauses[0].values[0],'Line\nBreak');
 }));
 
+test('live agent updates preserve unrelated nodes, selected task text, focused controls and reading position', async () => fixture(async (page,data) => {
+  data.agents=Array.from({length:20},(_,i)=>({id:i+1,project:projectId(1),name:`Worker ${i+1}`,state:'working',task:`Stable task ${i+1}`,context:100,total_tokens:1000,token_usage_state:'provisional'}));
+  await manualPolling(page); await reloadPage(page);
+  const task='[data-agent="10"] .agent-task';
+  await page.locator(task).scrollIntoViewIfNeeded();
+  const selected=await selectText(page,task);
+  await page.evaluate(()=>{window.retainedCard=document.querySelector('[data-agent="10"]');window.retainedOther=document.querySelector('[data-agent="9"]');window.retainedButton=document.querySelector('[data-agent="10"] [data-action=details]');window.retainedButton.focus({preventScroll:true});});
+  const top=await page.locator(task).evaluate(node=>node.getBoundingClientRect().top);
+  Object.assign(data.agents[19],{status:'A status update that changes an earlier card. '.repeat(12),waiting:{started_at:1,expires_at:9999999999,remaining_secs:80}});
+  Object.assign(data.agents[9],{total_tokens:2000,context:200});
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-agent="10"]')===window.retainedCard),true,'the same card survives changed accounting');
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-agent="9"]')===window.retainedOther),true,'an unrelated card is not recreated');
+  assert.equal(await page.evaluate(()=>document.activeElement===window.retainedButton),true,'the original focused control survives polling');
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.match(await page.locator('[data-agent="10"] .token-summary').textContent(),/2,000/,'selection in the task does not freeze other fields');
+  assert.ok(Math.abs(await page.locator(task).evaluate(node=>node.getBoundingClientRect().top)-top)<2,'earlier card changes do not shift the reading anchor');
+}));
+
+test('disappearing notice branches and optional detail fields retain selected text until selection clears',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Stopping worker',state:'paused',stopping:true,has_diagnostics:true,total_tokens:1,token_usage_state:'finalised'}];
+  await manualPolling(page);await reloadPage(page);
+  const selected=await selectText(page,'[data-part=stopping-reason]');
+  data.agents[0].stopping=false;data.agents[0].total_tokens=2;await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.match(await page.locator('[data-agent="1"] .token-summary').textContent(),/2/);
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-part=stopping-reason]').count(),0);assert.equal(await page.locator('[data-part=diagnostics]').count(),1);
+  data.agents[0].stopping=true;await page.evaluate(()=>refresh());await page.locator('[data-action=details]').click();
+  const detail=await selectText(page,'#agent-field-stopping');data.agents[0].stopping=false;await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),detail);assert.equal(await page.locator('dt[data-key=stopping]').count(),1);
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('dt[data-key=stopping]').count(),0);assert.equal(await page.locator('#agent-field-stopping').count(),0);
+}));
+
+test('a selected agent leaving a live filter is retained without stale actions and can rejoin before deselection',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Selected worker',state:'working',task:'Text being read'},{id:2,project:projectId(1),name:'Other worker',state:'working',total_tokens:1,token_usage_state:'final'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('[data-agent-filter=working]').click();await page.waitForFunction(()=>!state.pages.agentBrowser.pending&&state.agentFilter==='working');
+  const selected=await selectText(page,'[data-agent="1"] .agent-task');
+  data.agents[0].state='idle';data.agents[1].total_tokens=2;await page.evaluate(()=>refresh());
+  assert.equal(await page.evaluate(()=>getSelection().toString()),selected);
+  assert.equal(await page.locator('[data-agent="1"]').getAttribute('data-retained-selection'),'true');
+  assert.equal(await page.locator('[data-agent="1"] [data-action=pause]').isDisabled(),true);assert.equal(await page.locator('[data-agent="1"] [data-action=details]').isEnabled(),true);
+  assert.match(await page.locator('[data-agent="2"] .token-summary').textContent(),/2/);
+  assert.match(await page.locator('#agent-count').textContent(),/1 of 1 matches/,'server counts exclude the temporarily retained row');
+  data.agents[0].state='working';await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('[data-agent="1"]').getAttribute('data-retained-selection'),null);
+  assert.equal(await page.locator('[data-agent="1"] [data-action=pause]').isEnabled(),true);
+  data.agents[0].state='idle';await page.evaluate(()=>refresh());
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-agent="1"]').count(),0);assert.equal(await page.locator('[data-agent="2"]').count(),1);
+}));
+
+test('large loaded agent windows patch changed fields without replacing every card',async t=>fixture(async(page)=>{
+  await manualPolling(page);await reloadPage(page);
+  const result=await page.evaluate(()=>{
+    state.agentBrowser=Array.from({length:500},(_,i)=>({id:i+1,name:`Synthetic worker ${i+1}`,state:'working',task:'Review a synthetic task',harness:'codex',model:'example-model',effort:'medium',total_tokens:1000,token_usage_state:'provisional'}));
+    Object.assign(state.pages.agentBrowser,{project_total:500,total:500,counts:{all:500,active:500,attention:0,finished:0}});
+    renderAgents();
+    const root=document.querySelector('#agents'),nodes=[...root.querySelectorAll('[data-agent]')],observer=new MutationObserver(()=>{});
+    observer.observe(root,{childList:true,subtree:true});
+    const start=performance.now();state.agentBrowser[250].total_tokens=2000;renderAgents();
+    const elapsed=performance.now()-start,records=observer.takeRecords();observer.disconnect();
+    return {elapsed,reused:nodes.every(node=>root.querySelector(`[data-agent="${node.dataset.agent}"]`)===node),removedCards:records.flatMap(record=>[...record.removedNodes]).filter(node=>node.nodeType===1&&node.matches('[data-agent]')).length,total:root.querySelector('[data-agent="251"] .token-summary').textContent};
+  });
+  assert.equal(result.reused,true);assert.equal(result.removedCards,0);assert.match(result.total,/2,000/);
+  t.diagnostic(`500 loaded cards, one changed counter: ${result.elapsed.toFixed(1)} ms; no card replacements (informational, not a timing assertion).`);
+}));
+
+test('collection contention retains its last page without a connection warning or blocking an open conversation', async () => fixture(async (page,data) => {
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'idle'}];
+  data.threads=[conversation([incoming(1,'First retained message')])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('[data-message="1"]').waitFor();
+  const top=await page.locator('#messages').evaluate(node=>node.getBoundingClientRect().top);
+  await page.route(/\/agents\?/,route=>route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'collection changed; restart paging without a cursor'})}));
+  data.agents[0].status='Force a new collection revision';
+  data.threads[0].messages.push(incoming(2,'Arrived during collection contention'));
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#connection-banner').isVisible(),false,'changing snapshots are not network outages');
+  assert.equal(await page.locator('#live-text').textContent(),'live');
+  assert.deepEqual(await messageIds(page),[1,2],'an independent conversation still refreshes');
+  assert.ok(Math.abs(await page.locator('#messages').evaluate(node=>node.getBoundingClientRect().top)-top)<2,'retry feedback does not shift the conversation');
+  assert.equal(await page.locator('[data-agent="1"]').count(),1,'the last consistent collection remains visible');
+}));
+
+test('concurrent collection readers all treat exhausted snapshot retries as contention rather than failures',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Retained worker',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);
+  await page.route(/\/agents\?/,route=>route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'collection changed; restart paging'})}));
+  const results=await page.evaluate(async()=>{
+    state.revisions.agents='changed';
+    return (await Promise.allSettled([loadCollection('agents'),loadCollection('agents')])).map(result=>result.status);
+  });
+  assert.deepEqual(results,['fulfilled','fulfilled']);
+  assert.equal(await page.evaluate(()=>state.pages.agents.retrying),true);
+  assert.equal(await page.locator('#connection-banner').isVisible(),false);
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Retained worker/);
+}));
+
+test('overview snapshot contention is retried as live churn rather than a connection outage',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Retained worker',state:'idle'}];
+  await manualPolling(page);await reloadPage(page);
+  await page.route('**/overview*',route=>route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'record changed; restart reading'})}));
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#connection-banner').isVisible(),false);
+  assert.equal(await page.locator('#live-text').textContent(),'live');
+  assert.match(await page.locator('[data-agent="1"]').textContent(),/Retained worker/);
+}));
+
+test('keyed agent rendering cannot replay an obsolete selected empty-state or skip a later identical validation error',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'idle',task:'Selected task'}];
+  await manualPolling(page);await reloadPage(page);await selectText(page,'[data-agent="1"] .agent-task');
+  await page.locator('#agent-search').fill('state:invalid');
+  await page.waitForFunction(()=>currentAgentQuery()?.error);
+  await page.locator('#agent-search').fill('');
+  await page.waitForFunction(()=>currentAgentQuery()?.value&&state.pages.agentBrowser?.total===1);
+  await page.evaluate(()=>{getSelection().removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});
+  assert.equal(await page.locator('[data-agent="1"]').count(),1,'an obsolete selected-region update cannot replace current cards');
+  await page.locator('#agent-search').fill('state:invalid');
+  await page.waitForFunction(()=>currentAgentQuery()?.error);
+  assert.match(await page.locator('#agents').textContent(),/Invalid search query/,'a repeated empty-state still replaces keyed cards');
+}));
+
+test('connection feedback does not resize an open conversation or move its reading position', async () => fixture(async (page,data) => {
+  data.threads=[conversation([incoming(1,'Retained conversation. '.repeat(200))])];
+  await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
+  await page.locator('[data-message="1"]').waitFor();
+  await page.locator('#messages').evaluate(node=>node.scrollTop=100);
+  const before=await page.locator('#messages').evaluate(node=>({top:node.getBoundingClientRect().top,height:node.clientHeight,scroll:node.scrollTop}));
+  await page.route('**/overview*',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Temporarily unavailable'})}));
+  await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#connection-banner').isVisible(),true);
+  assert.deepEqual(await page.locator('#messages').evaluate(node=>({top:node.getBoundingClientRect().top,height:node.clientHeight,scroll:node.scrollTop})),before);
+}));
+
+for (const width of [1280,375]) test(`full-date history entries do not overlap at ${width}px`,async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Worker',state:'idle'}];
+  data.history=[{id:1,project:projectId(1),agent:1,kind:'agent.state',at:1800000000,details:{from:'idle',to:'working'}}];
+  await manualPolling(page); await page.setViewportSize({width,height:800}); await reloadPage(page); await page.locator('[data-action=details]').click();
+  await page.locator('#agent-lifecycle > summary').click();
+  const entry=page.locator('#agent-lifecycle-items .event').first(); await entry.waitFor();
+  const boxes=await entry.evaluate(node=>{const range=document.createRange();range.selectNodeContents(node.querySelector('time'));const a=range.getBoundingClientRect(),b=node.lastElementChild.getBoundingClientRect();return {overlap:a.right>b.left&&a.left<b.right&&a.bottom>b.top&&a.top<b.bottom,entry:node.getBoundingClientRect().right,right:Math.max(a.right,b.right)};});
+  assert.equal(boxes.overlap,false,'full timestamps and descriptions occupy separate space');
+  assert.ok(boxes.right<=boxes.entry+1,'history remains inside its scroll region');
+}));
+
+test('field-specific identity and task filters share visual and typed semantics without broad name matches',async()=>fixture(async(page,data)=>{
+  data.agents=[
+    {id:1,project:projectId(1),name:'Coordinator',state:'idle',task:'Review general work',launched_by:0,status:'Waiting for review'},
+    {id:2,project:projectId(1),name:'Worker',state:'idle',task:'Ask Coordinator to review parser',launched_by:1,status:'Ready'},
+    {id:3,project:projectId(1),name:'coordinator',state:'working',task:'Review parser',launched_by:1,status:'Waiting for review'},
+  ];
+  await manualPolling(page);await reloadPage(page);
+  await page.locator('#agent-search').fill('name:"Coordinator"');
+  await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===1);
+  await openVisualFilters(page);
+  assert.equal(await page.locator('[data-filter-field]').inputValue(),'name');
+  assert.equal(await page.locator('[data-filter-value]').inputValue(),'Coordinator');
+  await page.locator('[data-filter-field]').selectOption('launched_by');
+  await page.locator('[data-filter-value]').fill('1');
+  await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[3,2]);
+  await page.locator('#agent-search').fill('task:"REVIEW PARSER" status:"waiting for"');
+  await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===3);
+  await page.locator('#agent-search').fill('id:2');
+  await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===2);
+  await page.locator('#agent-search').fill('launched_by:user');
+  await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===1);
+}));
+
+test('state shortcuts replace summary views rather than stacking incompatible categories and keep whole-project counts',async()=>fixture(async(page,data)=>{
+  data.pageLimit=2;
+  data.agents=['working','idle','paused','crashed','done','closed','replaced'].map((state,index)=>({id:index+1,project:projectId(1),name:`Worker ${state}`,state,group:'Team'}));
+  await manualPolling(page);await reloadPage(page);
+  for(const state of ['working','idle','paused','crashed']) {
+    assert.equal(await page.locator(`[data-agent-count=${state}]`).textContent(),'1');
+    await page.locator(`[data-agent-filter=${state}]`).click();
+    await page.waitForFunction(expected=>state.pages.agentBrowser?.scope===collectionPath('agentBrowser')&&state.agentBrowser.length===1&&state.agentBrowser[0]?.state===expected,state);
+    assert.equal(await page.locator('[data-agent-filter][aria-pressed=true]').count(),1);
+    assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.state)),[state]);
+    assert.match(await page.locator('#agent-count').textContent(),/1 of 1 matches.*7 total/);
+  }
+  await page.locator('.state-shortcuts > details > summary').click();
+  await page.locator('[data-agent-filter=closed]').click();
+  await page.waitForFunction(()=>state.agentBrowser.length===1&&state.agentBrowser[0]?.state==='closed');
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.state)),['closed']);
+  await page.locator('[data-agent-filter=active]').click();
+  await page.waitForFunction(()=>state.pages.agentBrowser?.scope===collectionPath('agentBrowser')&&state.agentBrowser.length===2);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.state)),['idle','working']);
+  assert.equal(await page.locator('[data-agent-filter=closed]').getAttribute('aria-pressed'),'false');
+}));
+
+test('crash type filters match only current crashes, retain unknown classification and import into the visual builder',async()=>fixture(async(page,data)=>{
+  data.agents=[{id:1,project:projectId(1),name:'Transport failure',state:'crashed',failure_kind:'transport'},{id:2,project:projectId(1),name:'Unclassified failure',state:'crashed'},{id:3,project:projectId(1),name:'Recovered worker',state:'idle',failure_kind:'transport'}];
+  await manualPolling(page);await reloadPage(page);await page.locator('#agent-search').fill('failure_kind:transport');
+  await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===1);
+  await openVisualFilters(page);assert.equal(await page.locator('[data-filter-field]').inputValue(),'failure_kind');
+  await page.locator('[data-filter-value]').fill('unknown');await applyVisualFilters(page);
+  assert.deepEqual(await page.evaluate(()=>state.agentBrowser.map(agent=>agent.id)),[2]);
+}));
+
 test('workspace connection failures retain the last view and Retry now recovers without overlapping requests', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Visible worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
+  data.agents=[{id:1,project:projectId(1),name:'Visible worker',state:'idle',harness:'codex',model:'gpt-6.1-sol',effort:'medium'}];
   await manualPolling(page); await reloadPage(page);
   const unavailable=route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Workspace is temporarily unavailable'})});
   await page.route('**/overview*',unavailable);
@@ -5559,7 +6400,7 @@ test('workspace connection failures retain the last view and Retry now recovers 
   assert.equal(await page.locator('#connection-banner').isVisible(),true);
   assert.match(await page.locator('#connection-message').textContent(),/retry|reconnect|connection/i);
   assert.match(await page.locator('[data-agent="1"]').textContent(),/Visible worker/);
-  assert.equal(await page.locator('#project-select').inputValue(),'1');
+  assert.equal(await page.locator('#project-select').inputValue(),projectId(1));
   await page.unroute('**/overview*',unavailable);
   const before=data.getRequests.filter(url=>url.startsWith('/overview')).length;
   const retry=await holdRequest(page,'**/overview*','GET');
@@ -5569,7 +6410,7 @@ test('workspace connection failures retain the last view and Retry now recovers 
   retry.release(); await retry.remove();
   await page.waitForFunction(()=>document.querySelector('#connection-banner').hidden && !document.querySelector('#retry-connection').disabled);
   assert.equal(await page.locator('#live-text').textContent(),'live');
-  assert.equal(await page.locator('#project-select').inputValue(),'1');
+  assert.equal(await page.locator('#project-select').inputValue(),projectId(1));
   assert.equal(data.getRequests.filter(url=>url.startsWith('/overview')).length-before,1);
   assert.equal(data.requests.length,0);
 }));
@@ -5904,23 +6745,23 @@ test('a malformed successful message receipt cannot clear a draft or claim deliv
 }));
 
 test('an outgoing receipt cannot replace another project or erase its newer draft', async () => fixture(async (page,data) => {
-  data.threads=[conversation([]),conversation([],{id:2,project:2,title:'Other project'})];
+  data.threads=[conversation([]),conversation([],{id:2,project:projectId(2),title:'Other project'})];
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
   const receipt=await holdMessageReceipt(page);
   await page.locator('#message-form textarea').fill('Sent in first project'); await page.locator('#message-form button').click(); await receipt.started;
-  await page.locator('#project-select').selectOption('2'); await page.locator('[data-thread="2"]').click();
+  await page.locator('#project-select').selectOption(projectId(2)); await page.locator('[data-thread="2"]').click();
   await page.locator('#message-form textarea').fill('Other project draft');
   receipt.release(); await receipt.remove(); await page.waitForFunction(()=>pendingSends.size===0);
   assert.equal(await page.locator('#message-form textarea').inputValue(),'Other project draft');
   assert.equal(await page.locator('.message').count(),0);
   assert.equal(await page.evaluate(()=>state.thread.id),2);
-  await page.locator('#project-select').selectOption('1'); await page.locator('[data-thread="1"]').click();
+  await page.locator('#project-select').selectOption(projectId(1)); await page.locator('[data-thread="1"]').click();
   assert.equal(await page.locator('[data-message="1"] .message-text').textContent(),'Sent in first project');
   assert.equal(await page.locator('.message').count(),1);
 }));
 
 test('modal scrolling contains wheel gestures at both boundaries without moving the background', async () => fixture(async (page,data) => {
-  data.agents=Array.from({length:35},(_,i)=>({id:i+1,project:1,name:`Worker ${i+1}`,state:'paused',task:i===9?'Detail line\n'.repeat(90):'Review the example'}));
+  data.agents=Array.from({length:35},(_,i)=>({id:i+1,project:projectId(1),name:`Worker ${i+1}`,state:'paused',task:i===9?'Detail line\n'.repeat(90):'Review the example'}));
   data.agentLogs[10]=Array.from({length:80},(_,i)=>`Activity ${i}`);
   await manualPolling(page); await page.setViewportSize({width:1280,height:720}); await reloadPage(page);
   await page.locator('[data-agent="10"] [data-action=details]').click(); await page.locator('#agent-field-task').waitFor();
@@ -5948,7 +6789,7 @@ test('modal scrolling contains wheel gestures at both boundaries without moving 
 }));
 
 test('modal dismissal stays accessible after scrolling and preserves native keyboard focus', async () => fixture(async (page,data) => {
-  data.agents=[{id:1,project:1,name:'Long details',state:'paused',task:'Read this long detail\n'.repeat(90)}];
+  data.agents=[{id:1,project:projectId(1),name:'Long details',state:'paused',task:'Read this long detail\n'.repeat(90)}];
   await manualPolling(page); await page.setViewportSize({width:1280,height:720}); await reloadPage(page);
   const trigger=page.locator('[data-agent="1"] [data-action=details]');
   await trigger.click(); await page.locator('#agent-field-task').waitFor();
@@ -6085,7 +6926,7 @@ test('new-message divider excludes own, catch-up, pending and agent-only message
 }));
 
 test('expanded thread metadata scrolls without hiding close or disclosure controls',async()=>fixture(async(page,data)=>{
-  data.agents=Array.from({length:70},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
+  data.agents=Array.from({length:70},(_,i)=>({id:i+1,project:projectId(1),name:`Reviewer ${i+1} with a descriptive name`,state:'idle'}));
   data.threads=[conversation(Array.from({length:12},(_,i)=>incoming(i+1,'Read the earlier message\n'.repeat(4))),{members:[0,...data.agents.map(agent=>agent.id)]})]; data.reads[1]=12;
   await manualPolling(page); await page.setViewportSize({width:640,height:800}); await reloadPage(page);
   await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();
@@ -6114,7 +6955,7 @@ test('expanded thread metadata scrolls without hiding close or disclosure contro
 
 test('long thread titles cannot clip metadata or its management controls on a small screen',async()=>fixture(async(page,data)=>{
   const title='A descriptive thread title with enough context to stay understandable. '.repeat(12);
-  data.agents=Array.from({length:20},(_,i)=>({id:i+1,project:1,name:`Reviewer ${i+1}`,state:'idle'}));
+  data.agents=Array.from({length:20},(_,i)=>({id:i+1,project:projectId(1),name:`Reviewer ${i+1}`,state:'idle'}));
   data.threads=[conversation([incoming(1)],{title,members:[0,...data.agents.map(agent=>agent.id)]})]; data.reads[1]=1;
   await manualPolling(page); await page.setViewportSize({width:320,height:568}); await reloadPage(page);
   await openSidebar(page); await page.locator('[data-page=threads]').click(); await page.locator('[data-thread="1"]').click();

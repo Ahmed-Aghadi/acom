@@ -134,6 +134,10 @@
     .filter-actions { display: flex; gap: 5px; padding: 12px 0 0; flex-wrap: wrap; }
     .filter-actions button { background: transparent; border-color: transparent; color: var(--muted); }
     .filter-actions .active { background: var(--accent-soft); color: var(--accent); }
+    .filter-actions [data-agent-count] { display: inline-block; min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; }
+    .state-shortcuts { display: flex; align-items: start; gap: 8px; flex-wrap: wrap; }
+    .state-shortcuts > details { padding-top: 7px; }
+    .state-shortcuts > details > summary { color: var(--muted); font-size: 11px; }
     .agent-toolbar .filter-actions { gap: 8px; }
     .agent-toolbar .filter-actions button { font-size: 11px; }
     .agent-filters { margin-top: 12px; }
@@ -189,6 +193,10 @@
     .pill.waiting { background: #b6791315; color: var(--warn); }
     .meta { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
     .meta.launch-project, .launch-project, .meta.token-summary { white-space: normal; overflow-wrap: anywhere; }
+    .token-value { display: inline-block; position: relative; border-radius: 4px; font-variant-numeric: tabular-nums; }
+    .token-value.last-known { background: var(--surface); box-shadow: inset 0 -1px var(--line); }
+    .token-value.refreshing { background: linear-gradient(100deg,var(--surface) 20%,var(--accent-soft) 45%,var(--surface) 70%); background-size: 240% 100%; animation: token-refresh 2s linear infinite; }
+    @keyframes token-refresh { from { background-position: 160% 0; } to { background-position: -80% 0; } }
     .problem { margin-top: 6px; padding: 7px 9px; border-left: 2px solid var(--danger); background: #bd354908; color: var(--danger); font-size: 11px; overflow-wrap: anywhere; white-space: normal; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -201,6 +209,8 @@
     .event { position: relative; display: grid; grid-template-columns: 52px minmax(0,1fr); gap: 13px; padding: 15px 20px; border-bottom: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
     .event time { padding-top: 2px; color: var(--muted); font: 10px/1.6 ui-monospace, monospace; }
     .activity .event time { white-space: nowrap; }
+    .history-list .event { grid-template-columns: minmax(0,145px) minmax(0,1fr); }
+    .history-list .event time { white-space: normal; overflow-wrap: anywhere; }
     .actor { color: var(--accent); font-size: 11px; }
     body:has(#page-threads.active) .workspace { height: 100dvh; min-height: 560px; }
     main:has(> #page-threads.active) { display: flex; flex-direction: column; }
@@ -214,6 +224,9 @@
     .thread-list .panel-head { padding: 15px; background: var(--panel); }
     .thread-tools { padding: 13px 14px; border-bottom: 1px solid var(--line); }
     .thread-tools input { background: var(--panel); font-size: 12px; }
+    .thread-sort { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 11px; }
+    .thread-sort select { width: auto; flex: 1; padding: 6px 8px; font-size: 11px; }
+    #thread-sort-status { min-height: 1.6em; margin: 4px 0 0; font-size: 10px; }
     .thread-tools .filter-actions { gap: 1px; }
     .thread-row { display: block; width: 100%; min-height: 0; padding: 16px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; text-align: left; }
     .thread-row:hover { background: var(--panel); }
@@ -275,7 +288,9 @@
     .message-table th, .message-table td { padding: 6px 10px; border: 1px solid var(--line); }
     .composer { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px 12px; padding: 15px 20px 12px; border-top: 1px solid var(--line); align-items: center; }
     .composer textarea { min-height: 66px; max-height: 200px; resize: vertical; background: var(--surface); }
-    .composer-hint { grid-column: 1/-1; color: var(--muted); font-size: 10px; }
+    .composer-hint { grid-column: 1/-1; display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--muted); font-size: 10px; }
+    .draft-status { margin-left: auto; color: var(--muted); font-size: 10px; }
+    .draft-status button { margin-left: 6px; }
     #back-to-threads { display: none; }
     input, select, textarea { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); }
     input::placeholder, textarea::placeholder { color: var(--muted); opacity: .8; }
@@ -307,7 +322,11 @@
     .copy-button .icon { width: 15px; height: 15px; }
     .agent-task-label { color: var(--muted); font-weight: 600; }
     .coordination-warning { margin: 12px 0; padding: 12px; border: 1px solid var(--warn); border-radius: 8px; overflow-wrap: anywhere; }
-    #agent-subscriptions, #agent-diagnostics, #agent-lifecycle { margin-top: 16px; }
+    #agent-subscriptions, #agent-diagnostics, #agent-lifecycle, #agent-permissions { margin-top: 16px; }
+    .permission-rule { min-width: 0; margin: 14px 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+    .permission-states { display: flex; flex-wrap: wrap; gap: 10px 16px; margin: 12px 0; }
+    .permission-rule .member-list { max-height: 180px; }
+    .permission-rule > button { margin-top: 10px; }
     #agent-subscription-items .event > div { min-width: 0; overflow-wrap: anywhere; }
     .agent-log { max-height: 260px; margin: 9px 0 0; padding: 15px; overflow: auto; border: 1px solid #2c3a50; border-radius: 8px; background: #101b2d; color: #ccdaec; font: 11px/1.7 ui-monospace, monospace; white-space: pre-wrap; }
     #record-content { font: 12px/1.6 ui-monospace,monospace; }
@@ -343,7 +362,7 @@
     .member-list label { display: flex; align-items: center; gap: 11px; padding: 12px; border-bottom: 1px solid var(--line); }
     .member-list .meta { white-space: normal; overflow-wrap: anywhere; }
     .inline-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
-    .connection-banner { display: flex; align-items: center; gap: 15px; padding: 12px 18px; margin-bottom: 20px; background: #b6791310; border: 1px solid #b6791355; border-radius: 9px; color: var(--warn); font-size: 12px; }
+    .connection-banner { position: fixed; top: 64px; right: var(--workspace-gutter); z-index: 60; display: flex; align-items: center; gap: 15px; width: min(520px,calc(100vw - 28px)); padding: 12px 18px; background: var(--panel); border: 1px solid #b6791355; border-radius: 9px; box-shadow: var(--shadow); color: var(--warn); font-size: 12px; }
     .connection-banner button { margin-left: auto; flex: none; }
     #result-notice { padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 12px; }
     .toast { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(460px,calc(100vw - 32px)); padding: 15px 19px; border: 1px solid #344563; border-radius: 10px; background: #15233a; color: #fff; box-shadow: 0 10px 35px #07132630; opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; white-space: pre-line; overflow-wrap: anywhere; font-size: 13px; }
@@ -419,8 +438,9 @@
       .composer { padding: 12px; gap: 8px; } .message { grid-template-columns: minmax(0,1fr) 72px; column-gap: 10px; } .message.user { grid-template-columns: 72px minmax(0,1fr); } .message-bubble { padding: 11px 12px; } .message-head { gap: 3px; }
       .settings-save-state { max-width: 125px; text-align: right; font-size: 10px; } .settings-jump { gap: 8px 15px; }
       .connection-banner { align-items: start; padding: 12px; }
+      .history-list .event { grid-template-columns: minmax(0,1fr); gap: 3px; }
     }
-    @media (prefers-reduced-motion: reduce) { *, *:before, *:after { transition: none !important; scroll-behavior: auto !important; } }
+    @media (prefers-reduced-motion: reduce) { *, *:before, *:after { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
   </style>
 </head>
 <body>
@@ -472,6 +492,7 @@
       <div class="page-heading"><div><p class="eyebrow">Project workspace</p><h1 id="overview-title">Workspace overview</h1><p class="page-description">A clear view of your agents and the work moving between them.</p></div><span class="scope-note"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="13" rx="3"/><path d="M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4"/></svg><span id="overview-scope">Current project</span></span></div>
       <section class="usage-bar" aria-label="Account usage"><div class="usage-heading"><strong>Account usage</strong><span>Shared across projects</span></div><div class="usage" id="usage"></div></section>
       <div class="stats" id="workspace-stats" aria-label="Project summary"></div>
+      <div id="overview-history-host"></div>
       <div class="grid">
         <div class="stack">
           <section class="panel">
@@ -513,7 +534,9 @@
 
     <section class="page" id="page-settings" aria-labelledby="settings-title"><div class="page-heading"><div><p class="eyebrow">Project configuration</p><h1 id="settings-title">Settings</h1><p class="page-description">Choose how your agents work, coordinate, and recover.</p></div></div>
       <section class="panel preference-panel" aria-labelledby="preferences-title"><div class="panel-head"><h2 id="preferences-title">Browser preferences</h2></div><div class="preference-body"><label class="inline-check"><input type="checkbox" id="confirm-agent-actions" checked>Confirm agent actions</label><p>Ask before pausing, resuming, retrying, closing or reopening agents, including bulk actions. Applies immediately to all projects in this browser at this server address; not part of saved configurations.</p><p id="preferences-status" role="status"></p></div></section>
-      <section class="panel preference-panel" id="storage-panel" aria-labelledby="storage-title" aria-busy="false"><div class="panel-head"><h2 id="storage-title">Storage</h2><button type="button" class="small" id="storage-calculate">Calculate disk usage</button></div><div class="preference-body"><p>Allocated disk space in acom’s data directory, calculated only on request. Project files and native Claude/Codex histories elsewhere are not scanned. Files may change during or after calculation.</p><p id="storage-scope"></p><p id="storage-status" role="status" aria-label="Disk usage calculation">Not calculated yet.</p><dl class="details" id="storage-report" hidden><dt id="storage-project-label">This project’s captured logs</dt><dd id="storage-project"></dd><dt>All projects’ captured logs</dt><dd id="storage-all-projects"></dd><dt>Shared database</dt><dd id="storage-database"></dd><dt>Other / unassigned data</dt><dd id="storage-other"></dd><dt>Total acom data</dt><dd id="storage-total"></dd><dt>Data directory</dt><dd id="storage-home"></dd><dt>Last calculation</dt><dd id="storage-scanned"></dd></dl></div></section>
+      <section class="panel preference-panel" aria-labelledby="server-settings-title"><div class="panel-head"><h2 id="server-settings-title">Server settings</h2><button type="submit" form="server-settings-form" class="small" disabled>Save server settings</button></div><form class="preference-body" id="server-settings-form"><p>Applies to this installation across all projects, independently of project configurations.</p><div class="form-grid"><label>Provider usage check interval (seconds)<input type="number" name="usage_poll_secs" min="15" max="3600" step="1" required disabled><span>Default 120. Account checks do not run model turns; reported reset times can trigger earlier checks.</span></label><label>Metrics sampling interval (seconds)<input type="number" name="metrics_sample_secs" min="1" max="3600" step="1" required disabled><span>Default 5. Historical samples record changes; this does not delay live accounting or subscriptions.</span></label></div><p id="server-settings-status" role="status">Open Settings to load server settings.</p><button type="button" class="small" id="server-settings-reset" disabled>Reset draft</button></form></section>
+      <section class="panel preference-panel" id="storage-panel" aria-labelledby="storage-title" aria-busy="false"><div class="panel-head"><h2 id="storage-title">Storage</h2><button type="button" class="small" id="storage-calculate">Calculate disk usage</button></div><div class="preference-body"><p>Allocated disk space in acom’s data directory, calculated only on request. Project files and native Claude/Codex histories elsewhere are not scanned. Files may change during or after calculation.</p><p id="storage-scope"></p><p id="storage-status" role="status" aria-label="Disk usage calculation">Not calculated yet.</p><dl class="details" id="storage-report" hidden><dt data-storage-project id="storage-project-label">This project’s total</dt><dd id="storage-project" data-storage-project></dd><dt data-storage-project>Project core data</dt><dd id="storage-project-core" data-storage-project></dd><dt data-storage-project>Project output logs</dt><dd id="storage-project-logs" data-storage-project></dd><dt data-storage-project>Project metric history</dt><dd id="storage-project-metrics" data-storage-project></dd><dt data-storage-project>Project native session copies</dt><dd id="storage-project-native" data-storage-project></dd><dt>All projects’ output logs</dt><dd id="storage-all-projects"></dd><dt>All core databases</dt><dd id="storage-database"></dd><dt>All metric history</dt><dd id="storage-metrics"></dd><dt>All native session copies</dt><dd id="storage-native"></dd><dt>Recoverable trash</dt><dd id="storage-trash"></dd><dt>Other / unassigned data</dt><dd id="storage-other"></dd><dt>Total acom data</dt><dd id="storage-total"></dd><dt>Data directory</dt><dd id="storage-home"></dd><dt>Last calculation</dt><dd id="storage-scanned"></dd></dl></div></section>
+      <section class="panel preference-panel"><div class="preference-body" id="project-data-host"></div></section>
       <section class="panel settings-panel">
         <div class="panel-head"><h2>Configuration</h2><span class="settings-save-state" id="settings-save-state" role="status">All changes saved</span><button class="primary" form="settings-form">Save</button></div><div class="settings-jump" id="settings-jump" aria-label="Settings sections"></div>
         <form class="settings" id="settings-form"></form>
@@ -610,11 +633,13 @@
     </form>
   </dialog>
 
-  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div class="coordination-warning" id="agent-coordination-warning" hidden></div><details id="agent-subscriptions"><summary>Subscriptions &amp; deferred waits <span class="meta" id="agent-subscription-count"></span></summary><div id="agent-subscription-items" class="activity"></div><p class="inline-error" id="agent-subscriptions-error" role="status" hidden></p><button type="button" class="small" id="subscriptions-more" hidden>Load more subscriptions</button></details><details id="agent-diagnostics"><summary>Coordination warnings</summary><div id="agent-diagnostics-items" class="activity"></div><p class="inline-error" id="agent-diagnostics-error" role="status" hidden></p><button type="button" class="small" id="diagnostics-older" hidden>Load older warnings</button></details><div id="agent-config"></div><details id="agent-lifecycle"><summary>Lifecycle changes</summary><div id="agent-lifecycle-items" class="activity"></div><p class="inline-error" id="agent-lifecycle-error" role="status" hidden></p><button type="button" class="small" id="lifecycle-older" hidden>Load older changes</button></details><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
+  <dialog id="agent-dialog" aria-labelledby="agent-title"><form method="dialog"><h2 id="agent-title">Agent</h2><p class="meta" id="agent-detail-status" role="status"></p><dl class="details" id="agent-details"></dl><div class="coordination-warning" id="agent-coordination-warning" hidden></div><details id="agent-subscriptions"><summary>Subscriptions &amp; deferred waits <span class="meta" id="agent-subscription-count"></span></summary><div id="agent-subscription-items" class="activity"></div><p class="inline-error" id="agent-subscriptions-error" role="status" hidden></p><button type="button" class="small" id="subscriptions-more" hidden>Load more subscriptions</button></details><details id="agent-diagnostics"><summary>Coordination warnings</summary><div id="agent-diagnostics-items" class="activity"></div><p class="inline-error" id="agent-diagnostics-error" role="status" hidden></p><button type="button" class="small" id="diagnostics-older" hidden>Load older warnings</button></details><details id="agent-permissions"><summary>Delegated controls</summary><p class="meta">No access is granted by default. Rules authorize acom controls, not OS isolation. Helpers do not inherit rules; replacements do.</p><div id="permission-rules"></div><p id="permission-status" class="meta" role="status"></p><div class="filter-actions"><button type="button" id="permission-add">Add rule</button><button type="button" id="permission-revoke">Revoke all</button><button type="button" id="permission-reset">Reset draft</button><button type="button" id="permission-save">Save permissions</button></div></details><div id="agent-config"></div><details id="agent-lifecycle"><summary>Lifecycle changes</summary><div id="agent-lifecycle-items" class="activity"></div><p class="inline-error" id="agent-lifecycle-error" role="status" hidden></p><button type="button" class="small" id="lifecycle-older" hidden>Load older changes</button></details><div id="agent-history-host"></div><h3>Recent activity</h3><button type="button" class="small" id="log-older" hidden>Load older activity</button><pre class="agent-log" id="agent-log" role="region" aria-label="Agent output log" tabindex="0"></pre><div class="dialog-actions"><button value="cancel" formnovalidate>Close</button></div></form></dialog>
   <dialog id="record-dialog" aria-labelledby="record-title"><form method="dialog"><h2 id="record-title">Full record</h2><pre class="record-text" id="record-content"></pre><div class="dialog-actions"><button>Close</button></div></form></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
   <script src="/assets/markdown-it-15.0.3.min.js" integrity="sha384-ARStLecQmtLYjBgfD3+w+irhiSoLTnFk/ne6c0gRWQKQtC9791ZLMQ9D3OaBISt3"></script>
+  <script src="/assets/charts.js"></script>
+  <script src="/assets/project-data.js"></script>
   <script>
     function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
     function storeValue(key, value) {
@@ -630,20 +655,124 @@
     const drafts = new Map();
     const draftEdits = new Map();
     const draftKey = (project, thread) => `acom:draft:${project}:${thread}`;
+    function draftEntry(project, thread) {
+      const key=draftKey(project,thread);
+      if (!drafts.has(key)) {
+        let cache;try {cache=JSON.parse(stored(key));} catch (_) {}
+        const valid=cache&&typeof cache.text==='string'&&(cache.version==null||typeof cache.version==='string');
+        drafts.set(key,{key,project,thread:Number(thread),text:valid?cache.text:'',version:valid?cache.version:null,dirty:valid&&cache.dirty===true,loaded:false,sequence:0});
+      }
+      return drafts.get(key);
+    }
     function threadDraft(project, thread) {
-      const key = draftKey(project, thread);
-      return drafts.has(key) ? drafts.get(key) : stored(key) || '';
+      return draftEntry(project,thread).text;
     }
-    function saveDraft(project, thread, text) {
-      const key = draftKey(project, thread);
-      drafts.set(key, text);
-      if (!storeValue(key, text)) toast('Draft stays in this tab, but browser storage is unavailable. Copy it before closing the browser.', true);
+    function cacheDraft(entry) {
+      const saved=storeValue(entry.key,JSON.stringify({text:entry.text,version:entry.version,dirty:entry.dirty}));
+      if (!saved&&!entry.cacheWarning) {entry.cacheWarning=true;toast('Browser storage is unavailable. Keep this tab open until the draft is saved to the server, or copy it.',true);}
     }
-    function saveVisibleDraft() {
+    function saveDraft(project, thread, text, flush=false) {
+      const entry=draftEntry(project,thread);
+      if (entry.text!==text) {entry.text=text;entry.dirty=true;entry.sequence++;}
+      cacheDraft(entry);queueDraft(entry,flush);renderDraftStatus(entry);
+    }
+    function saveVisibleDraft(flush=true) {
       const form = $('#message-form');
-      if (form) saveDraft(form.dataset.draftProject, form.dataset.draftThread, $('[name=text]', form).value);
+      if (form) saveDraft(form.dataset.draftProject, form.dataset.draftThread, $('[name=text]', form).value,flush);
     }
-    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, configLoading: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: Number(new URL(location.href).searchParams.get('project')) || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
+    function renderDraftStatus(entry) {
+      const form=$('#message-form');
+      if (!form||form.dataset.draftProject!==entry.project||Number(form.dataset.draftThread)!==entry.thread) return;
+      let node=$('#draft-status');
+      if (!node) {node=document.createElement('span');node.id='draft-status';node.className='draft-status';node.setAttribute('role','status');$('.composer-hint',form).append(node);}
+      setHTML(node,entry.conflict?`Another saved draft differs. Your text is kept here. <button type="button" class="small" data-draft-use-saved${entry.remote?'':' disabled'}>Use saved draft</button><button type="button" class="small" data-draft-keep${entry.remote?'':' disabled'}>Keep this draft</button>`:entry.error?`${esc(entry.error)} <button type="button" class="small" data-draft-retry>Retry sync</button>`:entry.pending?'Saving draft…':entry.dirty?`Draft ${entry.cacheWarning?'kept in this tab':'saved in this browser'} · Sync pending`:!entry.loaded?'Loading saved draft…':entry.text?'Draft saved to server':'');
+    }
+    function showDraftText(entry, previous) {
+      const form=$('#message-form');
+      if (form?.dataset.draftProject===entry.project&&Number(form.dataset.draftThread)===entry.thread) {
+        const input=$('[name=text]',form);
+        if (input.value===previous&&input.value!==entry.text) input.value=entry.text;
+      }
+      renderDraftStatus(entry);
+    }
+    async function loadServerDraft(entry, force=false) {
+      if (entry.loading) return entry.loading;
+      if (!force&&entry.loaded&&Date.now()-(entry.checkedAt||0)<30000) return;
+      const generation=entry.serverGeneration||0;
+      entry.loading=(async()=>{
+        try {
+          const remote=await record(projectPath(`/threads/${entry.thread}/draft`,entry.project));
+          if(generation!==(entry.serverGeneration||0))return;
+          if(typeof remote.text!=='string'||typeof remote.version!=='string')throw new Error('Invalid saved draft response.');
+          const previous=entry.text;entry.remote=remote;entry.loaded=true;entry.checkedAt=Date.now();
+          if (!entry.dirty||entry.text===remote.text) {
+            Object.assign(entry,{text:remote.text,version:remote.version,dirty:false,conflict:false,blocked:false,error:null});
+          } else if (entry.version===remote.version||(entry.version==null&&remote.version==='empty')) {
+            entry.version=remote.version;entry.conflict=false;if(!entry.blocked)entry.error=null;
+          } else entry.conflict=true;
+          cacheDraft(entry);showDraftText(entry,previous);
+        } catch(error) {if(generation===(entry.serverGeneration||0)){entry.error=`Draft not synced: ${error.message}`;renderDraftStatus(entry);}}
+      })();
+      try {await entry.loading;}
+      finally {entry.loading=null;if(entry.loaded&&entry.dirty&&!entry.error&&!entry.blocked&&!entry.conflict)queueDraft(entry);}
+    }
+    function queueDraft(entry, flush=false) {
+      clearTimeout(entry.timer);
+      if (!entry.dirty||entry.conflict||entry.blocked) return;
+      if(flush)void syncDraft(entry);
+      else entry.timer=setTimeout(()=>syncDraft(entry),500);
+    }
+    function syncDraft(entry, keepalive=false) {
+      if(entry.syncing)return entry.syncing;
+      entry.syncing=writeDraft(entry,keepalive).finally(()=>{entry.syncing=null;});
+      return entry.syncing;
+    }
+    async function writeDraft(entry, keepalive=false) {
+      clearTimeout(entry.timer);
+      if(entry.pending||entry.conflict||entry.blocked||!entry.dirty)return;
+      if(!entry.loaded) {await loadServerDraft(entry);if(!entry.loaded||entry.conflict||entry.blocked||!entry.dirty)return;}
+      if(entry.pending)return;
+      const text=entry.text,version=entry.version,body=JSON.stringify({text,version});
+      if(new TextEncoder().encode(text).length>1048576) {entry.error='Draft exceeds the 1 MiB server limit. It remains in this browser.';entry.blocked=true;renderDraftStatus(entry);return;}
+      entry.pending=true;renderDraftStatus(entry);
+      try {
+        const result=await api(projectPath(`/threads/${entry.thread}/draft`,entry.project),{method:'PUT',body,...(keepalive&&new TextEncoder().encode(body).length<60000?{keepalive:true}:{})});
+        if(typeof result.version!=='string'||result.saved!==true)throw new Error('Draft save unconfirmed. Inspect the saved draft before retrying.');
+        Object.assign(entry,{version:result.version,dirty:entry.text!==text,error:null,remote:{text,version:result.version},serverGeneration:(entry.serverGeneration||0)+1});cacheDraft(entry);
+      } catch(error) {
+        entry.blocked=true;entry.error=`Draft not synced: ${error.message}`;
+        if(error.status===409) {entry.conflict=true;await loadServerDraft(entry,true);}
+      } finally {entry.pending=false;renderDraftStatus(entry);if(entry.dirty&&!entry.blocked&&!entry.conflict)queueDraft(entry);}
+    }
+    async function flushProjectDrafts(project) {
+      const form=$('#message-form');
+      if(form?.dataset.draftProject===project)saveVisibleDraft(false);
+      for(const entry of drafts.values())if(entry.project===project) {
+        clearTimeout(entry.timer);
+        if(entry.syncing)await entry.syncing;
+        if(entry.dirty&&!entry.blocked&&!entry.conflict)await syncDraft(entry);
+        if(entry.dirty||entry.blocked||entry.conflict)throw new Error(`Draft for thread #${entry.thread} is not saved. Resolve its sync status before exporting.`);
+      }
+    }
+    document.addEventListener('click',async event=>{
+      const button=event.target.closest('[data-draft-use-saved],[data-draft-keep],[data-draft-retry]');
+      if(!button)return;
+      const form=button.closest('#message-form'),entry=draftEntry(form.dataset.draftProject,form.dataset.draftThread);
+      if(entry.pending||entry.loading)return;
+      if(button.hasAttribute('data-draft-use-saved')&&entry.remote) {
+        const previous=entry.text;Object.assign(entry,{text:entry.remote.text,version:entry.remote.version,dirty:false,blocked:false,conflict:false,error:null});
+        draftEdits.set(entry.key,(draftEdits.get(entry.key)||0)+1);cacheDraft(entry);showDraftText(entry,previous);
+      } else if(button.hasAttribute('data-draft-keep')&&entry.remote) {
+        Object.assign(entry,{version:entry.remote.version,dirty:true,blocked:false,conflict:false,error:null});cacheDraft(entry);await syncDraft(entry);
+      } else if(button.hasAttribute('data-draft-retry')) {
+        entry.blocked=false;entry.error=null;await loadServerDraft(entry,true);if(!entry.conflict&&!entry.error)await syncDraft(entry);
+      }
+    });
+    window.addEventListener('pagehide',()=>{
+      saveVisibleDraft(false);
+      for(const entry of drafts.values())if(entry.dirty&&!entry.pending)void syncDraft(entry,true);
+    });
+    const state = { agents: [], threads: [], locks: [], activity: [], limits: null, settings: null, configs: [], editor: null, configLoading: null, saving: false, launchSettings: null, launchRequest: 0, folder: null, folderRequest: 0, usageProvider: null, threadFilter: stored('thread-filter') || 'mine', catalog: {}, projects: [], project: null, selectedProject: new URL(location.href).searchParams.get('project') || null, overviewRequest: 0, overviewRevision: null, pages: {}, settingsRevision: null, thread: null, selectedThread: null, threadRequest: 0 };
     const icons = {"overview": "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>", "chat": "<path d=\"M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5z\"/>", "settings": "<path d=\"m10 3-.6 2.4-2 .9L5 5.7l-2 3.5 1.8 1.7v2.2L3 14.8l2 3.5 2.4-.6 2 .9L10 21h4l.6-2.4 2-.9 2.4.6 2-3.5-1.8-1.7v-2.2L21 9.2l-2-3.5-2.4.6-2-.9L14 3z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>", "search": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/>", "agents": "<rect x=\"4\" y=\"7\" width=\"16\" height=\"13\" rx=\"3\"/><path d=\"M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12v4M23 12v4\"/>", "warning": "<path d=\"m12 3 10 18H2zM12 9v4M12 17h.01\"/>", "lock": "<rect x=\"4\" y=\"10\" width=\"16\" height=\"11\" rx=\"2\"/><path d=\"M8 10V7a4 4 0 0 1 8 0v3M12 14v3\"/>", "moon": "<path d=\"M20.9 13a9 9 0 1 1-9.9-9.9A7 7 0 0 0 20.9 13z\"/>", "sun": "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5\"/>", "check": "<path d=\"m5 12 4 4L19 6\"/>"};
     icons.copy = '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/>';
     const svgIcon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || ''}</svg>`;
@@ -656,6 +785,7 @@
     state.agentFilter = 'all'; state.agentSearch = ''; state.agentQuery = null; state.agentFilterDraft = null; state.agentBrowser = [];
     state.confirmAgentActions = stored('acom:confirm-agent-actions') !== 'false';
     const storage = { scope: null, revision: 0, pending: null, reports: new Map(), errors: new Map() };
+    const serverSettings = {value:null,revision:null,loading:null,saving:false,dirty:false,conflict:false,error:null};
     let agentSearchTimer = null;
     let agentQuerySequence = 0;
     let filterNodeSequence = 0;
@@ -702,6 +832,7 @@
     let serverClock = null;
     let selectedAgent = null, agentRequest = 0, agentLoading = null, agentLog = null, agentLifecycle = null, lifecycleLoading = null, agentDiagnostics = null, diagnosticsLoading = null, agentSubscriptions = null, subscriptionsLoading = null;
     const cancelingSubscriptions = new Set();
+    const permissionDrafts = new Map();
     const agentTransitions = new Set();
     let bulkAction = null;
     const $ = (s, root = document) => root.querySelector(s);
@@ -710,17 +841,34 @@
     const hasTokenCount = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
     const tokenCount = value => hasTokenCount(value) ? fmt(value) : '—';
     const tokenUsageState = agent => ({unknown:'Not reported', provisional:'In progress (provisional)', final:'Finalised', partial:'Partial (incomplete)'})[agent.token_usage_state] || 'Not reported';
-    function tokenTotal(agent) {
-      const last = agent.token_usage_last_total;
-      if (!hasTokenCount(last?.tokens) || last.tokens === agent.total_tokens) return tokenCount(agent.total_tokens);
-      const note = `Last known total${last.at ? ` at ${when(last.at)}` : ''}; current accounting is incomplete.`;
-      return `${tokenCount(last.tokens)} <span class="pill" title="${esc(note)}">Last known${agent.state === 'working' ? ' · Awaiting update' : ''}</span>`;
+    function tokenField(agent,key,label) {
+      const field=agent.token_usage_fields?.[key],last=field?.last_known;
+      const retained=hasTokenCount(last?.tokens)&&last.tokens!==agent[key],value=retained?last.tokens:agent[key];
+      if(!hasTokenCount(value))return '—';
+      const pending=field?.awaiting_update===true;
+      if(!retained&&!pending)return tokenCount(value);
+      const note=`${retained?'Last known ':''}${label.toLowerCase()}${field.observed_at!=null?` at ${when(field.observed_at)}`:''}.${retained?' Current accounting is incomplete.':''}${pending?' Awaiting update.':''}`;
+      return `<span class="token-value${retained?' last-known':''}${pending?' refreshing':''}" tabindex="0" title="${esc(note)}" aria-label="${esc(`${tokenCount(value)} tokens. ${note}`)}">${tokenCount(value)}</span>`;
     }
+    const tokenTotal=agent=>tokenField(agent,'total_tokens','Total');
     const agentTokenSummary = agent => `<div class="meta token-summary">Total tokens: ${tokenTotal(agent)} · ${tokenUsageState(agent)}</div>`;
     const when = n => n ? new Date(n * 1000).toLocaleString() : '—';
+    const localKey = (id, project = state.selectedProject) => `${project}:${id}`;
+    function projectPath(path, project = state.selectedProject) {
+      if (!project) throw new Error('Select a project first.');
+      return `/p/${encodeURIComponent(project)}${path}`;
+    }
+    function scopedPath(path, project) {
+      const url=new URL(path,location.href);
+      if (!/^\/(agents|threads|messages|locks|activity|history|notices|subscriptions|settings|agent-config|drafts|metrics)(\/|\?|$)/.test(url.pathname)) return path;
+      project??=url.searchParams.get('project')??state.selectedProject;
+      url.searchParams.delete('project');
+      return projectPath(url.pathname+url.search,project);
+    }
     function confirmAgentAction(message) { return !state.confirmAgentActions || confirm(message); }
     const who = id => Number(id) === 0 ? 'user' : `agent ${id}`;
     const deferredContent = new Map();
+    const deferredRemovals = new Map();
     function hasSelectedText(node) {
       const selection = getSelection();
       if (!selection || selection.isCollapsed) return false;
@@ -737,7 +885,7 @@
       deferredContent.delete(node);
       if (html) {
         const focused = node.contains(document.activeElement) ? document.activeElement : null;
-        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage','data-record','data-record-id','data-cancel-subscription'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
+        let selector = focused?.id ? `#${CSS.escape(focused.id)}` : focused ? ['data-action','data-id','data-name','data-thread','data-usage','data-window','data-check-usage','data-record','data-record-id','data-record-path','data-cancel-subscription'].filter(key => focused.hasAttribute(key)).map(key => `[${key}="${CSS.escape(focused.getAttribute(key))}"]`).join('') : '';
         const agent = focused?.closest('[data-agent]');
         if (selector && agent && node.contains(agent)) selector = `[data-agent="${CSS.escape(agent.dataset.agent)}"] ${selector}`;
         node.innerHTML = value; node._renderedHTML = value;
@@ -748,13 +896,99 @@
     }
     const setText = (node, value) => setContent(node, value);
     const setHTML = (node, value) => setContent(node, value, true);
-    document.addEventListener('selectionchange', () => {
-      for (const [node, {value, html}] of deferredContent) {
-        if (!node.isConnected) deferredContent.delete(node);
-        else setContent(node, value, html);
+    const viewKey = node => node.nodeType === Node.ELEMENT_NODE ? node.dataset.part || (node.dataset.action && `action:${node.dataset.action}:${node.dataset.id}`) : null;
+    function patchView(node, next) {
+      for (const attr of [...node.attributes]) if (!next.hasAttribute(attr.name)) node.removeAttribute(attr.name);
+      for (const attr of next.attributes) if (node.getAttribute(attr.name) !== attr.value) node.setAttribute(attr.name,attr.value);
+      if (node.innerHTML === next.innerHTML) { deferredContent.delete(node); return; }
+      delete node._renderedHTML;
+      const shape = value => [...value.childNodes].map(child=>viewKey(child)||child.nodeName).join('|');
+      if (hasSelectedText(node) && shape(node)!==shape(next)) {setHTML(node,next.innerHTML);return;}
+      if (!next.children.length || !node.children.length) { setHTML(node,next.innerHTML); return; }
+      const previous = [...node.childNodes], keyed = new Map(previous.map(child=>[viewKey(child),child]).filter(([key])=>key));
+      let before = node.firstChild;
+      for (const desired of [...next.childNodes]) {
+        const key = viewKey(desired);
+        let child = key ? keyed.get(key) : before && !viewKey(before) && before.nodeType === desired.nodeType && before.nodeName === desired.nodeName ? before : null;
+        if (!child) child = desired.cloneNode(true);
+        else if (child.nodeType === Node.ELEMENT_NODE) patchView(child,desired);
+        else if (child.textContent !== desired.textContent) {
+          if (hasSelectedText(node)) { setHTML(node,next.innerHTML); return; }
+          child.textContent = desired.textContent;
+        }
+        if (child !== before) moveView(node,child,before);
+        before = child.nextSibling;
+        const index = previous.indexOf(child); if (index >= 0) previous.splice(index,1);
       }
+      for (const child of previous) { deferredContent.delete(child); child.remove(); }
+    }
+    function moveView(parent, node, before) {
+      const selection = getSelection(), focused = node.contains(document.activeElement) ? document.activeElement : null;
+      const selected = selection?.anchorNode && (node.contains(selection.anchorNode) || node.contains(selection.focusNode)) ? [selection.anchorNode,selection.anchorOffset,selection.focusNode,selection.focusOffset] : null;
+      if (parent.moveBefore && node.parentNode === parent) parent.moveBefore(node,before);
+      else parent.insertBefore(node,before);
+      if (focused && document.activeElement !== focused) focused.focus({preventScroll:true});
+      if (selected) selection.setBaseAndExtent(...selected);
+    }
+    function syncViews(root, entries) {
+      deferredContent.delete(root); delete root._renderedHTML;
+      const previous=new Map([...root.children].map(node=>[node.dataset.viewKey,node]));
+      let before=root.firstChild;
+      for (const [key,html] of entries) {
+        let node=previous.get(key);
+        if (!node||node._viewHTML!==html) {
+          const template=document.createElement('template');template.innerHTML=html;
+          if (node) patchView(node,template.content.firstElementChild);
+          else node=template.content.firstElementChild;
+          node.dataset.viewKey=key;node._viewHTML=html;
+        }
+        deferredRemovals.delete(node);
+        previous.delete(key);
+        if (node!==before) moveView(root,node,before);
+        before=node.nextSibling;
+      }
+      for (const node of previous.values()) {
+        if (hasSelectedText(node)) {
+          deferredRemovals.set(node,[node]);delete node._viewHTML;
+          node.dataset.retainedSelection='true';node.title='No longer matches this view. Retained until text selection clears.';
+          if(node.matches('button'))node.disabled=true;
+          node.querySelectorAll('button:not([data-action="details"])').forEach(button=>button.disabled=true);
+        } else {deferredRemovals.delete(node);node.remove();}
+      }
+    }
+    function keepThreadListReading(update) {
+      const root=$('#thread-list'), scroll=root.closest('.thread-list'), bounds=scroll.getBoundingClientRect();
+      const anchor=scroll.scrollTop>0 ? [...root.children].find(node=>node.getBoundingClientRect().bottom>bounds.top) : null;
+      const top=anchor?.getBoundingClientRect().top;
+      update();
+      if (anchor?.isConnected) scroll.scrollTop+=anchor.getBoundingClientRect().top-top;
+    }
+    function keepReading(root, update) {
+      const visible = root.getClientRects().length && !document.querySelector('dialog[open]');
+      const anchor = visible ? [...root.querySelectorAll('[data-part="task"], [data-agent]')].find(node=>{const box=node.getBoundingClientRect();return box.top>=0&&box.top<innerHeight;}) : null;
+      const top = anchor?.getBoundingClientRect().top;
+      update();
+      if (anchor?.isConnected) window.scrollBy(0,anchor.getBoundingClientRect().top-top);
+    }
+    document.addEventListener('selectionchange', () => {
+      if (!deferredContent.size&&!deferredRemovals.size) return;
+      keepReading($('#agents'),()=>keepThreadListReading(()=>{
+        for (const [node, {value, html}] of deferredContent) {
+          if (!node.isConnected) deferredContent.delete(node);
+          else setContent(node, value, html);
+        }
+        for (const [key,pair] of deferredRemovals) {
+          if (!pair.some(node=>node.isConnected)) deferredRemovals.delete(key);
+          else if (!pair.some(hasSelectedText)) {pair.forEach(node=>node.remove());deferredRemovals.delete(key);}
+        }
+      }));
     });
     async function api(path, options = {}) {
+      const {project:context,global:globalContext,...requestOptions}=options;
+      let bodyProject;
+      if (typeof options.body==='string') {try {bodyProject=JSON.parse(options.body)?.project;} catch (_) {}}
+      if(!globalContext)path=scopedPath(path,context??bodyProject);
+      options=requestOptions;
       const reading = !options.method || options.method === 'GET';
       let response, text;
       try {
@@ -779,7 +1013,8 @@
       if (body?.result_truncated) {
         const counts = Object.entries(body.counts || {}).map(([key, count]) => `${key.replaceAll('_',' ')}: ${fmt(count)}`).join(' · ');
         const notice = $('#result-notice'); notice.hidden = false;
-        setHTML(notice, `Action completed. ${esc(counts)} ${body.receipt_event ? `<button type="button" class="small" data-record="receipts" data-record-id="${body.receipt_event}">Result details</button>` : `Full result details could not be saved. Inspect current state before retrying. ${esc(body.receipt_error || '')}`}`);
+        const receipt = typeof body.receipt_path === 'string' && /^\/(?:p\/[0-9a-f-]+\/receipts|global-receipts)\/[1-9]\d*$/.test(body.receipt_path) ? body.receipt_path : null;
+        setHTML(notice, `Action completed. ${esc(counts)} ${receipt ? `<button type="button" class="small" data-record-path="${esc(receipt)}">Result details</button>` : `Full result details are unavailable. Inspect current state before retrying. ${esc(body.receipt_error || '')}`}`);
       }
       return body;
     }
@@ -790,6 +1025,7 @@
       return url.pathname + url.search;
     }
     async function record(path, value, current = () => true) {
+      path=scopedPath(path);
       for (let attempt = 0; attempt < 3; attempt++) {
         if (!current()) return null;
         const first = value ?? await api(path);
@@ -810,16 +1046,21 @@
       }
     }
     function collectionPath(key, project = state.selectedProject) {
-      if (key === 'agentBrowser') return query('/agents', {project, category:state.agentFilter, search:state.agentSearch});
-      return query(`/${key}`, {project:['agents','threads','locks','activity'].includes(key) ? project : null});
+      const path=key==='agentBrowser' ? query('/agents',{category:state.agentFilter,search:state.agentSearch}) : key==='threads' ? query('/threads',{sort:state.threadSort}) : `/${key}`;
+      return ['agents','agentBrowser','threads','locks','activity'].includes(key)&&project ? projectPath(path,project) : path;
     }
     async function loadCollection(key, more = false) {
       if (key === 'agentBrowser' && !await agentQuery()) return;
       const scope = collectionPath(key), page = state.pages[key] ||= {scope, items:[], loaded:0};
+      if (['agents','agentBrowser','threads','locks','activity'].includes(key)&&!state.selectedProject) {
+        Object.assign(page,{scope,items:[],loaded:0,revision:'none',total:0,project_total:0,counts:{all:0,active:0,attention:0,finished:0,working:0,idle:0,paused:0,crashed:0,done:0,closed:0,replaced:0},has_more:false});
+        state[key]=[];return;
+      }
       if (page.scope !== scope) { state.pages[key] = {scope, items:[], loaded:0}; return loadCollection(key, more); }
       const sourceRevision = state.revisions?.[key === 'agentBrowser' ? 'agents' : key];
-      if (!more && page.revision && sourceRevision === (['agents','agentBrowser'].includes(key) ? page.sourceRevision : page.revision)) return;
-      if (page.pending) { await page.pending; return more ? loadCollection(key, true) : undefined; }
+      const cursorPage=['threads','projects','configs'].includes(key);
+      if (!more && page.revision && sourceRevision!=null && sourceRevision === (['agents','agentBrowser'].includes(key)||cursorPage ? page.sourceRevision : page.revision)) return;
+      if (page.pending) { try { await page.pending; } catch (error) { if (error.status !== 409) throw error; } return more ? loadCollection(key, true) : undefined; }
       const current = () => state.pages[key] === page && collectionPath(key) === scope;
       page.pending = (async () => {
         if (key === 'activity' && page.revision && !more) {
@@ -855,16 +1096,16 @@
           try {
             const direct = more && page.has_more && attempt === 0;
             let next = await api(query(scope, {limit:pageSize, max_bytes:pageBytes,
-              ...(direct ? {before:page.next_before, through:page.through, revision:page.revision} : {since:!more ? page.revision : null})}));
+              ...(direct ? cursorPage ? {cursor:page.next_cursor,revision:page.revision} : {before:page.next_before, through:page.through, revision:page.revision} : {since:!more ? page.revision : null})}));
             if (!current() || next.unchanged) return;
             let items = direct ? [...page.items, ...next.items] : [...next.items];
             const target = direct ? items.length : Math.max(page.loaded, more ? page.loaded + pageSize : 0);
             while (next.has_more && items.length < target) {
-              const before = next.next_before;
+              const before = cursorPage ? next.next_cursor : next.next_before;
               if (before == null) throw new Error('Missing collection cursor');
-              next = await api(query(scope, {before, through:next.through, revision:next.revision, limit:pageSize, max_bytes:pageBytes}));
+              next = await api(query(scope, {...(cursorPage ? {cursor:before} : {before,through:next.through}), revision:next.revision, limit:pageSize, max_bytes:pageBytes}));
               if (!current()) return;
-              if (next.has_more && next.next_before === before) throw new Error('Collection cursor did not advance');
+              if (next.has_more && (cursorPage ? next.next_cursor : next.next_before) === before) throw new Error('Collection cursor did not advance');
               items.push(...next.items);
             }
             items = [...new Map(items.map(item => [item.id, item])).values()];
@@ -884,7 +1125,12 @@
           } catch (error) { if (!current()) return; if (error.status !== 409 || attempt === 2) throw error; }
         }
       })();
-      try { await page.pending; }
+      try { await page.pending; page.retrying = false; page.error = null; }
+      catch (error) {
+        if (!current()) return;
+        if (error.status === 409) page.retrying = true;
+        else { page.error = error.message; throw error; }
+      }
       finally { page.pending = null; updatePaging(); }
     }
     function updatePaging() {
@@ -921,15 +1167,16 @@
     }
     async function refreshOverview(initial = false) {
       const details = refreshAgentDetails();
-      let healthy = false, connectionError = null;
-      const request = ++state.overviewRequest;
+      let healthy = false, connectionError = null, panelErrors = [];
+      const request = ++state.overviewRequest, project = state.selectedProject;
+      const current = () => request === state.overviewRequest;
       try {
-        const overview = await record(query('/overview', {project:state.selectedProject, since:state.overviewRevision}));
-        if (request !== state.overviewRequest) return;
+        const overview = await record(query('/overview', {project, since:state.overviewRevision}), undefined, current);
+        if (!current()) return;
         if (!overview.unchanged) {
-          state.project = overview.project;
-          if (state.project?.truncated) state.project = await record(`/projects/${state.project.id}`);
-          if (request !== state.overviewRequest) return;
+          const selected = overview.project?.truncated ? await record(`/projects/${overview.project.id}`, undefined, current) : overview.project;
+          if (!current()) return;
+          state.project = selected;
           setSelectedProject(state.project?.id ?? null);
           state.limits = overview.limits; state.url = overview.url;
           state.unreadTotal = overview.unread_total;
@@ -940,44 +1187,80 @@
           state.overviewRevision = overview.revision;
           state.revisions = overview.revisions;
         }
-        await Promise.all(['projects','configs','agents','threads','locks','activity',...(!agentSearchTimer ? ['agentBrowser'] : [])].map(key => loadCollection(key)));
+        const collections = ['projects','configs','agents','threads','locks','activity',...(!agentSearchTimer ? ['agentBrowser'] : [])];
+        const results = await Promise.allSettled(collections.map(key => loadCollection(key)));
+        panelErrors = results.flatMap((result,index)=>result.status === 'rejected' ? [`${collections[index] === 'agentBrowser' ? 'agent results' : collections[index]}: ${result.reason.message}`] : []);
         if (request !== state.overviewRequest) return;
         for (const id of new Set([state.editor?.config, state.project?.config].filter(id => id != null))) {
-          if (!state.configs.find(c => c.id === id)?.settings) await configSettings(id);
+          if (!state.configs.find(c => c.id === id)?.settings) await configSettings(id, current);
           if (request !== state.overviewRequest) return;
         }
         if (state.project && !state.projects.some(p => p.id === state.project.id)) state.projects = [...state.projects, state.project];
-        if (!Object.keys(state.catalog).length) state.catalog = await record('/catalog');
+        if (!Object.keys(state.catalog).length) {
+          const catalog = await record('/catalog', undefined, current);
+          if (!current()) return;
+          state.catalog = catalog;
+        }
+        if (!current()) return;
         const settingsRevision = `${state.selectedProject}:${state.revisions?.settings}`;
         if (settingsRevision !== state.settingsRevision) {
-          const config = state.project ? state.project.config : 1;
-          const settings = config == null ? await record(query('/settings', {project:state.selectedProject})) : await configSettings(config);
+          const config = state.project ? state.project.config : 'default';
+          const settings = config == null ? await record(query('/settings', {project:state.selectedProject}), undefined, current) : await configSettings(config, current);
           if (request !== state.overviewRequest) return;
           state.settings = settings; state.settingsRevision = settingsRevision;
         }
         if (state.project?.config != null && !state.configs.find(c => c.id === state.project.config)?.settings) {
-          await configSettings(state.project.config);
+          await configSettings(state.project.config, current);
         }
         if (request !== state.overviewRequest) return;
         healthy = true;
-      } catch (error) { connectionError = error; }
+      } catch (error) { if (error.status === 409) healthy=true; else connectionError=error; }
       if (request !== state.overviewRequest) return;
       $('#live-dot').classList.toggle('off', !healthy);
       setText($('#live-text'), healthy ? 'live' : 'connection error');
-      $('#connection-banner').hidden = healthy;
-      setText($('#connection-message'), healthy ? '' : `Connection interrupted. Your last view is still available. Retrying automatically. ${connectionError?.message || ''}`);
+      $('#connection-banner').hidden = healthy && !panelErrors.length;
+      setText($('#connection-message'), healthy ? panelErrors.length ? `Some views could not refresh. Their last available data is retained. Retrying automatically. ${panelErrors.join(' · ')}` : '' : `Connection interrupted. Your last view is still available. Retrying automatically. ${connectionError?.message || ''}`);
       render();
       syncSettings(initial);
       await Promise.all([
         state.selectedThread && $('#page-threads').classList.contains('active') ? refreshThread(false) : Promise.resolve(),
+        $('#page-settings').classList.contains('active') ? loadServerSettings() : Promise.resolve(),
         details,
       ]);
     }
 
-    function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); renderStorage(); updatePaging(); }
+    function render() { renderProject(); renderUsage(); renderStats(); renderAgents(); renderLocks(); renderActivity(); renderThreads(); renderRestartResume(); renderStorage(); updatePaging(); syncHistoryPanels(); syncProjectDataPanel(); }
+    let projectDataPanel=null;
+    function syncProjectDataPanel() {
+      if(!window.acomProjectData?.mount)return;
+      const project=state.selectedProject,projectInfo=state.projects.find(item=>item.id===project)||null;
+      const context={request:api,project,projectInfo,setText,beforeExport:flushProjectDrafts,readReceipt:(path,current)=>record(path,undefined,current),
+        current:()=>project===state.selectedProject&&$('#page-settings').classList.contains('active'),
+        onChanged:()=>refresh()};
+      if(!projectDataPanel)projectDataPanel=window.acomProjectData.mount($('#project-data-host'),context);
+      else projectDataPanel.updateContext(context);
+    }
+    const historyPanels=new Map();
+    function syncHistoryPanels() {
+      if(!window.acomCharts?.createPanel)return;
+      for(const [hostId,agent] of [['overview-history-host',null],['agent-history-host',selectedAgent]]) {
+        const host=document.getElementById(hostId),project=state.selectedProject,request=agentRequest;
+        const context={request:api,project,agent,projects:state.projects.map(({id,name,imported_at})=>({id,name,imported_at})),
+          current:()=>project===state.selectedProject&&(hostId==='overview-history-host'?$('#page-overview').classList.contains('active'):agent!=null&&agent===selectedAgent&&request===agentRequest&&$('#agent-dialog').open),
+          loadProjects:async()=>{await loadCollection('projects',true);return state.projects.map(({id,name,imported_at})=>({id,name,imported_at}));}};
+        if(!historyPanels.has(hostId))historyPanels.set(hostId,window.acomCharts.createPanel(host,context));
+        else historyPanels.get(hostId).updateContext(context);
+        historyPanels.get(hostId).refresh();
+      }
+    }
 
     function setSelectedProject(project) {
-      if (state.selectedProject !== project) { storage.scope = project; storage.revision++; state.configLoading = null; }
+      if (state.selectedProject !== project) {
+        storage.scope = project; storage.revision++; state.configLoading = null;
+        deferredContent.clear();deferredRemovals.clear();selectedAgent=null;agentRequest++;
+        if ($('#agent-dialog').open) $('#agent-dialog').close('cancel');
+        if ($('#record-dialog').open) $('#record-dialog').close('cancel');
+      }
       state.selectedProject = project;
     }
 
@@ -999,8 +1282,8 @@
       $('#storage-status').classList.toggle('inline-error', !!error && !busy);
       $('#storage-report').hidden = !report;
       if (!report) return;
-      $('#storage-project-label').hidden = project == null; $('#storage-project').hidden = project == null;
-      for (const [id, value] of [['project', report.bytes.project_logs], ['all-projects', report.bytes.all_project_logs], ['database', report.bytes.database], ['other', report.bytes.other], ['total', report.bytes.total]]) {
+      document.querySelectorAll('[data-storage-project]').forEach(node=>node.hidden=project==null);
+      for (const [id, value] of [['project', report.bytes.project], ['project-core',report.bytes.project_core], ['project-logs',report.bytes.project_logs], ['project-metrics',report.bytes.project_metrics], ['project-native',report.bytes.project_native], ['all-projects', report.bytes.all_project_logs], ['database', report.bytes.database], ['metrics',report.bytes.metrics], ['native',report.bytes.native], ['trash',report.bytes.trash], ['other', report.bytes.other], ['total', report.bytes.total]]) {
         const node = $(`#storage-${id}`);
         if (value == null) { setText(node, 'Unavailable'); node.removeAttribute('title'); continue; }
         const unit = Math.min(5, Math.floor(Math.log2(Math.max(1, value)) / 10));
@@ -1020,11 +1303,12 @@
         const report = await api(query('/storage', {project}));
         const count = value => Number.isSafeInteger(value) && value >= 0;
         if (report.project !== project || typeof report.home !== 'string' || typeof report.complete !== 'boolean' || typeof report.limited !== 'boolean'
-            || ![report.started_at, report.completed_at, report.entries, report.skipped, report.bytes?.all_project_logs, report.bytes?.database, report.bytes?.other, report.bytes?.total].every(count)
-            || (project == null ? report.bytes?.project_logs !== null : !count(report.bytes?.project_logs))
+            || ![report.started_at, report.completed_at, report.entries, report.skipped,...['all_project_logs','database','metrics','native','trash','other','total'].map(key=>report.bytes?.[key])].every(count)
+            || !['project','project_core','project_logs','project_metrics','project_native'].every(key=>project==null?report.bytes?.[key]===null:count(report.bytes?.[key]))
             || report.completed_at < report.started_at || (report.complete && (report.limited || report.skipped !== 0))
-            || report.bytes.total !== report.bytes.all_project_logs + report.bytes.database + report.bytes.other
-            || (project != null && report.bytes.project_logs > report.bytes.all_project_logs)) throw new Error('Invalid disk usage response.');
+            || report.bytes.total !== ['all_project_logs','database','metrics','native','trash','other'].reduce((total,key)=>total+report.bytes[key],0)
+            || (project!=null&&(report.bytes.project>report.bytes.total||report.bytes.project<['project_core','project_logs','project_metrics','project_native'].reduce((total,key)=>total+report.bytes[key],0)
+              || [['project_core','database'],['project_logs','all_project_logs'],['project_metrics','metrics'],['project_native','native']].some(([local,global])=>report.bytes[local]>report.bytes[global])))) throw new Error('Invalid disk usage response.');
         if (state.selectedProject === project && storage.revision === revision) storage.reports.set(project, report);
       } catch (error) {
         if (state.selectedProject === project && storage.revision === revision) storage.errors.set(project, error.message);
@@ -1090,7 +1374,7 @@
       setText($('#config-applied'), appliedConfigText());
     }
     function projectOptions(selected) {
-      return state.projects.map(p => `<option value="${p.id}" title="${esc(p.path)}" ${p.id === Number(selected) ? 'selected' : ''}>${esc(p.name || `Project #${p.id}`)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${p.id}` : ''}${p.unread ? ` · ${fmt(p.unread)} unread` : ''}</option>`).join('');
+      return state.projects.map(p => `<option value="${esc(p.id)}" title="${esc(p.path)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name || `Project #${p.id}`)}${state.projects.filter(x => x.name === p.name).length > 1 ? ` · #${esc(p.id)}` : ''}${p.unread ? ` · ${fmt(p.unread)} unread` : ''}</option>`).join('');
     }
     function resetThread() {
       saveVisibleDraft();
@@ -1159,7 +1443,7 @@
     }
 
     function usageLimit(limits, provider, win) {
-      return (provider === 'claude' ? limits[`claude_${win}`] || (win !== 'seven_day_fable' ? limits.claude : null) : limits[provider]) || {soft:null,hard:null};
+      return (provider === 'claude' ? limits[`claude_${win}`] : limits[provider]) || {soft:null,hard:null};
     }
 
     async function agentQuery() {
@@ -1186,7 +1470,7 @@
     }
     function currentAgentQuery() { return state.agentQuery?.raw === state.agentSearch ? state.agentQuery : null; }
     function quotedQueryValue(value) { return '"' + value.replaceAll('\\','\\\\').replaceAll('"','\\"') + '"'; }
-    function filterLabel(field) { return {group:'Group',provider:'Provider',model:'Model',effort:'Effort',state:'State',pause_reason:'Pause reason'}[field] || 'Text'; }
+    function filterLabel(field) { return {group:'Group',provider:'Provider',model:'Model',effort:'Effort',state:'State',pause_reason:'Pause reason',id:'Agent ID',name:'Name',launched_by:'Launched by',task:'Task contains',status:'Status contains',failure_kind:'Crash type'}[field] || 'Text'; }
     function newFilterValue(text = '', ungrouped = false) { return {id:++filterNodeSequence,text,ungrouped}; }
     function newFilterGroup(op = 'and', children = []) { return {id:++filterNodeSequence,kind:'group',op,children,negations:0}; }
     function importFilterNode(expression) {
@@ -1224,7 +1508,7 @@
     }
     function filterDraftError(root) {
       let leaves = 0, values = 0;
-      const enums = {provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart']};
+      const enums = {provider:['claude','codex'],state:['working','idle','paused','crashed','done','closed','replaced'],pause_reason:['manual','limit','restart'],failure_kind:['unknown','transport','authentication','model_unavailable','provider_rejected','model_switched','startup','process_exit']};
       function inspect(node, top = false) {
         if (node.kind === 'group') {
           if (!node.children.length) return top && !node.negations ? null : 'Add a condition to each group, or remove the empty group.';
@@ -1251,7 +1535,7 @@
       const exclude = `<label class="filter-exclude"><input type="checkbox" id="filter-exclude-${node.id}" data-filter-exclude${node.negations % 2 ? ' checked' : ''}>Exclude ${node.kind === 'group' ? 'group' : 'condition'}</label>`;
       const remove = root ? '' : '<button type="button" class="small" data-remove-filter-node>Remove</button>';
       if (node.kind === 'group') return `<div class="filter-group" data-filter-node="${node.id}"${root ? ' data-filter-root' : ''}><div class="filter-node-head"><label for="filter-op-${node.id}">Match <select id="filter-op-${node.id}" data-filter-op><option value="and"${node.op === 'and' ? ' selected' : ''}>all (AND)</option><option value="or"${node.op === 'or' ? ' selected' : ''}>any (OR)</option></select></label>${exclude}${remove}</div><div class="filter-children">${node.children.map(child => filterNodeHTML(child)).join('')}</div><div class="filter-editor-actions"><button type="button" class="small" data-add-filter-condition>Add condition</button><button type="button" class="small" data-add-filter-group>Add group</button></div></div>`;
-      const fields = ['', 'group','provider','model','effort','state','pause_reason'];
+      const fields = ['', 'id','name','group','provider','model','effort','state','pause_reason','failure_kind','launched_by','task','status'];
       return `<div class="filter-condition" data-filter-node="${node.id}" role="group" aria-label="Filter condition"><div class="filter-node-head"><label for="filter-field-${node.id}">Field <select id="filter-field-${node.id}" data-filter-field>${fields.map(field => `<option value="${field}"${node.field === field ? ' selected' : ''}>${filterLabel(field)}</option>`).join('')}</select></label>${exclude}${remove}</div>${node.values.map(value => `<div class="filter-value-row" data-filter-value-row="${value.id}"><input id="filter-value-${value.id}" data-filter-value aria-label="${esc(filterLabel(node.field))} value" autocomplete="off"${['provider','state','pause_reason'].includes(node.field) ? ` list="filter-options-${node.field}"` : ''} value="${esc(value.ungrouped && node.field === 'group' ? 'Ungrouped' : value.text)}"${value.ungrouped && node.field === 'group' ? ' disabled' : ''}>${node.field === 'group' ? `<button type="button" class="small" data-filter-ungrouped aria-pressed="${value.ungrouped}">${value.ungrouped ? 'Enter group' : 'Ungrouped'}</button>` : ''}${node.values.length > 1 ? '<button type="button" class="small" data-remove-filter-alternative aria-label="Remove alternative">×</button>' : ''}</div>`).join('')}<div class="filter-editor-actions"><button type="button" class="small" data-add-filter-alternative${!node.field ? ' disabled' : ''}>Add alternative</button></div></div>`;
     }
     function renderFilterEditor(structure = false) {
@@ -1305,14 +1589,16 @@
       const parsed = currentAgentQuery(), invalid = !!parsed?.error;
       const agents = current ? state.agentBrowser : [], ready = current && !!page.revision && !!parsed?.value;
       setText($('#agent-count'), invalid ? 'Query needs correction' : ready ? `Showing ${fmt(agents.length)} of ${fmt(page.total)} matches · ${fmt(page.project_total)} total` : 'Loading agents…');
+      $('#agent-count').title = page?.retrying ? 'Keeping the last consistent snapshot while this collection changes. Retrying automatically.' : page?.error ? `Last available results. ${page.error}` : '';
       $('#agent-query-error').hidden = !invalid; setText($('#agent-query-error'), parsed?.error || '');
       $('#agent-search').setAttribute('aria-invalid', String(invalid)); $('#agent-search').setAttribute('aria-describedby','agent-query-error');
       document.querySelectorAll('[data-agent-filter]').forEach(button => {
         const active = button.dataset.agentFilter === state.agentFilter;
         button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
-        setText($('[data-agent-count]',button), ready ? fmt(page.counts[button.dataset.agentFilter]) : '—');
+        const count = ready ? page.counts?.[button.dataset.agentFilter] : null;
+        setText($('[data-agent-count]',button), Number.isFinite(count) ? fmt(count) : '—');
       });
-      const labels = {active:'Active',attention:'Needs attention',finished:'Finished'};
+      const labels = {active:'Active',attention:'Needs attention',finished:'Finished',working:'Working',idle:'Idle',paused:'Paused',crashed:'Crashed',done:'Done',closed:'Closed',replaced:'Replaced'};
       const category = state.agentFilter === 'all' ? '' : `<button type="button" class="small" data-clear-agent-filter="category" aria-label="Remove ${labels[state.agentFilter]} filter">${labels[state.agentFilter]} ×</button>`;
       const clauses = parsed?.value?.clauses || [];
       const expression = parsed?.value?.clauses === null ? `<span class="filter-chip" data-agent-query="${parsed.id}"><button type="button" class="small" data-edit-agent-query aria-label="Edit query: ${esc(parsed.value.text)}">${esc(parsed.value.text)}</button><button type="button" class="small" data-clear-agent-filter="query" aria-label="Remove query">×</button></span>` : '';
@@ -1327,7 +1613,12 @@
       if (!agents.length) { setHTML(root, emptyState('search', 'No agents match', 'Try a different query or clear filters.')); return; }
       const groups = new Map();
       agents.forEach(a => { const key = a.group || 'Ungrouped'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(a); });
-      setHTML(root, [...groups].map(([group, agents]) => `<div class="group-title">${esc(group)}</div>${agents.map(agentRow).join('')}`).join(''));
+      const entries=[];
+      for (const [group, agents] of groups) {
+        entries.push([`group:${state.selectedProject}:${group}`,`<div class="group-title" data-agent-group="${esc(group)}">${esc(group)}</div>`]);
+        for (const agent of agents) entries.push([`agent:${localKey(agent.id)}`,agentRow(agent)]);
+      }
+      keepReading(root,()=>syncViews(root,entries));
       updateWaitTimers();
     }
     async function refreshAgentBrowser() {
@@ -1348,13 +1639,13 @@
     }
     function rememberWaiting(agent) {
       if (agent.waiting) {
-        const wait = agent.waiting, previous = waitingClocks.get(agent.id);
+        const wait = agent.waiting, previous = waitingClocks.get(localKey(agent.id,agent.project));
         if (!Number.isFinite(wait.remaining_secs) && previous && Number.isFinite(previous.remaining) && previous.waiting.started_at === wait.started_at && previous.waiting.expires_at === wait.expires_at) return;
         const received = waitingReceipts.get(wait) ?? performance.now();
         const remaining = Number.isFinite(wait.remaining_secs) ? wait.remaining_secs : serverClock && Number.isFinite(wait.expires_at) ? Math.max(0,wait.expires_at-serverClock.seconds-(received-serverClock.received)/1000) : null;
-        waitingClocks.set(agent.id, {waiting:wait,received,remaining});
+        waitingClocks.set(localKey(agent.id,agent.project), {waiting:wait,received,remaining});
       }
-      else if (!agent.is_waiting) waitingClocks.delete(agent.id);
+      else if (!agent.is_waiting) waitingClocks.delete(localKey(agent.id,agent.project));
     }
     function waitingDescription(agent) {
       const wait = agent.waiting, watches = [];
@@ -1363,11 +1654,11 @@
       if (wait.states?.length) watches.push(`states: ${wait.states.join(', ')}`);
       if (wait.status_text) watches.push('status changes');
       if (wait.usage) watches.push(subscriptionCondition({watch:{usage:wait.usage}}));
-      return `Waiting for notifications · <span data-wait-agent="${agent.id}" data-wait-started="${esc(wait.started_at)}" title="${esc(`Timeout at ${when(wait.expires_at)}`)}">checking timeout</span>${watches.length ? ` · watching ${esc(watches.join(' · '))}` : ''}`;
+      return `Waiting for notifications · <span data-wait-agent="${agent.id}" data-wait-project="${esc(agent.project??state.selectedProject)}" data-wait-started="${esc(wait.started_at)}" title="${esc(`Timeout at ${when(wait.expires_at)}`)}">checking timeout</span>${watches.length ? ` · watching ${esc(watches.join(' · '))}` : ''}`;
     }
     function updateWaitTimers() {
       document.querySelectorAll('[data-wait-agent]').forEach(node => {
-        const clock = waitingClocks.get(Number(node.dataset.waitAgent));
+        const clock = waitingClocks.get(localKey(Number(node.dataset.waitAgent),node.dataset.waitProject));
         if (!clock || String(clock.waiting.started_at) !== node.dataset.waitStarted) return;
         const remaining = clock.remaining;
         const seconds = Number.isFinite(remaining) ? Math.max(0, Math.ceil(remaining - (performance.now()-clock.received)/1000)) : null;
@@ -1375,7 +1666,7 @@
       });
     }
     function formatAgentLog(text) {
-      return text.replace(/^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\] \[(message|tool|error|turn-start|turn-end)\] /gm, (prefix, timestamp, kind) => {
+      return text.replace(/^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\] \[(message|tool|tool-start|tool-end|thinking-start|thinking-end|progress|error|turn-start|turn-end)\] /gm, (prefix, timestamp, kind) => {
         const time = new Date(timestamp);
         return Number.isNaN(time.getTime()) ? prefix : `[${time.toLocaleString()}] [${kind}] `;
       });
@@ -1396,10 +1687,10 @@
     }
     function agentRow(a) {
       const replacement = replacementSummary(a), starting = a.replacement_start || a.replacement_start_pending;
-      const stopping = a.stopping ? '<span class="pill waiting">Stopping</span><div class="meta">Stopping processes before releasing locks.</div>' : '';
-      const diagnostics = a.has_diagnostics ? '<span class="pill waiting" title="A suspected coordination loop was recorded; inspect Details. No automatic intervention.">Coordination warning recorded</span>' : '';
-      const waiting = a.waiting ? `<div class="meta agent-wait">${waitingDescription(a)}</div>` : a.is_waiting ? '<div class="meta agent-wait">Waiting for notifications · See Details for the watch and timeout.</div>' : '';
-      const disabled = a.stopping || agentTransitions.has(a.id) ? ' disabled' : '';
+      const stopping = a.stopping ? '<span data-part="stopping-label" class="pill waiting">Stopping</span><div data-part="stopping-reason" class="meta">Stopping processes before releasing locks.</div>' : '';
+      const diagnostics = a.has_diagnostics ? '<span data-part="diagnostics" class="pill waiting" title="A suspected coordination loop was recorded; inspect Details. No automatic intervention.">Coordination warning recorded</span>' : '';
+      const waiting = a.waiting ? `<div data-part="waiting" class="meta agent-wait">${waitingDescription(a)}</div>` : a.is_waiting ? '<div data-part="waiting" class="meta agent-wait">Waiting for notifications · See Details for the watch and timeout.</div>' : '';
+      const disabled = a.stopping || agentTransitions.has(localKey(a.id,a.project)) ? ' disabled' : '';
       if (a.truncated) return `<div class="agent" data-agent="${a.id}"><div class="agent-name">Agent #${a.id}</div>${stopping}${waiting}${diagnostics}<div class="meta">Details exceed the preview budget.${replacement}</div>${a.token_usage_state ? agentTokenSummary(a) : ''}<div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button></div></div>`;
       const task = a.task_preview ?? a.task, problemText = a.problem_preview ?? a.problem;
       const unavailable = a.model_unavailable || /model.*(not supported|not available|not found)|not supported.*account/i.test(problemText || '');
@@ -1410,12 +1701,12 @@
       const close = !['closed','replaced'].includes(a.state) ? `<button class="small danger" data-action="close" data-id="${a.id}"${disabled}>${starting ? 'Close replacement' : 'Close'}</button>` : '';
       const queued = !starting && a.wake_queued_at ? `<span class="pill waiting" title="${esc(a.wake_reason || '')}">waiting for a slot since ${esc(new Date(a.wake_queued_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</span>` : '';
       const waitReason = !starting && a.wake_reason ? `<div class="meta wait-reason">${esc(a.wake_reason)}</div>` : '';
-      const problem = a.has_problem || problemText ? `<div class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
+      const problem = a.has_problem || problemText ? `<div data-part="problem" class="problem">${a.state === 'replaced' ? 'Previous crash' : unavailable ? 'Model unavailable' : a.pause_reason === 'limit' ? 'Usage limit' : a.state === 'crashed' ? 'Crashed' : 'Problem'}: ${esc(problemText || 'See Details')}</div>` : '';
       const recovery = !starting && a.pause_reason === 'limit' ? `<div class="meta wait-reason">${state.settings?.auto_resume ? 'Auto-resume is on: waiting for confirmed usage and an active slot.' : 'Auto-resume is off: resume manually when ready.'}</div>` : '';
       return `<div class="agent" data-agent="${a.id}">
-        <div><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${queued}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
-        <div><div class="meta agent-task" title="${esc(`${a.status ? 'Status' : 'Task'}: ${a.status || task}`)}"><span class="agent-task-label">${a.status ? 'Status' : 'Task'}: </span>${esc(a.status || task)}</div>${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}<div class="meta">context ${tokenCount(a.context)} · ${fmt(a.turns)} turns</div>${agentTokenSummary(a)}<div class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
-        <div class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
+        <div data-part="identity"><div class="agent-name"><span>${esc(a.name)}</span><span class="pill ${starting && a.state === 'done' ? 'waiting' : esc(a.state)}">${starting && a.state === 'done' ? 'queued' : esc(a.state)}${a.state === 'paused' && a.pause_reason ? ` · ${esc(a.pause_reason)}` : ''}</span>${queued}</div><div class="meta">#${a.id} · ${esc(a.harness)} / ${esc(a.model)} / ${esc(a.effort)}</div></div>
+        <div data-part="body"><div data-part="task" class="meta agent-task" title="${esc(`${a.status ? 'Status' : 'Task'}: ${a.status || task}`)}"><span class="agent-task-label">${a.status ? 'Status' : 'Task'}: </span>${esc(a.status || task)}</div><div data-part="notices">${stopping}${waiting}${diagnostics}${replacement}${problem}${recovery}${waitReason}</div><div data-part="context" class="meta">context ${tokenCount(a.context)} · ${fmt(a.turns)} turns</div>${agentTokenSummary(a)}<div data-part="launch" class="meta">launched by ${who(a.launched_by)} at ${when(a.launched_at)}</div></div>
+        <div data-part="buttons" class="agent-buttons"><button class="small" data-action="details" data-id="${a.id}">Details</button>${buttons}${close}</div>
       </div>`;
     }
 
@@ -1434,6 +1725,9 @@
     }
 
     function renderThreads() {
+      const threadPage=state.pages.threads, current=threadPage?.scope===collectionPath('threads');
+      $('#thread-list').setAttribute('aria-busy',String(!current||!!threadPage?.pending));
+      setText($('#thread-sort-status'),!current||threadPage?.pending ? 'Updating order…' : threadPage?.retrying ? 'Keeping the last consistent order; refreshing…' : threadPage?.error ? `Last available list. ${threadPage.error}` : '');
       setText($('#thread-count'), `${state.pages.threads?.total ?? state.threads.length}`);
       document.querySelectorAll('[data-thread-filter]').forEach(b => {
         const active = b.dataset.threadFilter === state.threadFilter;
@@ -1442,7 +1736,8 @@
       const joined = t => typeof t.user_member === 'boolean' ? t.user_member : Array.isArray(t.members) ? t.members.includes(0) : null;
       const search = $('#thread-search').value.trim().toLowerCase();
       const threads = state.threads.filter(t => !search || `${t.title || ''} ${t.id}`.toLowerCase().includes(search)).filter(t=>state.threadFilter === 'all' || (state.threadFilter === 'unread' ? t.unread == null || t.unread > 0 : joined(t) == null || (joined(t) ? state.threadFilter === 'mine' : state.threadFilter === 'agents')));
-      setHTML($('#thread-list'), threads.length ? threads.map(t => `<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"${state.selectedThread === t.id ? ' aria-current="true"' : ''}><strong>${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} message${t.messages === 1 ? '' : 's'}`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div></button>`).join('') : `<div class="empty">${search ? 'No threads match your search. Try another title or thread ID.' : state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
+      if (threads.length) keepThreadListReading(()=>syncViews($('#thread-list'),threads.map(t=>[`thread:${localKey(t.id,t.project)}`,`<button class="thread-row ${state.selectedThread === t.id ? 'active' : ''}" data-thread="${t.id}"${state.selectedThread === t.id ? ' aria-current="true"' : ''}><strong data-part="title">${esc(t.title || `Thread #${t.id}`)}</strong>${t.unread ? `<span data-part="unread" class="pill unread">${fmt(t.unread)} unread</span> ` : ''}<span data-part="participation" class="pill ${joined(t) ? 'idle' : ''}">${joined(t) == null ? 'Membership unavailable' : joined(t) ? 'You’re a member' : 'Agent-only'}</span><div data-part="summary" class="meta">Thread #${t.id} · ${threadAccess(t)} · ${t.messages == null ? 'Message count unavailable' : `${fmt(t.messages)} message${t.messages === 1 ? '' : 's'}`} · ${Array.isArray(t.members) ? memberNames(t.members) : 'Member list exceeds the preview budget'}</div><div data-part="last-message" class="meta">${t.last_at ? `Last message ${esc(when(t.last_at))}` : 'No messages yet'}</div></button>`])));
+      else setHTML($('#thread-list'),`<div class="empty">${search ? 'No threads match your search. Try another title or thread ID.' : state.pages.threads?.has_more ? 'No matching threads in this page. Load more to browse earlier threads.' : state.threadFilter === 'unread' ? 'No unread messages in this project' : state.threadFilter === 'mine' ? 'No threads you’ve joined. Choose All to browse agent conversations.' : 'No threads here yet'}</div>`);
     }
 
     function threadAccess(thread) {
@@ -1491,10 +1786,10 @@
     function messageHtml(m, includeText = true) {
       const local = typeof m.id === 'string';
       const delivery = {sending:'Sending…',failed:'Failed · Not sent. Your text is kept here for retry.',unconfirmed:'Delivery unconfirmed · Check the conversation before retrying.'}[m.delivery] || '';
-      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.membership_unknown ? ' · Membership at send time unknown' : m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span><button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-bubble"><div class="message-text">${includeText ? renderMessageText(m.text) : ''}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div></div>`;
+      return `<div class="message ${Number(m.sender) === 0 ? 'user' : ''} ${m.delivery || ''}" ${local ? 'data-pending-message' : 'data-message'}="${esc(m.id)}"><div class="message-head"><span>${Number(m.sender) === 0 ? 'you' : `agent ${m.sender}`}${m.outside_membership ? ' · <span class="pill">Outside your membership</span>' : ''}</span><span>${when(m.at)}</span><button type="button" class="copy-button small" data-copy-message="${esc(m.id)}" aria-label="Copy message" title="Copy message">${svgIcon('copy')}</button></div><div class="message-bubble"><div class="message-text">${includeText ? renderMessageText(m.text) : ''}</div>${delivery ? `<div class="message-delivery" role="status">${delivery}</div>` : ''}</div></div>`;
     }
     function messageText(id) {
-      return state.thread?.messages.find(message => String(message.id) === id)?.text ?? [...outgoingMessages.values()].find(message => message.id === id || String(message.serverId) === id)?.text;
+      return state.thread?.messages.find(message => String(message.id) === id)?.text ?? [...outgoingMessages.values()].find(message => message.project===state.selectedProject&&message.thread===state.selectedThread&&(message.id === id || String(message.serverId) === id))?.text;
     }
     function syncUnreadDivider(thread, messages) {
       if (thread.unreadBoundary == null && thread.unread > 0 && thread.members?.includes(0)) {
@@ -1539,7 +1834,7 @@
       for (const message of shown) {
         const local = typeof message.id === 'string';
         let node = nodes.get(String(message.id)) || (message.localId && nodes.get(message.localId));
-        const header = JSON.stringify([message.id,message.sender,message.at,message.membership_unknown,message.outside_membership,message.delivery]);
+        const header = JSON.stringify([message.id,message.sender,message.at,message.outside_membership,message.delivery]);
         if (node) {
           if (node._messageHeader === header) continue;
           if (local) node.dataset.pendingMessage = message.id;
@@ -1582,11 +1877,11 @@
 
     let threadLoading = null;
     async function refreshThread(showError = true) {
-      const selected = state.selectedThread;
+      const selected = state.selectedThread, project=state.selectedProject;
       if (selected == null) return;
       if (threadLoading?.selected === selected && threadLoading.request === state.threadRequest) return threadLoading.promise;
       const request = ++state.threadRequest;
-      const current = () => request === state.threadRequest && selected === state.selectedThread;
+      const current = () => request === state.threadRequest && selected === state.selectedThread && project===state.selectedProject;
       const flight = {selected, request}; threadLoading = flight;
       flight.promise = (async () => {
       try {
@@ -1595,18 +1890,18 @@
         const metadataRevision = state.revisions?.threads;
         let metadata = existing;
         if (!metadata || metadata.metadataRevision !== metadataRevision || metadata.resume) {
-          metadata = await record(`/threads/${selected}/metadata`, undefined, current);
+          metadata = await record(projectPath(`/threads/${selected}/metadata`,project), undefined, current);
           if (!current()) return;
         }
         const missingUnread = existing && metadata.first_unread != null && metadata.first_unread <= (existing.messages.at(-1)?.id || 0) && !existing.messages.some(m => m.id === metadata.first_unread);
         let cursor = missingUnread ? {after:metadata.first_unread-1, through:metadata.latest_message} : existing ? existing.resume || {after:existing.messages.at(-1)?.id || 0} : metadata.first_unread != null ? {after:metadata.first_unread-1, through:metadata.latest_message} : {through:metadata.latest_message};
         while (current()) {
-        const page = await api(query(`/threads/${selected}/messages`, {...cursor, limit:pageSize, max_bytes:pageBytes}));
+        const page = await api(query(`/threads/${selected}/messages`, {...cursor, limit:pageSize, max_bytes:pageBytes}),{project});
         if (!current()) return;
         const t = {...metadata, metadataRevision};
         const incoming = [];
         for (const message of page.items) {
-          const full = message.truncated ? await record(`/messages/${message.id}?agent=0`, message, current) : message;
+          const full = message.truncated ? await record(projectPath(`/messages/${message.id}?agent=0`,project), message, current) : message;
           if (!current()) return;
           incoming.push(full);
         }
@@ -1637,6 +1932,7 @@
             <form class="composer" id="message-form" data-draft-project="${t.project}" data-draft-thread="${t.id}"><textarea name="text" aria-label="Message" placeholder="Message this thread" required></textarea><button class="primary"${pendingSends.has(draftKey(t.project, t.id)) ? ' disabled' : ''}>Send</button><span class="composer-hint">Enter for a new line · Ctrl / ⌘ + Enter to send</span></form>`;
           $('.thread-layout').classList.add('conversation-open');
           $('#message-form textarea').value = threadDraft(t.project, t.id);
+          const draft=draftEntry(t.project,t.id);renderDraftStatus(draft);void loadServerDraft(draft,true);
           const messages = $('#messages');
           messages.scrollTop = messages.scrollHeight;
           messages._followLatest = true;
@@ -1669,7 +1965,7 @@
         setHTML($('#thread-metadata'), `Owner: ${esc(threadOwner(t))} · Members: ${memberNames(t.members)}`);
         if ($('#thread-owner-dialog').open && Number($('#thread-owner-form').dataset.ownerThread) === t.id) setText($('#thread-owner-current'), `Current owner: ${threadOwner(t)}`);
         setText($('#thread-membership'), t.members?.includes(0) ? 'Leave thread' : 'Join thread');
-        $('#thread-membership').disabled = pendingMembership.has(t.id);
+        $('#thread-membership').disabled = pendingMembership.has(localKey(t.id,t.project));
         const live = !!t.watch?.length;
         $('#add-thread-members').hidden = live && !t.excluded_members?.length;
         setText($('#add-thread-members'), live ? 'Restore members' : 'Add members');
@@ -1690,6 +1986,7 @@
         }
         if (!current()) return;
         state.thread.loadingNew = false;
+        void loadServerDraft(draftEntry(project,selected));
         markThreadRead();
       } catch (error) {
         if (current()) {
@@ -1709,11 +2006,11 @@
       const current = () => state.thread?.id === t.id && state.selectedThread === t.id && messages === $('#messages');
       button.disabled = true;
       try {
-        const page = await api(query(`/threads/${t.id}/messages`, {before:t.messages[0]?.id, limit:pageSize, max_bytes:pageBytes}));
+        const page = await api(query(`/threads/${t.id}/messages`, {before:t.messages[0]?.id, limit:pageSize, max_bytes:pageBytes}),{project:t.project});
         if (!current()) return;
         const incoming = [];
         for (const m of page.items) {
-          incoming.push(m.truncated ? await record(`/messages/${m.id}?agent=0`, m, current) : m);
+          incoming.push(m.truncated ? await record(projectPath(`/messages/${m.id}?agent=0`,t.project), m, current) : m);
           if (!current()) return;
         }
         const known = new Set(state.thread.messages.map(m => m.id)), added = incoming.filter(m => !known.has(m.id)).sort((a,b) => a.id - b.id);
@@ -1739,7 +2036,7 @@
       if (p) p.unread = Math.max(0, (p.unread || 0) + delta);
       if (state.unreadTotal != null) state.unreadTotal = Math.max(0, state.unreadTotal + delta);
       if (summary) summary.unread = unread;
-      if (state.thread?.id === id && $('#thread-unread')) {
+      if (state.thread?.id === id && state.thread.project===project && $('#thread-unread')) {
         $('#thread-unread').hidden = !unread;
         setText($('#thread-unread'), `${fmt(unread)} unread · Jump to latest`);
       }
@@ -1749,13 +2046,13 @@
     async function markThreadRead() {
       const t = state.thread, messages = $('#messages');
       const through = t?.messages?.at(-1)?.id || 0;
-      if (!t?.unread || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(t.id) || !messages || !messages.getClientRects().length ||
+      if (!t?.unread || t.loadingNew || t.resume || through <= (t.last_read || 0) || reading.has(localKey(t.id,t.project)) || !messages || !messages.getClientRects().length ||
           !$('#page-threads').classList.contains('active') || document.visibilityState !== 'visible' ||
           !document.hasFocus() || $('dialog[open]') || messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 36) return;
-      reading.add(t.id);
+      reading.add(localKey(t.id,t.project));
       try {
-        const read = await api(`/threads/${t.id}/read`, { method: 'POST', body: JSON.stringify({ message: through }) });
-        if (state.thread?.id === t.id) {
+        const read = await api(`/threads/${t.id}/read`, { project:t.project,method: 'POST', body: JSON.stringify({ message: through }) });
+        if (state.thread?.id === t.id&&state.thread.project===t.project) {
           const previous = state.thread.unread;
           state.thread.last_read = Math.max(state.thread.last_read || 0, read.last_read);
           // Messages can arrive after the snapshot or while this request is pending.
@@ -1764,20 +2061,20 @@
           updateUnread(t.id, t.project, state.thread.unread, previous);
         }
       } catch (error) {
-        if (state.thread?.id === t.id) {
+        if (state.thread?.id === t.id&&state.thread.project===t.project) {
           setText($('#thread-read-error'), `Couldn't save read status: ${error.message}. Retrying automatically.`);
           $('#thread-read-error').hidden = false;
         }
-      } finally { reading.delete(t.id); }
+      } finally { reading.delete(localKey(t.id,t.project)); }
     }
 
     async function refreshAgentDetails() {
-      const id = selectedAgent, request = agentRequest;
+      const id = selectedAgent, request = agentRequest, project=state.selectedProject;
       if (id == null || !$('#agent-dialog').open || agentLoading === request) return;
       agentLoading = request;
       try {
         const current = () => request === agentRequest && id === selectedAgent && $('#agent-dialog').open;
-        const [a, log] = await Promise.all([record(`/agents/${id}`, undefined, current), loadAgentLog(id, request)]);
+        const [a, log] = await Promise.all([record(projectPath(`/agents/${id}`,project), undefined, current), loadAgentLog(id, request)]);
         if (request !== agentRequest || id !== selectedAgent || !$('#agent-dialog').open) return;
         rememberWaiting(a);
         for (const summary of [state.agents.find(item => item.id === id), state.agentBrowser.find(item => item.id === id)]) if (summary?.truncated && a.project === state.selectedProject) {
@@ -1789,7 +2086,7 @@
         setText($('#agent-title'), `${a.name} · #${a.id}`);
         const display = (key, value) => key === 'launched_by' ? who(value) : key.endsWith('_at') ? when(value) : value ?? '—';
         const fields = Object.entries(a).filter(([k,v]) => !['retry','continuation','replacement','replacement_request','replacement_start','replacement_pending','replacement_start_pending','running_configuration','stopping','waiting','is_waiting','has_diagnostics','subscriptions','diagnostics','total_tokens','fresh_in','cache_write','cache_read','output','token_usage_state','token_usage_updated_at','token_usage_last_total'].includes(k) && !Array.isArray(v) && (v == null || typeof v !== 'object')).map(([key,value]) => ({key,label:['model','effort'].includes(key) ? `next-turn ${key}` : key.replaceAll('_',' '),content:esc(display(key, value))}));
-        fields.push({key:'token_usage',label:'Token usage',content:tokenUsageState(a)}, {key:'total_tokens',label:'Total tokens',content:tokenTotal(a)}, ...[['fresh_in','Fresh input'],['cache_write','Cache writes'],['cache_read','Cache reads'],['output','Output']].map(([key,label]) => ({key,label,content:tokenCount(a[key])})));
+        fields.push({key:'token_usage',label:'Token usage',content:tokenUsageState(a)}, {key:'total_tokens',label:'Total tokens',content:tokenTotal(a)}, ...[['fresh_in','Fresh input'],['cache_write','Cache writes'],['cache_read','Cache reads'],['output','Output']].map(([key,label]) => ({key,label,content:tokenField(a,key,label)})));
         if (a.waiting) fields.push({key:'waiting',label:'waiting',content:waitingDescription(a)});
         const subscriptions = a.subscriptions || {active:0,pending:0};
         setText($('#agent-subscription-count'), `(${fmt(subscriptions.active)} active · ${fmt(subscriptions.pending)} pending events)`);
@@ -1809,6 +2106,9 @@
         if (a.continuation) fields.push({key:'continuation',label:'pending continuation',content:`${esc(a.continuation.text)}<br>${a.continuation.blocked ? `Waiting: ${esc(a.continuation.blocked)}` : 'One turn after the current turn succeeds'}`});
         updateAgentDetails(fields);
         updateWaitTimers();
+        const permissions=permissionEntry(id,project);permissions.readOnly=a.state==='replaced';
+        if ($('#agent-permissions').open) permissionControls();
+        syncHistoryPanels();
         if (a.state === 'replaced') $('#agent-config').replaceChildren();
         else if (!$('#agent-config').hasChildNodes()) renderAgentConfig(a);
         const configRoot = $('#agent-config'), blocked = !!a.replacement_request;
@@ -1839,8 +2139,8 @@
           el.textContent = text;
           el.scrollTop = atBottom ? el.scrollHeight : top;
         }
-        setText($('#agent-detail-status'), `Live · updated ${new Date().toLocaleTimeString()}`);
-        await Promise.all([$('#agent-lifecycle').open ? loadAgentLifecycle(id, request) : null, $('#agent-diagnostics').open ? loadAgentDiagnostics(id, request) : null, $('#agent-subscriptions').open ? loadAgentSubscriptions(id, request) : null]);
+        setText($('#agent-detail-status'), `Live · refreshed ${new Date().toLocaleTimeString()}`);
+        await Promise.all([$('#agent-lifecycle').open ? loadAgentLifecycle(id, request) : null, $('#agent-diagnostics').open ? loadAgentDiagnostics(id, request) : null, $('#agent-subscriptions').open ? loadAgentSubscriptions(id, request) : null, $('#agent-permissions').open ? loadPermissions(id,request) : null]);
       } catch (error) {
         if (request === agentRequest && $('#agent-dialog').open) setText($('#agent-detail-status'), `Updates unavailable: ${error.message}. Retrying automatically.`);
       } finally { if (agentLoading === request) agentLoading = null; }
@@ -1854,6 +2154,7 @@
       return loadAgentHistory(id, request, older, true);
     }
     async function loadAgentHistory(id, request, older, diagnostics) {
+      const project=state.selectedProject;
       const key = diagnostics ? 'diagnostics' : 'lifecycle', kind = diagnostics ? 'coordination.suspected-loop' : 'agent.state';
       const current = () => id === selectedAgent && request === agentRequest && $('#agent-dialog').open && $(`#agent-${key}`).open;
       if (!current() || (diagnostics ? diagnosticsLoading : lifecycleLoading)?.request === request) return;
@@ -1862,11 +2163,11 @@
       try {
         const cached = diagnostics ? agentDiagnostics : agentLifecycle, previous = cached?.id === id ? cached : null;
         const cursor = previous?.events.length ? older ? {before:previous.events.at(-1).id} : {after:previous.events[0].id} : {};
-        let page = await api(query('/history',{agent:id,kind,limit:30,max_bytes:pageBytes,...cursor}));
+        let page = await api(query('/history',{agent:id,kind,limit:30,max_bytes:pageBytes,...cursor}),{project});
         if (!current()) return;
         let replace = !previous?.events.length;
         // A burst beyond one page restarts at the latest window; never leave a hidden gap.
-        if (!older && cursor.after && page.has_more) {page=await api(query('/history',{agent:id,kind,limit:30,max_bytes:pageBytes}));replace=true;}
+        if (!older && cursor.after && page.has_more) {page=await api(query('/history',{agent:id,kind,limit:30,max_bytes:pageBytes}),{project});replace=true;}
         if (!current()) return;
         let events = [...new Map([...(replace ? [] : previous.events),...page.events].map(event=>[event.id,event])).values()].sort((a,b)=>b.id-a.id);
         const windowSize = Math.max(30,previous?.events.length || 0), trimmed = !older && events.length>windowSize;
@@ -1883,7 +2184,7 @@
     function subscriptionCondition(item) {
       const watch = item.watch || {}, parts = [];
       if (watch.agents) parts.push(`${watch.agents === 'all' ? 'all project agents' : `agents ${watch.agents.map(id=>`#${id}`).join(', ')}`} · ${watch.states?.length ? `states: ${watch.states.join(', ')}` : 'state changes'}${watch.status_text ? ' · status text' : ''}`);
-      if (watch.usage) { const usage=watch.usage, condition=usage.condition==='reset-due' ? 'estimated reset due (unconfirmed)' : usage.condition==='reset' ? 'confirmed reset/recovery' : `${usage.condition} ${usage.percent}%`; parts.push(`${usage.provider} / ${usage.window}: ${condition}`); }
+      if (watch.usage) { const usage=watch.usage, condition=usage.condition==='reset-due' ? 'estimated reset due (unconfirmed)' : `${usage.condition} ${usage.percent}%`; parts.push(`${usage.provider} / ${usage.window}: ${condition}`); }
       if (!parts.length) parts.push(item.mode === 'once' ? 'Own notifications' : 'Event subscription');
       return parts.join(' · ');
     }
@@ -1894,10 +2195,11 @@
     }
     function renderAgentSubscriptions() {
       if (!agentSubscriptions || agentSubscriptions.id !== selectedAgent) return;
-      setHTML($('#agent-subscription-items'), agentSubscriptions.items.length ? agentSubscriptions.items.map(item=>`<div class="event" data-subscription="${esc(item.id)}"><time>${esc(when(item.created_at))}</time><div><strong>${item.mode === 'once' ? 'Deferred wait' : 'Subscription'} #${esc(item.id)}</strong> · ${esc(item.state || 'details required')}<div>${item.truncated ? `<button type="button" class="small" data-record="subscriptions" data-record-id="${esc(item.id)}">Load full subscription</button>` : esc(subscriptionCondition(item))}</div>${item.deadline ? `<div class="meta">${item.state === 'active' ? 'Deadline' : 'Original deadline'}: ${esc(when(item.deadline))}</div>` : ''}${item.completion ? `<div>${esc(subscriptionCompletion(item))}${item.completed_at ? ` · ${esc(when(item.completed_at))}` : ''}</div>` : ''}${item.state === 'active' ? `<button type="button" class="small" data-cancel-subscription="${esc(item.id)}" aria-label="Cancel ${item.mode === 'once' ? 'deferred wait' : 'subscription'} #${esc(item.id)}"${cancelingSubscriptions.has(item.id) ? ' disabled' : ''}>${cancelingSubscriptions.has(item.id) ? 'Canceling…' : 'Cancel'}</button>` : ''}</div></div>`).join('') : '<p class="meta">No subscriptions or deferred waits.</p>');
+      setHTML($('#agent-subscription-items'), agentSubscriptions.items.length ? agentSubscriptions.items.map(item=>`<div class="event" data-subscription="${esc(item.id)}"><time>${esc(when(item.created_at))}</time><div><strong>${item.mode === 'once' ? 'Deferred wait' : 'Subscription'} #${esc(item.id)}</strong> · ${esc(item.state || 'details required')}<div>${item.truncated ? `<button type="button" class="small" data-record="subscriptions" data-record-id="${esc(item.id)}">Load full subscription</button>` : esc(subscriptionCondition(item))}</div>${item.deadline ? `<div class="meta">${item.state === 'active' ? 'Deadline' : 'Original deadline'}: ${esc(when(item.deadline))}</div>` : ''}${item.completion ? `<div>${esc(subscriptionCompletion(item))}${item.completed_at ? ` · ${esc(when(item.completed_at))}` : ''}</div>` : ''}${item.state === 'active' ? `<button type="button" class="small" data-cancel-subscription="${esc(item.id)}" aria-label="Cancel ${item.mode === 'once' ? 'deferred wait' : 'subscription'} #${esc(item.id)}"${cancelingSubscriptions.has(localKey(item.id)) ? ' disabled' : ''}>${cancelingSubscriptions.has(localKey(item.id)) ? 'Canceling…' : 'Cancel'}</button>` : ''}</div></div>`).join('') : '<p class="meta">No subscriptions or deferred waits.</p>');
       $('#subscriptions-more').hidden=!agentSubscriptions.has_more;
     }
     async function loadAgentSubscriptions(id, request, more = false) {
+      const project=state.selectedProject;
       const current = () => id === selectedAgent && request === agentRequest && $('#agent-dialog').open && $('#agent-subscriptions').open;
       if (!current() || subscriptionsLoading?.request === request) return;
       const flight = {id,request}; subscriptionsLoading=flight; $('#subscriptions-more').disabled=true;
@@ -1906,7 +2208,7 @@
         for (let attempt=0;attempt<3;attempt++) {
           try {
             const direct=more && previous?.has_more && attempt===0;
-            let page=await api(query('/subscriptions',{agent:id,limit:30,max_bytes:pageBytes,...(direct ? {before:previous.next_before,through:previous.through,revision:previous.revision} : {since:!more ? previous?.revision : null})}));
+            let page=await api(query('/subscriptions',{agent:id,limit:30,max_bytes:pageBytes,...(direct ? {before:previous.next_before,through:previous.through,revision:previous.revision} : {since:!more ? previous?.revision : null})}),{project});
             if (!current()) return;
             if (page.unchanged) {$('#agent-subscriptions-error').hidden=true;return;}
             let items=direct ? [...previous.items,...page.items] : [...page.items];
@@ -1914,7 +2216,7 @@
             while(page.has_more && items.length<target) {
               const before=page.next_before;
               if (before==null) throw new Error('Missing subscription cursor');
-              page=await api(query('/subscriptions',{agent:id,limit:30,max_bytes:pageBytes,before,through:page.through,revision:page.revision}));
+              page=await api(query('/subscriptions',{agent:id,limit:30,max_bytes:pageBytes,before,through:page.through,revision:page.revision}),{project});
               if (!current()) return;
               if(page.has_more && page.next_before===before)throw new Error('Subscription cursor did not advance');
               items.push(...page.items);
@@ -1927,6 +2229,125 @@
       finally {if(subscriptionsLoading===flight)subscriptionsLoading=null;if(current())$('#subscriptions-more').disabled=false;}
     }
     $('#agent-subscriptions').addEventListener('toggle',()=>{if($('#agent-subscriptions').open&&selectedAgent!=null)loadAgentSubscriptions(selectedAgent,agentRequest);});
+    const permissionStates = {pause:['working','idle','done'],resume:['paused','crashed'],close:['working','idle','paused','done','crashed'],reopen:['closed']};
+    const permissionRules = grants => grants.map(rule=>({action:rule.action,scope:rule.scope,states:[...rule.states],targets:(rule.agents || []).join(', ')}));
+    function permissionEntry(id=selectedAgent, project=state.selectedProject) {
+      if (id==null || !project) return null;
+      const key=localKey(id,project);
+      if (!permissionDrafts.has(key)) permissionDrafts.set(key,{id,project,rules:[],baseline:[],loaded:false,version:null,generation:0});
+      return permissionDrafts.get(key);
+    }
+    function permissionValue(entry) {
+      if (entry.rules.length>64) throw new Error('At most 64 rules are allowed.');
+      return entry.rules.map((rule,index)=>{
+        const fail=message=>{throw new Error(`Rule ${index+1}: ${message}`);};
+        if (!permissionStates[rule.action]) fail('choose an action.');
+        if (!['launched','selected','project'].includes(rule.scope)) fail('choose a scope.');
+        if (!rule.states.length || rule.states.some(value=>!permissionStates[rule.action].includes(value))) fail('select at least one eligible state.');
+        const value={action:rule.action,scope:rule.scope,states:[...new Set(rule.states)].sort()};
+        if (rule.scope==='selected') {
+          const parts=rule.targets.trim().split(/[\s,]+/);
+          if (!parts.length || parts.some(part=>!/^\d+$/.test(part)||!Number.isSafeInteger(Number(part))||Number(part)<=0)) fail('enter positive agent IDs separated by commas or spaces.');
+          value.agents=[...new Set(parts.map(Number))].sort((a,b)=>a-b);
+          if (value.agents.length>200 || value.agents.includes(entry.id)) fail('select 1–200 other agents in this project.');
+        }
+        return value;
+      });
+    }
+    function permissionDirty(entry) {
+      try {return JSON.stringify(permissionValue(entry))!==JSON.stringify(entry.baseline);}
+      catch (_) {return true;}
+    }
+    function permissionControls() {
+      const entry=permissionEntry(), panel=$('#agent-permissions');
+      if (!entry) return;
+      const locked=!entry.loaded||entry.saving||entry.readOnly, dirty=permissionDirty(entry);
+      let invalid='';try {permissionValue(entry);} catch(error) {invalid=error.message;}
+      panel.setAttribute('aria-busy',String(!!(entry.loading||entry.saving)));
+      $('#permission-rules').querySelectorAll('input,select,button').forEach(control=>control.disabled=!!locked);
+      $('#permission-add').disabled=locked||entry.rules.length>=64;
+      $('#permission-revoke').disabled=locked||!entry.rules.length;
+      $('#permission-save').disabled=locked||!!entry.loading||!dirty||!!invalid||entry.conflict;
+      $('#permission-reset').disabled=!!entry.saving||(!dirty&&!entry.conflict&&!entry.error);
+      setText($('#permission-save'),entry.saving?'Saving…':'Save permissions');
+      setText($('#permission-status'),entry.readOnly?`Replaced agents cannot receive permissions.${dirty?' Unsaved rules are not active; Reset draft to view saved permissions.':''}${entry.error?` ${entry.error}`:''}`:entry.error?entry.error:entry.conflict?'Permissions changed elsewhere. Reset draft to reload before saving.':!entry.loaded?'Loading permissions…':invalid?invalid:dirty?'Unsaved permissions.':entry.baseline.length?`${entry.baseline.length} saved rule${entry.baseline.length===1?'':'s'}.`:'No delegated permissions.');
+      $('#permission-status').classList.toggle('inline-error',!!entry.error||!!entry.conflict);
+    }
+    function renderPermissionEditor() {
+      const entry=permissionEntry();if (!entry || !$('#agent-permissions').open) return;
+      const agents=state.agents.filter(agent=>agent.id!==entry.id).sort((a,b)=>a.id-b.id);
+      setHTML($('#permission-rules'),entry.rules.map((rule,index)=>`<fieldset class="permission-rule" data-permission-rule="${index}" data-generation="${entry.generation}"><legend>Rule ${index+1}</legend><div class="form-grid"><label>Action <select id="permission-action-${index}" data-permission-field="action"><option value="">Choose action</option>${options(Object.keys(permissionStates),rule.action)}</select></label><label>Scope <select id="permission-scope-${index}" data-permission-field="scope"><option value="">Choose scope</option>${[['launched','Agents it launched'],['selected','Selected agents'],['project','All project agents']].map(([value,label])=>`<option value="${value}"${value===rule.scope?' selected':''}>${label}</option>`).join('')}</select></label></div><div class="permission-states" role="group" aria-label="Eligible states for rule ${index+1}">${(permissionStates[rule.action]||[]).map(value=>`<label class="inline-check"><input type="checkbox" id="permission-state-${index}-${value}" data-permission-state="${value}"${rule.states.includes(value)?' checked':''}> ${value}</label>`).join('')}</div>${rule.scope==='selected'?`<label>Agent IDs <input id="permission-targets-${index}" data-permission-field="targets" value="${esc(rule.targets)}" placeholder="IDs separated by commas or spaces"></label><details><summary>Choose from loaded agents</summary><label>Find agents <input type="search" data-permission-search placeholder="Name, ID or group"></label><div class="member-list">${agents.map(agent=>`<label data-permission-candidate data-search="${esc(`${agent.id} ${agent.name||''} ${agent.group||''}`.toLowerCase())}"><input type="checkbox" id="permission-agent-${index}-${agent.id}" data-permission-target="${agent.id}"${rule.targets.split(/[\s,]+/).map(Number).includes(agent.id)?' checked':''}><span>#${agent.id} ${esc(agent.name||'')}<span class="meta"> · ${esc(agent.state)}</span></span></label>`).join('')||'<p class="meta">No other loaded agents.</p>'}</div><button type="button" class="small" data-permission-more${state.pages.agents?.has_more?'':' hidden'}>Load more agents</button></details>`:''}<button type="button" class="small" data-permission-remove="${index}">Remove rule</button></fieldset>`).join(''));
+      permissionControls();
+    }
+    async function loadPermissions(id, request) {
+      const project=state.selectedProject, entry=permissionEntry(id,project);
+      const current=()=>project===state.selectedProject&&id===selectedAgent&&request===agentRequest&&$('#agent-dialog').open&&$('#agent-permissions').open;
+      if (!current()||entry.loading?.request===request||entry.saving) return;
+      const flight={request};entry.loading=flight;permissionControls();
+      try {
+        const value=await record(projectPath(`/agents/${id}/permissions`,project),undefined,current);
+        if (!current()) return;
+        if (!Array.isArray(value.grants)||typeof value.version!=='string') throw new Error('Invalid permission response.');
+        if (entry.loaded&&permissionDirty(entry)) {
+          if (value.version!==entry.version) entry.conflict=true;
+        } else if (!entry.loaded||value.version!==entry.version) {
+          entry.baseline=structuredClone(value.grants);entry.rules=permissionRules(value.grants);entry.version=value.version;entry.loaded=true;entry.generation++;
+          renderPermissionEditor();
+        }
+        entry.error=null;permissionControls();
+      } catch(error) {if(current()) {entry.error=`Permissions unavailable: ${error.message}`;permissionControls();}}
+      finally {if(entry.loading===flight)entry.loading=null;if(current())permissionControls();}
+    }
+    $('#agent-permissions').addEventListener('toggle',()=>{if($('#agent-permissions').open&&selectedAgent!=null) {renderPermissionEditor();loadPermissions(selectedAgent,agentRequest);}});
+    $('#agent-permissions').addEventListener('input',event=>{
+      const entry=permissionEntry(),row=event.target.closest('[data-permission-rule]');
+      if (!entry||!row||entry.saving||entry.readOnly||Number(row.dataset.generation)!==entry.generation) return;
+      if (event.target.matches('[data-permission-search]')) {
+        row.querySelectorAll('[data-permission-candidate]').forEach(node=>node.hidden=!node.dataset.search.includes(event.target.value.toLowerCase()));return;
+      }
+      const rule=entry.rules[Number(row.dataset.permissionRule)];
+      if (event.target.dataset.permissionField) {
+        const field=event.target.dataset.permissionField;rule[field]=event.target.value;
+        if (field==='action') rule.states=rule.states.filter(value=>permissionStates[rule.action]?.includes(value));
+        if (field!=='targets') {entry.generation++;renderPermissionEditor();}
+        else row.querySelectorAll('[data-permission-target]').forEach(input=>input.checked=rule.targets.split(/[\s,]+/).map(Number).includes(Number(input.dataset.permissionTarget)));
+      } else if (event.target.dataset.permissionState) {
+        rule.states=[...row.querySelectorAll('[data-permission-state]:checked')].map(input=>input.dataset.permissionState);
+      } else if (event.target.dataset.permissionTarget) {
+        const values=new Set(rule.targets.split(/[\s,]+/).map(Number).filter(value=>Number.isSafeInteger(value)&&value>0)),id=Number(event.target.dataset.permissionTarget);
+        if(event.target.checked)values.add(id);else values.delete(id);
+        rule.targets=[...values].sort((a,b)=>a-b).join(', ');$('[data-permission-field=targets]',row).value=rule.targets;
+      }
+      entry.error=null;permissionControls();
+    });
+    $('#agent-permissions').addEventListener('click',async event=>{
+      const button=event.target.closest('button');if(!button)return;
+      const entry=permissionEntry(),request=agentRequest;
+      if (!entry||entry.saving||((entry.readOnly||!entry.loaded)&&button.id!=='permission-reset')) return;
+      const row=button.closest('[data-permission-rule]');
+      if(row&&Number(row.dataset.generation)!==entry.generation)return;
+      if (button.id==='permission-add') {if(entry.rules.length>=64)return;entry.rules.push({action:'',scope:'',states:[],targets:''});}
+      else if (button.hasAttribute('data-permission-remove')) entry.rules.splice(Number(button.dataset.permissionRemove),1);
+      else if (button.id==='permission-revoke') entry.rules=[];
+      else if (button.id==='permission-reset') {
+        entry.rules=permissionRules(entry.baseline);entry.conflict=false;entry.error=null;entry.loaded=false;entry.generation++;renderPermissionEditor();await loadPermissions(entry.id,request);return;
+      } else if (button.hasAttribute('data-permission-more')) {
+        await loadCollection('agents',true);
+        if(entry.project===state.selectedProject&&request===agentRequest)renderPermissionEditor();return;
+      } else if (button.id==='permission-save') {
+        if(entry.conflict||entry.loading||!permissionDirty(entry))return;
+        let grants;try{grants=permissionValue(entry);}catch(error){entry.error=error.message;permissionControls();return;}
+        const path=projectPath(`/agents/${entry.id}/permissions`,entry.project),version=entry.version;
+        entry.saving=true;permissionControls();
+        try {
+          const result=await api(path,{method:'PUT',body:JSON.stringify({version,grants})});
+          entry.baseline=structuredClone(result.grants||grants);entry.rules=permissionRules(entry.baseline);entry.version=result.version??version;entry.error=null;entry.conflict=false;entry.generation++;
+        } catch(error) {entry.error=error.status===409?'Permissions changed or this agent is no longer eligible. Reset draft to reload before saving.':error.message;if(error.status===409)entry.conflict=true;}
+        finally {entry.saving=false;if(entry.project===state.selectedProject&&entry.id===selectedAgent&&$('#agent-dialog').open)renderPermissionEditor();}
+        return;
+      } else return;
+      entry.error=null;entry.generation++;renderPermissionEditor();
+    });
     async function loadAgentLog(id, request, older = false) {
       if (logLoading?.id === id && logLoading.request === request) {
         await logLoading.promise;
@@ -1938,13 +2359,14 @@
       finally { if (logLoading === flight) logLoading = null; }
     }
     async function readAgentLog(id, request, older = false) {
+      const project=state.selectedProject;
       const current = () => request === agentRequest && id === selectedAgent && $('#agent-dialog').open;
       for (let attempt = 0; attempt < 3; attempt++) {
         let previous = agentLog?.id === id ? agentLog : null;
         let cursor = previous ? older ? {before:previous.start, version:previous.version} : {after:previous.end, version:previous.version, since:previous.revision} : {};
         try {
           while (current()) {
-            const part = await api(query(`/agents/${id}/log`, {...cursor, lines:100, max_bytes:pageBytes}));
+            const part = await api(query(`/agents/${id}/log`, {...cursor, lines:100, max_bytes:pageBytes}),{project});
             if (!current()) return null;
             if (part.unchanged) return previous;
             const next = {id, ...part, text:previous ? older ? part.text + previous.text : previous.text + part.text : part.text,
@@ -1972,6 +2394,7 @@
           pair = [document.createElement('dt'),document.createElement('dd')];
           pair[0].dataset.key = key; pair[0].textContent = label; root.append(...pair);
         }
+        deferredRemovals.delete(pair[0]);
         if (!pair[1].querySelector('.detail-value')) {
           pair[1].innerHTML = `<span class="detail-value" id="agent-field-${esc(key)}"></span>${copyButton(`agent-field-${key}`, label.charAt(0).toUpperCase() + label.slice(1))}`;
         }
@@ -1979,10 +2402,14 @@
         $('.copy-button', pair[1]).hidden = content === '—' || !content;
         existing.delete(key);
       }
-      for (const pair of existing.values()) pair.forEach(node => node.remove());
+      for (const pair of existing.values()) {
+        if (pair.some(hasSelectedText)) deferredRemovals.set(pair[0],pair);
+        else {deferredRemovals.delete(pair[0]);pair.forEach(node=>node.remove());}
+      }
     }
 
     $('#agent-dialog').addEventListener('close', () => { if (!$('#agent-dialog').open) { selectedAgent = null; agentRequest++; } });
+    $('#agent-dialog').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('input:not([type=checkbox])'))event.preventDefault();});
     document.addEventListener('close', event => {
       const feedback = $('#toast');
       if (event.target.contains(feedback)) ([...document.querySelectorAll('dialog[open]')].at(-1) || document.body).append(feedback);
@@ -1994,12 +2421,41 @@
     function syncSettings(force = false) {
       if (!state.settings || state.saving || state.configLoading || ((state.editor?.dirty || state.editor?.pending) && !force)) return;
       const project = state.project?.id ?? null;
-      const config = state.project ? state.project.config : (state.editor?.project == null ? state.editor?.config ?? 1 : 1);
+      const config = state.project ? state.project.config : (state.editor?.project == null ? state.editor?.config ?? 'default' : 'default');
       const s = config == null ? state.settings : state.configs.find(c => c.id === config)?.settings || state.settings;
       const signature = JSON.stringify([project, config, s, state.configs.map(c => [c.id, c.name, c.projects]), state.projects.map(p => [p.id, p.name])]);
       if (!force && signature === state.editor?.signature) return;
       state.editor = { project, config, settings: structuredClone(s), signature, dirty: false, pending: false };
       renderSettings();
+    }
+    function serverSettingsDraft() {
+      return Object.fromEntries(['usage_poll_secs','metrics_sample_secs'].map(key=>[key,Number($(`[name=${key}]`,$('#server-settings-form')).value)]));
+    }
+    function renderServerSettings() {
+      const form=$('#server-settings-form'), current=serverSettings;
+      for (const key of ['usage_poll_secs','metrics_sample_secs']) {
+        const input=$(`[name=${key}]`,form);
+        if (!current.dirty && current.value && input.value !== String(current.value[key])) input.value=current.value[key];
+        input.disabled=!current.value||current.saving;
+      }
+      $('[form="server-settings-form"]').disabled=!current.value||!current.dirty||current.saving||!!current.loading||current.conflict;
+      $('#server-settings-reset').disabled=current.saving||(!current.dirty&&!current.error);
+      setText($('#server-settings-status'),current.saving ? 'Saving server settings…' : current.error ? `Server settings unavailable: ${current.error}. Your draft is retained.` : current.conflict ? 'Server settings changed elsewhere. Your draft is retained; Reset draft to reload current values.' : current.loading && !current.value ? 'Loading server settings…' : current.dirty ? 'Unsaved server settings.' : current.value ? 'Server settings saved.' : 'Server settings not loaded.');
+    }
+    async function loadServerSettings(force = false) {
+      if (serverSettings.loading) return serverSettings.loading;
+      const revision=state.revisions?.global_settings;
+      if (serverSettings.saving || (!force&&serverSettings.value&&serverSettings.revision===revision)) return;
+      serverSettings.loading=(async()=>{
+        try {
+          const value=await record('/global-settings');
+          if (serverSettings.dirty&&serverSettings.value&&settingsFingerprint(value)!==settingsFingerprint(serverSettings.value)) serverSettings.conflict=true;
+          Object.assign(serverSettings,{value,revision,error:null});
+        } catch (error) {serverSettings.error=error.message;}
+      })();
+      renderServerSettings();
+      try {await serverSettings.loading;}
+      finally {serverSettings.loading=null;renderServerSettings();}
     }
     function appliedConfigText() {
       if (!state.project) return 'No project selected.';
@@ -2015,9 +2471,9 @@
         return p?.name ? `${p.name} (#${id})` : `#${id}`;
       });
       const configControls = `<p class="launch-project" id="config-applied">${esc(appliedConfigText())}</p><div class="form-grid"><label>Select configuration <select id="config-select">${state.configs.map(c => `<option value="${c.id}" ${c.id === state.editor.config ? 'selected' : ''}>${esc(c.name || `Config #${c.id}`)}</option>`).join('')}${state.editor.project == null ? '' : `<option value="custom" ${state.editor.config == null ? 'selected' : ''}>Custom</option>`}</select></label>
-        ${config && config.id !== 1 ? `<label>Config name <input name="config_name" value="${esc(config.name)}" required></label>` : '<span></span>'}</div>
-        <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. ${config.id === 1 ? 'Default is read-only. Copy it with Save as new config, or choose Custom for this project.' : `Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.`}` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}${state.editor.pending ? ' Selection is not applied yet; Save applies it to this project.' : ''}</p>
-        <div class="actions"><button type="button" class="small" data-more="configs" hidden>More configurations</button><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 1 ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
+        ${config && config.id !== 'default' ? `<label>Config name <input name="config_name" value="${esc(config.name)}" required></label>` : '<span></span>'}</div>
+        <p class="launch-project" id="config-scope">${config ? `Used by: ${usedBy.length ? esc(usedBy.join(', ')) : 'no projects'}. ${config.id === 'default' ? 'Default is read-only. Copy it with Save as new config, or choose Custom for this project.' : `Saving edits this shared config${state.editor.project == null ? '' : ' and applies it to this project'}.`}` : 'Only this project. Custom starts with Default’s settings; Save applies your changes.'}${state.editor.pending ? ' Selection is not applied yet; Save applies it to this project.' : ''}</p>
+        <div class="actions"><button type="button" class="small" data-more="configs" hidden>More configurations</button><button type="button" id="save-config-as">Save as new config</button>${config && config.id !== 'default' ? `<button type="button" class="danger" id="remove-config" ${usedBy.length ? 'disabled' : ''} title="Only unused configs can be removed">Remove config</button>` : ''}</div>`;
       const harnesses = Object.entries(s.harnesses || {}).map(([name, h]) => `<div class="harness-settings" data-harness="${esc(name)}"><h4>${esc(name)}</h4><div class="form-grid">
         <label><span><input type="checkbox" name="enabled" ${h.enabled ? 'checked' : ''} style="width:auto"> Enabled</span></label><span></span>
         <label>Default model <select name="model">${modelOptions(name, h.models, h.model)}</select></label><label>Default effort <select name="effort">${options(h.efforts, h.effort)}</select></label>
@@ -2033,9 +2489,8 @@
       const per = Object.entries(s.limits?.active_per_harness || {}).map(([n, v]) => limit(`${capital(n)} active agents`, `active_per_harness.${n}`, v)).join('');
       const usage = [['claude','five_hour','Claude 5-hour'],['claude','seven_day','Claude weekly'],['claude','seven_day_fable','Claude Fable weekly'],['codex',null,'Codex']].map(([p,w,label]) => limit(`${label} subscription %`, `usage.${w ? `claude_${w}` : p}`, usageLimit(s.limits?.usage || {},p,w))).join('');
       $('#settings-form').innerHTML = `${configControls}<h3>Harnesses</h3>${harnesses}<h3>Limits <span class="meta">· per project, no combined cap</span></h3><p class="meta launch-project">Subscription usage is account-wide; these thresholds only act on this project's agents.</p>${limit('Active agents', 'active', s.limits?.active)}${per}${usage}${limit('Context tokens', 'context', s.limits?.context)}
-        <h3>Locks</h3><label style="max-width:300px">Maximum lock TTL (seconds) <input type="number" name="max_lock_ttl_secs" min="1" max="4294967295" step="1" required value="${s.max_lock_ttl_secs ?? 900}"></label><p class="meta launch-project">Every acquisition and renewal has a timed expiry; omitted TTL uses this maximum. Larger TTLs are rejected. Lowering the maximum shortens existing leases. Every pause stops the agent's processes, then releases its locks.</p>
+        <h3>Locks</h3><label style="max-width:300px">Maximum lock TTL (seconds) <input type="number" name="max_lock_ttl_secs" min="1" max="4294967295" step="1" required value="${s.max_lock_ttl_secs}"></label><p class="meta launch-project">Every acquisition and renewal has a timed expiry; omitted TTL uses this maximum. Larger TTLs are rejected. Lowering the maximum shortens existing leases. Every pause stops the agent's processes, then releases its locks.</p>
         <h3>Recovery</h3><label class="inline-check"><input type="checkbox" name="auto_resume" ${s.auto_resume ? 'checked' : ''}> Auto-resume after usage is confirmed available (including harness subscription stops)</label>
-        <label style="max-width:300px;margin-top:12px">Usage check interval (seconds) <input type="number" name="usage_poll_secs" min="15" max="3600" required value="${s.usage_poll_secs ?? 120}"></label><p class="meta launch-project">Default: 120 seconds. Periodic status checks detect early or free resets without spending model turns. Provider-reported reset times trigger earlier checks too. When projects differ, one shared account check uses the shortest interval. Failed checks keep agents paused.</p>
         <h3>Behavior</h3><label><span><input type="checkbox" name="done_closes" ${s.done_closes ? 'checked' : ''} style="width:auto"> Close agents when they mark done</span><span>Closed agents require explicit Reopen; messages wait in their inbox. Turn this off to let finished agents wake for new messages.</span></label>
         <label class="inline-check"><input type="checkbox" name="allow_agent_model_change" ${s.allow_agent_model_change ? 'checked' : ''}> Allow agents to change their model, including cross-provider replacement</label>
         <label class="inline-check"><input type="checkbox" name="allow_agent_effort_change" ${s.allow_agent_effort_change ? 'checked' : ''}> Allow agents to change their effort level</label>
@@ -2192,8 +2647,8 @@
       syncDefaultEfforts(root);
     }
 
-    async function mutate(path, body = {}) {
-      const result = await api(path, { method: 'POST', body: JSON.stringify(body) });
+    async function mutate(path, body = {}, project = body.project??state.selectedProject) {
+      const result = await api(path, { project,method: 'POST', body: JSON.stringify(body) });
       await refresh();
       return result;
     }
@@ -2218,6 +2673,7 @@
       });
     }
     for (const [id, label] of [['agent-subscription-items','Agent subscriptions'],['agent-diagnostics-items','Coordination warnings'],['agent-lifecycle-items','Lifecycle changes']]) {
+      $(`#${id}`).classList.add('history-list');
       const region = document.getElementById(id);
       region.tabIndex = 0; region.setAttribute('role', 'region'); region.setAttribute('aria-label', label);
     }
@@ -2312,17 +2768,18 @@
     });
 
     async function agentTransition(action, id) {
-      if (agentTransitions.has(id) || findAgent(id)?.stopping) return;
+      const project=state.selectedProject,key=localKey(id,project);
+      if (agentTransitions.has(key) || findAgent(id)?.stopping) return;
       const agent = findAgent(id), kind = action.dataset.action;
       const retry = agent?.state === 'crashed' || agent?.model_unavailable;
       const label = agent?.name ? `agent “${agent.name.length > 100 ? agent.name.slice(0,100) + '…' : agent.name}” (#${id})` : `agent #${id}`;
       const prompt = kind === 'pause' ? `Pause ${label}? This stops its processes and releases its locks.` : kind === 'close' ? `Close ${label}? This stops its processes and releases its locks. It cannot wake until reopened.` : kind === 'reopen' ? `Reopen ${label}? This may start work and consume provider quota.` : `${retry ? 'Retry' : 'Resume'} ${label}${retry ? ' with the same model' : ''}? This may start work and consume provider quota.`;
       if (!confirmAgentAction(prompt)) return;
-      agentTransitions.add(id); action.disabled = true; renderAgents();
+      agentTransitions.add(key); action.disabled = true; renderAgents();
       try {
-        const result = await mutate(`/agents/${id}/${kind}`);
+        const result = await mutate(`/agents/${id}/${kind}`,{},project);
         if (!result.result_truncated && result.warnings?.length) toast(result.warnings.join('\n'));
-      } finally { agentTransitions.delete(id); action.disabled = !!findAgent(id)?.stopping; renderAgents(); }
+      } finally { agentTransitions.delete(key); action.disabled = project===state.selectedProject&&!!findAgent(id)?.stopping; renderAgents(); }
     }
 
     document.addEventListener('click', async event => {
@@ -2369,13 +2826,14 @@
         if (hadFocus && document.activeElement === document.body && project === state.selectedProject) ($('#agent-filter-chips button') || $('#agent-filters > summary')).focus({preventScroll:true});
         return;
       }
-      const full = event.target.closest('[data-record]');
+      const full = event.target.closest('[data-record], [data-record-path]');
       if (full) {
-        const dialog = $('#record-dialog'); openDialog(dialog); const session = dialog._session;
-        const current = () => dialog.open && dialog._session === session;
-        setText($('#record-title'), `${full.dataset.record} #${full.dataset.recordId}`); setText($('#record-content'), 'Loading…');
+        const dialog = $('#record-dialog'); openDialog(dialog); const session = dialog._session,project=state.selectedProject;
+        const current = () => dialog.open && dialog._session === session && project===state.selectedProject;
+        const path=full.dataset.recordPath || scopedPath(`/${full.dataset.record}/${full.dataset.recordId}`,project);
+        setText($('#record-title'), full.dataset.recordPath ? 'Result details' : `${full.dataset.record} #${full.dataset.recordId}`); setText($('#record-content'), 'Loading…');
         try {
-          const value = await record(`/${full.dataset.record}/${full.dataset.recordId}`, undefined, current);
+          const value = await record(path, undefined, current);
           if (!current()) return;
           setText($('#record-content'), JSON.stringify(value, null, 2));
           const item = state[full.dataset.record]?.find(item => item.id === value.id);
@@ -2418,18 +2876,18 @@
       if (event.target.closest('#subscriptions-more')) {await loadAgentSubscriptions(selectedAgent,agentRequest,true);return;}
       const cancelSubscription=event.target.closest('[data-cancel-subscription]');
       if(cancelSubscription) {
-        const id=Number(cancelSubscription.dataset.cancelSubscription), agent=selectedAgent, request=agentRequest;
-        if(cancelingSubscriptions.has(id) || agent==null || !$('#agent-dialog').open || agentSubscriptions?.id!==agent || agentSubscriptions.items.find(item=>item.id===id)?.state!=='active')return;
-        cancelingSubscriptions.add(id); renderAgentSubscriptions();
+        const id=Number(cancelSubscription.dataset.cancelSubscription), agent=selectedAgent, request=agentRequest,project=state.selectedProject,key=localKey(id,project);
+        if(cancelingSubscriptions.has(key) || agent==null || !$('#agent-dialog').open || agentSubscriptions?.id!==agent || agentSubscriptions.items.find(item=>item.id===id)?.state!=='active')return;
+        cancelingSubscriptions.add(key); renderAgentSubscriptions();
         try {
-          const result=await api(`/subscriptions/${id}/cancel`,{method:'POST',body:JSON.stringify({agent:0})});
-          if(agentSubscriptions?.id===agent && result.id===id && ['resolved','canceled'].includes(result.state)) {
+          const result=await api(`/subscriptions/${id}/cancel`,{project,method:'POST',body:JSON.stringify({agent:0})});
+          if(project===state.selectedProject && request===agentRequest && agentSubscriptions?.id===agent && result.id===id && ['resolved','canceled'].includes(result.state)) {
             const item=agentSubscriptions.items.find(item=>item.id===id); if(item)Object.assign(item,result);
             if(agent===selectedAgent && request===agentRequest)renderAgentSubscriptions();
           }
           if(agent===selectedAgent && request===agentRequest && $('#agent-dialog').open)await refreshAgentDetails();
         } catch(error) {if(agent===selectedAgent && request===agentRequest)toast(error.message,true);}
-        finally {cancelingSubscriptions.delete(id);if(agent===selectedAgent && request===agentRequest)renderAgentSubscriptions();}
+        finally {cancelingSubscriptions.delete(key);if(agent===selectedAgent && request===agentRequest)renderAgentSubscriptions();}
         return;
       }
       if (event.target.closest('#log-older')) {
@@ -2487,10 +2945,11 @@
       }
       if(event.target.closest('#thread-membership')) {
         const thread = state.thread, id = state.selectedThread;
-        if (!thread || thread.id !== id || pendingMembership.has(id)) return;
-        pendingMembership.add(id); $('#thread-membership').disabled = true;
-        try { await mutate(`/threads/${id}/user`, {joined:!thread.members?.includes(0)}); } catch(error) {toast(error.message,true);}
-        finally { pendingMembership.delete(id); if (state.selectedThread === id && $('#thread-membership')) $('#thread-membership').disabled = false; } return;
+        const key=thread&&localKey(id,thread.project);
+        if (!thread || thread.id !== id || pendingMembership.has(key)) return;
+        pendingMembership.add(key); $('#thread-membership').disabled = true;
+        try { await mutate(`/threads/${id}/user`, {joined:!thread.members?.includes(0)},thread.project); } catch(error) {toast(error.message,true);}
+        finally { pendingMembership.delete(key); if (state.selectedThread === id && state.selectedProject===thread.project && $('#thread-membership')) $('#thread-membership').disabled = false; } return;
       }
       if(event.target.closest('#add-thread-members')) {
         if (!state.thread || state.thread.id !== state.selectedThread) return;
@@ -2570,7 +3029,7 @@
       const saveAgentConfig = event.target.closest('#save-agent-config');
       if (saveAgentConfig) {
         const root = $('#agent-config'), model = $('[name=agent_model]', root);
-        const session = root._configurationSession;
+        const session = root._configurationSession,project=state.selectedProject,agent=selectedAgent,agentRevision=agentRequest;
         if (!$('#agent-dialog form').reportValidity()) return;
         if (root.dataset.configurationBlocked === 'true') return;
         root.dataset.saving = 'true'; saveAgentConfig.disabled = true;
@@ -2582,10 +3041,11 @@
             if (!draft.trim()) throw new Error('Enter a continuation instruction.');
             request.continuation = draft.trim();
           }
-          const save = body => api('/agent-config', {method:'POST',body:JSON.stringify(body)});
+          const path=projectPath('/agent-config',project);
+          const save = body => api(path, {method:'POST',body:JSON.stringify(body)});
           try { await save(request); }
           catch (error) {
-            if (error.status !== 409 || !error.message.startsWith('Previous crashes for ') || !confirm(`${error.message}\n\nHave you reviewed these failures and want to acknowledge them?`)) throw error;
+            if (project!==state.selectedProject||agent!==selectedAgent||agentRevision!==agentRequest||session!==root._configurationSession||error.status !== 409 || !error.message.startsWith('Previous crashes for ') || !confirm(`${error.message}\n\nHave you reviewed these failures and want to acknowledge them?`)) throw error;
             await save({...request, ack_crashes:true});
           }
           if (request.continuation && text.value === draft) { checkbox.checked = false; text.value = ''; syncAgentContinuation(); }
@@ -2621,6 +3081,7 @@
         setText($('#current-view'), page.textContent.trim().split(' ')[0]);
         if (compactNavigation.matches) { applySidebar(true); $('#main-content').focus({preventScroll:true}); }
         if (page.dataset.page === 'threads' && state.selectedThread) { restoreThreadScroll(); await refreshThread(false); }
+        if (page.dataset.page === 'settings') await loadServerSettings();
         return;
       }
       const thread = event.target.closest('[data-thread]');
@@ -2641,9 +3102,10 @@
       if (!action) return;
       try {
         const id = Number(action.dataset.id);
-        if (action.dataset.action !== 'details' && (findAgent(id)?.stopping || agentTransitions.has(id))) return;
+        if (action.dataset.action !== 'details' && (findAgent(id)?.stopping || agentTransitions.has(localKey(id)))) return;
         if (action.dataset.action === 'another-model') {
-          const agent=await record(`/agents/${id}`);
+          const project=state.selectedProject,agent=await record(projectPath(`/agents/${id}`,project));
+          if (project!==state.selectedProject||!action.isConnected) return;
           $('#launch-project-select').innerHTML=projectOptions(agent.project);
           const dialog = $('#launch-dialog'); openDialog(dialog);
           const session = dialog._session; await setLaunchProject();
@@ -2656,6 +3118,7 @@
           agentLifecycle = null; $('#agent-lifecycle').open=false; $('#agent-lifecycle-items').replaceChildren(); $('#agent-lifecycle-error').hidden=true; $('#lifecycle-older').hidden=true;
           agentDiagnostics=null; $('#agent-diagnostics').open=false; $('#agent-diagnostics-items').replaceChildren(); $('#agent-diagnostics-error').hidden=true; $('#diagnostics-older').hidden=true;
           agentSubscriptions=null; $('#agent-subscriptions').open=false; $('#agent-subscription-items').replaceChildren(); $('#agent-subscriptions-error').hidden=true; $('#subscriptions-more').hidden=true;
+          $('#agent-permissions').open=false;$('#permission-rules').replaceChildren();$('#permission-status').textContent='';
           $('#agent-subscription-count').textContent=''; $('#agent-coordination-warning').hidden=true;
           $('#agent-title').textContent = `Agent #${id}`;
           $('#agent-details').replaceChildren(); $('#agent-config').replaceChildren(); $('#agent-log').textContent = '';
@@ -2682,11 +3145,13 @@
       bulkAction = {action, project:project?.id ?? null}; renderRestartResume();
       try {
         const result = await mutate(action === 'pause' ? '/pause-all' : action === 'resume' ? '/resume-all' : '/resume-restart', scoped ? {project:project.id} : {});
-        if (action === 'restart') {
-          const failed = result.counts?.errors ?? result.errors?.length ?? 0;
-          if (result.result_truncated) toast(`Restart-paused agents ${scope}: ${fmt(result.counts?.ids ?? result.ids?.length)} resumed, ${fmt(failed)} failed. See the completed-action result below.`, failed > 0);
-          else toast([`Resumed ${fmt(result.ids?.length)} restart-paused agents ${scope}.`, ...(result.warnings || []), ...(result.errors || [])].join('\n'), !!result.errors?.length);
-        } else if (scoped) toast(`${action === 'pause' ? 'Paused' : 'Resumed'} ${fmt(result.counts?.ids ?? result.ids?.length)} agents ${scope}.`);
+        const completed=result.counts?.ids,failed=result.counts?.errors;
+        if(!Number.isSafeInteger(completed)||completed<0||!Number.isSafeInteger(failed)||failed<0)throw new Error('Action completed, but result counts are unavailable. Inspect current state before retrying.');
+        const label=id=>{const name=state.projects.find(item=>item.id===id)?.name;return name?`Project “${name}” (#${id})`:`Project #${id}`;};
+        const text=issue=>typeof issue==='string'?issue:issue?.error||issue?.message||JSON.stringify(issue);
+        const issues=[...(result.results||[]).flatMap(item=>[...(item.warnings||[]),...(item.errors||[])].map(issue=>`${label(item.project)}: ${text(issue)}`)),...(result.errors||[]).map(issue=>`${label(issue.project)}: ${text(issue)}`)];
+        if(result.result_truncated&&action==='restart')toast(`Restart-paused agents ${scope}: ${fmt(completed)} resumed, ${fmt(failed)} error${failed===1?'':'s'}. See the completed-action result below.`,failed>0);
+        else toast([`${action==='pause'?'Paused':'Resumed'} ${fmt(completed)} ${action==='restart'?'restart-paused ':''}agents ${scope}.${failed?` ${fmt(failed)} error${failed===1?'':'s'}.`:''}`,...issues,...(result.result_truncated?['See the completed-action result below.']:[])].join('\n'),failed>0);
       } catch (e) { toast(e.message, true); }
       finally { bulkAction = null; renderRestartResume(); }
     }
@@ -2698,7 +3163,7 @@
     $('#launch-model').addEventListener('change', () => { showCustom($('#launch-model'), $('#launch-custom-row')); setLaunchEfforts(); showModelWarning(); });
     $('#launch-project-select').addEventListener('change', setLaunchProject);
     async function setLaunchProject() {
-      let p = state.projects.find(x => x.id === Number($('#launch-project-select').value));
+      let p = state.projects.find(x => x.id === $('#launch-project-select').value);
       $('#launch-project').textContent = p ? `Agents will work in ${p.path}` : 'Select a project';
       const request = ++state.launchRequest;
       const button = $('#launch-form button.primary');
@@ -2723,7 +3188,7 @@
       if (!discardSettings()) { event.target.value = state.selectedProject ?? ''; return; }
       getSelection()?.removeAllRanges();
       state.editor = null;
-      filterContextRevision++; setSelectedProject(Number(event.target.value));
+      filterContextRevision++; setSelectedProject(event.target.value);
       state.projectActions = null;
       state.overviewRevision = null; state.settingsRevision = null;
       state.project = state.projects.find(p => p.id === state.selectedProject);
@@ -2750,13 +3215,13 @@
       if (event.target.id === 'config-select') {
         if (state.saving) { event.target.value = state.editor.config ?? 'custom'; return; }
         if (!discardSettings()) { state.configLoading = null; event.target.value = state.editor.config ?? 'custom'; setSettingsControls(); return; }
-        const config = event.target.value === 'custom' ? null : Number(event.target.value);
+        const config = event.target.value === 'custom' ? null : event.target.value;
         const project = state.selectedProject, select = event.target;
         const selection = state.configLoading = {project, config};
         const current = () => state.configLoading === selection && project === state.selectedProject && $('#config-select') === select && select.value === (config ?? 'custom').toString();
         setSettingsControls();
         try {
-          const s = config == null && state.project?.config == null ? state.settings : await configSettings(config ?? 1, current);
+          const s = config == null && state.project?.config == null ? state.settings : await configSettings(config ?? 'default', current);
           if (!current()) return;
           state.configLoading = null;
           state.editor = { project: state.project?.id ?? null, config, settings: structuredClone(s), dirty: false, pending: !!state.project && config !== state.project.config };
@@ -2824,7 +3289,6 @@
       const button = event.submitter;
       const submission = dialogSubmission(form);
       const data = Object.fromEntries(new FormData(form));
-      data.project = Number(data.project);
       if (button) button.disabled = true;
       try {
         if (data.model === '__custom__') {
@@ -2898,29 +3362,29 @@
     });
     $('#members-form').addEventListener('submit',async event=> {
       event.preventDefault(); const form = event.currentTarget, button = event.submitter, submission = dialogSubmission(form);
-      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread), project = Number(form.dataset.memberProject);
+      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread), project = form.dataset.memberProject;
       if (thread !== state.selectedThread || project !== state.selectedProject) return;
       if(!members.length) {toast('Choose at least one member.',true);return;}
       if (button) button.disabled = true;
-      try {await mutate(`/threads/${thread}/members`,{members}); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) $('#members-dialog').close();} catch(error) {if (submission.current()) toast(error.message,true);}
+      try {await mutate(`/threads/${thread}/members`,{members},project); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) $('#members-dialog').close();} catch(error) {if (submission.current()) toast(error.message,true);}
       finally {if(button && submission.latest()) button.disabled=false;}
     });
     $('#remove-members-form').addEventListener('submit',async event=> {
       event.preventDefault(); const form = event.currentTarget, button = event.submitter, submission = dialogSubmission(form);
-      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread), project = Number(form.dataset.memberProject);
+      const members=new FormData(form).getAll('member'), thread = Number(form.dataset.memberThread), project = form.dataset.memberProject;
       if (thread !== state.selectedThread || project !== state.selectedProject) return;
       if (!members.length) {toast('Choose at least one member.',true);return;}
       if (button) button.disabled = true;
-      try {await mutate(`/threads/${thread}/members/remove`,{members}); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) $('#remove-members-dialog').close();} catch(error) {if (submission.current()) toast(error.message,true);}
+      try {await mutate(`/threads/${thread}/members/remove`,{members},project); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) $('#remove-members-dialog').close();} catch(error) {if (submission.current()) toast(error.message,true);}
       finally {if(button && submission.latest()) button.disabled=false;}
     });
     $('#thread-owner-form').addEventListener('submit',async event=> {
       event.preventDefault(); const form = event.currentTarget, button = event.submitter, submission = dialogSubmission(form);
-      const owner = Number(new FormData(form).get('owner')), thread = Number(form.dataset.ownerThread), project = Number(form.dataset.ownerProject);
+      const owner = Number(new FormData(form).get('owner')), thread = Number(form.dataset.ownerThread), project = form.dataset.ownerProject;
       if (thread !== state.selectedThread || project !== state.selectedProject) return;
       if (!Number.isSafeInteger(owner) || owner < 1) {toast('Enter a positive agent ID.',true);return;}
       if (button) button.disabled = true;
-      try {await mutate(`/threads/${thread}/owner`,{owner}); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) {$('#thread-owner-dialog').close();form.reset();}} catch(error) {if (submission.current()) toast(error.message,true);}
+      try {await mutate(`/threads/${thread}/owner`,{owner},project); if (submission.current() && thread === state.selectedThread && project === state.selectedProject) {$('#thread-owner-dialog').close();form.reset();}} catch(error) {if (submission.current()) toast(error.message,true);}
       finally {if(button && submission.latest()) button.disabled=false;}
     });
 
@@ -2934,7 +3398,7 @@
         if (!discardSettings()) return;
         const result = await api('/projects', { method: 'POST', body: JSON.stringify({ path: new FormData(form).get('path') }) });
         if (submission.current() && project === state.selectedProject) {
-          filterContextRevision++; setSelectedProject(Number(result.id)); state.overviewRevision = null; state.editor = null; resetThread();
+          filterContextRevision++; setSelectedProject(result.id); state.overviewRevision = null; state.editor = null; resetThread();
         }
         await refresh();
         if (submission.current()) { $('#project-dialog').close(); form.reset(); }
@@ -2949,17 +3413,17 @@
       const { draftProject: project, draftThread: thread } = form.dataset, text = $('[name=text]', form).value;
       const key = draftKey(project, thread), edits = draftEdits.get(key) || 0;
       if (pendingSends.has(key) || !text.trim()) return;
-      const previous = [...outgoingMessages.values()].filter(message => message.project === Number(project) && message.thread === Number(thread) && message.text === text && ['failed','unconfirmed'].includes(message.delivery));
+      const previous = [...outgoingMessages.values()].filter(message => message.project === project && message.thread === Number(thread) && message.text === text && ['failed','unconfirmed'].includes(message.delivery));
       if (previous.some(message => message.delivery === 'unconfirmed') && !confirm('Delivery is unconfirmed. This message may already be saved. Have you checked the conversation and want to send it again?')) return;
       previous.forEach(message => outgoingMessages.delete(message.id));
-      const outgoing = {id:`pending-${++outgoingSequence}`,project:Number(project),thread:Number(thread),sender:0,text,at:Date.now()/1000,delivery:'sending',after:state.thread?.id === Number(thread) ? state.thread.messages.at(-1)?.id || 0 : 0};
+      const outgoing = {id:`pending-${++outgoingSequence}`,project,thread:Number(thread),sender:0,text,at:Date.now()/1000,delivery:'sending',after:state.thread?.id === Number(thread) ? state.thread.messages.at(-1)?.id || 0 : 0};
       outgoingMessages.set(outgoing.id, outgoing);
       pendingSends.add(key);
       saveDraft(project, thread, text);
       button.disabled = true;
       syncMessageBubbles();
       try {
-        const result = await api('/messages', { method: 'POST', body: JSON.stringify({ thread: Number(thread), text }) });
+        const result = await api('/messages', { project,method: 'POST', body: JSON.stringify({ thread: Number(thread), text }) });
         if (!Number.isSafeInteger(result.id) || result.id < 1) throw new Error('Delivery unconfirmed: the server response did not contain a message ID. Check the conversation before retrying.');
         outgoing.serverId = result.id; outgoing.delivery = null;
         syncMessageBubbles();
@@ -2980,6 +3444,20 @@
         const current = $('#message-form');
         if (current?.dataset.draftProject === project && current.dataset.draftThread === thread) $('button', current).disabled = false;
       }
+    });
+    const stateShortcuts=document.createElement('div');stateShortcuts.className='state-shortcuts';
+    const stateShortcut=(key,label)=>`<button type="button" class="small" data-agent-filter="${key}" aria-pressed="false">${label} <span data-agent-count="${key}">—</span></button>`;
+    stateShortcuts.innerHTML=`<div class="filter-actions" aria-label="Agent states">${[['working','Working'],['idle','Idle'],['paused','Paused'],['crashed','Crashed']].map(([key,label])=>stateShortcut(key,label)).join('')}</div><details><summary>More states</summary><div class="filter-actions" aria-label="Additional agent states">${[['done','Done'],['closed','Closed'],['replaced','Replaced']].map(([key,label])=>stateShortcut(key,label)).join('')}</div></details>`;
+    $('#agent-filters').before(stateShortcuts);
+    const threadSortOptions=['latest_message','newest','oldest','title'];
+    state.threadSort=threadSortOptions.includes(stored('acom:thread-sort')) ? stored('acom:thread-sort') : 'latest_message';
+    $('.thread-tools').insertAdjacentHTML('beforeend',`<label class="thread-sort">Sort threads<select id="thread-sort">${[['latest_message','Latest message'],['newest','Newest thread'],['oldest','Oldest thread'],['title','Title A–Z']].map(([key,label])=>`<option value="${key}"${state.threadSort===key?' selected':''}>${label}</option>`).join('')}</select></label><p class="meta" id="thread-sort-status" role="status"></p>`);
+    $('#thread-sort').addEventListener('change',async event=>{
+      const sort=event.target.value;if(!threadSortOptions.includes(sort))return;
+      state.threadSort=sort;storeValue('acom:thread-sort',sort);
+      const loading=loadCollection('threads');renderThreads();updatePaging();
+      try {await loading;} catch (error) {toast(error.message,true);}
+      renderThreads();updatePaging();
     });
     $('#confirm-agent-actions').checked = state.confirmAgentActions;
     $('#confirm-agent-actions').addEventListener('change', event => {
@@ -3079,14 +3557,14 @@
       if (event.target.matches('#message-form textarea')) {
         const form = event.target.form, key = draftKey(form.dataset.draftProject, form.dataset.draftThread);
         draftEdits.set(key, (draftEdits.get(key) || 0) + 1);
-        saveVisibleDraft();
+        saveVisibleDraft(false);
       }
     });
 
     function collectSettings() {
       const form = $('#settings-form');
       const next = structuredClone(state.editor.settings);
-      if (state.editor.config === 1) return next;
+      if (state.editor.config === 'default') return next;
       form.querySelectorAll('[data-harness]').forEach(root => {
         const h = next.harnesses[root.dataset.harness];
         h.enabled = $('[name=enabled]', root).checked;
@@ -3104,7 +3582,6 @@
         const numberOrNull = input => input.value.trim() === '' ? null : Number(input.value);
         target.soft = numberOrNull($('[name=soft]', root)); target.hard = numberOrNull($('[name=hard]', root));
       });
-      delete next.limits.usage.claude;
       next.max_lock_ttl_secs = Number($('[name=max_lock_ttl_secs]', form).value);
       if (!Number.isInteger(next.max_lock_ttl_secs) || next.max_lock_ttl_secs < 1 || next.max_lock_ttl_secs > 4294967295) throw new Error('Maximum lock TTL must be a positive whole number of seconds (at most 4294967295).');
       next.auto_resume = $('[name=auto_resume]', form).checked;
@@ -3124,7 +3601,6 @@
         if (!target?.enabled || !target.models.includes(rule.model)) throw new Error('Enable the retry provider and allow its model in Harnesses.');
         next.crash_retries[source] = rule;
       });
-      next.usage_poll_secs = Number($('[name=usage_poll_secs]', form).value);
       next.prompts = Object.fromEntries(['launch','wake','resume'].map(name=>[name,$(`[name=prompt_${name}]`,form).value]));
       return next;
     }
@@ -3147,7 +3623,7 @@
       setSettingsControls();
     }
     function setSettingsControls() {
-      const busy = state.saving, loading = !!state.configLoading, readOnly = state.editor?.config === 1;
+      const busy = state.saving, loading = !!state.configLoading, readOnly = state.editor?.config === 'default';
       setText($('#settings-save-state'), busy ? 'Saving…' : loading ? 'Loading configuration…' : state.editor?.dirty ? 'Unsaved changes' : state.editor?.pending ? 'Selection not applied' : readOnly ? 'Default · read-only' : 'All changes saved');
       $('#settings-form').setAttribute('aria-busy', String(busy || loading));
       $('#settings-form').querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = busy || (loading && el.id !== 'config-select' && el.dataset.more !== 'configs') || (readOnly && !el.dataset.more && !['config-select','save-config-as'].includes(el.id)));
@@ -3175,7 +3651,7 @@
         if (name !== undefined) {
           const result = await api('/configs', { method: 'POST', body: JSON.stringify({ name, settings: next }) });
           config = result.id;
-        } else if (config != null && config !== 1) {
+        } else if (config != null && config !== 'default') {
           const rename = $('[name=config_name]', $('#settings-form'))?.value.trim();
           if (settingsFingerprint(next) !== editor.baseline || (rename != null && rename !== editor.name)) {
             await api(`/configs/${config}`, { method: 'PUT', body: JSON.stringify({ settings: next, ...(rename == null ? {} : { name: rename }) }) });
@@ -3189,6 +3665,25 @@
       } finally { setSettingsBusy(false); }
       syncSettings(true); toast('Settings saved');
     }
+    $('#server-settings-form').addEventListener('input',()=>{
+      serverSettings.dirty=settingsFingerprint(serverSettingsDraft())!==settingsFingerprint(serverSettings.value);
+      serverSettings.error=null;renderServerSettings();
+    });
+    $('#server-settings-reset').addEventListener('click',async()=>{
+      if (serverSettings.saving) return;
+      serverSettings.dirty=false;serverSettings.conflict=false;serverSettings.error=null;
+      renderServerSettings();await loadServerSettings(true);
+    });
+    $('#server-settings-form').addEventListener('submit',async event=>{
+      event.preventDefault();
+      if (!serverSettings.value||serverSettings.saving||serverSettings.loading||!serverSettings.dirty||serverSettings.conflict||!event.currentTarget.reportValidity()) return;
+      const next=serverSettingsDraft();serverSettings.saving=true;serverSettings.error=null;renderServerSettings();
+      try {
+        const value=await api('/global-settings',{method:'PUT',body:JSON.stringify({settings:next})});
+        Object.assign(serverSettings,{value,dirty:false,conflict:false,revision:null});
+      } catch (error) {serverSettings.error=error.message;}
+      finally {serverSettings.saving=false;renderServerSettings();}
+    });
     $('#settings-form').addEventListener('submit', async event => {
       event.preventDefault();
       try { await saveConfig(); } catch (error) { toast(error.message, true); }

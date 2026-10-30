@@ -7,6 +7,7 @@ Launch and coordinate Claude Code and Codex agents across your projects from one
 - Set project-level usage, concurrency and context limits.
 - Configure crash retries, model replacement and usage recovery.
 - Inspect activity, pause or resume work, and keep conversations across turns.
+- Inspect token history, grant scoped agent controls, and export or restore projects.
 
 ![acom overview showing grouped agents, usage, lifecycle controls and shared locks](docs/images/overview.png)
 
@@ -44,7 +45,7 @@ Models in the catalog are choices, not account-access checks. Select a model sup
 
 Each project has its own agents, threads, locks and settings. A single server handles all your projects. Agents receive their identity, task, rules and the built-in [agent guide](src/guide.md); they coordinate through the `acom` CLI.
 
-Threads let you talk with agents and let them talk with each other. They can be public or private, use fixed members or follow live agent-state/group filters. Drafts survive pane switches and reloads in the same browser.
+Threads let you talk with agents and let them talk with each other. They can be public or private, use fixed members or follow live agent-state/group filters. Drafts save locally immediately and sync to the server, with conflict protection between tabs.
 
 Messages display basic Markdown and appear immediately with a sending indicator until acom confirms they are saved. Copy icons preserve original message text and make paths and agent details easy to reuse. Hide the sidebar for more space; the workspace expands with your viewport.
 
@@ -60,15 +61,19 @@ group:"Security review" state:paused,crashed reentrancy
 
 Spaces combine conditions with AND; commas within a field give alternatives. This finds the exact group, either state, and `reentrancy` in the agent's metadata. Use `state:idle OR pause_reason:limit` for idle or limit-paused agents, and `NOT (state:closed OR state:replaced)` to exclude closed and replaced agents. Parentheses group conditions; precedence is NOT, AND, OR. The visual **Filters** editor supports Match all/any, exclusion and nested groups without query syntax. Click **Apply filters** to update results. See [agent search](docs/usage.md#finding-agents) for all fields and quoting rules.
 
+Use `name:"Launcher"` for an exact name, or `id:5` for one project-local agent. Details → **Delegated controls** lets you grant selected pause, resume, close or reopen actions to an agent, scoped to its directly launched workers, selected agents or the project. No permissions are granted by default. These are trusted-local coordination rules, not OS isolation.
+
 ## Data and shutdown
 
-acom stores its database and captured logs in `~/.acom`; set `ACOM_HOME` for a separate data directory. Native conversations remain in each provider CLI's storage. Browser drafts and preferences stay in that browser. Agents edit project files, but acom keeps none of its own state there.
+acom stores data in `~/.acom`; set `ACOM_HOME` for a separate installation. Each project has a stable UUID and its own core database, optional metrics database and captured files under `projects/<UUID>/`. Numeric agent/thread/message IDs start independently in each project. Global settings, saved configurations and account observations live separately. Native conversations remain in provider storage unless explicitly archived. Agents edit project files, but acom keeps none of its own state there.
 
-**Settings → Storage → Calculate disk usage** checks allocated disk space on demand: the selected project's captured logs, all projects' logs, the shared database and other data. Results include scan times and may change while agents work; no scans run automatically. See [storage details](docs/usage.md#storage-restarts-and-upgrades).
+**Settings → Storage → Calculate disk usage** checks allocated space on demand, split by project and core state, metrics, logs, native archives, trash and other data. Results may change while agents work; no scans run automatically. Optional history/captured-file cleanup does not remove messages or authoritative accounting. See [storage details](docs/usage.md#storage-restarts-and-upgrades).
+
+Project archives are uncompressed `.tar` files containing private project data. Export includes the applied configuration and server-saved drafts; logs and native transcripts are optional. Import validates in staging, never overwrites a project, and starts no workers. See [project archives](docs/usage.md#project-archives).
 
 Ctrl-C or SIGTERM stops owned workers and their tools, then releases their locks. Interrupted turns become **restart-paused**; idle agents and existing manual/limit pauses retain their state. Starting the server does not automatically resume interrupted turns. Use **Resume restart-paused**, or `acom resume-restart` for all projects, when ready.
 
-Before upgrading, stop working agents through the old server. Incompatible data or invalid stored settings produce an error without silently replacing your configuration. See [storage, restarts and upgrades](docs/usage.md#storage-restarts-and-upgrades).
+This development format is intentionally incompatible with the previous shared database. Before upgrading, stop the old server and back up its entire data directory. Use a fresh `ACOM_HOME` and recreate configurations; there is no automatic migration or deletion. Current-format archives can be restored into another installation. See [storage, restarts and upgrades](docs/usage.md#storage-restarts-and-upgrades).
 
 ## Troubleshooting
 

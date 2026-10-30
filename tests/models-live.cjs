@@ -8,6 +8,7 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn, spawnSync } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
+const {scoped,projectHome}=require('./fixture-workspace.cjs');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const TURN_MS = 120000;
@@ -146,14 +147,15 @@ test('all catalog models: tools, requested model, effort, and same-session reope
   let serverError;
   server.on('error', error => { serverError = error; });
   const alive = () => !serverError && server.exitCode === null && server.signalCode === null;
+  let selectedProject;
   const api = async (route, body, method = body === undefined ? 'GET' : 'POST') => {
-    const res = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(15000) });
+    const res = await fetch(url + scoped(route,selectedProject,body), { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(15000) });
     const value = await res.json();
     if (!res.ok) throw Error(`${method} ${route}: ${value.error || JSON.stringify(value)}`);
     return value;
   };
-  const processes = () => readProcesses(path.join(state, 'acom.db'));
-  const stopped = id => !processes().some(p => id === undefined || p.id === id);
+  const processes = () => fs.existsSync(path.join(state,'projects')) ? fs.readdirSync(path.join(state,'projects')).filter(id=>/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)).flatMap(project=>readProcesses(path.join(projectHome(state,project),'acom.db')).map(row=>({...row,project}))) : [];
+  const stopped = (id,project=selectedProject) => !processes().some(p => id === undefined || p.project===project&&p.id===id);
   const until = async (check, ms, label) => {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
@@ -166,7 +168,7 @@ test('all catalog models: tools, requested model, effort, and same-session reope
   };
   const stopAgent = async id => {
     const agent = await api(`/agents/${id}`);
-    if (['working', 'idle', 'done'].includes(agent.state)) await api(`/agents/${id}/pause`, { locks: 'release' });
+    if (['working', 'idle', 'done'].includes(agent.state)) await api(`/agents/${id}/pause`, {});
     await until(() => stopped(id), 15000, `agent ${id} termination`);
     if (agent.state !== 'closed' && agent.state !== 'replaced') await api(`/agents/${id}/close`, {});
   };
@@ -174,8 +176,8 @@ test('all catalog models: tools, requested model, effort, and same-session reope
   const inspectTurn = async (row, turn, effort, offsets) => {
     const agent = await until(async () => {
       const a = await api(`/agents/${row.agent_id}`);
-      const agents = await api(`/agents?project=${row.project}`);
-      if (agents.length !== 1) {
+      const agents = await api('/agents?limit=2&max_bytes=65536');
+      if (agents.total !== 1) {
         const error = Error('Unexpected helper agent: stopping the isolated test'); error.fatal = true;
         try { await api('/pause-all', {}); } catch {}
         throw error;
@@ -190,7 +192,7 @@ test('all catalog models: tools, requested model, effort, and same-session reope
       state: agent.state, problem: agent.problem || null, pause_reason: agent.pause_reason || null,
       session: agent.session || null, requested_model: agent.model, requested_effort: agent.effort,
       turns: agent.turns, output_log: raw, conversation_history: native || null,
-      stderr_log: path.join(state, 'logs', `${row.agent_id}.err`),
+      stderr_log: path.join(projectHome(state,row.project), 'logs', `${row.agent_id}.err`),
       stdout_offset: offsets.stdout, native_offset: offsets.native, ...observed,
       proof: fs.existsSync(proof) ? fs.readFileSync(proof, 'utf8') : null,
     };
@@ -217,9 +219,12 @@ test('all catalog models: tools, requested model, effort, and same-session reope
   };
   try {
     await until(async () => { try { return await api('/overview'); } catch { return false; } }, 15000, 'server startup');
-    const overview = await api('/overview');
-    report.model_catalog = overview.model_catalog;
-    const models = Object.entries(overview.model_catalog).flatMap(([harness, catalog]) => catalog.map(model => ({ harness, ...model }))).filter(model => selected(model.harness, model.id, report.filter));
+    const catalog = await api('/catalog?max_bytes=65536');
+    const defaults = (await api('/configs/default?max_bytes=65536')).settings;
+    const globalSettings = await api('/global-settings');
+    await api('/global-settings',{settings:{...globalSettings,usage_poll_secs:3600}},'PUT');
+    report.model_catalog = catalog;
+    const models = Object.entries(catalog).flatMap(([harness, models]) => models.map(model => ({ harness, ...model }))).filter(model => selected(model.harness, model.id, report.filter));
     assert.ok(models.length, 'Filter selected no catalog models');
     for (const model of models) {
       const row = { harness: model.harness, model: model.id, efforts: model.efforts, status: 'running', started_at: new Date().toISOString() };
@@ -230,11 +235,11 @@ test('all catalog models: tools, requested model, effort, and same-session reope
         row.project_path = path.join(root, `${row.harness}-${row.model}`);
         fs.mkdirSync(row.project_path);
         row.project = (await api('/projects', { path: row.project_path })).id;
-        const settings = structuredClone(overview.settings);
+        selectedProject=row.project;
+        const settings = structuredClone(defaults);
         settings.auto_resume = false;
         settings.done_closes = true;
         settings.crash_retries = {};
-        settings.usage_poll_secs = 3600;
         settings.limits.usage = {};
         settings.limits.active = { soft: null, hard: 1 };
         for (const h of Object.keys(settings.limits.active_per_harness)) settings.limits.active_per_harness[h] = { soft: null, hard: 1 };
@@ -262,12 +267,12 @@ test('all catalog models: tools, requested model, effort, and same-session reope
         row.reason = error.message.slice(0, 2000);
         // A launch can persist a crashed row before returning an error.
         if (!row.agent_id && row.project) {
-          try { row.agent_id = (await api(`/agents?project=${row.project}`))[0]?.id; } catch {}
+          try { row.agent_id = (await api('/agents?limit=1&max_bytes=65536')).items[0]?.id; } catch {}
         }
         if (row.agent_id) {
           try {
             const a = await api(`/agents/${row.agent_id}`);
-            row.failure = { state: a.state, problem: a.problem, pause_reason: a.pause_reason, session: a.session, output_log: a.output_log, conversation_history: a.conversation_history, stderr_log: path.join(state, 'logs', `${row.agent_id}.err`) };
+            row.failure = { state: a.state, problem: a.problem, pause_reason: a.pause_reason, session: a.session, output_log: a.output_log, conversation_history: a.conversation_history, stderr_log: path.join(projectHome(state,row.project), 'logs', `${row.agent_id}.err`) };
           } catch {}
         }
         if (error.fatal) throw error;
@@ -284,14 +289,14 @@ test('all catalog models: tools, requested model, effort, and same-session reope
   } finally {
     try {
       if (alive()) { await api('/pause-all', {}); await until(() => stopped(), 15000, 'all test harnesses stopped'); }
-      else if (fs.existsSync(path.join(state, 'acom.db')) && !stopped()) throw Error('Server exited with test harnesses still running');
+      else if (!stopped()) throw Error('Server exited with test harnesses still running');
     } catch (error) {
       report.cleanup_error = error.message;
       // Only kill groups whose leader environment matches this isolated server/agent.
       for (const proc of processes()) {
         try {
           const vars = fs.readFileSync(`/proc/${proc.pid}/environ`).toString().split('\0');
-          if (!vars.includes(`ACOM_URL=${url}`) || !vars.includes(`ACOM_ID=${proc.id}`)) throw Error('Cannot verify test process ownership');
+          if (!vars.includes(`ACOM_URL=${url}/p/${proc.project}`) || !vars.includes(`ACOM_ID=${proc.id}`)) throw Error('Cannot verify test process ownership');
           process.kill(-proc.pid, 'SIGKILL');
         } catch (failure) {
           if (failure.code !== 'ENOENT' && failure.code !== 'ESRCH') report.cleanup_error += `; agent ${proc.id}: ${failure.message}`;

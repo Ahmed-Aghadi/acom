@@ -8,6 +8,7 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
+const {scoped,projectHome}=require('./fixture-workspace.cjs');
 
 test('real Codex model access, tools and same-conversation reopen', { skip: process.env.ACOM_LIVE_TEST !== '1' }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acom-live-'));
@@ -22,12 +23,14 @@ test('real Codex model access, tools and same-conversation reopen', { skip: proc
   const server = spawn(binary, ['serve', '--port', String(port)], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   let errors = ''; server.stderr.on('data', chunk => errors += chunk);
   const url = `http://127.0.0.1:${port}`;
+  let selectedProject;
   const stopped = () => {
-    const db=new DatabaseSync(path.join(env.ACOM_HOME,'acom.db'),{readOnly:true});
+    if(!selectedProject)return true;
+    const db=new DatabaseSync(path.join(projectHome(env.ACOM_HOME,selectedProject),'acom.db'),{readOnly:true,timeout:5000});
     try{return db.prepare('SELECT count(*) n FROM agents WHERE pid IS NOT NULL').get().n===0;}finally{db.close();}
   };
   const api = async (route, body) => {
-    const res = await fetch(url + route, { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'}, ...(body ? { body: JSON.stringify(body) } : {}) });
+    const res = await fetch(url + scoped(route,selectedProject,body), { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'}, ...(body ? { body: JSON.stringify(body) } : {}) });
     const value = await res.json(); assert.equal(res.status, 200, JSON.stringify(value)); return value;
   };
   const until = async (check, label) => {
@@ -47,6 +50,7 @@ test('real Codex model access, tools and same-conversation reopen', { skip: proc
   try {
     await until(async()=> {try{return (await fetch(url+'/overview')).ok;}catch{return false;}},'startup');
     const p=await api('/projects',{path:project});
+    selectedProject=p.id;
     const rejected=await api('/agents',{project:p.id,harness:'codex',model:'gpt-6.1-sol',task:'Only run acom done and then finish. Do not change any files.'});
     const access=await until(async()=> {
       const a=await api(`/agents/${rejected.id}`); return ['closed','crashed','paused'].includes(a.state) && stopped() ? a : false;
@@ -76,9 +80,9 @@ test('real Codex model access, tools and same-conversation reopen', { skip: proc
     assert.equal(second.model,model);
     assert.equal(fs.readFileSync(path.join(project,'proof.txt'),'utf8'),'first-turn\nsecond-turn\n');
     assert.deepEqual((await api(`/threads/${active.id}`)).members,[0]);
-    const history=await api(`/history?project=${p.id}&agent=${agent.id}&thread=${active.id}`);
-    assert.ok(history.events.some(e=>e.kind==='thread.joined'));
-    assert.ok(history.events.some(e=>e.kind==='thread.left'));
+    const history=await api(`/history?agent=${agent.id}&thread=${active.id}&limit=200&max_bytes=65536`);
+    assert.ok(history.items.some(e=>e.kind==='thread.joined'));
+    assert.ok(history.items.some(e=>e.kind==='thread.left'));
     t.diagnostic(`${model}: tools, identity/limits, done, no closed wake, live membership and same-session reopen passed`);
     const limits=await api('/limits');
     t.diagnostic(JSON.stringify({usage:limits.usage.map(w=>({provider:w.provider,window:w.win,used:w.used_pct,reset:w.resets_at})),checks:limits.checks.map(c=>({provider:c.provider,checked:!!c.checked_at,error:c.error}))}));

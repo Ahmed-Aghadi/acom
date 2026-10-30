@@ -42,7 +42,7 @@ async function fixture(run) {
     assert.equal(response.status, status, `${route}: ${JSON.stringify(value)}`);
     return value;
   };
-  let db;
+  const databases=[];
   try {
     const deadline = Date.now() + 10000;
     for (;;) {
@@ -53,15 +53,18 @@ async function fixture(run) {
     }
     const projects = [];
     for (const project of projectDirs) projects.push(await api('/projects', 200, { path: project }));
-    db = new DatabaseSync(path.join(home, 'acom.db'));
-    const insert = db.prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
-    insert.run(11, projects[0].id, 'First', 'Never launched', 'codex', 'gpt-6-sol', 'medium', 'closed', 0, 0);
-    insert.run(22, projects[1].id, 'Second', 'Never launched', 'claude', 'claude-opus-5-5', 'high', 'closed', 0, 0);
-    const logs = path.join(home, 'logs'); fs.mkdirSync(logs, { recursive: true });
-    const snapshot = () => Object.fromEntries(['projects', 'agents', 'configs', 'activity', 'events', 'notices', 'locks', 'messages', 'threads', 'members', 'marks', 'user_reads', 'summary_cursors', 'update_deliveries'].map(table => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
-    await run({ root, home, logs, projects, projectDirs, api, snapshot, db });
+    const projectHomes=projects.map(project=>path.join(home,'projects',project.id));
+    const cores=projectHomes.map(projectHome=>{const db=new DatabaseSync(path.join(projectHome,'acom.db'));databases.push(db);return db;});
+    const shared=new DatabaseSync(path.join(home,'global','shared.db'));databases.push(shared);
+    const registry=new DatabaseSync(path.join(home,'global','acom.db'));databases.push(registry);
+    cores[0].prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(11,1,?,?,?,?,?,?,0,0)').run('First','Never launched','codex','gpt-6-sol','medium','closed');
+    cores[1].prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(11,1,?,?,?,?,?,?,0,0)').run('Second','Never launched','claude','claude-opus-5-5','high','closed');
+    const logs=projectHomes.map(projectHome=>path.join(projectHome,'logs'));
+    const readTables=(db,tables)=>Object.fromEntries(tables.map(table=>[table,db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+    const snapshot=()=>({projects:cores.map(db=>readTables(db,['projects','agents','activity','events','notices','locks','messages','threads','members','marks','user_reads','summary_cursors','update_deliveries'])),shared:readTables(shared,['configs','config_uses']),registry:readTables(registry,['workspace_projects'])});
+    await run({root,home,logs,projectHomes,projects,projectDirs,api,snapshot,cores,shared,registry});
   } finally {
-    db?.close();
+    for(const db of databases)db.close();
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await new Promise(resolve => child.once('exit', resolve));
     fs.rmSync(root, { recursive: true, force: true });
@@ -78,10 +81,10 @@ test('storage reports are explicit fixed-shape reads and leave business state un
   assert.ok(report.started_at >= requested && report.completed_at >= report.started_at && report.completed_at <= Date.now() / 1000);
   assert.equal(report.bytes.project_logs, 0);
   for (const value of Object.values(report.bytes)) assert.ok(Number.isSafeInteger(value) && value >= 0);
-  assert.equal(report.bytes.total, report.bytes.all_project_logs + report.bytes.database + report.bytes.other);
+  assert.equal(report.bytes.total, categoryTotal(report.bytes));
   assert.ok(report.bytes.database > 0);
   const global = await api('/storage');
-  assert.equal(global.project, null); assert.equal(global.bytes.project_logs, null);
+  assert.equal(global.project, null);for(const field of ['project','project_core','project_logs','project_metrics','project_native'])assert.equal(global.bytes[field],null);
   assert.deepEqual(snapshot(), before, 'measuring does not create history, acknowledge messages, change config or start agents');
 }));
 
@@ -91,36 +94,39 @@ test('storage query validation rejects unknown, repeated and unavailable scope w
     const error = await api('/storage?' + query, 400);
     assert.match(error.error, /project|query|parameter|encoding|unknown|invalid/i, query);
   }
-  await api('/storage?project=999999', 404);
+  await api('/storage?project=99999999-9999-4999-8999-999999999999', 404);
   assert.deepEqual(snapshot(), before);
 }));
 
-test('storage uses allocated blocks, categorizes registered root logs, and never reads their contents', async () => fixture(async ({ home, logs, projects, projectDirs, api, snapshot }) => {
-  const first = path.join(logs, '11.jsonl'), readable = path.join(logs, '11.txt'), second = path.join(logs, '22.err');
+test('storage uses allocated blocks, project-local roots and independent categories without reading contents', async () => fixture(async ({ home, logs, projectHomes, projects, projectDirs, api, snapshot }) => {
+  const first = path.join(logs[0], '11.jsonl'), readable = path.join(logs[0], '11.txt'), second = path.join(logs[1], '11.err');
   const fd = fs.openSync(first, 'w');
   try { fs.ftruncateSync(fd, 32 * 1024 * 1024); fs.writeSync(fd, 'tail', 32 * 1024 * 1024 - 4); } finally { fs.closeSync(fd); }
   fs.writeFileSync(readable, 'Unreadable output is still measured by metadata.');
-  fs.linkSync(readable, path.join(logs, '11.err'));
+  fs.linkSync(readable, path.join(logs[0], '11.err'));
   fs.writeFileSync(second, Buffer.alloc(7000, 65));
-  fs.writeFileSync(path.join(logs, '999.jsonl'), 'Orphan log belongs to Other.');
-  fs.writeFileSync(path.join(logs, '11.jsonl.backup'), 'Not an agent output extension.');
-  const nested = path.join(logs, 'old'); fs.mkdirSync(nested);
+  const orphan=path.join(logs[0], '999.jsonl');fs.writeFileSync(orphan, 'A canonical log remains project data even when its agent record is absent.');
+  fs.writeFileSync(path.join(logs[0], '11.jsonl.backup'), 'Not an agent output extension.');
+  const nested = path.join(logs[0], 'old'); fs.mkdirSync(nested);
   fs.writeFileSync(path.join(nested, '11.jsonl'), 'Nested logs are not canonical agent logs.');
   fs.writeFileSync(path.join(home, 'acom.db.backup'), 'Not a database sidecar.');
+  const nativeRoot=path.join(projectHomes[0],'native');fs.mkdirSync(nativeRoot,{recursive:true});const native=path.join(nativeRoot,'11.jsonl');fs.writeFileSync(native,'A synthetic archived native transcript.');
+  const trash=path.join(home,'trash','retained');fs.mkdirSync(trash);fs.writeFileSync(path.join(trash,'metrics.db'),'Synthetic retained optional history.');
   fs.writeFileSync(path.join(projectDirs[0], 'not-acom-data'), Buffer.alloc(1024 * 1024, 66));
   const old = new Date('2001-01-01T00:00:00Z'); fs.utimesSync(first, old, old); fs.utimesSync(readable, old, old);
   fs.chmodSync(readable, 0);
   const atimes = [first, readable].map(file => fs.statSync(file, { bigint: true }).atimeNs);
-  const firstBytes = allocated(first) + allocated(readable), secondBytes = allocated(second), before = snapshot();
+  const firstBytes = allocated(first) + allocated(readable)+allocated(orphan), secondBytes = allocated(second), before = snapshot();
   assert.ok(allocated(first) < fs.statSync(first).size / 100, 'fixture is actually sparse');
   const one = await api(`/storage?project=${projects[0].id}`);
   assert.equal(one.complete, true); assert.equal(one.skipped, 0);
   assert.equal(one.bytes.project_logs, firstBytes, 'hardlinked outputs count once');
   assert.equal(one.bytes.all_project_logs, firstBytes + secondBytes);
-  assert.equal(one.bytes.total, one.bytes.all_project_logs + one.bytes.database + one.bytes.other);
+  assert.equal(one.bytes.total, categoryTotal(one.bytes));
   assert.equal(one.bytes.total, allocatedTree(home), 'all files and directory blocks are included exactly once');
-  const sharedBytes = fs.readdirSync(home).filter(name => ['acom.db', 'acom.db-wal', 'acom.db-shm', 'acom.db-journal'].includes(name)).reduce((n, name) => n + allocated(path.join(home, name)), 0);
-  assert.equal(one.bytes.database, sharedBytes, 'SQLite sidecars are shared database storage');
+  const coreBytes=[path.join(home,'global'),...projectHomes].reduce((bytes,directory)=>bytes+fs.readdirSync(directory).filter(name=>/^(acom|shared)\.db(?:-(?:wal|shm|journal))?$/.test(name)).reduce((sum,name)=>sum+allocated(path.join(directory,name)),0),0);
+  assert.equal(one.bytes.database,coreBytes,'per-project and shared SQLite core files/sidecars are one category');
+  assert.equal(one.bytes.project_native,allocated(native));assert.ok(one.bytes.metrics>0);assert.ok(one.bytes.trash>0);
   const two = await api(`/storage?project=${projects[1].id}`), empty = await api(`/storage?project=${projects[2].id}`);
   assert.equal(two.bytes.project_logs, secondBytes); assert.equal(empty.bytes.project_logs, 0);
   assert.deepEqual([first, readable].map(file => fs.statSync(file, { bigint: true }).atimeNs), atimes, 'no log contents read');
@@ -131,12 +137,14 @@ test('storage does not traverse symlinked log files, directories or external pro
   const outside = path.join(root, 'native-history'); fs.mkdirSync(outside);
   const native = path.join(outside, 'conversation.jsonl'); fs.writeFileSync(native, Buffer.alloc(4 * 1024 * 1024, 65));
   const old = new Date('2001-01-01T00:00:00Z'); fs.utimesSync(outside, old, old); fs.utimesSync(native, old, old);
-  fs.symlinkSync(native, path.join(logs, '11.jsonl'));
-  fs.symlinkSync(outside, path.join(logs, 'native'));
+  fs.symlinkSync(native, path.join(logs[0], '11.jsonl'));
+  fs.symlinkSync(outside, path.join(logs[0], 'native'));
   const atimes = [outside, native].map(file => fs.statSync(file, { bigint: true }).atimeNs);
   const report = await api(`/storage?project=${projects[0].id}`);
-  assert.equal(report.bytes.project_logs, allocated(path.join(logs, '11.jsonl')));
+  assert.equal(report.bytes.project_logs, allocated(path.join(logs[0], '11.jsonl')));
   assert.equal(report.bytes.all_project_logs, report.bytes.project_logs, 'only the link itself, not its target, can be charged');
   assert.ok(report.bytes.total < allocated(native), 'external history is not charged to acom');
   assert.deepEqual([outside, native].map(file => fs.statSync(file, { bigint: true }).atimeNs), atimes, 'external trees and files are not opened');
 }));
+
+function categoryTotal(bytes){return ['all_project_logs','database','metrics','native','trash','other'].reduce((sum,key)=>sum+bytes[key],0);}

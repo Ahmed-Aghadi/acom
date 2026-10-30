@@ -4,6 +4,7 @@ use crate::harness::{TokenSource, TokenUsage};
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS agent_token_usage(agent_id INTEGER PRIMARY KEY, ledger TEXT NOT NULL);";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct Counts {
     values: [Option<u64>; 4],
     total: Option<u64>,
@@ -59,6 +60,7 @@ impl Counts {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Turn {
     messages: BTreeMap<String, Counts>,
     active_message: Option<String>,
@@ -81,13 +83,23 @@ impl Turn {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct LastTotal {
-    tokens: u64,
-    at: Option<i64>,
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LastTotal {
+    pub tokens: u64,
+    pub at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FieldInfo {
+    observed_at: Option<i64>,
+    state_at: Option<i64>,
+    last_known: Option<LastTotal>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Ledger {
     previous: Counts,
     previous_partial: bool,
@@ -96,18 +108,51 @@ struct Ledger {
     codex_complete: bool,
     turn: Option<Turn>,
     updated_at: Option<i64>,
-    #[serde(default)]
     last_total: Option<LastTotal>,
+    fields: [FieldInfo; 5],
 }
 
 impl Ledger {
-    fn remember_total(&mut self, harness: &str) {
-        if let Some(tokens) = self.counts(harness).total {
-            self.last_total = Some(LastTotal {
-                tokens,
-                at: self.updated_at,
-            });
+    fn reconcile_fields(
+        &mut self,
+        harness: &str,
+        before: &Counts,
+        previous_quality: &str,
+        reported: [bool; 5],
+        at: i64,
+    ) {
+        let counts = self.counts(harness);
+        let quality = self.state(harness, true).to_owned();
+        let current = [
+            counts.values[0],
+            counts.values[1],
+            counts.values[2],
+            counts.values[3],
+            counts.total,
+        ];
+        let previous = [
+            before.values[0],
+            before.values[1],
+            before.values[2],
+            before.values[3],
+            before.total,
+        ];
+        for (index, (value, old)) in current.into_iter().zip(previous).enumerate() {
+            let field = &mut self.fields[index];
+            if value != old || quality != previous_quality || reported[index] {
+                field.state_at = Some(at);
+            }
+            if reported[index]
+                && let Some(tokens) = value
+            {
+                field.observed_at = Some(at);
+                field.last_known = Some(LastTotal {
+                    tokens,
+                    at: Some(at),
+                });
+            }
         }
+        self.last_total = self.fields[4].last_known.clone();
     }
 
     fn session(&mut self, session: Option<&str>) {
@@ -123,13 +168,48 @@ impl Ledger {
 
     fn begin(&mut self, harness: &str, session: Option<&str>) {
         self.finish(harness);
+        let before = self.counts(harness);
+        let quality = self.state(harness, true).to_owned();
         if harness == "codex" {
             self.session(session);
         }
         self.turn = Some(Turn::default());
+        self.reconcile_fields(harness, &before, &quality, [false; 5], now());
     }
 
     fn observe(&mut self, sample: TokenUsage) -> bool {
+        let harness = if matches!(sample.source, TokenSource::CodexSession { .. }) {
+            "codex"
+        } else {
+            "claude"
+        };
+        let before = self.counts(harness);
+        let quality = self.state(harness, true).to_owned();
+        let untrusted = matches!(sample.source, TokenSource::ClaudeResult { trusted: false });
+        let reported = sample
+            .counts
+            .map(|value| value.is_some_and(|value| !untrusted || value > 0));
+        let total = if harness == "codex" {
+            sample.total.is_some()
+        } else {
+            sample.total.is_some_and(|value| !untrusted || value > 0)
+                || reported.iter().any(|value| *value)
+        };
+        let at = now();
+        if !self.apply(sample) {
+            return false;
+        }
+        self.reconcile_fields(
+            harness,
+            &before,
+            &quality,
+            [reported[0], reported[1], reported[2], reported[3], total],
+            at,
+        );
+        true
+    }
+
+    fn apply(&mut self, sample: TokenUsage) -> bool {
         let counts = Counts {
             values: sample.counts,
             total: sample.total,
@@ -216,6 +296,8 @@ impl Ledger {
     }
 
     fn finish(&mut self, harness: &str) {
+        let before = self.counts(harness);
+        let quality = self.state(harness, true).to_owned();
         let Some(mut turn) = self.turn.take() else {
             return;
         };
@@ -228,6 +310,7 @@ impl Ledger {
             self.previous = self.previous.add(&turn.usage);
             self.previous_partial |= !turn.complete;
         }
+        self.reconcile_fields(harness, &before, &quality, [false; 5], now());
     }
 
     fn counts(&self, harness: &str) -> Counts {
@@ -280,12 +363,11 @@ const EMPTY: Counts = Counts {
 };
 
 fn load(st: &St, id: i64) -> R<(Ledger, String)> {
-    let (harness, session, turns, values): (String, Option<String>, i64, [i64; 4]) = st.db.query_row(
-        "SELECT harness,session_id,turns,fresh_in,cache_write,cache_read,output FROM agents WHERE id=?1",
+    let (harness, session): (String, Option<String>) = st.db.query_row(
+        "SELECT harness,session_id FROM agents WHERE id=?1",
         [id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, [row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?])),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let values = values.map(|value| u64::try_from(value).unwrap_or(0));
     let saved: Option<String> = st
         .db
         .query_row(
@@ -294,90 +376,187 @@ fn load(st: &St, id: i64) -> R<(Ledger, String)> {
             |row| row.get(0),
         )
         .optional()?;
-    let mut ledger: Ledger = if let Some(saved) = saved {
+    let ledger: Ledger = if let Some(saved) = saved {
         serde_json::from_str(&saved)
             .map_err(|error| Fail(500, format!("invalid token accounting: {error}")))?
     } else {
-        // Older counters establish positive observations, not that zero was measured.
-        let counts = Counts {
-            values: values.map(|value| (value > 0).then_some(value)),
-            total: values
-                .iter()
-                .any(|value| *value > 0)
-                .then(|| values.iter().copied().fold(0_u64, u64::saturating_add)),
-        };
-        if harness == "codex" {
-            Ledger {
-                session,
-                codex: counts,
-                ..Ledger::default()
-            }
-        } else {
-            Ledger {
-                previous: counts,
-                previous_partial: turns > 0 || values.iter().any(|value| *value > 0),
-                ..Ledger::default()
-            }
+        Ledger {
+            session,
+            ..Ledger::default()
         }
     };
-    if ledger.last_total.is_none() {
-        ledger.remember_total(&harness);
-    }
     Ok((ledger, harness))
 }
 
-fn save(st: &St, id: i64, harness: &str, ledger: &Ledger) -> R<()> {
+fn save(st: &St, id: i64, ledger: &Ledger) -> R<()> {
     st.db.execute(
         "INSERT INTO agent_token_usage(agent_id,ledger) VALUES(?1,?2) ON CONFLICT(agent_id) DO UPDATE SET ledger=excluded.ledger WHERE ledger<>excluded.ledger",
         params![id, serde_json::to_string(ledger).unwrap()],
     )?;
-    let values = ledger
-        .counts(harness)
-        .values
-        .map(|value| value.unwrap_or(0).min(i64::MAX as u64) as i64);
-    st.db.execute(
-        "UPDATE agents SET fresh_in=?2,cache_write=?3,cache_read=?4,output=?5 WHERE id=?1 AND (fresh_in<>?2 OR cache_write<>?3 OR cache_read<>?4 OR output<>?5)",
-        params![id,values[0],values[1],values[2],values[3]],
+    Ok(())
+}
+
+pub(super) fn validate_archive(db: &Connection) -> R<()> {
+    let invalid:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM metric_dirty WHERE generation<1 OR recorded_generation<0 OR recorded_generation>generation OR checkpoint_generation<0 OR checkpoint_generation>generation OR queued_at<0)",[],|row|row.get(0))?;
+    if invalid {
+        return Err(bad("invalid archived metric capture generations"));
+    }
+    let mut statement = db.prepare(
+        "SELECT agent_id,ledger,length(ledger) FROM agent_token_usage ORDER BY agent_id",
     )?;
+    let mut stored = statement.query([])?;
+    while let Some(row) = stored.next()? {
+        let id: i64 = row.get(0)?;
+        if row.get::<_, i64>(2)? > 16 * 1024 * 1024 {
+            return Err(bad(format!(
+                "archived agent {id} token ledger exceeds 16 MiB"
+            )));
+        }
+        let ledger: Ledger = serde_json::from_str(&row.get::<_, String>(1)?)
+            .map_err(|error| bad(format!("invalid archived agent {id} token ledger: {error}")))?;
+        let valid_time = |at: Option<i64>| at.is_none_or(|at| at >= 0);
+        if !valid_time(ledger.updated_at) || ledger.last_total != ledger.fields[4].last_known {
+            return Err(bad("invalid archived token accounting timestamps or total"));
+        }
+        for field in &ledger.fields {
+            if !valid_time(field.observed_at)
+                || !valid_time(field.state_at)
+                || field.last_known.as_ref().and_then(|known| known.at) != field.observed_at
+                || field
+                    .last_known
+                    .as_ref()
+                    .is_some_and(|known| known.at.is_none())
+                || field
+                    .observed_at
+                    .zip(field.state_at)
+                    .is_some_and(|(observed, state)| observed > state)
+                || field.observed_at.is_some() && field.state_at.is_none()
+            {
+                return Err(bad("invalid archived per-field token freshness"));
+            }
+        }
+    }
+    let parse_counter = |value: Option<String>| -> R<()> {
+        if let Some(value) = value {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| bad("invalid archived unsigned counter"))?;
+            if parsed.to_string() != value {
+                return Err(bad(
+                    "archived counters must be canonical unsigned decimal strings",
+                ));
+            }
+        }
+        Ok(())
+    };
+    let mut statement = db.prepare("SELECT value,observed_at FROM context_observations")?;
+    let mut contexts = statement.query([])?;
+    while let Some(row) = contexts.next()? {
+        parse_counter(Some(row.get(0)?))?;
+        if row.get::<_, i64>(1)? < 0 {
+            return Err(bad("invalid archived context observation time"));
+        }
+    }
+    let mut statement =
+        db.prepare("SELECT baseline,latest,observed_at,quality,metric FROM counter_origins")?;
+    let mut counters = statement.query([])?;
+    while let Some(row) = counters.next()? {
+        parse_counter(row.get(0)?)?;
+        let latest: Option<String> = row.get(1)?;
+        let at: Option<i64> = row.get(2)?;
+        let quality: String = row.get(3)?;
+        let metric: String = row.get(4)?;
+        if latest.is_some() != at.is_some()
+            || at.is_some_and(|at| at < 0)
+            || !matches!(
+                quality.as_str(),
+                "unknown" | "provisional" | "partial" | "final"
+            )
+            || !FIELD_NAMES.contains(&metric.as_str())
+        {
+            return Err(bad("invalid archived counter origin metadata"));
+        }
+        parse_counter(latest)?;
+    }
+    let mut statement =
+        db.prepare("SELECT id,source_instance,started_at,imported_at FROM recording_origins")?;
+    let mut origins = statement.query([])?;
+    while let Some(row) = origins.next()? {
+        crate::workspace::validate_uuid(&row.get::<_, String>(0)?)?;
+        crate::workspace::validate_uuid(&row.get::<_, String>(1)?)?;
+        if row.get::<_, i64>(2)? < 0 || row.get::<_, Option<i64>>(3)?.is_some_and(|at| at < 0) {
+            return Err(bad("invalid archived recording origin time"));
+        }
+    }
+    Ok(())
+}
+
+/// Detach provider sessions without counting old absolute snapshots again or refreshing numeric evidence.
+pub(super) fn seal_import(db: &Connection) -> R<()> {
+    let mut after = 0;
+    loop {
+        let ids = rows(
+            db,
+            "SELECT agent_id id FROM agent_token_usage WHERE agent_id>?1 ORDER BY agent_id LIMIT 64",
+            [after],
+        )?;
+        if ids.is_empty() {
+            break;
+        }
+        for item in ids {
+            let id = item["id"].as_i64().unwrap();
+            after = id;
+            let (saved,harness):(String,String)=db.query_row("SELECT u.ledger,a.harness FROM agent_token_usage u JOIN agents a ON a.id=u.agent_id WHERE u.agent_id=?",[id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            let mut ledger: Ledger = serde_json::from_str(&saved)
+                .map_err(|error| bad(format!("invalid archived token ledger: {error}")))?;
+            ledger.finish(&harness);
+            if harness == "codex" {
+                let before = ledger.counts(&harness);
+                let quality = ledger.state(&harness, false).to_owned();
+                ledger.previous = ledger.previous.add(&ledger.codex);
+                ledger.previous_partial |= ledger.codex.any() && !ledger.codex_complete;
+                ledger.codex = Counts::default();
+                ledger.codex_complete = true;
+                ledger.reconcile_fields(&harness, &before, &quality, [false; 5], now());
+            }
+            ledger.session = None;
+            db.execute(
+                "UPDATE agent_token_usage SET ledger=?2 WHERE agent_id=?1",
+                params![id, serde_json::to_string(&ledger).unwrap()],
+            )?;
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn begin(st: &St, id: i64, session: Option<&str>) -> R<()> {
     let (mut ledger, harness) = load(st, id)?;
     ledger.begin(&harness, session);
-    save(st, id, &harness, &ledger)
+    save(st, id, &ledger)?;
+    metric_history::record_counter_summaries(st, id, &observations(st, id)?, true)
 }
 
 pub(super) fn finish(st: &St, id: i64) -> R<()> {
     let (mut ledger, harness) = load(st, id)?;
     ledger.finish(&harness);
-    save(st, id, &harness, &ledger)
+    save(st, id, &ledger)?;
+    metric_history::record_counter_summaries(st, id, &observations(st, id)?, true)
 }
 
 pub(super) fn session(st: &St, id: i64, session: &str) -> R<()> {
     let (mut ledger, harness) = load(st, id)?;
     if harness == "codex" {
         ledger.session(Some(session));
-        save(st, id, &harness, &ledger)?;
+        save(st, id, &ledger)?;
     }
     Ok(())
 }
 
 pub(super) fn record(st: &St, id: i64, sample: TokenUsage) -> R<()> {
-    let (mut ledger, harness) = load(st, id)?;
-    let reports_total = match &sample.source {
-        TokenSource::CodexSession { .. } => sample.total.is_some(),
-        TokenSource::ClaudeResult { trusted: false } => {
-            sample.total.is_some_and(|value| value > 0)
-                || sample.counts.iter().flatten().any(|value| *value > 0)
-        }
-        _ => sample.total.is_some() || sample.counts.iter().any(Option::is_some),
-    };
+    let (mut ledger, _) = load(st, id)?;
     if ledger.observe(sample) {
-        if reports_total {
-            ledger.remember_total(&harness);
-        }
-        save(st, id, &harness, &ledger)?;
+        save(st, id, &ledger)?;
+        metric_history::record_counter_summaries(st, id, &observations(st, id)?, false)?;
     }
     Ok(())
 }
@@ -396,7 +575,79 @@ pub(super) fn attach(st: &St, agent: &mut Value) -> R<()> {
     agent["token_usage_last_total"] = json!(ledger.last_total);
     agent["token_usage_state"] = json!(ledger.state(&harness, agent["state"] == "working"));
     agent["token_usage_updated_at"] = json!(ledger.updated_at);
+    agent["context"] = json!(metric_history::context_value(st, id)?);
+    let mut fields = serde_json::Map::new();
+    for (name, field) in FIELD_NAMES.into_iter().zip(&ledger.fields) {
+        let mut value = json!(field);
+        value["awaiting_update"] = json!(
+            agent["state"] == "working" && ledger.turn.as_ref().is_some_and(|turn| !turn.finalized)
+        );
+        fields.insert(name.into(), value);
+    }
+    agent["token_usage_fields"] = Value::Object(fields);
     Ok(())
+}
+
+pub(super) const FIELD_NAMES: [&str; 5] = [
+    "fresh_in",
+    "cache_write",
+    "cache_read",
+    "output",
+    "total_tokens",
+];
+
+pub(super) fn observations(st: &St, id: i64) -> R<Vec<crate::metrics::Observation>> {
+    use crate::metrics::{Kind, Number, Observation, Point, Quality, Series};
+    let (ledger, harness) = load(st, id)?;
+    let counts = ledger.counts(&harness);
+    let values = [
+        counts.values[0],
+        counts.values[1],
+        counts.values[2],
+        counts.values[3],
+        counts.total,
+    ];
+    let working: bool = st.db.query_row(
+        "SELECT state='working' FROM agents WHERE id=?",
+        [id],
+        |row| row.get(0),
+    )?;
+    let quality = match ledger.state(&harness, working) {
+        "final" => Quality::Final,
+        "provisional" => Quality::Provisional,
+        "partial" => Quality::Partial,
+        _ => Quality::Unknown,
+    };
+    let mut result = Vec::new();
+    for (index, name) in FIELD_NAMES.into_iter().enumerate() {
+        let field = &ledger.fields[index];
+        let Some(at) = field.state_at else { continue };
+        let observed = field
+            .last_known
+            .as_ref()
+            .filter(|last| Some(last.tokens) == values[index]);
+        let value = observed.map(|last| Number::Counter(last.tokens));
+        result.push(Observation {
+            series: Series {
+                entity: format!("agent:{id}"),
+                metric: name.into(),
+                kind: Kind::Counter,
+            },
+            point: Point {
+                observed_at: at,
+                value_observed_at: observed.and_then(|last| last.at),
+                quality: if value.is_some() {
+                    quality
+                } else {
+                    Quality::Unknown
+                },
+                value,
+            },
+            correction: false,
+            coverage_gap: false,
+        });
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -411,6 +662,103 @@ mod tests {
             source,
             counts: values,
             total,
+        }
+    }
+
+    fn archive_database() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::app::SCHEMA).unwrap();
+        crate::app::initialize_views(&db).unwrap();
+        db.execute_batch("INSERT INTO projects(id,path,name,created_at) VALUES(1,'/synthetic','synthetic',0);INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(1,1,'worker','synthetic','codex','test','medium','working',0,0);").unwrap();
+        db
+    }
+
+    #[test]
+    fn archive_validation_uses_ledger_types_and_canonical_durable_numbers() {
+        let db = archive_database();
+        let mut ledger = Ledger::default();
+        ledger.begin("codex", Some("old-session"));
+        ledger.observe(TokenUsage {
+            source: TokenSource::CodexSession { finalized: true },
+            counts: [None; 4],
+            total: Some(10),
+        });
+        let saved = serde_json::to_string(&ledger).unwrap();
+        db.execute("INSERT INTO agent_token_usage VALUES(1,?)", [&saved])
+            .unwrap();
+        validate_archive(&db).unwrap();
+        let mut malformed: Value = serde_json::from_str(&saved).unwrap();
+        malformed["unexpected"] = json!(true);
+        db.execute(
+            "UPDATE agent_token_usage SET ledger=?",
+            [malformed.to_string()],
+        )
+        .unwrap();
+        assert!(validate_archive(&db).is_err());
+        db.execute("UPDATE agent_token_usage SET ledger=?", [&saved])
+            .unwrap();
+        db.execute("INSERT INTO context_observations VALUES(1,'01',10)", [])
+            .unwrap();
+        assert!(validate_archive(&db).is_err());
+        db.execute("UPDATE context_observations SET value='0'", [])
+            .unwrap();
+        validate_archive(&db).unwrap();
+        malformed = serde_json::from_str(&saved).unwrap();
+        malformed["fields"][4]["observed_at"] = json!(-1);
+        db.execute(
+            "UPDATE agent_token_usage SET ledger=?",
+            [malformed.to_string()],
+        )
+        .unwrap();
+        assert!(validate_archive(&db).is_err());
+    }
+
+    #[test]
+    fn import_seals_native_accounting_once_without_refreshing_numeric_observations() {
+        for finalized in [false, true] {
+            let db = archive_database();
+            let mut ledger = Ledger::default();
+            ledger.begin("codex", Some("old-session"));
+            ledger.observe(TokenUsage {
+                source: TokenSource::CodexSession { finalized },
+                counts: [None; 4],
+                total: Some(100),
+            });
+            for field in &mut ledger.fields {
+                if let Some(known) = &mut field.last_known {
+                    field.observed_at = Some(10);
+                    field.state_at = Some(10);
+                    known.at = Some(10);
+                }
+            }
+            ledger.last_total = ledger.fields[4].last_known.clone();
+            db.execute(
+                "INSERT INTO agent_token_usage VALUES(1,?)",
+                [serde_json::to_string(&ledger).unwrap()],
+            )
+            .unwrap();
+            seal_import(&db).unwrap();
+            seal_import(&db).unwrap();
+            validate_archive(&db).unwrap();
+            let saved: String = db
+                .query_row("SELECT ledger FROM agent_token_usage", [], |row| row.get(0))
+                .unwrap();
+            let mut imported: Ledger = serde_json::from_str(&saved).unwrap();
+            assert_eq!(imported.counts("codex").total, Some(100));
+            assert_eq!(imported.fields[4].observed_at, Some(10));
+            assert_eq!(imported.last_total.as_ref().unwrap().at, Some(10));
+            assert!(imported.session.is_none());
+            assert_eq!(
+                imported.state("codex", false),
+                if finalized { "final" } else { "partial" }
+            );
+            imported.begin("codex", Some("new-session"));
+            imported.observe(TokenUsage {
+                source: TokenSource::CodexSession { finalized: true },
+                counts: [None; 4],
+                total: Some(5),
+            });
+            assert_eq!(imported.counts("codex").total, Some(105));
         }
     }
 
@@ -450,6 +798,40 @@ mod tests {
         ledger.finish("claude");
         assert_eq!(ledger.counts("claude").total, Some(71));
         assert_eq!(ledger.state("claude", false), "final");
+    }
+
+    #[test]
+    fn field_freshness_and_last_known_values_only_advance_on_numeric_source_evidence() {
+        let mut ledger = Ledger::default();
+        ledger.begin("claude", None);
+        ledger.observe(sample(
+            TokenSource::ClaudeStreamStart("first".into()),
+            [Some(10), Some(20), Some(30), Some(1)],
+        ));
+        for field in &mut ledger.fields {
+            field.observed_at = Some(10);
+            field.state_at = Some(10);
+            field.last_known.as_mut().unwrap().at = Some(10);
+        }
+        ledger.observe(sample(
+            TokenSource::ClaudeStreamDelta,
+            [None, None, None, Some(2)],
+        ));
+        for field in &ledger.fields[..3] {
+            assert_eq!(field.observed_at, Some(10));
+            assert_eq!(field.state_at, Some(10));
+        }
+        let output_at = ledger.fields[3].observed_at;
+        assert!(output_at.unwrap() > 10);
+        assert_eq!(ledger.fields[3].last_known.as_ref().unwrap().tokens, 2);
+        assert_eq!(ledger.fields[4].last_known.as_ref().unwrap().tokens, 62);
+        ledger.finish("claude");
+        assert_eq!(ledger.fields[3].observed_at, output_at);
+        assert_eq!(ledger.fields[0].observed_at, Some(10));
+        let before = serde_json::to_value(&ledger.fields).unwrap();
+        let ledger: Ledger =
+            serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(ledger.fields).unwrap(), before);
     }
 
     #[test]

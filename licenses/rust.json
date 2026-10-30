@@ -1,7 +1,7 @@
 {
   "targets": ["aarch64-unknown-linux-gnu","x86_64-unknown-linux-gnu"],
   "lock_sha256": "b09745ce6e116096be1be89f432131c2b717848ebecba4173e26de232215f0e9",
-  "manifest_sha256": "85800470e144588d46ad8b557209d6dfbc5e4d6317c2f4e52716a0fef7ee6c7a",
+  "manifest_sha256": "3f884ec674b08230b9292964995c03d02b33d50e927d91720f2dbb351a75d634",
   "packages": [
     {"name":"anstream","version":"1.0.0","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6"}},
     {"name":"anstyle","version":"1.0.14","license":"MIT OR Apache-2.0","selected":"MIT","files":["LICENSE-MIT"],"file_sha256":{"LICENSE-MIT":"6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6"}},

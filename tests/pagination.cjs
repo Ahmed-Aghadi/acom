@@ -10,6 +10,10 @@ const net = require('node:net');
 const { DatabaseSync } = require('node:sqlite');
 const { spawn } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome, attachGlobal } = require('./fixture-workspace.cjs');
+const mockProject='11111111-1111-4111-8111-111111111111';
+const lifecycleStates=['working','idle','paused','done','closed','crashed','replaced'];
+const stateCounts=rows=>Object.fromEntries(lifecycleStates.map(state=>[state,rows.filter(row=>row.state===state).length]));
 
 async function cli(args, { cwd, env }, { closedStdout = false, stdout: destination = 'pipe' } = {}) {
   const child = spawn(closedStdout ? '/bin/sh' : binary, closedStdout
@@ -45,6 +49,7 @@ async function mock(handler, run) {
   fs.mkdirSync(bin);
   const requests = [];
   const server = http.createServer((req, res) => {
+    if(req.url.startsWith(`/p/${mockProject}/`))req.url=req.url.slice(`/p/${mockProject}`.length);
     requests.push({ method: req.method, url: req.url });
     res.on('error', () => {});
     handler(req, res);
@@ -53,7 +58,7 @@ async function mock(handler, run) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const env = {
     ...process.env,
-    ACOM_URL: `http://127.0.0.1:${server.address().port}`,
+    ACOM_URL: `http://127.0.0.1:${server.address().port}/p/${mockProject}`,
     ACOM_HOME: path.join(root, 'state'),
     CODEX_HOME: path.join(root, 'codex'),
     CLAUDE_CONFIG_DIR: path.join(root, 'no-credentials'),
@@ -86,7 +91,7 @@ test('CLI closed stdout exits quietly for local and API-backed output', async t 
         const result = await cli(args, fixture, { closedStdout: true });
         assert.equal(result.status, 0, result.stderr);
         assert.equal(result.stderr, '', 'an intentionally closed consumer must not emit a panic or warning');
-        assert.equal(fixture.requests.length, args[0] === 'agents' ? 2 : 0);
+        assert.equal(fixture.requests.length, args[0] === 'agents' ? 1 : 0);
       });
     });
   }
@@ -330,7 +335,7 @@ test('CLI privacy viewer is separate from membership and history filters', async
       const request = fixture.requests.find(request => new URL(request.url, 'http://fixture').pathname === endpoint);
       assert.ok(request, JSON.stringify(fixture.requests));
       const query = new URL(request.url, 'http://fixture').searchParams;
-      assert.equal(query.get('project'), '9'); assert.equal(query.get(identityKey), '7');
+      assert.equal(query.get('project'), null); assert.equal(query.get(identityKey), '7');
       if (identityKey === 'viewer') assert.equal(query.get('agent'), filter, 'caller identity must not overwrite or introduce a membership/history filter');
       assert.ok(fixture.requests.every(request => request.method === 'GET'));
     });
@@ -388,7 +393,7 @@ test('CLI agent lifecycle filters validate before requests and retain paging sco
       const request = fixture.requests.find(request => request.url.startsWith('/agents?'));
       assert.ok(request, JSON.stringify(fixture.requests));
       const query = new URL(request.url, 'http://fixture').searchParams;
-      assert.equal(query.get('project'), '9');
+      assert.equal(query.get('project'), null);
       assert.equal(query.get('group'), 'two words');
       assert.equal(query.get('pause_reason'), flags.at(-1));
       if (flags.includes('--state')) assert.equal(query.get('state'), 'paused');
@@ -441,7 +446,7 @@ test('CLI agent queries validate before discovery and preserve every paging filt
       assert.ok(request, JSON.stringify(fixture.requests));
       const query = new URL(request.url, 'http://fixture').searchParams;
       for (let index = 0; index < flags.length; index += 2) assert.equal(query.get(flags[index].slice(2)), flags[index + 1]);
-      assert.equal(query.get('project'), '9');
+      assert.equal(query.get('project'), null);
       const hint = result.stdout.split('\n').find(line => line.startsWith('More available: '));
       assert.ok(hint, result.stdout);
       for (let index = 0; index < flags.length; index += 2) assert.ok(hint.includes(`${flags[index]} '${flags[index + 1]}'`) || hint.includes(`${flags[index]} ${flags[index + 1]}`), hint);
@@ -471,7 +476,7 @@ test('CLI locks distinguishes stopping reservations from ordinary timed leases',
       assert.match(result.stdout,/expires/); assert.doesNotMatch(result.stdout,/releasing after worker stops/);
     }
     assert.ok(fixture.requests.every(request=>request.method==='GET'));
-    assert.equal(fixture.requests.length,2);
+    assert.equal(fixture.requests.length,1);
   });
 });
 
@@ -583,6 +588,7 @@ test('failed project lookup retains its cause and never launches an agent', asyn
         });
         res.end(body);
       }, async fixture => {
+        fixture.env.ACOM_URL=fixture.env.ACOM_URL.replace(`/p/${mockProject}`,'');
         const result = await cli(['launch', '--task', 'must never launch'], fixture);
         assert.notEqual(result.status, 0);
         if (status === 500) assert.match(result.stderr, /project database lookup failed explicitly/);
@@ -597,6 +603,7 @@ test('failed project lookup retains its cause and never launches an agent', asyn
       res.writeHead(200,{'Content-Type':'application/json'});
       res.end('null');
     },async fixture=>{
+      fixture.env.ACOM_URL=fixture.env.ACOM_URL.replace(`/p/${mockProject}`,'');
       const result=await cli(['launch','--task','must never launch'],fixture);
       assert.notEqual(result.status,0);
       assert.match(result.stderr,/invalid acom response: expected a JSON object/);
@@ -624,7 +631,7 @@ async function isolated(run) {
   for (const dir of [home, bin, projectDir]) fs.mkdirSync(dir);
   const env = { ...process.env, ACOM_HOME: home, CODEX_HOME: path.join(root, 'codex'), CLAUDE_CONFIG_DIR: path.join(root, 'no-credentials'), PATH: bin };
   for (const key of ['ACOM_ID', 'ACOM_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY']) delete env[key];
-  let server, url, errors = '';
+  let server, url, project, errors = '';
   const stop = async () => {
     if (!server || server.exitCode !== null || server.signalCode !== null) return;
     const exited = new Promise(resolve => server.once('exit', resolve));
@@ -645,32 +652,32 @@ async function isolated(run) {
     }, 'isolated server startup');
   };
   const api = async (method, route, body, status = 200, budget) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const response = await fetch(url + scoped(route,project?.id,body), { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const text = await response.text();
     assert.equal(response.status, status, `${method} ${route}: ${text.slice(0, 1000)}`);
     if (budget !== undefined && status === 200) assert.ok(Buffer.byteLength(text) <= budget, `${route} exceeded ${budget} bytes (${Buffer.byteLength(text)})`);
     return JSON.parse(text);
   };
-  const db = action => {
-    const connection = new DatabaseSync(path.join(home, 'acom.db'));
+  const db = (action, selected=project.id) => {
+    const connection = new DatabaseSync(path.join(projectHome(home,selected), 'acom.db'));attachGlobal(connection,home);
     try { connection.exec('PRAGMA busy_timeout=5000'); return action(connection); }
     finally { connection.close(); }
   };
   try {
     await start();
-    const project = await api('POST', '/projects', { path: projectDir });
+    project = await api('POST', '/projects', { path: projectDir });
     // All agents are closed database fixtures. No API launch or provider client
     // exists, and the empty PATH also prevents periodic checks from falling back.
     db(connection => {
       connection.exec('BEGIN');
       const insert = connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,?,?,'codex','gpt-6-sol','medium','closed',0,0)");
-      for (let id = 1; id <= 130; id++) insert.run(id, project.id, `fixture ${id}`, 'team', `task ${id}`);
+      for (let id = 1; id <= 130; id++) insert.run(id, 1, `fixture ${id}`, 'team', `task ${id}`);
       const usage = connection.prepare('INSERT INTO usage_checks(provider,attempted_at,next_check,in_flight) VALUES(?,?,?,0) ON CONFLICT(provider) DO UPDATE SET attempted_at=excluded.attempted_at,next_check=excluded.next_check,in_flight=0');
       const now = Math.floor(Date.now() / 1000);
       for (const provider of ['codex', 'claude']) usage.run(provider, now, now + 3600);
       connection.exec('COMMIT');
     });
-    await run({ api, db, start, stop, home, env, project, projectDir, root, url });
+    await run({ api, db, start, stop, home:projectHome(home,project.id), env:{...env,ACOM_URL:`${url}/p/${project.id}`}, project, projectDir, root, url });
   } finally {
     await stop();
     fs.rmSync(root,{recursive:true,force:true});
@@ -684,6 +691,7 @@ function params(route, values) {
 }
 
 async function collect(api, route, { ascending = false, limit = 3, max_bytes = 2048 } = {}) {
+  const opaque=/^\/(configs|projects)(?:\?|$)/.test(route);
   let query = { limit, max_bytes }, previous, count = 0;
   const items = [];
   for (;;) {
@@ -692,13 +700,18 @@ async function collect(api, route, { ascending = false, limit = 3, max_bytes = 2
     assert.ok(page.items.length <= limit);
     assert.equal(typeof page.total, 'number');
     for (const item of page.items) {
-      assert.equal(typeof item.id, 'number');
-      if (previous !== undefined) assert.ok(ascending ? item.id > previous : item.id < previous, `cursor repeated or reordered ID ${item.id}`);
+      assert.equal(typeof item.id, opaque ? 'string' : 'number');
+      if (previous !== undefined) assert.ok(ascending||opaque ? item.id > previous : item.id < previous, `cursor repeated or reordered ID ${item.id}`);
       previous = item.id;
       items.push(item);
     }
     if (!page.has_more) return { items, page };
     assert.ok(page.items.length > 0, 'nonterminal page must make progress');
+    if(opaque) {
+      assert.equal(typeof page.next_cursor,'string');
+      query={limit,max_bytes,cursor:page.next_cursor,revision:page.revision};
+      assert.ok(++count<1000,'opaque pagination did not terminate');continue;
+    }
     const direction = ascending ? 'after' : 'before';
     const cursor = ascending ? page.next_after : page.next_before;
     assert.equal(cursor, page.items.at(-1).id);
@@ -852,7 +865,7 @@ test('immutable message pages and UTF-8 chunks remain complete across bounded re
       const explicit=await api('GET',`/messages/${outside}?agent=0&max_bytes=65536`);
       assert.deepEqual(hydrated.value,explicit);
       assert.equal(hydrated.value.outside_membership,true);
-      assert.equal(hydrated.value.membership_unknown,false);
+      assert.equal(Object.hasOwn(hydrated.value,'membership_unknown'),false,'fresh membership intervals are always authoritative');
       assert.equal(page.items[0].outside_membership,hydrated.value.outside_membership);
       assert.equal(page.items[0].membership_unknown,hydrated.value.membership_unknown);
       assert.equal(page.items[1].id,inside);
@@ -883,7 +896,7 @@ test('mutable collection cursors reject changed views and conditional reads stay
     });
     await t.test('counter updates also invalidate a collection cursor', async () => {
       const first = await api('GET', `/agents?project=${project.id}&limit=3&max_bytes=4096`);
-      db(connection => connection.prepare('UPDATE agents SET output=output+1 WHERE id=1').run());
+      db(connection => connection.prepare("INSERT INTO context_observations VALUES(1,'123',1) ON CONFLICT(agent_id) DO UPDATE SET value=excluded.value,observed_at=excluded.observed_at").run());
       await api('GET', params(`/agents?project=${project.id}`, { before: first.next_before, through: first.through, revision: first.revision, limit: 3, max_bytes: 4096 }), undefined, 409);
     });
     await t.test('invalid cursors and sizes fail explicitly', async () => {
@@ -896,9 +909,9 @@ test('mutable collection cursors reject changed views and conditional reads stay
       await api('POST','/locks',{project:project.id,name,about:'pause releases an ordinary timed lease'});
       db(connection=>{
         connection.prepare("UPDATE agents SET state='idle' WHERE id=1").run();
-        connection.prepare('UPDATE locks SET holder=1,expires_at=?,frozen=0,frozen_left=NULL WHERE project=? AND name=?').run(Math.floor(Date.now()/1000)+600,project.id,name);
+        connection.prepare('UPDATE locks SET holder=1,expires_at=? WHERE project=1 AND name=?').run(Math.floor(Date.now()/1000)+600,name);
       });
-      const holder=()=>db(connection=>connection.prepare('SELECT holder FROM locks WHERE project=? AND name=?').get(project.id,name).holder);
+      const holder=()=>db(connection=>connection.prepare('SELECT holder FROM locks WHERE project=? AND name=?').get(1,name).holder);
       try {
         for(const expected_holder of [null,'1',0,-1,1.5,false,1]) {
           await api('POST','/locks/free',{project:project.id,name,expected_holder},400);
@@ -916,7 +929,7 @@ test('mutable collection cursors reject changed views and conditional reads stay
         await until(()=>holder()===null,'even an idle pause releases after asynchronous cleanup proof');
         assert.equal(holder(),null);
         assert.equal((await api('GET','/agents/1')).state,'paused');
-        db(connection=>connection.prepare('UPDATE locks SET holder=1,expires_at=? WHERE project=? AND name=?').run(Math.floor(Date.now()/1000)+600,project.id,name));
+        db(connection=>connection.prepare('UPDATE locks SET holder=1,expires_at=? WHERE project=? AND name=?').run(Math.floor(Date.now()/1000)+600,1,name));
         await api('POST','/locks/free',{project:project.id,name});
         assert.equal(holder(),null,'ordinary explicit user Free remains supported');
       } finally {
@@ -934,7 +947,7 @@ test('agent filters search the whole project and return exact bounded facets', a
       || category === 'active' && ['working', 'idle'].includes(record.state)
       || category === 'attention' && (['paused', 'crashed'].includes(record.state) || record.id === 9)
       || category === 'finished' && ['done', 'closed', 'replaced'].includes(record.state);
-    const counts = rows => Object.fromEntries(['all', 'active', 'attention', 'finished'].map(category => [category, rows.filter(record => matches(record, category)).length]));
+    const counts = rows => ({...Object.fromEntries(['all', 'active', 'attention', 'finished'].map(category => [category, rows.filter(record => matches(record, category)).length])),...stateCounts(rows)});
     const longTask = `${'x'.repeat(900)} ÄäDeepNeedle 東京🙂`;
     db(connection => {
       connection.exec('BEGIN');
@@ -1004,9 +1017,9 @@ test('agent filters search the whole project and return exact bounded facets', a
       db(connection => {
         connection.exec('BEGIN');
         const insert = connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(?,?,'foreign cohort','facet','cohort task','codex','gpt-6-sol','medium',?,?,0,0)");
-        ['paused', 'paused', 'paused', 'working', 'idle', 'done'].forEach((state, index) => insert.run(131 + index, other.id, state, index < 2 ? 'restart' : state === 'paused' ? 'user' : null));
+        ['paused', 'paused', 'paused', 'working', 'idle', 'done'].forEach((state, index) => insert.run(131 + index, 1, state, index < 2 ? 'restart' : state === 'paused' ? 'user' : null));
         connection.exec('COMMIT');
-      });
+      },other.id);
       const overview = await api('GET', `/overview?project=${project.id}`);
       assert.equal(overview.project.id, project.id);
       assert.deepEqual(overview.agent_counts, counts(records));
@@ -1019,7 +1032,8 @@ test('agent filters search the whole project and return exact bounded facets', a
       assert.deepEqual(page.counts, counts(records.slice(1, 8)));
       assert.equal(page.project_total, 130);
       const all = await api('GET', '/agents?max_bytes=512', undefined, 200, 512);
-      assert.equal(all.project_total, 136);
+      assert.equal(all.project_total, 130,'unqualified fixture reads remain in their explicitly selected project');
+      assert.equal((await api('GET',`/p/${other.id}/agents?max_bytes=512`)).project_total,6);
     });
   });
 });
@@ -1041,7 +1055,7 @@ test('structured agent filters preserve exact facets, paging and lifecycle scope
       || category === 'active' && ['working', 'idle'].includes(record.state)
       || category === 'attention' && ['paused', 'crashed'].includes(record.state)
       || category === 'finished' && ['done', 'closed', 'replaced'].includes(record.state);
-    const counts = rows => Object.fromEntries(['all', 'active', 'attention', 'finished'].map(category => [category, rows.filter(record => matchesCategory(record, category)).length]));
+    const counts = rows => ({...Object.fromEntries(['all', 'active', 'attention', 'finished'].map(category => [category, rows.filter(record => matchesCategory(record, category)).length])),...stateCounts(rows)});
     const matches = (record, filter) => (!filter.state || record.state === filter.state)
       && (!filter.pause_reason || record.state === 'paused' && (filter.pause_reason === 'manual' ? ['user', 'all'].includes(record.pause_reason) : record.pause_reason === filter.pause_reason))
       && (!filter.group || record.group === filter.group)
@@ -1129,7 +1143,7 @@ test('structured agent filters preserve exact facets, paging and lifecycle scope
     await t.test('structured matches never narrow project totals or project/global controls', async () => {
       const otherDir = path.join(root, 'other-project'); fs.mkdirSync(otherDir);
       const other = await api('POST', '/projects', { path: otherDir });
-      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,?,'other','cohort task','codex','gpt-6-sol','medium','paused','limit',0,0)").run(other.id));
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,1,'other','cohort task','codex','gpt-6-sol','medium','paused','limit',0,0)").run(),other.id);
       const overview = await api('GET', `/overview?project=${project.id}`);
       assert.deepEqual(overview.agent_counts, counts(records));
       assert.deepEqual(overview.project_actions, { pause_eligible: 3, resume_eligible: 8, restart_paused: 1 });
@@ -1138,8 +1152,9 @@ test('structured agent filters preserve exact facets, paging and lifecycle scope
       assert.deepEqual(scoped.items.map(item => item.id), [130, 127, 5, 1]);
       assert.equal(scoped.page.project_total, 130);
       const global = await collect(api, '/agents?pause_reason=limit', { limit: 2, max_bytes: 512 });
-      assert.deepEqual(global.items.map(item => item.id), [131, 130, 127, 5, 1]);
-      assert.equal(global.page.project_total, 131);
+      assert.deepEqual(global.items.map(item => item.id), [130, 127, 5, 1]);
+      assert.equal(global.page.project_total, 130);
+      assert.deepEqual((await collect(api,`/p/${other.id}/agents?pause_reason=limit`,{limit:2,max_bytes:512})).items.map(item=>item.id),[131]);
       assert.deepEqual((await api('GET', `/overview?project=${project.id}`)).project_actions, overview.project_actions);
     });
   });
@@ -1167,6 +1182,7 @@ test('agent query fields, literals and alternatives stay exact across bounded pa
     update(10, { model: 'custom,model', effort: 'fixed,effort', state: 'closed', reason: null });
     update(11, { state: 'closed', reason: null, name: 'boundaryleft', task: 'boundaryright', status: 'statusneedle', effort: 'effortonlyneedle' });
     const categories = rows => ({
+      ...stateCounts(rows),
       all: rows.length,
       active: rows.filter(row => ['working', 'idle'].includes(row.state)).length,
       attention: rows.filter(row => ['paused', 'crashed'].includes(row.state)).length,
@@ -1194,7 +1210,7 @@ test('agent query fields, literals and alternatives stay exact across bounded pa
       const search = 'group:"Security review" provider:codex model:model-id effort:high state:paused,crashed reentrancy';
       const result = await collect(api, route({ search }), { limit: 1, max_bytes: 512 });
       assert.deepEqual(result.items.map(row => row.id), [130, 127, 2, 1]);
-      assert.deepEqual(result.page.counts, { all: 4, active: 0, attention: 4, finished: 0 });
+      assert.deepEqual(result.page.counts, categories(records.filter(row=>[130,127,2,1].includes(row.id))));
       assert.equal(result.page.project_total, 130);
       for (const category of ['all', 'active', 'attention', 'finished']) {
         const page = await api('GET', route({ search, category, max_bytes: 512 }), undefined, 200, 512);
@@ -1291,14 +1307,15 @@ test('agent query fields, literals and alternatives stay exact across bounded pa
     await t.test('provider/model/group matches stay project scoped and never alter bulk counts', async () => {
       const otherDir = path.join(root, 'query-other-project'); fs.mkdirSync(otherDir);
       const other = await api('POST', '/projects', { path: otherDir });
-      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,?,'foreign','Security review','reentrancy','codex','model-id','high','paused','limit',0,0)").run(other.id));
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,1,'foreign','Security review','reentrancy','codex','model-id','high','paused','limit',0,0)").run(),other.id);
       const overview = await api('GET', `/overview?project=${project.id}`);
       assert.deepEqual(overview.agent_counts, categories(records));
       const search = 'group:"Security review" provider:codex model:model-id effort:high state:paused,crashed reentrancy';
       assert.deepEqual(await ids({ search }), [130, 127, 2, 1]);
       const global = await collect(api, params('/agents', { search }), { limit: 1, max_bytes: 512 });
-      assert.deepEqual(global.items.map(row => row.id), [131, 130, 127, 2, 1]);
-      assert.equal(global.page.project_total, 131);
+      assert.deepEqual(global.items.map(row => row.id), [130, 127, 2, 1]);
+      assert.equal(global.page.project_total, 130);
+      assert.deepEqual((await collect(api,params(`/p/${other.id}/agents`,{search}),{limit:1,max_bytes:512})).items.map(item=>item.id),[131]);
       const fresh = await api('GET', `/overview?project=${project.id}`);
       assert.deepEqual(fresh.project_actions, overview.project_actions);
       assert.equal(fresh.pause_eligible, overview.pause_eligible); assert.equal(fresh.resume_eligible, overview.resume_eligible);
@@ -1330,6 +1347,7 @@ test('Boolean agent queries preserve truth, project scope and bounded traversal'
     set(127, { state: 'idle', group: 'Security review' });
     set(130, { state: 'paused', reason: 'limit', group: 'Other' });
     const counts = rows => ({
+      ...stateCounts(rows),
       all: rows.length,
       active: rows.filter(row => ['working', 'idle'].includes(row.state)).length,
       attention: rows.filter(row => ['paused', 'crashed'].includes(row.state)).length,
@@ -1352,7 +1370,7 @@ test('Boolean agent queries preserve truth, project scope and bounded traversal'
     await t.test('idle OR limit pause returns the union once, with exact category counts', async () => {
       const search = 'state:idle OR pause_reason:limit';
       assert.deepEqual(await ids(search), [130, 127, 12, 8, 2, 1]);
-      const expected = { all: 6, active: 3, attention: 3, finished: 0 };
+      const expected = counts(records.filter(row=>row.state==='idle'||limitPaused(row)));
       for (const category of ['all', 'active', 'attention', 'finished']) {
         const page = await collect(api, route({ search, category }), { limit: 1, max_bytes: 512 });
         const predicate = row => (row.state === 'idle' || limitPaused(row))
@@ -1499,14 +1517,15 @@ test('Boolean agent queries preserve truth, project scope and bounded traversal'
     await t.test('OR cannot escape project or scalar scope, including SQL-like literal values', async () => {
       const otherDir = path.join(root, 'boolean-other-project'); fs.mkdirSync(otherDir);
       const other = await api('POST', '/projects', { path: otherDir });
-      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,?,'foreign',?,'boolean task','codex','gpt-6-sol','medium','paused','limit',0,0)").run(other.id, injection));
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,pause_reason,launched_by,launched_at) VALUES(131,1,'foreign',?,'boolean task','codex','gpt-6-sol','medium','paused','limit',0,0)").run(injection),other.id);
       const before = await api('GET', `/overview?project=${project.id}`);
       const search = `state:idle OR group:${JSON.stringify(injection)} OR pause_reason:limit`;
       assert.deepEqual(await ids(search), [130, 127, 12, 8, 2, 1]);
       assert.deepEqual(await ids(`group:${JSON.stringify(injection)}`), [12]);
       const global = await collect(api, params('/agents', { search }), { limit: 1, max_bytes: 512 });
-      assert.deepEqual(global.items.map(row => row.id), [131, 130, 127, 12, 8, 2, 1]);
-      assert.equal(global.page.project_total, 131);
+      assert.deepEqual(global.items.map(row => row.id), [130, 127, 12, 8, 2, 1]);
+      assert.equal(global.page.project_total, 130);
+      assert.deepEqual((await collect(api,params(`/p/${other.id}/agents`,{search}),{limit:1,max_bytes:512})).items.map(item=>item.id),[131]);
       const after = await api('GET', `/overview?project=${project.id}`);
       assert.deepEqual(after.agent_counts, before.agent_counts);
       assert.deepEqual(after.project_actions, before.project_actions);
@@ -1530,33 +1549,31 @@ test('project bulk pause leaves other projects and their locks untouched', async
     const otherDir = path.join(root, 'other-project');
     fs.mkdirSync(otherDir);
     const other = await api('POST', '/projects', { path: otherDir });
-    db(connection => {
-      connection.exec('BEGIN');
-      const insert = connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,'other','fixture','codex','gpt-6-sol','medium',?,0,0)");
-      for (const [index, state] of ['working', 'idle', 'done', 'paused', 'crashed', 'replaced'].entries()) {
-        connection.prepare('UPDATE agents SET state=? WHERE id=?').run(state, index + 1);
-        insert.run(131 + index, other.id, state);
-      }
-      connection.exec('COMMIT');
-    });
+    for (const [index,state] of ['working','idle','done','paused','crashed','replaced'].entries()) {
+      db(connection=>connection.prepare('UPDATE agents SET state=? WHERE id=?').run(state,index+1));
+      db(connection=>connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,1,'other','fixture','codex','gpt-6-sol','medium',?,0,0)").run(index+131,state),other.id);
+    }
     for (const [scope, agent] of [[project.id, 1], [other.id, 131]]) {
       await api('POST', '/locks', { project: scope, name: 'held', about: 'Scoped bulk pause fixture' });
-      await api('POST', '/locks/acquire', { agent, name: 'held', wait: 0, ttl: 600 });
+      await api('POST', `/p/${scope}/locks/acquire`, { agent, name: 'held', wait: 0, ttl: 600 });
     }
     const foreign = () => db(connection => ({
-      agents: connection.prepare('SELECT * FROM agents WHERE project=? ORDER BY id').all(other.id),
-      locks: connection.prepare('SELECT * FROM locks WHERE project=? ORDER BY name').all(other.id),
-    }));
+      agents: connection.prepare('SELECT * FROM agents ORDER BY id').all(),
+      locks: connection.prepare('SELECT * FROM locks ORDER BY name').all(),
+    }),other.id);
     const before = foreign();
-    assert.deepEqual((await api('POST', '/pause-all', { project: project.id })).ids.toSorted((a, b) => a - b), [1, 2, 3]);
-    await until(() => db(connection => connection.prepare('SELECT holder FROM locks WHERE project=?').get(project.id).holder) === null, 'project pause releases its own lock');
+    assert.deepEqual(await api('POST','/pause-all',{project:project.id}),{counts:{ids:3,errors:0,warnings:0},results:[{project:project.id,ids:[1,2,3]}],errors:[]});
+    await until(() => db(connection => connection.prepare('SELECT holder FROM locks WHERE project=?').get(1).holder) === null, 'project pause releases its own lock');
     assert.deepEqual(foreign(), before, 'another project retains every lifecycle field and held lease');
     assert.deepEqual(db(connection => connection.prepare('SELECT id,state FROM agents WHERE id<=6 ORDER BY id').all()).map(row => ({ ...row })), [
       { id: 1, state: 'paused' }, { id: 2, state: 'paused' }, { id: 3, state: 'paused' },
       { id: 4, state: 'paused' }, { id: 5, state: 'crashed' }, { id: 6, state: 'replaced' },
     ]);
-    assert.deepEqual((await api('POST', '/pause-all', {})).ids.toSorted((a, b) => a - b), [131, 132, 133], 'omitting project retains global scope');
-    await until(() => db(connection => connection.prepare('SELECT holder FROM locks WHERE project=?').get(other.id).holder) === null, 'global pause releases the remaining project lock');
+    const allPaused=await api('POST','/pause-all',{});
+    assert.deepEqual(allPaused.errors,[]);
+    assert.deepEqual(allPaused.results.find(result=>result.project===other.id).ids,[131,132,133],'omitting project retains global scope');
+    assert.deepEqual(allPaused.results.find(result=>result.project===project.id).ids,[]);
+    await until(() => db(connection => connection.prepare('SELECT holder FROM locks WHERE project=1').get().holder,other.id) === null, 'global pause releases the remaining project lock');
   });
 });
 
@@ -1565,33 +1582,28 @@ test('project bulk resume respects scope and restart-only pause reasons', async 
     const otherDir = path.join(root, 'other-project');
     fs.mkdirSync(otherDir);
     const other = await api('POST', '/projects', { path: otherDir });
-    db(connection => {
-      connection.exec('BEGIN');
-      const insert = connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,pause_reason,pause_from,paused_at,launched_by,launched_at) VALUES(?,?,'other','fixture','codex','gpt-6-sol','medium','paused',?,?,1,0,0)");
-      for (const [index, reason] of ['restart', 'user', 'limit'].entries()) {
-        const from = index === 1 ? 'done' : 'idle';
-        connection.prepare("UPDATE agents SET state='paused',pause_reason=?,pause_from=?,paused_at=1 WHERE id=?").run(reason, from, index + 1);
-        insert.run(131 + index, other.id, reason, from);
-      }
-      connection.prepare("UPDATE agents SET state='crashed' WHERE id=4").run();
-      connection.exec('COMMIT');
-    });
-    const foreign = () => db(connection => connection.prepare('SELECT * FROM agents WHERE project=? ORDER BY id').all(other.id));
+    for (const [index,reason] of ['restart','user','limit'].entries()) {
+      const from=index===1?'done':'idle';
+      db(connection=>connection.prepare("UPDATE agents SET state='paused',pause_reason=?,pause_from=?,paused_at=1 WHERE id=?").run(reason,from,index+1));
+      db(connection=>connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,pause_reason,pause_from,paused_at,launched_by,launched_at) VALUES(?,1,'other','fixture','codex','gpt-6-sol','medium','paused',?,?,1,0,0)").run(index+131,reason,from),other.id);
+    }
+    db(connection=>connection.prepare("UPDATE agents SET state='crashed' WHERE id=4").run());
+    const foreign = () => db(connection => connection.prepare('SELECT * FROM agents ORDER BY id').all(),other.id);
     const before = foreign();
     const resumed = await api('POST', '/resume-restart', { project: project.id });
-    assert.deepEqual(resumed, { ids: [1], errors: [], warnings: [] });
+    assert.deepEqual(resumed, {counts:{ids:1,errors:0,warnings:0},results:[{project:project.id,ids:[1],errors:[],warnings:[]}],errors:[]});
     assert.deepEqual(foreign(), before);
     assert.deepEqual(db(connection => connection.prepare('SELECT id,pause_reason FROM agents WHERE id IN (2,3) ORDER BY id').all()).map(row => ({ ...row })), [
       { id: 2, pause_reason: 'user' }, { id: 3, pause_reason: 'limit' },
     ]);
-    assert.deepEqual((await api('POST', '/resume-all', { project: project.id })).ids.toSorted((a, b) => a - b), [2, 3]);
+    assert.deepEqual((await api('POST', '/resume-all', { project: project.id })).results[0].ids.toSorted((a, b) => a - b), [2, 3]);
     assert.deepEqual(foreign(), before);
     assert.deepEqual(db(connection => connection.prepare('SELECT id,state,pause_reason FROM agents WHERE id<=4 ORDER BY id').all()).map(row => ({ ...row })), [
       { id: 1, state: 'idle', pause_reason: null }, { id: 2, state: 'done', pause_reason: null },
       { id: 3, state: 'idle', pause_reason: null }, { id: 4, state: 'crashed', pause_reason: null },
     ]);
-    assert.deepEqual((await api('POST', '/resume-restart', {})).ids, [131], 'global restart-only resume still spans projects');
-    assert.deepEqual((await api('POST', '/resume-all', {})).ids.toSorted((a, b) => a - b), [132, 133], 'global resume includes remaining manual and limit pauses');
+    assert.deepEqual((await api('POST', '/resume-restart', {})).results.find(result=>result.project===other.id).ids,[131], 'global restart-only resume still spans projects');
+    assert.deepEqual((await api('POST', '/resume-all', {})).results.find(result=>result.project===other.id).ids.toSorted((a,b)=>a-b),[132,133], 'global resume includes remaining manual and limit pauses');
   });
 });
 
@@ -1608,7 +1620,7 @@ test('project bulk actions reject invalid scopes without mutation', async () => 
         assert.match(result.error, /project/i);
         assert.deepEqual(snapshot(), before, `${route} project=${JSON.stringify(invalid)} must not change state`);
       }
-      await api('POST', route, { project: 999999 }, 404);
+      await api('POST', route, { project: '99999999-9999-4999-8999-999999999999' }, 404);
       await api('POST', route, { project: project.id, projects: [] }, 400);
       await api('POST', `${route}?project=${project.id}`, {}, 400);
       assert.deepEqual(snapshot(), before, `${route} invalid scope must not broaden to all projects`);
@@ -1699,13 +1711,13 @@ test('large detail types and agent logs remain recoverable without providers', a
       assert.equal((await complete(api,`/locks/${locks.items[0].id}`)).value.about,longText);
     });
     await t.test('configuration stubs can be recovered by ID', async () => {
-      const base=await api('GET','/configs/1?max_bytes=65536');
+      const base=await api('GET','/configs/default?max_bytes=65536');
       base.settings.prompts.launch='漢🙂"\\\n'.repeat(300);
       const added=await api('POST','/configs',{name:'large configuration',settings:base.settings});
       const result=await complete(api,`/configs/${added.id}`,512);
       assert.equal(result.value.settings.prompts.launch,base.settings.prompts.launch);
       const configs=await collect(api,'/configs',{max_bytes:512});
-      assert.deepEqual(configs.items.map(item=>item.id),[added.id,1]);
+      assert.deepEqual(configs.items.map(item=>item.id),[added.id,'default'].sort());
       assert.ok(configs.items.every(item=>item.truncated));
     });
     await t.test('oversized thread metadata retains full title and membership', async () => {
@@ -1728,12 +1740,12 @@ test('large detail types and agent logs remain recoverable without providers', a
         const insert=connection.prepare("INSERT INTO activity(project,at,actor,what) VALUES(?,0,'owned fixture',?)");
         let largeId;
         for(let index=0;index<100;index++) {
-          const inserted=Number(insert.run(project.id,index===96?longText:`activity ${index}`).lastInsertRowid);
+          const inserted=Number(insert.run(1,index===96?longText:`activity ${index}`).lastInsertRowid);
           if(index===96) largeId=inserted;
         }
         return largeId;
       });
-      const expected=db(connection=>connection.prepare('SELECT id FROM activity WHERE project=? OR project IS NULL ORDER BY id DESC').all(project.id).map(row=>row.id));
+      const expected=db(connection=>connection.prepare('SELECT id FROM activity WHERE project=? OR project IS NULL ORDER BY id DESC').all(1).map(row=>row.id));
       const activity=await collect(api,`/activity?project=${project.id}`,{limit:5,max_bytes:512});
       assert.deepEqual(activity.items.map(item=>item.id),expected);
       const large=activity.items.find(item=>item.id===largeId);
@@ -1839,7 +1851,7 @@ test('retained notices and large mutation receipts stay bounded without replay',
     await t.test('oversized send receipt is saved and subsequent reads do not send again',async()=>{
       db(connection=>{
         const insert=connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,'closed receipt fixture','codex','gpt-6-sol','medium','closed',0,0)");
-        for(let id=131;id<=300;id++) insert.run(id,project.id,`receipt fixture ${id}`);
+        for(let id=131;id<=300;id++) insert.run(id,1,`receipt fixture ${id}`);
       });
       const thread=await api('POST','/threads',{project:project.id,title:'large receipt',members:Array.from({length:300},(_,index)=>String(index+1)),include_user:true});
       const receipt=await api('POST','/messages',{thread:thread.id,text:'exactly one saved message'},200,16000);
@@ -1862,7 +1874,7 @@ test('retained notices and large mutation receipts stay bounded without replay',
       const otherDir=path.join(path.dirname(projectDir),'foreign-project');
       fs.mkdirSync(otherDir);
       const other=await api('POST','/projects',{path:otherDir});
-      db(connection=>connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(301,?,'foreign receipt reader','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(other.id));
+      db(connection=>connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(301,1,'foreign receipt reader','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(),other.id);
       await api('GET',`/receipts/${receipt.receipt_event}?agent=301&max_bytes=65536`,undefined,404);
     });
   });

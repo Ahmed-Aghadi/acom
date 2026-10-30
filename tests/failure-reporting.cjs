@@ -7,6 +7,7 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome } = require('./fixture-workspace.cjs');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const diagnostic = 'Reconnecting... 2/5 (synthetic transport interrupted)';
 const terminal = 'Synthetic authoritative terminal failure';
@@ -26,7 +27,7 @@ let prompt='';process.stdin.on('data',data=>prompt+=data);process.stdin.on('end'
  const runs=fs.existsSync(file('runs'))?JSON.parse(fs.readFileSync(file('runs'),'utf8')):[];
  const mode=runs[0]?.mode||prompt.match(/FAILURE_REPORTING:([A-Z_]+)/)?.[1];
  const session='22222222-2222-4222-8222-'+String(id).padStart(12,'0');
- runs.push({mode,pid:process.pid,prompt,resume:args[1]==='resume',session});fs.writeFileSync(file('runs'),JSON.stringify(runs));
+ runs.push({mode,pid:process.pid,prompt,resume:args[1]==='resume',session});fs.writeFileSync(file('runs')+'.pending',JSON.stringify(runs));fs.renameSync(file('runs')+'.pending',file('runs'));
  const dir=path.join(process.env.CODEX_HOME,'sessions','2026','01','01');fs.mkdirSync(dir,{recursive:true});
  const history=path.join(dir,'rollout-'+session+'.jsonl'),side=value=>fs.appendFileSync(history,JSON.stringify(value)+'\\n');
  side({type:'session_meta',payload:{id:session}});emit({type:'thread.started',thread_id:session});
@@ -89,17 +90,20 @@ async function fixture(run) {
   const url = `http://127.0.0.1:${port}`;
   const server = spawn(binary, ['serve', '--port', String(port)], { cwd: projectDir, env, stdio: ['ignore', 'ignore', 'pipe'] });
   let errors = ''; server.stderr.on('data', data => errors += data);
+  let project, runtimeHome;
   const api = async (method, route, body) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const response = await fetch(url + scoped(route, project, body), { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = await response.json(); assert.equal(response.status, 200, `${method} ${route}: ${JSON.stringify(value)}`); return value;
   };
-  const file = (name, id) => path.join(home, `${name}-${id}`);
+  const file = (name, id) => path.join(runtimeHome, `${name}-${id}`);
   const runs = id => fs.existsSync(file('runs', id)) ? JSON.parse(fs.readFileSync(file('runs', id), 'utf8')) : [];
   try {
     await until(async () => { if (server.exitCode !== null) throw Error(errors); try { return (await fetch(url + '/catalog')).ok; } catch { return false; } }, 'fixture startup');
-    const project = (await api('POST', '/projects', { path: projectDir })).id;
-    const config = (await api('GET', '/configs/1')).settings;
-    config.auto_resume = false; config.usage_poll_secs = 3600;
+    project = (await api('POST', '/projects', { path: projectDir })).id;
+    runtimeHome = projectHome(home, project);
+    const config = (await api('GET', '/configs/default')).settings;
+    config.auto_resume = false;
+    await api('PUT', '/global-settings', {settings:{usage_poll_secs:3600,metrics_sample_secs:5}});
     config.limits.active = { soft: null, hard: null };
     for (const limits of [config.limits.active_per_harness, config.limits.usage]) for (const key of Object.keys(limits)) limits[key] = { soft: null, hard: null };
     config.crash_retries = {};

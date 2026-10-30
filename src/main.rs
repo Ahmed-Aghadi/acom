@@ -1,9 +1,13 @@
 mod app;
+mod archive;
 mod harness;
+mod metrics;
 mod paging;
 mod run;
 mod server;
+mod storage;
 mod usage;
+mod workspace;
 
 use app::{GUIDE, MODELS, hhmm, who};
 use clap::{Args, Parser, Subcommand};
@@ -16,6 +20,7 @@ const LICENSES: &str = concat!(
     "\n",
     include_str!("../THIRD_PARTY_NOTICES.txt")
 );
+static PROJECT_CONTEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 // CLI output may be piped to a reader that exits early. Server logging is separate.
 macro_rules! print {
@@ -54,8 +59,10 @@ acom: launch coding agents and let them talk and share locks.
 
 One server runs every project: start it once with `acom serve`. A project is a folder;
 agents run in their project's folder and only see that project's agents, threads and locks.
+Numeric agent/thread/message IDs are project-local. Owner commands use the current folder's
+project; launched agents receive a project-scoped ACOM_URL. Project/config IDs are strings.
 
-Agents never run user commands.
+Owner controls may require delegated permission when used by agents.
 
 Offline command (no server or project needed):
   licenses                                Print the project and third-party license notices
@@ -70,6 +77,9 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   status <text>                           Set your status text
   group <name>                            Put yourself in a group
   done                                    Mark your task finished, then end your turn
+  permissions [ID]                       Inspect delegated lifecycle permissions (default: yourself)
+  control pause|resume|close|reopen --agents IDs|all|launched [--if-state STATES]
+                                          Apply owner-granted controls without waking agents to ask them
   wait [--timeout duration | --ack ID] [--idle] [watch flags]
                                           Wait now, or register a one-shot wake and end your turn
   subscribe [watch flags]                 Persistently wake on matching events; end your turn normally
@@ -96,7 +106,7 @@ Agent commands (your ID comes from ACOM_ID; they act on your project):
   send --thread <TID> [text]              Post in a thread (stdin if text is left out)
   inbox [--mark new|in-progress|handled]  Your messages with that mark (default new)
   notices [ID]                            Retained notices / one full notice
-  receipt <ID>                            Full saved command result; never repeats the action
+  receipt <ID> [--global]                 Full saved command result; never repeats the action
   activity [ID]                           Project activity / one full activity record
   log <ID> [--before BYTE | --after BYTE] [--through BYTE] [--version V] [--since R]
            [--lines N] [--max-bytes N]    Bounded captured-activity chunks (JSON); agents only their own
@@ -113,9 +123,14 @@ User commands (they act on the project the current folder is in):
   serve [--port N]                        Run the server (default port 7400; data in ~/.acom)
   projects                                List projects
   project read <ID>                       One project's details
-  configs / config <ID>                  Config summaries / one config's details
+  configs / config <ID|default>          Config summaries / one config's details
   project add [path]                      Add a folder as a project (default: this folder)
   project remove <ID>                     Remove a project that has no agents
+  project export <UUID> <destination> [--logs] [--native]
+                                          Export a private project snapshot without overwrite
+  project inspect-archive <source>        Inspect a project archive without importing it
+  project import <source> --path <folder> [--accept-default-change]
+                                          Restore an archived project into a folder, workers stopped
   launch ... [--force]                    Launch an agent in this folder's project (added if
                                           needed); --force confirms past a hard limit
   send --thread <TID> [text]              Post as user
@@ -130,17 +145,20 @@ Selectors: active, working, idle, paused, done, closed, crashed, replaced, group
 Durations: 30s, 5m, 1h.
 Watch flags (wait and subscribe; agent and usage conditions combine with OR):
   --agents all|IDs [--states states] [--status-text] [--after EVENT_ID]
-  --usage provider --window name (--above PERCENT | --below PERCENT | --reset | --reset-due)
+  --usage provider --window name (--above PERCENT | --below PERCENT | --reset-due)
   Peer watches report transitions, not current states. Member messages already notify/wake you;
   joining/leaving alone does not resolve waits or wake idle agents.
-  Usage is polled; --reset is confirmed recovery, --reset-due is only the estimated deadline.
+  Usage is polled; --reset-due reports only the estimated deadline, not confirmed recovery.
   Use window IDs from limits; Claude display aliases are accepted and normalized in receipts.
   --idle returns a wait ID immediately; finish the turn without `acom done`. It does not stop tools.
 
-Lists (agents, threads, inbox, notices, locks, projects, activity, configs, subscriptions, thread read):
+Lists (agents, inbox, notices, locks, activity, subscriptions, thread read):
   [--before ID | --after ID] [--through ID] [--revision R] [--since R]
   [--limit N] [--max-bytes N]            Defaults: 50 items, 16000 JSON bytes.
   Continue with the printed cursor, through and revision; changed snapshots fail visibly.
+Threads: [--sort latest_message|newest|oldest|title] [--cursor C] [--revision R | --since R]
+  [--limit N] [--max-bytes N]            Continue with the printed opaque cursor and same sort.
+Projects/configs: [--cursor C] [--revision R | --since R] [--limit N] [--max-bytes N]
 Details (me, agent, read, notice ID, config, project read, lock read, receipt, limits, history ID, subscription):
   [--offset BYTE] [--version V] [--max-bytes N]
   Oversized records print a stub. Offset mode returns JSON chunks; retain the version.
@@ -207,7 +225,7 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["acom", "agents", "--provider", "other"]).is_err());
         for (search, group) in [
             ("group:crew", Some("crew")),
-            ("task:x", None),
+            ("unknown_field:x", None),
             ("state:active", None),
         ] {
             assert!(
@@ -319,7 +337,6 @@ mod cli_tests {
             for condition in [
                 vec!["--above", "80"],
                 vec!["--below", "30.5"],
-                vec!["--reset"],
                 vec!["--reset-due"],
             ] {
                 let mut args = vec![
@@ -337,6 +354,7 @@ mod cli_tests {
                 vec!["--usage", "claude"],
                 vec!["--usage", "claude", "--window", "five_hour"],
                 vec!["--window", "five_hour"],
+                vec!["--usage", "claude", "--window", "five_hour", "--reset"],
                 vec!["--above", "80"],
                 vec![
                     "--usage",
@@ -382,7 +400,7 @@ mod cli_tests {
                 "claude",
                 "--window",
                 "five_hour",
-                "--reset"
+                "--reset-due"
             ])
             .is_err()
         );
@@ -576,10 +594,7 @@ mod cli_tests {
             message_context(&json!({"mark":"handled", "outside_membership":true})),
             "\n[sent while you were not a member]"
         );
-        assert_eq!(
-            message_context(&json!({"membership_unknown":true, "outside_membership":true})),
-            "\n[membership at send time unknown]"
-        );
+        assert_eq!(message_context(&json!({"outside_membership":false})), "");
     }
 
     #[test]
@@ -624,13 +639,10 @@ mod cli_tests {
     fn growing_read_commands_share_explicit_page_and_chunk_options() {
         for command in [
             "agents",
-            "threads",
             "inbox",
             "notices",
             "locks",
-            "projects",
             "activity",
-            "configs",
             "subscriptions",
         ] {
             assert!(
@@ -679,12 +691,163 @@ mod cli_tests {
                 "acom", "thread", "read", "1", "--after", "0", "--offset", "0",
             ],
             vec!["acom", "thread", "details", "1", "--offset", "0"],
-            vec!["acom", "project", "read", "1", "--offset", "0"],
+            vec![
+                "acom",
+                "project",
+                "read",
+                "11111111-1111-4111-8111-111111111111",
+                "--offset",
+                "0",
+            ],
             vec!["acom", "lock", "read", "1", "--offset", "0"],
             vec!["acom", "subscription", "1", "--offset", "0"],
             vec!["acom", "log", "1", "--after", "0", "--lines", "200"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
+        }
+    }
+
+    #[test]
+    fn thread_lists_use_sorted_opaque_cursors_not_numeric_id_ranges() {
+        let Cli {
+            cmd: Cmd::Threads { page },
+        } = Cli::try_parse_from(["acom", "threads"]).unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(page.sort, "latest_message");
+        for sort in ["latest_message", "newest", "oldest", "title"] {
+            let Cli {
+                cmd: Cmd::Threads { page },
+            } = Cli::try_parse_from([
+                "acom",
+                "threads",
+                "--sort",
+                sort,
+                "--cursor",
+                "0123456789abcdef.2",
+                "--limit",
+                "1",
+                "--max-bytes",
+                "512",
+            ])
+            .unwrap()
+            else {
+                panic!("wrong command")
+            };
+            assert!(page.query().contains(&format!("sort={sort}")));
+            assert!(page.query().contains("cursor=0123456789abcdef.2"));
+        }
+        for suffix in [
+            vec!["--sort", "latest"],
+            vec!["--cursor", ""],
+            vec!["--before", "2"],
+            vec!["--after", "0"],
+            vec!["--through", "2"],
+            vec!["--cursor", "0123456789abcdef.2", "--since", "r"],
+            vec!["--revision", "r", "--since", "r"],
+            vec!["--limit", "0"],
+            vec!["--max-bytes", "511"],
+        ] {
+            let mut args = vec!["acom", "threads"];
+            args.extend(suffix);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn project_and_configuration_lists_use_string_ids_and_opaque_cursors() {
+        for command in ["projects", "configs"] {
+            assert!(
+                Cli::try_parse_from([
+                    "acom",
+                    command,
+                    "--cursor",
+                    "opaque",
+                    "--revision",
+                    "r",
+                    "--limit",
+                    "1",
+                    "--max-bytes",
+                    "512"
+                ])
+                .is_ok()
+            );
+            for suffix in [
+                vec!["--before", "2"],
+                vec!["--after", "0"],
+                vec!["--through", "2"],
+                vec!["--limit", "0"],
+                vec!["--cursor", ""],
+                vec!["--since", "r", "--cursor", "opaque"],
+            ] {
+                let mut args = vec!["acom", command];
+                args.extend(suffix);
+                assert!(Cli::try_parse_from(args).is_err());
+            }
+        }
+        let project = "11111111-1111-4111-8111-111111111111";
+        for command in ["read", "remove"] {
+            assert!(Cli::try_parse_from(["acom", "project", command, project]).is_ok());
+            for invalid in ["1", "../sample", "11111111-1111-4111-8111-11111111111Z"] {
+                assert!(Cli::try_parse_from(["acom", "project", command, invalid]).is_err());
+            }
+        }
+        for id in ["default", "0123456789abcdef0123456789abcdef"] {
+            assert!(Cli::try_parse_from(["acom", "config", id]).is_ok());
+        }
+        for id in [
+            "1",
+            "Default",
+            "../sample",
+            "0123456789ABCDEF0123456789ABCDEF",
+        ] {
+            assert!(Cli::try_parse_from(["acom", "config", id]).is_err());
+        }
+    }
+
+    #[test]
+    fn project_url_context_and_global_routes_do_not_depend_on_numeric_agent_ids() {
+        let project = "11111111-1111-4111-8111-111111111111";
+        let base = format!("http://127.0.0.1:7400/p/{project}");
+        assert_eq!(
+            project_url_parts(&base).unwrap(),
+            ("http://127.0.0.1:7400", Some(project))
+        );
+        assert_eq!(
+            project_url_parts("http://127.0.0.1:7400").unwrap(),
+            ("http://127.0.0.1:7400", None)
+        );
+        assert!(project_url_parts("http://127.0.0.1:7400/p/1").is_err());
+        for path in [
+            "/projects?path=sample",
+            "/projects/id",
+            "/configs/default",
+            "/global-settings",
+            "/catalog",
+            "/overview",
+            "/usage/check",
+            "/pause-all",
+            "/resume-all",
+            "/resume-restart",
+            "/agent-query?search=x",
+        ] {
+            assert!(global_route(path), "{path}");
+        }
+        for path in [
+            "/agents",
+            "/agents/1",
+            "/threads/1",
+            "/messages/1",
+            "/history",
+            "/locks",
+            "/subscriptions",
+            "/receipts/1",
+            "/limits",
+            "/settings",
+            "/activity/1",
+        ] {
+            assert!(!global_route(path), "{path}");
         }
     }
     #[test]
@@ -773,6 +936,50 @@ impl PageArgs {
 }
 
 #[derive(Args)]
+struct ThreadPageArgs {
+    #[arg(long, default_value = "latest_message", value_parser = ["latest_message", "newest", "oldest", "title"])]
+    sort: String,
+    #[command(flatten)]
+    page: CursorPageArgs,
+}
+
+impl ThreadPageArgs {
+    fn query(&self) -> String {
+        format!("sort={}&{}", encode(&self.sort), self.page.query())
+    }
+}
+
+#[derive(Args)]
+struct CursorPageArgs {
+    #[arg(long, conflicts_with = "since", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    cursor: Option<String>,
+    #[arg(long, conflicts_with = "since")]
+    revision: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(i64).range(1..=200))]
+    limit: i64,
+    #[arg(long, default_value_t = 16000, value_parser = clap::value_parser!(i64).range(512..=65536))]
+    max_bytes: i64,
+}
+
+impl CursorPageArgs {
+    fn query(&self) -> String {
+        let mut query = format!("limit={}&max_bytes={}", self.limit, self.max_bytes);
+        for (name, value) in [
+            ("cursor", &self.cursor),
+            ("revision", &self.revision),
+            ("since", &self.since),
+        ] {
+            if let Some(value) = value {
+                query += &format!("&{name}={}", encode(value));
+            }
+        }
+        query
+    }
+}
+
+#[derive(Args)]
 struct RecordArgs {
     #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
     offset: Option<i64>,
@@ -825,13 +1032,6 @@ struct WatchArgs {
         long,
         requires = "usage",
         group = "usage_condition",
-        help = "Match confirmed usage-window reset or recovery"
-    )]
-    reset: bool,
-    #[arg(
-        long,
-        requires = "usage",
-        group = "usage_condition",
         help = "Match the estimated reset deadline, not confirmed recovery"
     )]
     reset_due: bool,
@@ -869,12 +1069,10 @@ impl WatchArgs {
                 ("above", Some(value))
             } else if let Some(value) = self.below {
                 ("below", Some(value))
-            } else if self.reset {
-                ("reset", None)
             } else if self.reset_due {
                 ("reset-due", None)
             } else {
-                return Err("usage watch requires --above, --below, --reset, or --reset-due");
+                return Err("usage watch requires --above, --below, or --reset-due");
             };
             let window = self.window.ok_or("usage watch requires --window")?;
             let mut usage = json!({"provider":provider,"window":window,"condition":condition});
@@ -930,10 +1128,32 @@ enum Cmd {
         name: String,
     },
     Done,
+    /// Apply only the lifecycle controls granted to this agent by the owner.
+    Control {
+        #[arg(value_parser = ["pause", "resume", "close", "reopen"])]
+        action: String,
+        #[arg(long, value_parser = control_targets)]
+        agents: String,
+        #[arg(long = "if-state", value_delimiter = ',', value_parser = app::STATES)]
+        if_states: Option<Vec<String>>,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(i64).range(1..=200))]
+        limit: i64,
+        #[arg(long, requires = "through", value_parser = clap::value_parser!(i64).range(0..))]
+        after: Option<i64>,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        through: Option<i64>,
+    },
+    /// Inspect the owner-assigned lifecycle grants for an agent.
+    Permissions {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        id: Option<i64>,
+        #[command(flatten)]
+        record: RecordArgs,
+    },
     Wait {
         #[arg(long, default_value = "60s")]
         timeout: String,
-        #[arg(long, conflicts_with_all = ["timeout", "idle", "agents", "states", "status_text", "after", "usage", "window", "above", "below", "reset", "reset_due"], value_parser = clap::value_parser!(i64).range(1..))]
+        #[arg(long, conflicts_with_all = ["timeout", "idle", "agents", "states", "status_text", "after", "usage", "window", "above", "below", "reset_due"], value_parser = clap::value_parser!(i64).range(1..))]
         ack: Option<i64>,
         #[arg(
             long,
@@ -1015,7 +1235,7 @@ enum Cmd {
     },
     Threads {
         #[command(flatten)]
-        page: PageArgs,
+        page: ThreadPageArgs,
     },
     Thread {
         #[command(subcommand)]
@@ -1083,15 +1303,18 @@ enum Cmd {
     },
     Configs {
         #[command(flatten)]
-        page: PageArgs,
+        page: CursorPageArgs,
     },
     Config {
-        id: i64,
+        #[arg(value_parser = config_key)]
+        id: String,
         #[command(flatten)]
         record: RecordArgs,
     },
     Receipt {
         id: i64,
+        #[arg(long)]
+        global: bool,
         #[command(flatten)]
         record: RecordArgs,
     },
@@ -1147,7 +1370,7 @@ enum Cmd {
     },
     Projects {
         #[command(flatten)]
-        page: PageArgs,
+        page: CursorPageArgs,
     },
     Project {
         #[command(subcommand)]
@@ -1159,14 +1382,37 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
+    /// Save an uncompressed project archive. Existing files are never overwritten.
+    Export {
+        #[arg(value_parser = project_uuid)]
+        id: String,
+        destination: String,
+        #[arg(long)]
+        logs: bool,
+        #[arg(long)]
+        native: bool,
+    },
+    InspectArchive {
+        source: String,
+    },
+    /// Restore into an existing folder without starting any workers.
+    Import {
+        source: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        accept_default_change: bool,
+    },
     Add {
         path: Option<String>,
     },
     Remove {
-        id: i64,
+        #[arg(value_parser = project_uuid)]
+        id: String,
     },
     Read {
-        id: i64,
+        #[arg(value_parser = project_uuid)]
+        id: String,
         #[command(flatten)]
         record: RecordArgs,
     },
@@ -1249,6 +1495,82 @@ fn die(msg: &str) -> ! {
     exit(1)
 }
 
+fn project_uuid(value: &str) -> Result<String, String> {
+    workspace::validate_uuid(value).map_err(|error| error.1)?;
+    Ok(value.into())
+}
+
+fn config_key(value: &str) -> Result<String, String> {
+    if value == "default"
+        || (value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        Ok(value.into())
+    } else {
+        Err("configuration must be default or a saved configuration's 32-character ID".into())
+    }
+}
+
+fn project_url_parts(base: &str) -> Result<(&str, Option<&str>), String> {
+    match base.rsplit_once("/p/") {
+        Some((root, project)) => {
+            workspace::validate_uuid(project).map_err(|error| error.1)?;
+            Ok((root, Some(project)))
+        }
+        None => Ok((base, None)),
+    }
+}
+
+fn global_route(path: &str) -> bool {
+    let route = path.split('?').next().unwrap_or(path);
+    matches!(
+        route.split('/').nth(1).unwrap_or(""),
+        "projects"
+            | "configs"
+            | "global-settings"
+            | "catalog"
+            | "models"
+            | "folders"
+            | "overview"
+            | "usage"
+            | "pause-all"
+            | "resume-all"
+            | "resume-restart"
+            | "agent-query"
+    )
+}
+
+fn root_base() -> String {
+    let base = base_url();
+    project_url_parts(&base)
+        .unwrap_or_else(|error| die(&error))
+        .0
+        .to_string()
+}
+
+fn request_base(path: &str) -> String {
+    let base = base_url();
+    let (root, project) = project_url_parts(&base).unwrap_or_else(|error| die(&error));
+    if global_route(path) {
+        return root.to_string();
+    }
+    if project.is_some() {
+        return base;
+    }
+    if my_id().is_some() {
+        die("agent commands require the project-scoped ACOM_URL supplied at launch");
+    }
+    match project_here() {
+        Some(project) => format!("{root}/p/{project}"),
+        None if path.split('?').next() == Some("/limits") => root.to_string(),
+        None => die(
+            "this folder isn't in an acom project. Run the command inside one, or add it with `acom project add`.",
+        ),
+    }
+}
+
 /// The server's address: ACOM_URL, or the port the running server wrote to ~/.acom/port.
 fn base_url() -> String {
     if let Ok(u) = std::env::var("ACOM_URL") {
@@ -1285,8 +1607,16 @@ fn call(method: &str, path: &str, body: Option<Value>) -> Value {
     });
     if value["result_truncated"] == true {
         if let Some(id) = value["receipt_event"].as_i64() {
+            let scope = if value["receipt_path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("/global-receipts/"))
+            {
+                " --global"
+            } else {
+                ""
+            };
             eprintln!(
-                "Action completed; response contains samples only. Full result: acom receipt {id}"
+                "Action completed; response contains samples only. Full result: acom receipt {id}{scope}"
             );
         }
         if let Some(error) = value["receipt_error"].as_str() {
@@ -1307,7 +1637,17 @@ fn request_with_timeout(
     body: Option<Value>,
     timeout: Option<std::time::Duration>,
 ) -> Result<Value, (u16, String)> {
-    let url = format!("{}{path}", base_url());
+    request_at(&request_base(path), method, path, body, timeout)
+}
+
+fn request_at(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value, (u16, String)> {
+    let url = format!("{base}{path}");
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -1327,12 +1667,7 @@ fn request_with_timeout(
                 .send(b.as_bytes())
         }
     };
-    let mut res = res.map_err(|e| {
-        (
-            0,
-            format!("can't reach the acom server at {}: {e}", base_url()),
-        )
-    })?;
+    let mut res = res.map_err(|e| (0, format!("can't reach the acom server at {base}: {e}")))?;
     let status = res.status().as_u16();
     let text = res.body_mut().read_to_string().map_err(|e| {
         (
@@ -1366,44 +1701,40 @@ fn cwd() -> String {
 }
 
 /// The project the current folder is in, if any.
-fn project_here() -> Option<i64> {
-    match request("GET", &format!("/projects?path={}", encode(&cwd())), None) {
+fn project_here() -> Option<String> {
+    let base = base_url();
+    if let Some(project) = project_url_parts(&base)
+        .unwrap_or_else(|error| die(&error))
+        .1
+    {
+        return Some(project.into());
+    }
+    if let Some(project) = PROJECT_CONTEXT.get() {
+        return Some(project.clone());
+    }
+    match request_at(
+        &root_base(),
+        "GET",
+        &format!("/projects?path={}", encode(&cwd())),
+        None,
+        None,
+    ) {
         Ok(project) => {
             if project["truncated"] == true {
                 die(
                     "project lookup exceeds the response budget; read its details with `acom project read <ID>`",
                 );
             }
-            Some(
-                project["id"]
-                    .as_i64()
-                    .unwrap_or_else(|| die("invalid project lookup response")),
-            )
+            let id = project["id"]
+                .as_str()
+                .and_then(|id| project_uuid(id).ok())
+                .unwrap_or_else(|| die("invalid project lookup response: missing project UUID"));
+            let _ = PROJECT_CONTEXT.set(id.clone());
+            Some(id)
         }
         Err((404, _)) => None,
         Err((_, message)) => die(&message),
     }
-}
-
-/// For user commands that act on a project: the one the current folder is in.
-fn user_project() -> i64 {
-    project_here().unwrap_or_else(|| {
-        die("this folder isn't in an acom project. Run the command inside one, or add it with `acom project add`.")
-    })
-}
-
-/// What listings cover: an agent sees its own project; the user sees the project of the
-/// current folder, or every project when the folder isn't in one.
-fn scope() -> String {
-    let project = match my_id() {
-        Some(id) => Some(
-            get(&format!("/agents/{id}/project"))["project"]
-                .as_i64()
-                .unwrap_or_else(|| die("invalid agent project response")),
-        ),
-        None => project_here(),
-    };
-    project.map(|p| format!("project={p}")).unwrap_or_default()
 }
 
 fn viewer_query(key: &str) -> String {
@@ -1431,6 +1762,13 @@ fn post(path: &str, body: Value) -> Value {
 fn user_body(mut b: Value) -> Value {
     if let Some(v) = my_id() {
         b["via"] = json!(v);
+        let base = base_url();
+        if let Some(project) = project_url_parts(&base)
+            .unwrap_or_else(|error| die(&error))
+            .1
+        {
+            b["via_project"] = json!(project);
+        }
     }
     b
 }
@@ -1518,6 +1856,16 @@ fn ids(s: &str) -> Result<Vec<i64>, String> {
         .collect()
 }
 
+fn control_targets(value: &str) -> Result<String, String> {
+    if !matches!(value, "all" | "launched") {
+        let values = ids(value)?;
+        if values.len() > 200 {
+            return Err("at most 200 selected agent IDs are allowed".into());
+        }
+    }
+    Ok(value.into())
+}
+
 fn text_or_stdin(words: Vec<String>) -> String {
     if !words.is_empty() {
         return words.join(" ");
@@ -1558,7 +1906,40 @@ fn result_count(v: &Value, key: &str) -> usize {
     v["counts"][key]
         .as_u64()
         .map(|n| n as usize)
-        .unwrap_or_else(|| v[key].as_array().map_or(0, Vec::len))
+        .unwrap_or_else(|| {
+            v[key].as_array().map_or(0, Vec::len)
+                + v["results"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|result| result_count(result, key))
+                    .sum::<usize>()
+        })
+}
+
+fn print_bulk_messages(value: &Value, project: Option<&str>) {
+    let project = value["project"].as_str().or(project);
+    for key in ["warnings", "errors"] {
+        for message in value[key].as_array().into_iter().flatten() {
+            let scope = message["project"]
+                .as_str()
+                .or(project)
+                .map(|p| format!("project {p}: "))
+                .unwrap_or_default();
+            let text = message
+                .as_str()
+                .or_else(|| message["error"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| message.to_string());
+            eprintln!(
+                "{}: {scope}{text}",
+                if key == "errors" { "error" } else { "warning" }
+            );
+        }
+    }
+    for result in value["results"].as_array().into_iter().flatten() {
+        print_bulk_messages(result, project);
+    }
 }
 
 fn page_hint(v: &Value, args: &PageArgs, command: &str) {
@@ -1586,6 +1967,25 @@ fn page_hint(v: &Value, args: &PageArgs, command: &str) {
         next += &format!(" --revision {}", shell_word(revision));
     }
     println!("More available: {next}");
+}
+
+fn cursor_page_hint(v: &Value, args: &CursorPageArgs, command: &str) {
+    if v["unchanged"] == true {
+        println!("unchanged");
+    }
+    if v["has_more"] != true {
+        return;
+    }
+    let cursor = v["next_cursor"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| die("invalid page response: missing continuation cursor"));
+    println!(
+        "More available: {command} --cursor {} --limit {} --max-bytes {}",
+        shell_word(cursor),
+        args.limit,
+        args.max_bytes
+    );
 }
 
 fn record_output(v: &Value, args: &RecordArgs, command: &str) -> bool {
@@ -1622,9 +2022,7 @@ fn sender(v: &Value) -> String {
 }
 
 fn message_context(m: &Value) -> &'static str {
-    if m["membership_unknown"].as_bool() == Some(true) {
-        "\n[membership at send time unknown]"
-    } else if m["outside_membership"].as_bool() == Some(true) {
+    if m["outside_membership"].as_bool() == Some(true) {
         "\n[sent while you were not a member]"
     } else {
         ""
@@ -1882,7 +2280,7 @@ fn main() {
             }
         }
         Cmd::Limits { record } => {
-            let value = get(&format!("/limits?{}&{}", scope(), record.query()));
+            let value = get(&format!("/limits?{}", record.query()));
             if !record_output(&value, &record, "acom limits") {
                 println!("{}", value["text"].as_str().unwrap_or(""));
                 let choices = value["usage_windows"]
@@ -1919,6 +2317,49 @@ fn main() {
         Cmd::Group { name } => {
             post(&format!("/agents/{}/group", me()), json!({ "group": name }));
             println!("group set to {}", short_label(&name));
+        }
+        Cmd::Permissions { id, record } => {
+            let id = id.or_else(my_id).unwrap_or_else(|| die("give an agent ID"));
+            let result = get(&format!(
+                "/agents/{id}/permissions?{}{}",
+                record.query(),
+                viewer_query("viewer")
+            ));
+            if !record_output(&result, &record, &format!("acom permissions {id}")) {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            }
+        }
+        Cmd::Control {
+            action,
+            agents,
+            if_states,
+            limit,
+            after,
+            through,
+        } => {
+            let targets = if matches!(agents.as_str(), "all" | "launched") {
+                app::ControlTargets::Selector(agents.clone())
+            } else {
+                app::ControlTargets::Selected(ids(&agents).unwrap_or_else(|error| die(&error)))
+            };
+            let result = post(
+                "/controls",
+                json!({"agent":my_id().unwrap_or(0),"action":action,"agents":targets,
+                "if_states":if_states,"limit":limit,"after":after,"through":through}),
+            );
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            if result["has_more"] == true {
+                let states = if_states
+                    .as_ref()
+                    .map(|values| format!(" --if-state {}", values.join(",")))
+                    .unwrap_or_default();
+                eprintln!(
+                    "more: acom control {action} --agents {}{states} --limit {limit} --after {} --through {}",
+                    shell_word(&agents),
+                    result["next_after"],
+                    result["through"]
+                );
+            }
         }
         Cmd::Done => {
             post(&format!("/agents/{}/done", me()), json!({}));
@@ -2047,7 +2488,7 @@ fn main() {
             }
             .normalized()
             .unwrap_or_else(|error| die(&error.1));
-            let mut path = format!("/agents?{}&{}", scope(), page.query());
+            let mut path = format!("/agents?{}", page.query());
             let mut command = "acom agents".to_string();
             for (key, value) in [
                 ("search", search),
@@ -2127,12 +2568,13 @@ fn main() {
             match my_id() {
                 Some(id) => b["agent"] = json!(id),
                 None => {
-                    let project = project_here().unwrap_or_else(|| {
+                    if project_here().is_none() {
                         let p = post("/projects", user_body(json!({ "path": cwd() })));
+                        let id=p["id"].as_str().unwrap_or_else(||die("project may have been added, but its UUID was not returned; inspect acom projects before retrying"));
+                        project_uuid(id).unwrap_or_else(|_|die("project may have been added, but its UUID was invalid; inspect acom projects before retrying"));
+                        let _ = PROJECT_CONTEXT.set(id.to_string());
                         println!("added project {}", p["path"].as_str().unwrap_or(""));
-                        p["id"].as_i64().unwrap_or(0)
-                    });
-                    b["project"] = json!(project);
+                    }
                     b = user_body(b);
                 }
             }
@@ -2147,8 +2589,7 @@ fn main() {
         }
         Cmd::Threads { page } => {
             let result = get(&format!(
-                "/threads?{}&{}{}",
-                scope(),
+                "/threads?{}{}",
                 page.query(),
                 viewer_query("viewer")
             ));
@@ -2178,7 +2619,11 @@ fn main() {
                     t(&th["last_at"])
                 );
             }
-            page_hint(&result, &page, "acom threads");
+            cursor_page_hint(
+                &result,
+                &page.page,
+                &format!("acom threads --sort {}", page.sort),
+            );
         }
         Cmd::Thread { cmd } => match cmd {
             ThreadCmd::New {
@@ -2202,7 +2647,6 @@ fn main() {
                         b["include_user"] = json!(include_user);
                     }
                     None => {
-                        b["project"] = json!(user_project());
                         b["include_user"] = json!(true);
                     }
                 }
@@ -2452,7 +2896,7 @@ fn main() {
             offset,
             version,
         } => {
-            let mut query = vec![scope()];
+            let mut query = Vec::new();
             if let Some(viewer) = my_id() {
                 query.push(format!("viewer={viewer}"));
             }
@@ -2512,7 +2956,7 @@ fn main() {
             println!("marked {} message(s) {mark}", selected.len());
         }
         Cmd::Locks { page } => {
-            let result = get(&format!("/locks?{}&{}", scope(), page.query()));
+            let result = get(&format!("/locks?{}", page.query()));
             for l in page_items(&result) {
                 if item_truncated(l, &format!("acom lock read {}", l["id"])) {
                     continue;
@@ -2564,8 +3008,7 @@ fn main() {
                     max_bytes: page.max_bytes,
                 };
                 let result = get(&format!(
-                    "/activity/{id}?{}&{}{}",
-                    scope(),
+                    "/activity/{id}?{}{}",
                     args.query(),
                     viewer_query("agent")
                 ));
@@ -2574,8 +3017,7 @@ fn main() {
                 }
             } else {
                 let result = get(&format!(
-                    "/activity?{}&{}{}",
-                    scope(),
+                    "/activity?{}{}",
                     page.query(),
                     viewer_query("agent")
                 ));
@@ -2586,7 +3028,7 @@ fn main() {
         Cmd::Configs { page } => {
             let result = get(&format!("/configs?{}", page.query()));
             println!("{result}");
-            page_hint(&result, &page, "acom configs");
+            cursor_page_hint(&result, &page, "acom configs");
         }
         Cmd::Config { id, record } => {
             let result = get(&format!("/configs/{id}?{}", record.query()));
@@ -2594,10 +3036,20 @@ fn main() {
                 println!("{result}");
             }
         }
-        Cmd::Receipt { id, record } => {
-            let context = my_id().map(|a| format!("agent={a}&")).unwrap_or_default();
-            let result = get(&format!("/receipts/{id}?{context}{}", record.query()));
-            if !record_output(&result, &record, &format!("acom receipt {id}")) {
+        Cmd::Receipt { id, global, record } => {
+            let context = if global {
+                String::new()
+            } else {
+                my_id().map(|a| format!("agent={a}&")).unwrap_or_default()
+            };
+            let endpoint = if global {
+                "global-receipts"
+            } else {
+                "receipts"
+            };
+            let command = format!("acom receipt {id}{}", if global { " --global" } else { "" });
+            let result = get(&format!("/{endpoint}/{id}?{context}{}", record.query()));
+            if !record_output(&result, &record, &command) {
                 println!("{result}");
             }
         }
@@ -2653,16 +3105,15 @@ fn main() {
         }
         Cmd::Lock { cmd } => match cmd {
             LockCmd::Read { id, record } => {
-                let result = get(&format!("/locks/{id}?{}&{}", scope(), record.query()));
+                let result = get(&format!("/locks/{id}?{}", record.query()));
                 if !record_output(&result, &record, &format!("acom lock read {id}")) {
                     println!("{result}");
                 }
             }
             LockCmd::New { name, about } => {
                 let mut b = json!({ "name": name, "about": about });
-                match my_id() {
-                    Some(id) => b["agent"] = json!(id),
-                    None => b["project"] = json!(user_project()),
+                if let Some(id) = my_id() {
+                    b["agent"] = json!(id);
                 }
                 post("/locks", b);
                 println!("created lock {}", short_label(&name));
@@ -2686,10 +3137,7 @@ fn main() {
                 println!("released {}", short_label(&name));
             }
             LockCmd::Free { name } => {
-                post(
-                    "/locks/free",
-                    user_body(json!({ "project": user_project(), "name": name })),
-                );
+                post("/locks/free", user_body(json!({ "name": name })));
                 println!("freed {}", short_label(&name));
             }
         },
@@ -2699,27 +3147,27 @@ fn main() {
         }
         Cmd::PauseAll => {
             let v = post("/pause-all", user_body(json!({})));
+            print_bulk_messages(&v, None);
             println!(
                 "paused {} agent(s); locks release after their old workers stop",
                 result_count(&v, "ids")
             );
+            if result_count(&v, "errors") > 0 {
+                exit(1);
+            }
         }
         Cmd::ResumeAll => {
             let v = post("/resume-all", user_body(json!({})));
+            print_bulk_messages(&v, None);
             println!("resumed {} agent(s)", result_count(&v, "ids"));
+            if result_count(&v, "errors") > 0 {
+                exit(1);
+            }
         }
         Cmd::ResumeRestart => {
             let v = post("/resume-restart", user_body(json!({})));
             let failed = result_count(&v, "errors") > 0;
-            for key in ["warnings", "errors"] {
-                for message in v[key].as_array().into_iter().flatten() {
-                    eprintln!(
-                        "{}: {}",
-                        if key == "errors" { "error" } else { "warning" },
-                        message.as_str().unwrap_or("")
-                    );
-                }
-            }
+            print_bulk_messages(&v, None);
             write_stdout_status(
                 format_args!(
                     "resumed {} restart-paused agent(s) across all projects\n",
@@ -2756,16 +3204,61 @@ fn main() {
                 }
                 println!(
                     "{:>3}  {} · {} · {} agents, {} active",
-                    p["id"],
+                    p["id"].as_str().unwrap_or(""),
                     p["name"].as_str().unwrap_or(""),
                     p["path"].as_str().unwrap_or(""),
                     p["agents"],
                     p["active"]
                 );
             }
-            page_hint(&result, &page, "acom projects");
+            cursor_page_hint(&result, &page, "acom projects");
         }
         Cmd::Project { cmd } => match cmd {
+            ProjectCmd::Export {
+                id,
+                destination,
+                logs,
+                native,
+            } => {
+                let result = post(
+                    &format!("/projects/{id}/export"),
+                    user_body(
+                        json!({"destination":absolute_path(&destination),"logs":logs,"native":native}),
+                    ),
+                );
+                println!("{result}");
+            }
+            ProjectCmd::InspectArchive { source } => {
+                let result = post(
+                    "/projects/inspect-archive",
+                    user_body(json!({"source":absolute_path(&source)})),
+                );
+                println!("{result}");
+            }
+            ProjectCmd::Import {
+                source,
+                path,
+                accept_default_change,
+            } => {
+                let source = absolute_path(&source);
+                let inspected = post(
+                    "/projects/inspect-archive",
+                    user_body(json!({"source":source})),
+                );
+                let version = inspected["version"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        die("archive inspection returned no version; nothing was imported")
+                    });
+                let result = post(
+                    "/projects/import",
+                    user_body(
+                        json!({"source":source,"path":absolute_path(&path),"accept_default_change":accept_default_change,"version":version}),
+                    ),
+                );
+                println!("{result}");
+            }
             ProjectCmd::Read { id, record } => {
                 let result = get(&format!("/projects/{id}?{}", record.query()));
                 if !record_output(&result, &record, &format!("acom project read {id}")) {
@@ -2793,5 +3286,14 @@ fn main() {
                 println!("removed project {id}");
             }
         },
+    }
+}
+
+fn absolute_path(value: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(&cwd()).join(path)
     }
 }

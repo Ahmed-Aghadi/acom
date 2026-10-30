@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
+const { scoped, projectHome } = require('../tests/fixture-workspace.cjs');
 
 async function main() {
   const binary = fs.realpathSync(process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom'));
@@ -27,7 +28,9 @@ async function main() {
   const server = spawn(binary, ['serve', '--port', String(port)], { cwd: root, env, stdio: ['ignore', 'ignore', 'pipe'] });
   let errors = '', browser;
   server.stderr.on('data', chunk => errors += chunk);
+  let project;
   const api = async (method, route, body) => {
+    route = scoped(route, project?.id, body);
     const response = await fetch(base + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = await response.json();
     assert.ok(response.ok, `${method} ${route}: ${JSON.stringify(value)}`);
@@ -41,16 +44,20 @@ async function main() {
       assert.ok(Date.now() < deadline, `Server did not start: ${errors}`);
       await new Promise(resolve => setTimeout(resolve, 50));
     }
-    const project = await api('POST', '/projects', { path: projectDir });
+    project = await api('POST', '/projects', { path: projectDir });
+    const runtimeHome = projectHome(home, project.id);
     const now = Math.floor(Date.now() / 1000);
-    const db = new DatabaseSync(path.join(home, 'acom.db'));
+    const registry = new DatabaseSync(path.join(home, 'global', 'acom.db'));
+    try { registry.prepare('UPDATE workspace_projects SET path=?,name=? WHERE id=?').run('/workspace/sample-app', 'sample-app', project.id); }
+    finally { registry.close(); }
+    const db = new DatabaseSync(path.join(runtimeHome, 'acom.db'));
     try {
       db.exec('PRAGMA busy_timeout=5000');
       db.exec('BEGIN');
-      db.prepare('UPDATE projects SET path=?,name=? WHERE id=?').run('/workspace/sample-app', 'sample-app', project.id);
-      db.prepare('DELETE FROM activity WHERE project=?').run(project.id);
-      const insert = db.prepare(`INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,status_text,pause_reason,pause_from,paused_at,launched_by,launched_at,context,fresh_in,cache_read,output,turns)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      db.prepare('UPDATE projects SET path=?,name=? WHERE id=1').run('/workspace/sample-app', 'sample-app');
+      db.exec('DELETE FROM activity WHERE project=1');
+      const insert = db.prepare(`INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,status_text,pause_reason,pause_from,paused_at,launched_by,launched_at,turns)
+        VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
       const agents = [
         [1, 'API implementation', 'Implementation', 'Implement cursor pagination and validate request parameters.', 'codex', 'gpt-6.1-sol', 'high', 'working', 'Adding cursor boundary tests', null, 42000, 14000, 60000, 4800, 6],
         [2, 'Security review', 'Review', 'Review authorization and error handling; report concrete findings.', 'claude', 'claude-opus-5-5', 'high', 'idle', 'Waiting for the pagination patch', null, 37000, 11000, 52000, 3200, 4],
@@ -58,10 +65,18 @@ async function main() {
         [4, 'Documentation', 'Implementation', 'Document the new API and add a minimal usage example.', 'claude', 'claude-sonnet-5-5', 'medium', 'closed', 'Usage examples updated', null, 18000, 5000, 16000, 1800, 2],
       ];
       for (const [id, name, group, task, provider, model, effort, state, status, pause, context, fresh, cache, output, turns] of agents) {
-        insert.run(id, project.id, name, group, task, provider, model, effort, state, status, pause, pause ? 'working' : null, pause ? now - 90 : null, 0, now - 1500 + id * 100, context, fresh, cache, output, turns);
+        insert.run(id, name, group, task, provider, model, effort, state, status, pause, pause ? 'working' : null, pause ? now - 90 : null, 0, now - 1500 + id * 100, turns);
+        db.prepare('INSERT INTO context_observations VALUES(?,?,?)').run(id, String(context), now);
+        const values = [fresh, 0, cache, output], total = fresh + cache + output;
+        const counts = { values, total }, empty = { values: [null, null, null, null], total: null };
+        const last = tokens => ({ tokens, at: now });
+        const ledger = { previous: provider === 'claude' ? counts : empty, previous_partial: false, session: null,
+          codex: provider === 'codex' ? counts : empty, codex_complete: true, turn: null, updated_at: now,
+          last_total: last(total), fields: [...values, total].map(value => ({ observed_at: now, state_at: now, last_known: last(value) })) };
+        db.prepare('INSERT INTO agent_token_usage VALUES(?,?)').run(id, JSON.stringify(ledger));
       }
       db.prepare('INSERT INTO locks(project,name,about,created_at,holder,acquired_at,expires_at) VALUES(?,?,?,?,?,?,?)')
-        .run(project.id, 'api-routes', 'Changes to shared API routes', now - 900, 1, now - 120, now + 780);
+        .run(1, 'api-routes', 'Changes to shared API routes', now - 900, 1, now - 120, now + 780);
       const thread = db.prepare('INSERT INTO threads(id,project,title,created_by,created_at) VALUES(?,?,?,?,?)');
       const member = db.prepare('INSERT INTO members(thread_id,agent_id) VALUES(?,?)');
       for (const [id, title, owner, members] of [
@@ -69,7 +84,7 @@ async function main() {
         [2, 'Release checklist', 0, [0, 1, 4]],
         [3, 'Review notes', 2, [2, 3]],
       ]) {
-        thread.run(id, project.id, title, owner, now - 900);
+        thread.run(id, 1, title, owner, now - 900);
         for (const agent of members) member.run(id, agent);
       }
       const message = db.prepare('INSERT INTO messages(id,thread_id,sender,text,at) VALUES(?,?,?,?,?)');
@@ -94,7 +109,7 @@ async function main() {
         [-240, 'user', 'paused #3 Regression tests'],
         [-180, 'agent 4', 'completed documentation · closed'],
         [-120, 'user', 'sent a message in thread #1'],
-      ].forEach(([offset, actor, what]) => activity.run(project.id, now + offset, actor, what));
+      ].forEach(([offset, actor, what]) => activity.run(1, now + offset, actor, what));
       db.exec('COMMIT');
     } finally { db.close(); }
     browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM || undefined, headless: true });
@@ -124,12 +139,12 @@ async function main() {
     assert.deepEqual(pageErrors, []);
     const agents = (await api('GET', `/agents?project=${project.id}`)).items;
     assert.deepEqual(agents.map(agent => agent.state).sort(), ['closed', 'idle', 'paused', 'working']);
-    const inspected = new DatabaseSync(path.join(home, 'acom.db'), { readOnly: true });
+    const inspected = new DatabaseSync(path.join(runtimeHome, 'acom.db'), { readOnly: true });
     try {
       assert.equal(inspected.prepare('SELECT count(*) AS started FROM agents WHERE pid IS NOT NULL OR session_id IS NOT NULL OR session_started<>0').get().started, 0);
       assert.equal(inspected.prepare("SELECT count(*) AS started FROM events WHERE kind='agent.turn-started'").get().started, 0);
     } finally { inspected.close(); }
-    for (const dir of [path.join(home, 'logs'), env.CODEX_HOME, env.CLAUDE_CONFIG_DIR]) {
+    for (const dir of [path.join(runtimeHome, 'logs'), env.CODEX_HOME, env.CLAUDE_CONFIG_DIR]) {
       assert.ok(!fs.existsSync(dir) || fs.readdirSync(dir).length === 0, `capture must not create harness logs or native files: ${dir}`);
     }
     console.log(`Captured overview.png and threads.png in ${images}; sample fixture only, no provider turns.`);

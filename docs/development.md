@@ -14,6 +14,12 @@ Harness diagnostics are not necessarily terminal failures. Codex's [JSON event i
 
 Token reports have different scopes. Claude's [accounting contract](https://code.claude.com/docs/en/agent-sdk/cost-tracking) requires message-ID deduplication and cumulative stream deltas for output; `result.usage` is per invocation, unlike session-wide `modelUsage`. Codex CLI 0.164.0 observations establish that stdout and native usage snapshots share cumulative session scope. Preserve missing values, partial coverage and interruptions; test repeated reports, final reconciliation, resumes and source ordering without using private transcripts as fixtures.
 
+Project IDs are UUIDs; numeric entities are project-local. Carry the full project context through delayed callbacks, process ownership, cursors, permissions, API requests and browser caches. Tests must deliberately reuse numeric IDs across projects. Do not restore the old root database/API as a test convenience; fixture-only helpers select the real scoped routes.
+
+Core and shared-account writes use on-disk SQLite rollback journals and full synchronization so attached-database writes can commit together. Optional metrics are a separate WAL database, never attached to core: failures or history cleanup must not erase accounting or break coordination. SQLite documents the constraints on [attached transactions](https://www.sqlite.org/lang_attach.html) and [multi-file atomic commits](https://www.sqlite.org/atomiccommit.html). Archives use the existing MIT-licensed rusqlite backup feature, not a new archive dependency; backup steps are bounded rather than retrying indefinitely.
+
+Treat source observation time, a local sampling/check attempt, and successful checks as different evidence. Keep exact counters as decimal strings on history endpoints, preserve unknowns, quality, corrections and origin boundaries, and never claim that a clock estimate proves recovery. Imported recording segments must be identified exactly, not inferred from second-resolution timestamps. Archive validation must compare exact schemas before querying application tables, then validate storage types, typed payloads and references: SQLite column affinity does not guarantee a value's type. Imports must never resurrect processes, locks or pending starts. Once an archive is published or cleanup applied, later audit/durability failures are warnings, not rejection or an invitation to repeat the mutation.
+
 ## Licenses and releases
 
 Keep the project's MIT [LICENSE](../LICENSE) unchanged when updating third-party notices. [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt) is generated from the reviewed [Rust inventory](../licenses/rust.json) and existing Markdown notices. It includes build dependencies and bundled native-source notices conservatively, not a claim that every listed source file is linked. `acom licenses` embeds and prints the project's license followed by these notices without using a server, provider or data directory.
@@ -43,6 +49,7 @@ cargo build && node --test tests/server.cjs tests/pagination.cjs tests/thread-ac
 node --test tests/storage.cjs tests/http-boundaries.cjs tests/process-cleanup.cjs
 node --test tests/failure-reporting.cjs
 node --test tests/token-usage.cjs
+node --test tests/cli-context.cjs
 node --test tests/licenses.cjs
 cargo audit
 ```
@@ -53,6 +60,7 @@ Browser tests for the UI (optional; no model turns or provider login):
 npm install --no-save --package-lock=false playwright
 npx playwright install chromium
 node --test tests/ui.cjs
+node --test tests/charts.cjs tests/project-data.cjs
 ACOM_BROWSER_TEST=1 node --test tests/server.cjs
 ```
 

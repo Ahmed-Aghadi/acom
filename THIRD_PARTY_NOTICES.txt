@@ -4,7 +4,7 @@ Third-party notices for acom
 acom's own source is MIT-licensed (see LICENSE). Third-party components retain the terms below.
 Reviewed Cargo targets: aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu.
 Cargo.lock SHA-256: b09745ce6e116096be1be89f432131c2b717848ebecba4173e26de232215f0e9.
-Cargo.toml SHA-256: 85800470e144588d46ad8b557209d6dfbc5e4d6317c2f4e52716a0fef7ee6c7a.
+Cargo.toml SHA-256: 3f884ec674b08230b9292964995c03d02b33d50e927d91720f2dbb351a75d634.
 Build-time dependencies and bundled dependency source are included conservatively; not all are linked.
 Rust toolchain/standard-library and separately supplied system-library notices are outside this inventory.
 Before publishing binaries, include the matching toolchain/platform notices for that release.

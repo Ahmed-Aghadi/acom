@@ -112,6 +112,60 @@ impl PageQuery {
                     break;
                 }
                 items.push(stub(&item));
+                if envelope(&items, true).to_string().len() > self.max_bytes as usize {
+                    items[0] = json!({"id":item["id"],"truncated":true});
+                    // Keep the most useful evidence first under a tiny budget;
+                    // the scoped URL already identifies the project.
+                    for key in [
+                        "token_usage_last_total",
+                        "is_waiting",
+                        "total_tokens",
+                        "token_usage_state",
+                        "state",
+                        "project",
+                        "thread",
+                        "sender",
+                        "at",
+                    ] {
+                        if let Some(value) = item.get(key).filter(|v| !v.is_null()) {
+                            items[0][key] = value.clone();
+                            if envelope(&items, true).to_string().len() > self.max_bytes as usize {
+                                items[0].as_object_mut().unwrap().remove(key);
+                            }
+                        }
+                    }
+                    if let Some(fields) = item["token_usage_fields"].as_object() {
+                        for key in [
+                            "total_tokens",
+                            "fresh_in",
+                            "cache_write",
+                            "cache_read",
+                            "output",
+                        ] {
+                            if let Some(value) = fields.get(key) {
+                                items[0]["token_usage_fields"][key] = value.clone();
+                                if envelope(&items, true).to_string().len()
+                                    > self.max_bytes as usize
+                                {
+                                    items[0]["token_usage_fields"]
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .remove(key);
+                                    if items[0]["token_usage_fields"]
+                                        .as_object()
+                                        .unwrap()
+                                        .is_empty()
+                                    {
+                                        items[0]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("token_usage_fields");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -152,6 +206,7 @@ fn stub(item: &Value) -> Value {
         "total_tokens",
         "token_usage_state",
         "token_usage_last_total",
+        "token_usage_fields",
     ] {
         if let Some(value) = item.get(key).filter(|v| !v.is_null()) {
             result[key] = value.clone();
@@ -244,22 +299,25 @@ mod tests {
     #[test]
     fn oversized_agent_stubs_preserve_last_known_totals_including_zero() {
         let last = json!({"tokens":0,"at":42});
-        let page = PageQuery {
-            max_bytes: 512,
-            ..Default::default()
+        let metadata =
+            json!({"observed_at":42,"state_at":43,"last_known":last,"awaiting_update":true});
+        for budget in [512, 2000] {
+            let page = PageQuery { max_bytes: budget, ..Default::default() }
+                .finish(vec![json!({"id":1,"task":"x".repeat(4000),"total_tokens":null,
+                    "token_usage_state":"provisional","token_usage_last_total":last,
+                    "token_usage_fields":{"total_tokens":metadata,"fresh_in":metadata,"cache_write":metadata,"cache_read":metadata,"output":metadata}})],1,1,"r").unwrap();
+            assert!(page.to_string().len() <= budget as usize);
+            assert_eq!(page["items"][0]["truncated"], true);
+            assert_eq!(page["items"][0]["total_tokens"], Value::Null);
+            assert_eq!(page["items"][0]["token_usage_last_total"], last);
+            assert_eq!(
+                page["items"][0]["token_usage_fields"]["total_tokens"],
+                metadata
+            );
+            if budget == 2000 {
+                assert_eq!(page["items"][0]["token_usage_fields"]["fresh_in"], metadata);
+            }
         }
-        .finish(
-            vec![json!({"id":1,"task":"x".repeat(2000),"total_tokens":null,
-                "token_usage_state":"provisional","token_usage_last_total":last})],
-            1,
-            1,
-            "r",
-        )
-        .unwrap();
-        assert!(page.to_string().len() <= 512);
-        assert_eq!(page["items"][0]["truncated"], true);
-        assert_eq!(page["items"][0]["total_tokens"], Value::Null);
-        assert_eq!(page["items"][0]["token_usage_last_total"], last);
     }
 
     #[test]

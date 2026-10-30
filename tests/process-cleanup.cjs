@@ -8,6 +8,7 @@ const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome, attachGlobal } = require('./fixture-workspace.cjs');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const alive = pid => { try { return !fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).startsWith('Z'); } catch (e) { if (e.code === 'ENOENT') return false; throw e; } };
 function killOwnedTool(pid, id, home, url) {
@@ -41,7 +42,7 @@ const emit=value=>console.log(JSON.stringify(value));
 let prompt='';process.stdin.on('data',data=>prompt+=data);process.stdin.on('end',async()=>{
  const previous=fs.existsSync(file('starts'))?JSON.parse(fs.readFileSync(file('starts'),'utf8')):[];
  const oldTools=fs.readdirSync(home).filter(name=>/^tool-pid-/.test(name)).map(name=>Number(fs.readFileSync(path.join(home,name),'utf8'))).filter(alive);
- previous.push({pid:process.pid,prompt,oldTools});fs.writeFileSync(file('starts'),JSON.stringify(previous));
+ previous.push({pid:process.pid,prompt,oldTools});fs.writeFileSync(file('starts')+'.pending',JSON.stringify(previous));fs.renameSync(file('starts')+'.pending',file('starts'));
  emit(claude?{type:'system',subtype:'init',session_id:'11111111-1111-4111-8111-'+String(id).padStart(12,'0')}:{type:'thread.started',thread_id:'11111111-1111-4111-8111-'+String(id).padStart(12,'0')});
  if(previous.length>1&&!previous[0].prompt.includes('CLEANUP_REST_DONE')||prompt.includes('CLEANUP_TARGET')){process.exit(0);return}
  if(previous.length===1)await post('/locks',{agent:id,name:'guarded-'+id,about:'Owned tools must stop before release'});
@@ -70,35 +71,37 @@ async function fixture(run) {
   const url = `http://127.0.0.1:${port}`;
   const server = spawn(binary, ['serve', '--port', String(port)], { cwd: project, env, stdio: ['ignore', 'ignore', 'pipe'] });
   let errors = ''; server.stderr.on('data', data => errors += data);
+  let projectId, runtimeHome;
   const api = async (method, route, body, status = 200) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const response = await fetch(url + scoped(route, projectId, body), { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = await response.json(); assert.equal(response.status, status, `${method} ${route}: ${JSON.stringify(value)}`); return value;
   };
-  const file = (name, id) => path.join(home, `${name}-${id}`);
+  const file = (name, id) => path.join(runtimeHome, `${name}-${id}`);
   const starts = id => fs.existsSync(file('starts', id)) ? JSON.parse(fs.readFileSync(file('starts', id), 'utf8')) : [];
   let db;
   try {
     await until(async () => { if (server.exitCode !== null) throw Error(errors); try { return (await fetch(url + '/catalog')).ok; } catch { return false; } }, 'server startup');
     const p = await api('POST', '/projects', { path: project });
-    const config = (await api('GET', '/configs/1')).settings;
+    projectId=p.id;runtimeHome=projectHome(home,projectId);
+    const config = (await api('GET', '/configs/default')).settings;
     config.allow_agent_model_change = true; config.allow_agent_effort_change = true;
     config.limits.active = { soft: null, hard: null };
     for (const provider of Object.keys(config.limits.active_per_harness)) config.limits.active_per_harness[provider] = { soft: null, hard: null };
     await api('PUT', `/projects/${p.id}/config`, { custom: config });
-    db = new DatabaseSync(path.join(home, 'acom.db'));
+    db = new DatabaseSync(path.join(runtimeHome, 'acom.db'));attachGlobal(db,home);
     const launch = async task => {
       const a = await api('POST', '/agents', { project: p.id, task, harness: 'codex', model: 'gpt-6-sol', effort: 'medium' });
       if (!task.includes('CLEANUP_TARGET')) await until(() => fs.existsSync(file('ready', a.id)), 'fake source ready');
       return a.id;
     };
-    await run({ root, home, project: p.id, api, file, starts, db, launch, config, saveConfig: () => api('PUT', `/projects/${p.id}/config`, { custom: config }), view: id => api('GET', `/agents/${id}`), release: id => fs.writeFileSync(file('release', id), 'exit'), tool: id => Number(fs.readFileSync(file('tool-pid', id), 'utf8')) });
+    await run({ root, home:runtimeHome, project: p.id, api, file, starts, db, launch, config, saveConfig: () => api('PUT', `/projects/${p.id}/config`, { custom: config }), view: id => api('GET', `/agents/${id}`), release: id => fs.writeFileSync(file('release', id), 'exit'), tool: id => Number(fs.readFileSync(file('tool-pid', id), 'utf8')) });
   } finally {
     db?.close();
     if (server.exitCode === null) server.kill('SIGTERM');
     await until(() => server.exitCode !== null, 'server shutdown', 15000);
-    for (const name of fs.readdirSync(home).filter(name => /^tool-pid-/.test(name))) {
-      const pid = Number(fs.readFileSync(path.join(home, name), 'utf8'));
-      killOwnedTool(pid, Number(name.slice('tool-pid-'.length)), home, url);
+    for (const name of runtimeHome ? fs.readdirSync(runtimeHome).filter(name => /^tool-pid-/.test(name)) : []) {
+      const pid = Number(fs.readFileSync(path.join(runtimeHome, name), 'utf8'));
+      killOwnedTool(pid, Number(name.slice('tool-pid-'.length)), runtimeHome, `${url}/p/${projectId}`);
     }
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -116,7 +119,7 @@ test('crash retains an expired lease until detached owned tools stop, without ki
     await delay(1100);
     const lock = (await f.api('GET', `/locks?project=${f.project}`)).items.find(lock => lock.name === `guarded-${id}`);
     assert.equal(lock.holder, id); assert.ok(alive(tool)); assert.ok(alive(foreign.pid));
-    f.db.prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(2,?,\'contender\',\'No provider process\',\'codex\',\'gpt-6-sol\',\'medium\',\'working\',0,0)').run(f.project);
+    f.db.prepare('INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(2,1,\'contender\',\'No provider process\',\'codex\',\'gpt-6-sol\',\'medium\',\'working\',0,0)').run();
     await f.api('POST', '/locks/acquire', { agent: 2, name: `guarded-${id}`, ttl: 120 }, 409);
     await f.api('POST', '/locks/free', { project: f.project, name: `guarded-${id}` }, 409);
     await f.api('POST', '/locks/release', { agent: id, name: `guarded-${id}` }, 409);

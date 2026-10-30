@@ -37,6 +37,100 @@ pub struct TokenUsage {
     pub source: TokenSource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    Unknown,
+    Transport,
+    Authentication,
+    ModelUnavailable,
+    ProviderRejected,
+    ModelSwitched,
+    Startup,
+    ProcessExit,
+}
+
+impl FailureKind {
+    pub const ALL: [Self; 8] = [
+        Self::Unknown,
+        Self::Transport,
+        Self::Authentication,
+        Self::ModelUnavailable,
+        Self::ProviderRejected,
+        Self::ModelSwitched,
+        Self::Startup,
+        Self::ProcessExit,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Transport => "transport",
+            Self::Authentication => "authentication",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::ProviderRejected => "provider_rejected",
+            Self::ModelSwitched => "model_switched",
+            Self::Startup => "startup",
+            Self::ProcessExit => "process_exit",
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Failure {
+    pub message: String,
+    pub kind: FailureKind,
+    pub code: Option<String>,
+    pub source: Option<String>,
+}
+
+impl Failure {
+    fn reported(message: &str, source: &str, code: Option<&str>) -> Self {
+        // Categories follow explicit protocol codes, never prose or tool output.
+        // Codex 0.164.0's generated CodexErrorInfo schema supplies these names.
+        let kind = match code {
+            Some(
+                "httpConnectionFailed"
+                | "HttpConnectionFailed"
+                | "responseStreamConnectionFailed"
+                | "ResponseStreamConnectionFailed"
+                | "responseStreamDisconnected"
+                | "ResponseStreamDisconnected"
+                | "responseTooManyFailedAttempts"
+                | "ResponseTooManyFailedAttempts",
+            ) => FailureKind::Transport,
+            Some("unauthorized" | "Unauthorized") => FailureKind::Authentication,
+            Some("cyberPolicy" | "misalignmentPolicyViolation" | "badRequest") => {
+                FailureKind::ProviderRejected
+            }
+            _ => FailureKind::Unknown,
+        };
+        Self {
+            message: short(message, 300),
+            kind,
+            code: code.map(|code| short(code, 128)),
+            source: Some(source.to_string()),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            kind: FailureKind::Unknown,
+            code: None,
+            source: None,
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 pub enum Event {
     /// The harness's session ID, needed to resume it.
     Session(String),
@@ -53,12 +147,19 @@ pub enum Event {
     Text(String),
     /// A tool action, separate from ordinary assistant text.
     Tool(String),
+    /// Explicit native progress, without retaining hidden reasoning content.
+    Activity {
+        id: String,
+        kind: String,
+        phase: String,
+        text: String,
+    },
     /// A provisional harness error; completion can resolve it without a crash.
-    Diagnostic(String),
+    Diagnostic(Failure),
     /// An explicit successful native turn completion, not merely a process exit.
     TurnCompleted,
     /// A structured harness failure. The supervisor decides recovery after exit.
-    Failed(String),
+    Failed(Failure),
     /// An unexpected model switch; stop the process before it can do more work.
     ModelSwitched(String),
     /// The subscription's usage limit was hit mid-turn. acom pauses the agent until the window resets.
@@ -133,22 +234,24 @@ pub fn hook_output(text: &str) -> String {
 }
 
 pub fn new_uuid() -> String {
+    try_new_uuid().expect("OS randomness is unavailable")
+}
+
+pub fn try_new_uuid() -> std::io::Result<String> {
     let mut b = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut b);
-    }
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!(
+    Ok(format!(
         "{}-{}-{}-{}-{}",
         &h[0..8],
         &h[8..12],
         &h[12..16],
         &h[16..20],
         &h[20..32]
-    )
+    ))
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -158,6 +261,12 @@ fn short(s: &str, n: usize) -> String {
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
     }
+}
+
+fn native_id(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 256)
 }
 
 fn quote(p: &Path) -> String {
@@ -332,6 +441,25 @@ fn claude_events(v: &Value) -> Vec<Event> {
         },
         "stream_event" if v["parent_tool_use_id"].is_null() => {
             let event = &v["event"];
+            if let Some(index) = event["index"].as_u64() {
+                match event["type"].as_str() {
+                    Some("content_block_start") if event["content_block"]["type"] == "thinking" => {
+                        out.push(Event::Activity {
+                            id: format!("claude:block:{index}"),
+                            kind: "thinking".into(),
+                            phase: "started".into(),
+                            text: "Thinking".into(),
+                        });
+                    }
+                    Some("content_block_stop") => out.push(Event::Activity {
+                        id: format!("claude:block:{index}"),
+                        kind: "block".into(),
+                        phase: "completed".into(),
+                        text: String::new(),
+                    }),
+                    _ => {}
+                }
+            }
             let usage = match event["type"].as_str() {
                 Some("message_start") => event["message"]["id"]
                     .as_str()
@@ -393,12 +521,39 @@ fn claude_events(v: &Value) -> Vec<Event> {
                             .or(input["file_path"].as_str())
                             .or(input["pattern"].as_str());
                         let name = b["name"].as_str().unwrap_or("tool");
-                        out.push(Event::Tool(match what {
+                        let text = match what {
                             Some(w) => format!("{name}: {}", short(w, 200)),
                             None => name.to_string(),
-                        }));
+                        };
+                        out.push(match native_id(&b["id"]) {
+                            Some(id) => Event::Activity {
+                                id: format!("claude:tool:{id}"),
+                                kind: "tool".into(),
+                                phase: "started".into(),
+                                text,
+                            },
+                            None => Event::Tool(text),
+                        });
                     }
                     _ => {}
+                }
+            }
+        }
+        "user" if v["parent_tool_use_id"].is_null() => {
+            for block in v["message"]["content"].as_array().into_iter().flatten() {
+                if block["type"] == "tool_result"
+                    && let Some(id) = native_id(&block["tool_use_id"])
+                {
+                    out.push(Event::Activity {
+                        id: format!("claude:tool:{id}"),
+                        kind: "tool".into(),
+                        phase: "completed".into(),
+                        text: if block["is_error"] == true {
+                            "Tool returned an error".into()
+                        } else {
+                            "Tool completed".into()
+                        },
+                    });
                 }
             }
         }
@@ -443,7 +598,11 @@ fn claude_events(v: &Value) -> Vec<Event> {
                 {
                     out.push(Event::LimitHit(short(text, 200)));
                 } else {
-                    out.push(Event::Failed(short(text, 300)));
+                    out.push(Event::Failed(Failure::reported(
+                        text,
+                        "claude.result",
+                        v["code"].as_str().or(v["subtype"].as_str()),
+                    )));
                 }
             }
         }
@@ -638,25 +797,28 @@ fn codex_events(v: &Value) -> Vec<Event> {
             .and_then(|v| v.pointer("/error/message").or(v.get("message")))
             .and_then(Value::as_str)
             .unwrap_or(message);
-        let code = error["code"]
-            .as_str()
-            .or(event["codex_error_info"].as_str())
-            .or(error["codex_error_info"].as_str())
-            .or(error["codexErrorInfo"].as_str())
+        let code = native_error_code(&error["code"])
+            .or(native_error_code(&event["codex_error_info"]))
+            .or(native_error_code(&error["codex_error_info"]))
+            .or(native_error_code(&error["codexErrorInfo"]))
             .or(nested
                 .as_ref()
                 .and_then(|v| v.pointer("/error/code"))
-                .and_then(Value::as_str))
-            .unwrap_or("");
+                .and_then(native_error_code));
         // Generic error frames can describe retried requests. Failed completion
         // is authoritative; the supervisor reconciles other errors at exit.
         let lower = message.to_ascii_lowercase();
         if matches!(
             code,
-            "usage_limit_reached"
-                | "rate_limit_exceeded"
-                | "insufficient_quota"
-                | "UsageLimitExceeded"
+            Some(
+                "usage_limit_reached"
+                    | "rate_limit_exceeded"
+                    | "insufficient_quota"
+                    | "UsageLimitExceeded"
+                    | "usageLimitExceeded"
+                    | "RateLimitExceeded"
+                    | "rateLimitExceeded"
+            )
         ) || lower.contains("usage limit")
             || lower.contains("rate limit")
             || lower.contains("quota exceeded")
@@ -664,10 +826,21 @@ fn codex_events(v: &Value) -> Vec<Event> {
         {
             return vec![Event::LimitHit(short(message, 200))];
         }
+        let failure = Failure::reported(
+            message,
+            if v["type"] == "turn.failed" {
+                "codex.turn.failed"
+            } else if completion {
+                "codex.failed_completion"
+            } else {
+                "codex.error"
+            },
+            code,
+        );
         return vec![if failed {
-            Event::Failed(short(message, 300))
+            Event::Failed(failure)
         } else {
-            Event::Diagnostic(short(message, 300))
+            Event::Diagnostic(failure)
         }];
     }
     if completion && v["type"] == "event_msg" {
@@ -693,8 +866,46 @@ fn codex_events(v: &Value) -> Vec<Event> {
             .into_iter()
             .chain([Event::TurnCompleted])
             .collect(),
-        "item.completed" => {
+        "item.started" | "item.updated" | "item.completed" => {
             let item = &v["item"];
+            let phase = match v["type"].as_str() {
+                Some("item.started") => "started",
+                Some("item.updated") => "updated",
+                _ => "completed",
+            };
+            if let Some(id) = native_id(&item["id"]) {
+                let kind = item["type"].as_str().unwrap_or("");
+                let text = match kind {
+                    "command_execution" => item["command"]
+                        .as_str()
+                        .map(|command| format!("shell: {}", short(command, 200))),
+                    "mcp_tool_call" => item["tool"]
+                        .as_str()
+                        .map(|tool| format!("MCP: {}", short(tool, 200))),
+                    "web_search" => Some(match item["query"].as_str() {
+                        Some(query) => format!("search: {}", short(query, 200)),
+                        None => "Web search".into(),
+                    }),
+                    "file_change" => Some("Changed files".into()),
+                    "reasoning" if phase != "updated" => Some("Thinking".into()),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    return vec![Event::Activity {
+                        id: format!("codex:item:{id}"),
+                        kind: if kind == "reasoning" {
+                            "thinking".into()
+                        } else {
+                            "tool".into()
+                        },
+                        phase: phase.into(),
+                        text,
+                    }];
+                }
+            }
+            if phase != "completed" {
+                return vec![];
+            }
             let event = match item["type"].as_str().unwrap_or("") {
                 "agent_message" => item["text"].as_str().map(|s| Event::Text(short(s, 300))),
                 "command_execution" => item["command"]
@@ -747,6 +958,15 @@ fn codex_events(v: &Value) -> Vec<Event> {
         }
         _ => vec![],
     }
+}
+
+fn native_error_code(value: &Value) -> Option<&str> {
+    value.as_str().filter(|code| !code.is_empty()).or_else(|| {
+        let object = value.as_object()?;
+        (object.len() == 1)
+            .then(|| object.keys().next().map(String::as_str))
+            .flatten()
+    })
 }
 
 fn codex_side_file(session: &str) -> Option<PathBuf> {
@@ -991,7 +1211,7 @@ mod tests {
             assert!(
                 events
                     .iter()
-                    .any(|e| matches!(e, Event::Failed(text) if text == reason))
+                    .any(|e| matches!(e, Event::Failed(failure) if failure.message == reason))
             );
             assert!(!events.iter().any(|e| matches!(e, Event::LimitHit(_))));
         }
@@ -1586,7 +1806,7 @@ mod tests {
         ] {
             let events = parse_line("codex", line);
             assert!(
-                matches!(events.as_slice(), [Event::Diagnostic(text)] if !text.is_empty()),
+                matches!(events.as_slice(), [Event::Diagnostic(failure)] if !failure.message.is_empty()),
                 "{line}"
             );
         }
@@ -1616,7 +1836,7 @@ mod tests {
         ] {
             let events = parse_line("codex", line);
             assert!(
-                matches!(events.as_slice(), [Event::Failed(text)] if text == "Synthetic terminal failure"),
+                matches!(events.as_slice(), [Event::Failed(failure)] if failure.message == "Synthetic terminal failure"),
                 "{line}"
             );
         }
@@ -1632,7 +1852,7 @@ mod tests {
             let events = parse_line("codex", line);
             assert_eq!(events.len(), 1, "{line}");
             assert!(
-                matches!(&events[0], Event::Failed(text) if !text.is_empty()),
+                matches!(&events[0], Event::Failed(failure) if !failure.message.is_empty()),
                 "{line}"
             );
         }
@@ -1676,12 +1896,126 @@ mod tests {
     #[test]
     fn codex_unwraps_account_model_errors_as_failures_not_quota() {
         let events = parse_line("codex", &serde_json::json!({"type":"turn.failed","error":{"message":serde_json::json!({"error":{"message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}).to_string()}}).to_string());
-        assert!(matches!(&events[0],Event::Failed(t) if t.starts_with("The 'gpt-6.1-sol'")));
+        assert!(
+            matches!(&events[0],Event::Failed(failure) if failure.message.starts_with("The 'gpt-6.1-sol'"))
+        );
         assert!(!events.iter().any(|e| matches!(e, Event::LimitHit(_))));
         let events = parse_line(
             "codex",
             r#"{"type":"turn.failed","error":{"codexErrorInfo":"UsageLimitExceeded","message":"Account blocked"}}"#,
         );
         assert!(events.iter().any(|e| matches!(e, Event::LimitHit(_))));
+    }
+
+    #[test]
+    fn failure_categories_follow_structured_codes_not_error_words() {
+        for kind in FailureKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+        for (code, expected) in [
+            (
+                json!({"responseStreamDisconnected":{"httpStatusCode":null}}),
+                FailureKind::Transport,
+            ),
+            (
+                json!({"HttpConnectionFailed":{"http_status_code":502}}),
+                FailureKind::Transport,
+            ),
+            (json!("unauthorized"), FailureKind::Authentication),
+            (json!("cyberPolicy"), FailureKind::ProviderRejected),
+            (json!("badRequest"), FailureKind::ProviderRejected),
+            (json!("newProviderCode"), FailureKind::Unknown),
+            (Value::Null, FailureKind::Unknown),
+        ] {
+            for (kind, terminal) in [("turn.failed", true), ("error", false)] {
+                let events = parse_line("codex", &json!({
+                    "type":kind,
+                    "error":{"message":"Unauthorized transport model not found", "codexErrorInfo":code}
+                }).to_string());
+                let failure = match events.as_slice() {
+                    [Event::Failed(failure)] if terminal => failure,
+                    [Event::Diagnostic(failure)] if !terminal => failure,
+                    _ => panic!("unexpected failure event for {kind}: {code}"),
+                };
+                assert_eq!(failure.kind, expected, "{kind}: {code}");
+                assert_eq!(failure.message, "Unauthorized transport model not found");
+                assert_eq!(failure.code.is_some(), !code.is_null());
+                assert_eq!(
+                    failure.source.as_deref(),
+                    Some(if terminal {
+                        "codex.turn.failed"
+                    } else {
+                        "codex.error"
+                    })
+                );
+            }
+        }
+        for code in ["usageLimitExceeded", "rateLimitExceeded"] {
+            let events = parse_line("codex", &json!({"type":"turn.failed","error":{"message":"Account unavailable","codexErrorInfo":code}}).to_string());
+            assert!(matches!(events.as_slice(), [Event::LimitHit(_)]), "{code}");
+        }
+        let events = parse_line(
+            "claude",
+            r#"{"type":"result","is_error":true,"subtype":"error_during_execution","result":"Transport unauthorized model not found"}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Failed(failure)] if failure.kind==FailureKind::Unknown && failure.code.as_deref()==Some("error_during_execution") && failure.source.as_deref()==Some("claude.result"))
+        );
+    }
+
+    #[test]
+    fn progress_uses_native_lifecycle_without_revealing_reasoning_or_tool_output() {
+        for (phase, kind) in [
+            ("started", "tool"),
+            ("updated", "tool"),
+            ("completed", "tool"),
+        ] {
+            let events = parse_line("codex", &json!({"type":format!("item.{phase}"),"item":{"id":"command-1","type":"command_execution","command":"pwd","aggregated_output":"do not copy tool output"}}).to_string());
+            assert!(
+                matches!(events.as_slice(), [Event::Activity{id,kind:actual,phase:actual_phase,text}] if id=="codex:item:command-1" && actual==kind && actual_phase==phase && text=="shell: pwd")
+            );
+        }
+        for phase in ["started", "completed"] {
+            let events = parse_line("codex", &json!({"type":format!("item.{phase}"),"item":{"id":"reasoning-1","type":"reasoning","text":"do not copy reasoning","summary":["do not copy reasoning"]}}).to_string());
+            assert!(
+                matches!(events.as_slice(), [Event::Activity{id,kind,phase:actual,text}] if id=="codex:item:reasoning-1" && kind=="thinking" && actual==phase && text=="Thinking")
+            );
+        }
+        assert!(parse_line("codex", r#"{"type":"item.updated","item":{"id":"reasoning-1","type":"reasoning","text":"do not copy reasoning"}}"#).is_empty());
+        let events = parse_line(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"do not copy reasoning"}}}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Activity{id,kind,phase,text}] if id=="claude:block:2" && kind=="thinking" && phase=="started" && text=="Thinking")
+        );
+        let events = parse_line(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":2}}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Activity{id,kind,phase,text}] if id=="claude:block:2" && kind=="block" && phase=="completed" && text.is_empty())
+        );
+        let events = parse_line(
+            "claude",
+            r#"{"type":"assistant","message":{"content":[{"id":"tool-1","type":"tool_use","name":"Bash","input":{"command":"pwd"}}]}}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Activity{id,kind,phase,text}] if id=="claude:tool:tool-1" && kind=="tool" && phase=="started" && text=="Bash: pwd")
+        );
+        let events = parse_line(
+            "claude",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"do not copy tool output"}]}}"#,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Activity{id,kind,phase,text}] if id=="claude:tool:tool-1" && kind=="tool" && phase=="completed" && text=="Tool returned an error")
+        );
+        for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"do not copy reasoning"}}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":"nested","event":{"type":"content_block_start","index":2,"content_block":{"type":"thinking"}}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"quoted tool_result example"}]}}"#,
+        ] {
+            assert!(parse_line("claude", line).is_empty(), "{line}");
+        }
     }
 }

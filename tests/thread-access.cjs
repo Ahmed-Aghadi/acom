@@ -9,6 +9,7 @@ const net = require('node:net');
 const { DatabaseSync } = require('node:sqlite');
 const { spawn, spawnSync } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome, attachGlobal } = require('./fixture-workspace.cjs');
 
 async function isolated(run) {
   for (const client of ['codex', 'claude']) {
@@ -21,7 +22,7 @@ async function isolated(run) {
   const env = { ...process.env, ACOM_HOME: home, CODEX_HOME: path.join(root, 'codex'),
     CLAUDE_CONFIG_DIR: path.join(root, 'no-credentials'), PATH: bin };
   for (const key of ['ACOM_ID', 'ACOM_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY']) delete env[key];
-  let server, url;
+  let server, url, project;
   const stop = async () => {
     if (!server || server.exitCode !== null || server.signalCode !== null) return;
     const exited = new Promise(resolve => server.once('exit', resolve));
@@ -47,7 +48,7 @@ async function isolated(run) {
     throw Error(`Server startup timed out: ${errors}`);
   };
   const request = async (method, route, body) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' },
+    const response = await fetch(url + scoped(route,project?.id,body), { method, headers: { 'Content-Type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     return { status: response.status, value: await response.json() };
   };
@@ -63,26 +64,26 @@ async function isolated(run) {
     assert.equal(typeof result.value.error, 'string');
     return result.value;
   };
-  const db = action => {
-    const connection = new DatabaseSync(path.join(home, 'acom.db'));
+  const db = (action, selected=project.id) => {
+    const connection = new DatabaseSync(path.join(projectHome(home,selected), 'acom.db'));attachGlobal(connection,home);
     try { connection.exec('PRAGMA busy_timeout=5000'); return action(connection); }
     finally { connection.close(); }
   };
   const cli = (args, agent) => spawnSync(binary, args, { cwd: projectDir, encoding: 'utf8',
-    timeout: 15000, env: { ...env, ACOM_URL: url, ...(agent === undefined ? {} : { ACOM_ID: String(agent) }) } });
+    timeout: 15000, env: { ...env, ACOM_URL: `${url}/p/${project.id}`, ...(agent === undefined ? {} : { ACOM_ID: String(agent) }) } });
   try {
     await start();
-    const project = await api('POST', '/projects', { path: projectDir });
+    project = await api('POST', '/projects', { path: projectDir });
     db(connection => {
       const insert = connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,'team','closed access fixture','codex','gpt-6-sol','medium','closed',0,0)");
-      for (let id = 1; id <= 4; id++) insert.run(id, project.id, `fixture ${id}`);
+      for (let id = 1; id <= 4; id++) insert.run(id, 1, `fixture ${id}`);
       const later = Math.floor(Date.now() / 1000) + 3600;
       for (const provider of ['claude', 'codex']) connection.prepare('UPDATE usage_checks SET next_check=? WHERE provider=?').run(later, provider);
     });
     const create = (extra = {}) => api('POST', '/threads', {
       project: project.id, title: 'audience fixture', members: ['1'], include_user: true, ...extra,
     });
-    await run({ api, request, denied, db, cli, create, project, home, start, stop });
+    await run({ api, request, denied, db, cli, create, project, home:projectHome(home,project.id), root, start, stop });
   } finally {
     await stop();
     fs.rmSync(root, { recursive: true, force: true });
@@ -269,16 +270,16 @@ test('thread access and removal remain consistent across API, CLI and restart', 
 
     await t.test('ownership targets must be agents in the same project and invalid requests change nothing', async () => {
       const thread = await api('POST', '/threads', { agent: 2, title: 'validated ownership', private: true, members: ['1'] });
-      const foreignPath = path.join(path.dirname(f.home), 'foreign-project');
+      const foreignPath = path.join(f.root, 'foreign-project');
       fs.mkdirSync(foreignPath);
       const foreign = await api('POST', '/projects', { path: foreignPath });
-      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(7,?,'foreign owner fixture','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(foreign.id));
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(7,1,'foreign owner fixture','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(),foreign.id);
       const before = await metadata(thread.id, 0), beforeEvents = events(thread.id);
       for (const owner of [0, -1, 1.5, '3', null, true, [], {}]) {
         await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner }, 400);
       }
       await api('POST', `/threads/${thread.id}/owner`, { agent: 2 }, 400);
-      await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 7 }, 400);
+      await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 7 }, 404);
       await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 99999 }, 404);
       state(4, 'replaced');
       try { await api('POST', `/threads/${thread.id}/owner`, { agent: 2, owner: 4 }, 409); }
@@ -320,7 +321,7 @@ test('thread access and removal remain consistent across API, CLI and restart', 
 
       const large = await api('POST', '/threads', { agent: 2, title: 'ownership preview ' + 'x'.repeat(1000), private: true, members: ['1'] });
       await api('POST', `/threads/${large.id}/owner`, { agent: 2, owner: 3 });
-      const page = await api('GET', `/threads?project=${project.id}&viewer=0&limit=1&max_bytes=512`);
+      const page = await api('GET', `/threads?project=${project.id}&viewer=0&sort=newest&limit=1&max_bytes=512`);
       assert.equal(page.items[0].id, large.id);
       assert.equal(page.items[0].truncated, true);
       assert.equal(page.items[0].owner, 3);
@@ -456,7 +457,7 @@ test('thread access and removal remain consistent across API, CLI and restart', 
       const thread = await create({ title: 'private event title', private: true });
       await send(thread.id, 'private event message');
       const receipt = db(connection => Number(connection.prepare("INSERT INTO events(project,at,kind,actor,agent,thread,details) VALUES(?,0,'command.receipt','user',0,?,?)")
-        .run(project.id, thread.id, JSON.stringify({ response: { members: [0, 1], private_note: 'private receipt marker' } })).lastInsertRowid));
+        .run(1, thread.id, JSON.stringify({ response: { members: [0, 1], private_note: 'private receipt marker' } })).lastInsertRowid));
       for (const route of [`/history?project=${project.id}&viewer=2`,
         `/history?project=${project.id}&viewer=2&agent=1`, `/history?project=${project.id}&viewer=2&agent=0`]) {
         const history = await api('GET', route);
@@ -515,7 +516,7 @@ test('thread access and removal remain consistent across API, CLI and restart', 
       assert.equal(events(live.id).filter(event => event.kind === 'thread.joined' && event.agent === 1).length, 2);
       state(1, 'paused'); state(1, 'closed');
       assert.ok((await metadata(live.id, 0)).members.includes(1));
-      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,launched_by,launched_at) VALUES(5,?,'new fixture','team','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(project.id));
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,grp,task,harness,model,effort,state,launched_by,launched_at) VALUES(5,1,'new fixture','team','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run());
       assert.ok((await metadata(live.id, 0)).members.includes(5), 'ordinary new matching agents still join live threads');
     });
 
@@ -566,7 +567,7 @@ test('thread access and removal remain consistent across API, CLI and restart', 
     });
 
     await t.test('coordination counts do not advertise inaccessible private messages', async () => {
-      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(6,?,'count fixture','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run(project.id));
+      db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(6,1,'count fixture','closed fixture','codex','gpt-6-sol','medium','closed',0,0)").run());
       const thread = await create({ private: true, members: ['6'] });
       await send(thread.id, 'revoked pending private message');
       await members(thread.id, [6], 0, true);

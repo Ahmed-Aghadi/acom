@@ -291,50 +291,67 @@ pub fn next_check(at: i64, interval: u64, resets: impl Iterator<Item = i64>) -> 
         .fold(at + interval as i64, |n, r| n.min(r))
 }
 
+fn check_due(
+    attempted: Option<i64>,
+    next: i64,
+    at: i64,
+    mut resets: impl Iterator<Item = i64>,
+) -> bool {
+    next <= at || resets.any(|reset| reset <= at && reset > attempted.unwrap_or(0))
+}
+
+fn next_known_check(db: &rusqlite::Connection, provider: &str, at: i64, interval: u64) -> R<i64> {
+    let resets = rows(
+        db,
+        "SELECT resets_at FROM global.usage WHERE provider=?1 AND resets_at IS NOT NULL",
+        [provider],
+    )?;
+    Ok(next_check(
+        at,
+        interval,
+        resets.iter().filter_map(|row| row["resets_at"].as_i64()),
+    ))
+}
+
 pub fn schedule(app: &Arc<App>) -> R<()> {
     let mut due = Vec::new();
     {
         let st = app.lock();
-        let projects = rows(&st.db, "SELECT id FROM projects", [])?;
-        let interval = projects
-            .iter()
-            .map(|p| st.settings_for(p["id"].as_i64()).usage_poll_secs)
-            .min()
-            .unwrap_or_else(|| st.settings_for(None).usage_poll_secs);
+        let interval = st.global_settings()?.usage_poll_secs;
         for provider in crate::harness::KNOWN {
             st.db.execute(
-                "INSERT OR IGNORE INTO usage_checks(provider,next_check) VALUES(?1,?2)",
+                "INSERT OR IGNORE INTO global.usage_checks(provider,next_check) VALUES(?1,?2)",
                 params![provider, now()],
             )?;
-            let (attempt, next, busy): (Option<i64>, i64, bool) = st.db.query_row("SELECT attempted_at, coalesce(next_check,0),in_flight FROM usage_checks WHERE provider=?1", [provider], |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?)))?;
+            let (attempt, next, busy): (Option<i64>, i64, bool) = st.db.query_row("SELECT attempted_at, coalesce(next_check,0),in_flight FROM global.usage_checks WHERE provider=?1", [provider], |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?)))?;
             if busy {
                 continue;
             }
             let resets = rows(
                 &st.db,
-                "SELECT resets_at FROM usage WHERE provider=?1 AND resets_at IS NOT NULL",
+                "SELECT resets_at FROM global.usage WHERE provider=?1 AND resets_at IS NOT NULL",
                 [provider],
             )?;
-            let reset_due = resets.iter().any(|r| {
-                r["resets_at"]
-                    .as_i64()
-                    .is_some_and(|t| t <= now() && t > attempt.unwrap_or(0))
-            });
-            if next <= now() || reset_due || attempt.is_some_and(|t| t + interval as i64 <= now()) {
+            if check_due(
+                attempt,
+                next,
+                now(),
+                resets.iter().filter_map(|row| row["resets_at"].as_i64()),
+            ) {
                 // Reserve before releasing the mutex; at most one request per provider at a time.
-                st.db.execute("UPDATE usage_checks SET attempted_at=?2,next_check=?3,in_flight=1 WHERE provider=?1", params![provider, now(), now()+interval as i64])?;
-                due.push((provider.to_string(), interval));
+                st.db.execute("UPDATE global.usage_checks SET attempted_at=?2,next_check=?3,in_flight=1 WHERE provider=?1", params![provider, now(), now()+interval as i64])?;
+                due.push(provider.to_string());
             }
         }
     }
-    for (provider, interval) in due {
+    for provider in due {
         let app = app.clone();
         std::thread::spawn(move || {
             let result = read(&provider);
-            if let Err(e) = finish(&app, &provider, interval, result) {
+            if let Err(e) = finish(&app, &provider, result) {
                 let st = app.lock();
                 let _ = st.db.execute(
-                    "UPDATE usage_checks SET in_flight=0,error=?2 WHERE provider=?1",
+                    "UPDATE global.usage_checks SET in_flight=0,error=?2 WHERE provider=?1",
                     params![
                         provider,
                         "Could not save usage status; keeping the last reading."
@@ -347,18 +364,14 @@ pub fn schedule(app: &Arc<App>) -> R<()> {
     Ok(())
 }
 
-pub fn finish(
-    app: &Arc<App>,
-    provider: &str,
-    interval: u64,
-    result: Result<Vec<Window>, String>,
-) -> R<()> {
+pub fn finish(app: &Arc<App>, provider: &str, result: Result<Vec<Window>, String>) -> R<()> {
     let st = app.lock();
+    let interval = st.global_settings()?.usage_poll_secs;
     match result {
         Ok(mut windows) => {
             let marker = rows(
                 &st.db,
-                "SELECT at FROM usage WHERE provider=?1 AND win='limit' AND at>=coalesce((SELECT attempted_at FROM usage_checks WHERE provider=?1),0)",
+                "SELECT at FROM global.usage WHERE provider=?1 AND win='limit' AND at>=coalesce((SELECT attempted_at FROM global.usage_checks WHERE provider=?1),0)",
                 [provider],
             )?;
             if !marker.is_empty()
@@ -374,28 +387,32 @@ pub fn finish(
                 });
             }
             // A check begun before a Fable exhaustion event cannot clear it.
-            let fable_marker = rows(&st.db, "SELECT at FROM usage WHERE provider=?1 AND win='seven_day_fable'
-                AND used_pct>=100 AND at>=coalesce((SELECT attempted_at FROM usage_checks WHERE provider=?1),0)", [provider])?;
+            let fable_marker = rows(&st.db, "SELECT at FROM global.usage WHERE provider=?1 AND win='seven_day_fable'
+                AND used_pct>=100 AND at>=coalesce((SELECT attempted_at FROM global.usage_checks WHERE provider=?1),0)", [provider])?;
             if !fable_marker.is_empty() {
                 windows.retain(|w| w.name != "seven_day_fable");
             }
-            let tx = st.db.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &st.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             // Missing Codex buckets and optional Fable usage are unknown, not resets.
             // Keep their reading timestamps; only fresh observations replace them.
             for w in &windows {
                 st.observe_usage(provider, &w.name, w.used, w.reset)?;
             }
             let names: Vec<_> = windows.iter().map(|w| w.name.as_str()).collect();
-            tx.execute("DELETE FROM usage WHERE provider=?1 AND (provider<>'codex' OR win='limit') AND NOT (provider='claude' AND win='seven_day_fable') AND NOT EXISTS(SELECT 1 FROM json_each(?2) WHERE value=usage.win)",params![provider,serde_json::json!(names).to_string()])?;
-            let next = next_check(now(), interval, windows.iter().filter_map(|w| w.reset));
-            tx.execute("INSERT INTO usage_checks(provider,checked_at,attempted_at,next_check,error) VALUES(?1,?2,?2,?3,NULL)
+            tx.execute("DELETE FROM global.usage WHERE provider=?1 AND (provider<>'codex' OR win='limit') AND NOT (provider='claude' AND win='seven_day_fable') AND NOT EXISTS(SELECT 1 FROM json_each(?2) WHERE value=usage.win)",params![provider,serde_json::json!(names).to_string()])?;
+            let next = next_known_check(&st.db, provider, now(), interval)?;
+            tx.execute("INSERT INTO global.usage_checks(provider,checked_at,attempted_at,next_check,error) VALUES(?1,?2,?2,?3,NULL)
                 ON CONFLICT(provider) DO UPDATE SET checked_at=?2,next_check=?3,error=NULL,in_flight=0", params![provider,now(),next])?;
             tx.commit()?;
         }
         Err(error) => {
+            let next = next_known_check(&st.db, provider, now(), interval)?;
             st.db.execute(
-                "UPDATE usage_checks SET next_check=?2,error=?3,in_flight=0 WHERE provider=?1",
-                params![provider, now() + interval as i64, error],
+                "UPDATE global.usage_checks SET next_check=?2,error=?3,in_flight=0 WHERE provider=?1",
+                params![provider, next, error],
             )?;
         }
     }
@@ -409,6 +426,16 @@ mod tests {
     fn resets_and_poll_interval_both_schedule_checks() {
         assert_eq!(next_check(100, 120, [150, 900].into_iter()), 150);
         assert_eq!(next_check(100, 120, [90, 900].into_iter()), 220);
+    }
+
+    #[test]
+    fn persisted_retry_deadline_prevents_restarting_a_slow_failed_check() {
+        assert!(!check_due(Some(10), 220, 100, [].into_iter()));
+        assert!(check_due(Some(10), 100, 100, [].into_iter()));
+        assert!(check_due(Some(10), 220, 100, [100].into_iter()));
+        assert!(!check_due(Some(100), 220, 100, [100].into_iter()));
+        assert!(!check_due(Some(10), 220, 100, [101].into_iter()));
+        assert!(check_due(None, 100, 100, [].into_iter()));
     }
     #[test]
     fn provider_responses_and_unknowns() {

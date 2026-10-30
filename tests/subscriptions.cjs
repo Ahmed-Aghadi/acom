@@ -9,6 +9,7 @@ const net = require('node:net');
 const { DatabaseSync } = require('node:sqlite');
 const { spawn } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome, attachGlobal } = require('./fixture-workspace.cjs');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, label, timeout = 10000) {
@@ -67,9 +68,9 @@ if(process.argv[2]==='app-server') {
   fs.copyFileSync(path.join(bin, 'codex'), path.join(bin, 'claude'));
   const env = { ...process.env, ACOM_HOME: home, CODEX_HOME: path.join(root, 'codex'), CLAUDE_CONFIG_DIR: path.join(root, 'no-credentials'), PATH: bin };
   for (const key of ['ACOM_ID', 'ACOM_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) delete env[key];
-  let server, url, stderr = '';
-  const db = action => {
-    const connection = new DatabaseSync(path.join(home, 'acom.db'));
+  let server, url, project, runtimeHome, stderr = '';
+  const db = (action, selected=project.id) => {
+    const connection = new DatabaseSync(path.join(projectHome(home,selected), 'acom.db'));attachGlobal(connection,home);
     try { connection.exec('PRAGMA busy_timeout=5000'); return action(connection); }
     finally { connection.close(); }
   };
@@ -91,13 +92,13 @@ if(process.argv[2]==='app-server') {
     }, 'server startup');
   };
   const api = async (method, route, body, expected = 200) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const response = await fetch(url + scoped(route,project?.id,body), { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const raw = await response.text();
     assert.ok((Array.isArray(expected) ? expected : [expected]).includes(response.status), `${method} ${route}: expected ${expected}, got ${response.status}: ${raw.slice(0, 1200)}`);
     return JSON.parse(raw);
   };
   const cli = async (args, id) => {
-    const child = spawn(binary, args, { cwd: projectDir, env: { ...env, ACOM_URL: url, ...(id ? { ACOM_ID: String(id) } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(binary, args, { cwd: projectDir, env: { ...env, ACOM_URL: `${url}/p/${project.id}`, ...(id ? { ACOM_ID: String(id) } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', chunk => stdout += chunk); child.stderr.on('data', chunk => stderr += chunk);
     const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
@@ -108,37 +109,39 @@ if(process.argv[2]==='app-server') {
     } finally { clearTimeout(timer); }
   };
   const runs = id => {
-    const file = path.join(home, 'runs.jsonl');
+    const file = path.join(runtimeHome, 'runs.jsonl');
     return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).filter(row => id === undefined || row.id === id) : [];
   };
   try {
     await start();
-    const project = await api('POST', '/projects', { path: projectDir });
+    project = await api('POST', '/projects', { path: projectDir });
+    runtimeHome=projectHome(home,project.id);
     const otherDir = path.join(root, 'other'); fs.mkdirSync(otherDir);
     const other = await api('POST', '/projects', { path: otherDir });
-    const settings = (await api('GET', '/configs/1')).settings;
+    const settings = (await api('GET', '/configs/default')).settings;
     settings.done_closes = false; settings.auto_resume = false;
     settings.allow_agent_model_change = true;
     settings.limits.active = { soft: null, hard: null };
     for (const key of Object.keys(settings.limits.active_per_harness)) settings.limits.active_per_harness[key] = { soft: null, hard: null };
     for (const key of Object.keys(settings.limits.usage)) settings.limits.usage[key] = { soft: null, hard: null };
-    settings.usage_poll_secs = 3600;
+    await api('PUT','/global-settings',{settings:{usage_poll_secs:3600,metrics_sample_secs:5}});
     for (const p of [project, other]) await api('PUT', `/projects/${p.id}/config`, { custom: settings });
     db(connection => {
       const insert = connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(?,?,?,'subscription fixture','codex','gpt-6-sol','medium','working',0,0)");
-      for (let id = 1; id <= 8; id++) insert.run(id, id === 8 ? other.id : project.id, `fixture ${id}`);
+      for (let id = 1; id <= 7; id++) insert.run(id, 1, `fixture ${id}`);
       const at = Math.floor(Date.now() / 1000);
       const usage = connection.prepare('INSERT INTO usage_checks(provider,attempted_at,next_check,in_flight) VALUES(?,?,?,0) ON CONFLICT(provider) DO UPDATE SET attempted_at=excluded.attempted_at,next_check=excluded.next_check,in_flight=0');
       for (const provider of ['codex', 'claude']) usage.run(provider, at, at + 3600);
     });
-    await run({ api, cli, db, start, stop, home, root, project, other, runs, env, projectDir });
+    db(connection => connection.prepare("INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at) VALUES(8,1,'foreign','subscription fixture','codex','gpt-6-sol','medium','working',0,0)").run(),other.id);
+    await run({ api, cli, db, start, stop, home:runtimeHome, accountHome:home, root, project, other, runs, env, projectDir });
   } finally {
     await stop();
     for (const { pid } of runs()) {
       try {
         const vars = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
         const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
-        if (vars.includes(`ACOM_HOME=${home}`) && ['codex', 'claude'].some(client => args.includes(path.join(bin, client)))) process.kill(-pid, 'SIGKILL');
+        if (vars.includes(`ACOM_HOME=${runtimeHome}`) && ['codex', 'claude'].some(client => args.includes(path.join(bin, client)))) process.kill(-pid, 'SIGKILL');
       } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
     }
     fs.rmSync(root, { recursive: true, force: true });
@@ -156,7 +159,7 @@ test('subscription validation, project permissions, listing, and cancellation', 
     { agent: 1, usage: { provider: 'codex', window: 'primary', condition: 'above' } },
     { agent: 1, usage: { provider: 'codex', window: 'primary', condition: 'above', percent: 101 } },
     { agent: 1, usage: { provider: 'unknown', window: 'primary', condition: 'reset' } },
-  ]) await api('POST', '/subscriptions', body, 400);
+  ]) await api('POST', '/subscriptions', body, Array.isArray(body.agents)&&body.agents.includes(8) ? 404 : 400);
   const first = await api('POST', '/subscriptions', { agent: 1, agents: [2], states: ['crashed', 'done'] });
   assert.ok(first.id > 0); assert.equal(first.agent, 1); assert.equal(first.mode, 'persistent'); assert.equal(first.state, 'active');
   const second = await api('POST', '/subscriptions', { agent: 1, agents: 'all', status_text: true });
@@ -216,9 +219,9 @@ test('watch requests reject typos, malformed filters, and unknown queries withou
   }
   for (const args of [
     ['subscribe', '--agents', '2', '--state', 'done'],
-    ['subscribe', '--usage', 'claude', '--window', 'five_horu', '--reset'],
-    ['wait', '--idle', '--usage', 'claude', '--window', 'five_horu', '--reset'],
-    ['wait', '--timeout', '1s', '--usage', 'claude', '--window', 'five_horu', '--reset'],
+    ['subscribe', '--usage', 'claude', '--window', 'five_horu', '--reset-due'],
+    ['wait', '--idle', '--usage', 'claude', '--window', 'five_horu', '--reset-due'],
+    ['wait', '--timeout', '1s', '--usage', 'claude', '--window', 'five_horu', '--reset-due'],
   ]) {
     const before = snapshot();
     const rejected = await cli(args, 1);
@@ -248,7 +251,7 @@ test('display usage-window aliases normalize and match events across persistent,
   await until(async () => Boolean((await api('GET', '/agents/3')).waiting), 'foreground alias registration');
   db(connection => {
     const insert = connection.prepare("INSERT INTO events(project,at,kind,actor,details) VALUES(?,unixepoch(),'usage.observed','acom',?)");
-    for (const window of ['five_hour', 'seven_day']) insert.run(project.id, JSON.stringify({ provider: 'claude', window, before_used: 20, used: 90, reset: false }));
+    for (const window of ['five_hour', 'seven_day']) insert.run(1, JSON.stringify({ provider: 'claude', window, before_used: 20, used: 90 }));
   });
   const delivered = await foreground;
   assert.equal(delivered.status, 0, delivered.stderr); assert.match(delivered.stdout, /90/); assert.match(delivered.stdout, /five_hour/);
@@ -265,7 +268,7 @@ test('usage-window discovery distinguishes absent known windows, observed dynami
     ['codex', 'codex primary', 'codex primary'], ['codex', 'codex secondary', 'codex secondary'],
     ['codex', 'account limit', 'account limit'], ['codex', 'codex account limit', 'codex account limit'],
   ]) {
-    const row = await api('POST', '/subscriptions', { agent: 1, usage: { provider, window, condition: 'reset' } });
+    const row = await api('POST', '/subscriptions', { agent: 1, usage: { provider, window, condition: 'reset-due' } });
     assert.equal(row.watch.usage.window, canonical, 'known windows need not have a current reading');
   }
   db(connection => {
@@ -273,7 +276,7 @@ test('usage-window discovery distinguishes absent known windows, observed dynami
     connection.prepare("INSERT INTO usage_observations(provider,win,used_pct,at) VALUES('claude','optional_window',40,unixepoch()-60)").run();
   });
   for (const [provider, window] of [['codex', 'custom-bucket primary'], ['claude', 'optional_window']]) {
-    const row = await api('POST', '/subscriptions', { agent: 1, usage: { provider, window, condition: 'reset' } });
+    const row = await api('POST', '/subscriptions', { agent: 1, usage: { provider, window, condition: 'reset-due' } });
     assert.equal(row.watch.usage.window, window);
   }
   const limits = await cli(['limits'], 1);
@@ -285,7 +288,7 @@ test('usage-window discovery distinguishes absent known windows, observed dynami
     ['claude', 'custom-bucket primary'], ['codex', 'CUSTOM-BUCKET PRIMARY'],
   ]) {
     for (const route of ['/subscriptions', '/wait/1']) {
-      const error = await api('POST', route, { ...(route === '/subscriptions' ? { agent: 1 } : { timeout: 1 }), usage: { provider, window, condition: 'reset' } }, 400);
+      const error = await api('POST', route, { ...(route === '/subscriptions' ? { agent: 1 } : { timeout: 1 }), usage: { provider, window, condition: 'reset-due' } }, 400);
       assert.match(error.error, /window/i); assert.match(error.error, /acom limits/);
     }
   }
@@ -364,7 +367,7 @@ test('deadline-second events cannot resolve early, but timely backlog still beat
     connection.exec('BEGIN');
     const boundary = connection.prepare('SELECT unixepoch() at').get().at;
     connection.prepare('UPDATE subscriptions SET deadline=? WHERE id=?').run(boundary, subscription.id);
-    const event = Number(connection.prepare("INSERT INTO events(project,at,kind,actor,agent,details) VALUES(?,?,'agent.status','agent 2',2,?)").run(project.id, boundary + offset, JSON.stringify({ from: null, to: label })).lastInsertRowid);
+    const event = Number(connection.prepare("INSERT INTO events(project,at,kind,actor,agent,details) VALUES(?,?,'agent.status','agent 2',2,?)").run(1, boundary + offset, JSON.stringify({ from: null, to: label })).lastInsertRowid);
     connection.exec('COMMIT');
     return event;
   });
@@ -615,7 +618,7 @@ test('true replacement transfers stable subscription ownership and unacknowledge
   await sleep(1200); assert.equal(runs(successor).length, 1);
 }));
 
-test('usage thresholds notify on crossings, distinguish due from confirmed resets, and ignore failed readings', async () => fixture(async ({ api, db, home, project }) => {
+test('usage thresholds notify on crossings, distinguish estimated deadlines from observed decreases, and ignore failed readings', async () => fixture(async ({ api, db, accountHome:home, project }) => {
   let reset = Math.floor(Date.now() / 1000) + 3600;
   const reads = () => fs.existsSync(path.join(home, 'usage-reads')) ? fs.readFileSync(path.join(home, 'usage-reads'), 'utf8').split('\n').filter(Boolean).length : 0;
   const check = async (percent, at = reset) => {
@@ -625,7 +628,8 @@ test('usage thresholds notify on crossings, distinguish due from confirmed reset
     await until(async () => {
       const view = await api('GET', `/limits?project=${project.id}`);
       return reads() > before && view.usage.some(row => row.provider === 'codex' && row.win === 'codex primary' && row.used_pct === percent && row.resets_at === at)
-        && db(connection => connection.prepare("SELECT in_flight FROM usage_checks WHERE provider='codex'").get()?.in_flight === 0);
+        && db(connection => connection.prepare("SELECT in_flight FROM usage_checks WHERE provider='codex'").get()?.in_flight === 0
+          && connection.prepare('SELECT (SELECT event_id FROM account_cursor WHERE id=1)=(SELECT coalesce(max(id),0) FROM global.account_events) ready').get().ready===1);
     }, `usage reading ${percent}%`);
   };
   await check(20);
@@ -644,7 +648,8 @@ test('usage thresholds notify on crossings, distinguish due from confirmed reset
   await check(10);
   assert.match((await hook(api, 3)).text, /10/);
 
-  const resetWatch = await api('POST', '/subscriptions', { agent: 4, usage: { provider: 'codex', window: 'codex primary', condition: 'reset' } });
+  await api('POST', '/subscriptions', { agent: 4, usage: { provider: 'codex', window: 'codex primary', condition: 'reset' } },400);
+  const resetWatch = await api('POST', '/subscriptions', { agent: 4, usage: { provider: 'codex', window: 'codex primary', condition: 'below', percent:10 } });
   const dueWatch = await api('POST', '/subscriptions', { agent: 5, usage: { provider: 'codex', window: 'codex primary', condition: 'reset-due' } });
   reset = Math.floor(Date.now() / 1000) + 2;
   await check(10, reset);
@@ -652,7 +657,7 @@ test('usage thresholds notify on crossings, distinguish due from confirmed reset
   assert.equal((await hook(api, 4)).text, '', 'estimated reset time is not confirmation');
   await check(0, reset + 3600);
   const confirmed = await hook(api, 4);
-  assert.match(confirmed.text, new RegExp(`(?:subscription|Subscription) #?${resetWatch.id}\\b`)); assert.match(confirmed.text, /reset/i);
+  assert.match(confirmed.text, new RegExp(`(?:subscription|Subscription) #?${resetWatch.id}\\b`)); assert.match(confirmed.text, /0/);
   fs.writeFileSync(path.join(home, 'usage.json'), JSON.stringify({ rateLimits: { primary: { usedPercent: null } } }));
   await api('POST', '/usage/check', { provider: 'codex' });
   await until(async () => (await api('GET', `/limits?project=${project.id}`)).checks.some(row => row.provider === 'codex' && row.error), 'failed usage check recorded');
@@ -708,8 +713,8 @@ test('suspected wake cycles are evidence-backed, deduplicated advisories without
     const ids = [];
     for (let i = 0; i < 6; i++) {
       const source = i % 2 ? 2 : 1, target = i % 2 ? 1 : 2;
-      const sourceEvent = Number(insert.run(project.id, 'agent.state', 'acom', source, JSON.stringify({ from: 'idle', to: 'working' })).lastInsertRowid);
-      ids.push(Number(insert.run(project.id, 'subscription.wake', 'acom', target, JSON.stringify({ sources: [source], subscriptions: [target === 1 ? one.id : two.id], events: [sourceEvent] })).lastInsertRowid));
+      const sourceEvent = Number(insert.run(1, 'agent.state', 'acom', source, JSON.stringify({ from: 'idle', to: 'working' })).lastInsertRowid);
+      ids.push(Number(insert.run(1, 'subscription.wake', 'acom', target, JSON.stringify({ sources: [source], subscriptions: [target === 1 ? one.id : two.id], events: [sourceEvent] })).lastInsertRowid));
     }
     return ids;
   });

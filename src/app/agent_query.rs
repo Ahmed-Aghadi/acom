@@ -1,15 +1,22 @@
 use super::{AgentFilter, R, STATES, bad};
+use crate::harness::FailureKind;
 use rusqlite::types::Value as SqlValue;
 use serde::Serialize;
 use std::collections::BTreeSet;
 
-const FIELDS: [&str; 6] = [
+const FIELDS: [&str; 12] = [
     "group",
     "provider",
     "model",
     "effort",
     "state",
     "pause_reason",
+    "id",
+    "name",
+    "launched_by",
+    "task",
+    "status",
+    "failure_kind",
 ];
 const MAX_BYTES: usize = 4096;
 const MAX_CLAUSES: usize = 64;
@@ -120,8 +127,13 @@ impl Expression {
     fn normalized(&self) -> Self {
         match self {
             Self::Clause { clause } => Self::Clause {
-                clause: if clause.field.is_none() {
-                    QueryClause::new(None, vec![clause.values[0].to_lowercase()])
+                clause: if matches!(clause.field.as_deref(), None | Some("task" | "status")) {
+                    let values: BTreeSet<_> = clause
+                        .values
+                        .iter()
+                        .map(|value| value.to_lowercase())
+                        .collect();
+                    QueryClause::new(clause.field.clone(), values.into_iter().collect())
                 } else {
                     clause.clone()
                 },
@@ -194,7 +206,20 @@ impl Expression {
                         "EXISTS (SELECT 1 FROM json_each(json_array(a.name,CAST(a.id AS TEXT),a.harness,a.model,a.grp,a.status_text,a.task)) field WHERE instr(acom_lower(coalesce(field.value,'')),?{bind})>0)"
                     );
                 }
+                if matches!(field, Some("task" | "status")) {
+                    let column = if field == Some("task") {
+                        "a.task"
+                    } else {
+                        "a.status_text"
+                    };
+                    return format!(
+                        "EXISTS (SELECT 1 FROM json_each(?{bind}) term WHERE instr(acom_lower(coalesce({column},'')),term.value)>0)"
+                    );
+                }
                 let column = match field.unwrap() {
+                    "id" => "a.id",
+                    "name" => "a.name",
+                    "launched_by" => "a.launched_by",
                     "group" => "coalesce(a.grp,'')",
                     "provider" => "a.harness",
                     "model" => "a.model",
@@ -203,12 +228,28 @@ impl Expression {
                     "pause_reason" => {
                         "CASE WHEN a.pause_reason IN ('user','all') THEN 'manual' ELSE a.pause_reason END"
                     }
+                    "failure_kind" => {
+                        "coalesce(json_extract((SELECT details FROM agent_failures f WHERE f.agent_id=a.id),'$.kind'),'unknown')"
+                    }
                     _ => unreachable!(),
                 };
-                let predicate =
-                    format!("coalesce(({column}) IN (SELECT value FROM json_each(?{bind})),0)");
+                let value = if matches!(field, Some("id" | "launched_by")) {
+                    "CAST(value AS INTEGER)"
+                } else {
+                    "value"
+                };
+                let exact = format!("({column}) IN (SELECT {value} FROM json_each(?{bind}))");
+                let predicate = if matches!(field, Some("id" | "launched_by")) {
+                    // These identity columns are NOT NULL. Keeping the predicate
+                    // unwrapped lets SQLite seek instead of scanning the project.
+                    exact
+                } else {
+                    format!("coalesce({exact},0)")
+                };
                 if field == Some("pause_reason") {
                     format!("(coalesce(a.state='paused',0) AND {predicate})")
+                } else if field == Some("failure_kind") {
+                    format!("(coalesce(a.state='crashed',0) AND {predicate})")
                 } else {
                     predicate
                 }
@@ -396,8 +437,13 @@ impl ParsedAgentQuery {
     }
 
     pub fn from_filter(filter: AgentFilter<'_>) -> R<Self> {
-        if !["all", "active", "attention", "finished"].contains(&filter.category) {
-            return Err(bad("category must be all, active, attention or finished"));
+        if !["all", "active", "attention", "finished"].contains(&filter.category)
+            && !STATES.contains(&filter.category)
+        {
+            return Err(bad(format!(
+                "category must be all, active, attention, finished, or {}",
+                STATES.join(", ")
+            )));
         }
         let mut query = Self::parse(filter.search)?;
         for (field, value) in [
@@ -439,11 +485,36 @@ impl ParsedAgentQuery {
         if self.value_count > MAX_VALUES {
             return Err(bad("search must have at most 128 field values"));
         }
-        for value in &values {
+        for value in &mut values {
+            if matches!(field.as_deref(), Some("id" | "launched_by")) {
+                let allow_user = field.as_deref() == Some("launched_by");
+                let parsed = if allow_user && value == "user" {
+                    Some(0)
+                } else if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    value.parse::<i64>().ok()
+                } else {
+                    None
+                };
+                let minimum = if allow_user { 0 } else { 1 };
+                let Some(id) = parsed.filter(|id| *id >= minimum) else {
+                    let choices = if allow_user {
+                        "user, 0, or a positive integer agent ID"
+                    } else {
+                        "a positive integer agent ID"
+                    };
+                    return Err(bad(format!(
+                        "{} must be {choices} (at most {})",
+                        field.as_deref().unwrap(),
+                        i64::MAX
+                    )));
+                };
+                *value = id.to_string();
+            }
             let valid = match field.as_deref() {
                 Some("provider") => ["claude", "codex"].contains(&value.as_str()),
                 Some("state") => STATES.contains(&value.as_str()),
                 Some("pause_reason") => ["manual", "limit", "restart"].contains(&value.as_str()),
+                Some("failure_kind") => FailureKind::ALL.iter().any(|kind| kind.as_str() == value),
                 Some("group") => true,
                 _ => !value.is_empty(),
             };
@@ -452,6 +523,11 @@ impl ParsedAgentQuery {
                     Some("provider") => "claude or codex".to_string(),
                     Some("state") => STATES.join(", "),
                     Some("pause_reason") => "manual, limit or restart".to_string(),
+                    Some("failure_kind") => FailureKind::ALL
+                        .iter()
+                        .map(|kind| kind.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     _ => "nonempty".to_string(),
                 };
                 return Err(bad(format!(
@@ -772,6 +848,177 @@ mod tests {
         assert_ne!(
             ParsedAgentQuery::parse("a OR b c").unwrap().scope(),
             ParsedAgentQuery::parse("(a OR b) c").unwrap().scope()
+        );
+    }
+
+    #[test]
+    fn targeted_fields_validate_ids_and_keep_literal_values() {
+        for input in [
+            "id:0",
+            "id:user",
+            "id:-1",
+            "id:+1",
+            "id:1.0",
+            "id:1e2",
+            "id:١",
+            "id:9223372036854775808",
+            "launched_by:-1",
+            "launched_by:USER",
+            "launched_by:9223372036854775808",
+            "name:\"\"",
+            "task:\"\"",
+            "status:\"\"",
+            "failure_kind:network",
+            "failure_kind:Transport",
+        ] {
+            assert_eq!(
+                ParsedAgentQuery::parse(input).unwrap_err().0,
+                400,
+                "{input}"
+            );
+        }
+        let query = ParsedAgentQuery::parse(
+            r#"id:00042,42,9223372036854775807 name:"Launch, er" launched_by:user,0,007 task:"A_%\\B" status:ÄÄ"#,
+        )
+        .unwrap();
+        let clauses = query.clauses().unwrap();
+        assert_eq!(clauses[0].values, ["42", "9223372036854775807"]);
+        assert_eq!(clauses[1].values, ["Launch, er"]);
+        assert_eq!(clauses[2].values, ["0", "7"]);
+        assert_eq!(clauses[3].values, ["A_%\\B"]);
+        assert_eq!(clauses[4].values, ["ÄÄ"]);
+        assert_eq!(
+            query.scope(),
+            ParsedAgentQuery::parse(&query.text()).unwrap().scope()
+        );
+        assert_eq!(
+            ParsedAgentQuery::parse("task:Review,REVIEW status:ÄÄ launched_by:user id:00042")
+                .unwrap()
+                .scope(),
+            ParsedAgentQuery::parse("id:42 launched_by:0 status:ää task:review")
+                .unwrap()
+                .scope()
+        );
+        assert_ne!(
+            ParsedAgentQuery::parse("name:Launcher").unwrap().scope(),
+            ParsedAgentQuery::parse("name:launcher").unwrap().scope()
+        );
+    }
+
+    #[test]
+    fn targeted_fields_compile_to_scoped_exact_or_literal_substring_matches() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.create_scalar_function(
+            "acom_lower",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TABLE agents(id INTEGER,project INTEGER,name TEXT,launched_by INTEGER,task TEXT,status_text TEXT,state TEXT DEFAULT 'crashed');
+             CREATE TABLE agent_failures(agent_id INTEGER PRIMARY KEY, details TEXT);
+             INSERT INTO agents(id,project,name,launched_by,task,status_text) VALUES
+                (1,1,'Launcher',0,'Review A_%\\B parser','Waiting for ÄÄ review'),
+                (2,1,'launcher',1,'Launcher reviews something else',NULL),
+                (3,1,'Worker',1,NULL,'Launcher'),
+                (12,1,'Launcher helper',0,'Review AXZB parser','Ready'),
+                (4,2,'Launcher',1,'Review A_%\\B parser','Waiting for ÄÄ review');
+             UPDATE agents SET state='idle' WHERE id=2;
+             INSERT INTO agent_failures VALUES (1,json_object('kind','transport')),(2,json_object('kind','authentication'));",
+        )
+        .unwrap();
+        for (search, expected) in [
+            ("id:1", vec![1]),
+            ("id:001,3", vec![1, 3]),
+            ("name:Launcher", vec![1]),
+            ("name:launcher", vec![2]),
+            ("launched_by:user", vec![1, 12]),
+            ("launched_by:1", vec![2, 3]),
+            (r#"task:"a_%\\b""#, vec![1]),
+            ("task:launcher", vec![2]),
+            ("status:launcher", vec![3]),
+            ("status:ää", vec![1]),
+            ("task:ready,review", vec![1, 2, 12]),
+            ("NOT status:launcher", vec![1, 2, 12]),
+            ("NOT task:review", vec![3]),
+            ("failure_kind:transport", vec![1]),
+            ("failure_kind:authentication", vec![]),
+            ("failure_kind:unknown", vec![3, 12]),
+            ("NOT failure_kind:transport", vec![2, 3, 12]),
+            ("state:idle OR failure_kind:transport", vec![1, 2]),
+            (
+                "launched_by:1 (task:review OR status:launcher) NOT name:Launcher",
+                vec![2, 3],
+            ),
+            (r#"name:"x' OR 1=1 --""#, vec![]),
+        ] {
+            let (predicate, params) = ParsedAgentQuery::parse(search).unwrap().compile(Some(1));
+            let mut statement = db
+                .prepare(&format!(
+                    "SELECT id FROM agents a WHERE a.project=?1 AND ({predicate}) ORDER BY id"
+                ))
+                .unwrap();
+            let found = statement
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(found, expected, "{search}");
+        }
+    }
+
+    #[test]
+    fn identity_predicates_keep_indexed_lookup_and_categories_accept_states() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE agents(id INTEGER PRIMARY KEY, project INTEGER NOT NULL,launched_by INTEGER NOT NULL);
+             CREATE INDEX project_agents ON agents(project,id);
+             CREATE INDEX launched_agents ON agents(project,launched_by);",
+        )
+        .unwrap();
+        for field in ["id", "launched_by"] {
+            let (predicate, params) = ParsedAgentQuery::parse(&format!("{field}:42"))
+                .unwrap()
+                .compile(Some(1));
+            let details: Vec<String> = db
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN SELECT id FROM agents a WHERE a.project=?1 AND ({predicate})"
+                ))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(params), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.starts_with("SEARCH a ") && detail.contains(&format!("{field}=?"))
+                }),
+                "{field}: {details:?}"
+            );
+        }
+        for category in STATES
+            .iter()
+            .copied()
+            .chain(["all", "active", "attention", "finished"])
+        {
+            assert!(
+                ParsedAgentQuery::from_filter(AgentFilter {
+                    category,
+                    ..AgentFilter::default()
+                })
+                .is_ok()
+            );
+        }
+        assert!(
+            ParsedAgentQuery::from_filter(AgentFilter {
+                category: "stopped",
+                ..AgentFilter::default()
+            })
+            .is_err()
         );
     }
 }

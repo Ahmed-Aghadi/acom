@@ -1,11 +1,12 @@
 // The HTTP API. Thin: it parses requests and calls into App.
 
 use crate::app::{
-    AgentFilter, App, Fail, HistoryQuery, LaunchReq, PageQuery, ParsedAgentQuery, R, Settings,
-    ThreadReq, UsageWatch, WaitAgents, WaitOptions, acom_home, actor, bad, bounded_record,
-    not_found,
+    AgentFilter, App, Fail, GlobalSettings, HistoryQuery, LaunchReq, PageQuery, ParsedAgentQuery,
+    R, Settings, ThreadReq, UsageWatch, WaitAgents, WaitOptions, acom_home, actor, bad,
+    bounded_record, not_found,
 };
 use crate::harness::catalog;
+use crate::workspace::Workspace;
 use serde_json::{Value, json};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
@@ -18,8 +19,12 @@ use std::time::Duration;
 
 const UI: &str = include_str!("ui.html");
 const MARKDOWN: &str = include_str!("vendor/markdown-it-15.0.3.min.js");
+const CHARTS: &str = include_str!("charts.js");
+const PROJECT_DATA: &str = include_str!("project-data.js");
 const MARKDOWN_NOTICES: &str = include_str!("vendor/NOTICES.txt");
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+mod metrics_api;
+mod workspace_api;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -46,7 +51,7 @@ pub fn serve(port: u16) {
         std::process::exit(1);
     }
     let home = acom_home();
-    if let Err(e) = std::fs::create_dir_all(&home) {
+    if let Err(e) = crate::app::private_directory(&home) {
         eprintln!("can't create {}: {e}", home.display());
         std::process::exit(1);
     }
@@ -68,7 +73,7 @@ pub fn serve(port: u16) {
             std::process::exit(1);
         }
     };
-    let app = match App::open(home.clone(), url.clone()) {
+    let app = match Workspace::open(home.clone(), url.clone()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("can't start: {}", e.1);
@@ -88,7 +93,7 @@ pub fn serve(port: u16) {
                 if let Err(e) = app.tick() {
                     eprintln!("tick: {}", e.1);
                 }
-                if let Err(e) = crate::usage::schedule(&app) {
+                if let Err(e) = crate::usage::schedule(&app.global) {
                     eprintln!("usage checks: {}", e.1);
                 }
             }
@@ -116,17 +121,17 @@ pub fn serve(port: u16) {
     drop(lock);
 }
 
-fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
+fn handle(app: &Arc<Workspace>, mut req: tiny_http::Request) {
     let method = req.method().as_str().to_string();
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
-    let res = request_body(app, &mut req, &method).and_then(|b| {
+    let res = request_body(&app.global, &mut req, &method).and_then(|b| {
         let segs: Vec<&str> = path
             .trim_matches('/')
             .split('/')
             .filter(|s| !s.is_empty())
             .collect();
-        route(app, &method, &segs, &Query(query), &b)
+        workspace_api::route_workspace(app, &method, &segs, &Query(query), &b)
     });
     let (code, body, ctype) = match res {
         Ok(Reply::Html(h)) => (200, h.to_string(), "text/html; charset=utf-8"),
@@ -495,12 +500,17 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
             "GET",
             [
                 "assets",
-                "markdown-it-15.0.3.min.js" | "markdown-NOTICES.txt",
+                "markdown-it-15.0.3.min.js"
+                | "markdown-NOTICES.txt"
+                | "charts.js"
+                | "project-data.js",
             ],
         ) => ("", "", ""),
         ("GET", ["models"] | ["catalog"] | ["agents", _, "project"]) => ("", "", ""),
         ("GET", ["overview"]) => ("", "project since", RECORD),
         ("GET", ["settings"] | ["limits"] | ["locks", _]) => ("", "project", RECORD),
+        ("GET", ["global-settings"]) => ("", "", RECORD),
+        ("PUT", ["global-settings"]) => ("settings via", "", ""),
         ("GET", ["storage"]) => ("", "project", ""),
         ("GET", ["projects"]) if q.get("path").is_some() => ("", "path", RECORD),
         ("GET", ["projects"] | ["configs"] | ["notices", _]) => ("", "", PAGE),
@@ -512,6 +522,9 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
         ),
         ("GET", ["agent-query"]) => ("", "search", RECORD),
         ("GET", ["agents", _] | ["messages", _] | ["receipts", _]) => ("", "agent", RECORD),
+        ("GET", ["agents", _, "permissions"]) => ("", "viewer", RECORD),
+        ("PUT", ["agents", _, "permissions"]) => ("grants version via", "", ""),
+        ("POST", ["controls"]) => ("agent action agents if_states limit after through", "", ""),
         ("GET", ["agents", _, "log"]) => (
             "",
             "agent lines before after through version since limit max_bytes",
@@ -519,9 +532,11 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
         ),
         ("GET", ["subscriptions"]) => ("", "agent viewer", PAGE),
         ("GET", ["subscriptions", _]) => ("", "viewer", RECORD),
-        ("GET", ["threads"]) => ("", "project agent viewer", PAGE),
+        ("GET", ["threads"]) => ("", "project agent viewer sort cursor", PAGE),
         ("GET", ["threads", _]) => ("", "agent offset version", PAGE),
         ("GET", ["threads", _, "metadata"]) => ("", "agent", RECORD),
+        ("GET", ["threads", _, "draft"]) => ("", "", RECORD),
+        ("PUT", ["threads", _, "draft"]) => ("text version via", "", ""),
         ("GET", ["threads", _, "messages"]) => ("", "agent", PAGE),
         ("GET", ["folders"]) => (
             "",
@@ -584,7 +599,10 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
     match b.as_object() {
         Some(fields) => {
             for (key, value) in fields {
-                if !allowed(key, body) && !allowed(key, body_extra) {
+                if !(allowed(key, body)
+                    || allowed(key, body_extra)
+                    || key == "via_project" && allowed("via", body))
+                {
                     return Err(bad(format!("unknown request field {key:?}")));
                 }
                 validate_body_value(method, p, key, value)?;
@@ -592,6 +610,9 @@ fn validate_request(method: &str, p: &[&str], q: &Query, b: &Value) -> R<()> {
         }
         None if method == "GET" && b.is_null() => {}
         None => return Err(bad("request body must be a JSON object")),
+    }
+    if b.get("via_project").is_some() && b["via"].as_i64().is_none_or(|id| id <= 0) {
+        return Err(bad("via_project requires a positive via agent ID"));
     }
     let mut seen = std::collections::HashSet::new();
     for part in q.0.split('&').filter(|part| !part.is_empty()) {
@@ -672,7 +693,12 @@ fn validate_body_value(method: &str, p: &[&str], key: &str, value: &Value) -> R<
         return Ok(());
     }
     let valid = match key {
-        "agent" | "via" | "message" | "after" => value.as_i64().is_some_and(|n| n >= 0),
+        "via_project" => value
+            .as_str()
+            .is_some_and(|s| crate::workspace::validate_uuid(s).is_ok()),
+        "agent" | "via" | "message" | "after" | "through" => value.as_i64().is_some_and(|n| n >= 0),
+        "limit" => value.as_i64().is_some_and(|n| (1..=200).contains(&n)),
+        "grants" | "if_states" => value.is_array(),
         "id" | "project" | "thread" | "owner" | "delivery_id" | "config" => {
             value.as_i64().is_some_and(|n| n > 0)
         }
@@ -731,7 +757,10 @@ fn validate_query_value(p: &[&str], key: &str, value: &str) -> R<()> {
         "max_bytes" => (512..=65536).contains(&number()?),
         "before" | "after" if p != ["folders"] => number()? >= 0,
         "hidden" => matches!(value, "0" | "1"),
-        "category" => matches!(value, "all" | "active" | "attention" | "finished"),
+        "category" => {
+            matches!(value, "all" | "active" | "attention" | "finished")
+                || crate::app::STATES.contains(&value)
+        }
         "mark" => crate::app::MARKS.contains(&value),
         "group" | "search" | "state" | "pause_reason" | "provider" | "model" | "effort" => true,
         _ => !value.is_empty(),
@@ -769,7 +798,10 @@ fn strict_decode(value: &str) -> R<String> {
 
 /// Who a user command came from: "user", or "user (via agent 7)".
 fn user(b: &Value) -> String {
-    actor(0, opt_int(b, "via"))
+    match (b["via_project"].as_str(), opt_int(b, "via")) {
+        (Some(project), Some(agent)) => format!("user (via project {project} agent {agent})"),
+        _ => actor(0, opt_int(b, "via")),
+    }
 }
 
 fn page(q: &Query) -> R<PageQuery> {
@@ -784,9 +816,9 @@ fn page(q: &Query) -> R<PageQuery> {
     })
 }
 
-fn record(value: Value, q: &Query) -> R<Value> {
+fn record(app: &App, value: Value, q: &Query) -> R<Value> {
     bounded_record(
-        value,
+        app.public_value(value),
         q.int("offset")?,
         q.int("max_bytes")?.unwrap_or(16000),
         q.get("version").as_deref(),
@@ -795,6 +827,9 @@ fn record(value: Value, q: &Query) -> R<Value> {
 
 fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Reply> {
     use Reply::Json as J;
+    if let Some(reply) = metrics_api::route_metrics(app, method, p, q, b) {
+        return reply;
+    }
     validate_request(method, p, q, b)?;
     if app.lock().shutting_down {
         return Err(Fail(503, "the server is stopping".into()));
@@ -808,6 +843,8 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
     let reply = match (method, p) {
         ("GET", []) => Reply::Html(UI),
         ("GET", ["assets", "markdown-it-15.0.3.min.js"]) => Reply::Script(MARKDOWN),
+        ("GET", ["assets", "charts.js"]) => Reply::Script(CHARTS),
+        ("GET", ["assets", "project-data.js"]) => Reply::Script(PROJECT_DATA),
         ("GET", ["assets", "markdown-NOTICES.txt"]) => Reply::Text(MARKDOWN_NOTICES),
         ("GET", ["models"]) => Reply::Text(crate::app::MODELS),
         ("POST", ["agent-config"]) => {
@@ -830,21 +867,27 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({}))
         }
         ("GET", ["overview"]) => J(record(
+            app,
             app.overview(q.int("project")?, q.get("since").as_deref())?,
             q,
         )?),
-        ("GET", ["settings"]) => J(record(json!(app.settings(q.int("project")?)), q)?),
-        ("GET", ["storage"]) => J(app.storage_usage(q.int("project")?)?),
+        ("GET", ["settings"]) => J(record(app, json!(app.settings(q.int("project")?)), q)?),
+        ("GET", ["global-settings"]) => J(record(app, json!(app.global_settings()?), q)?),
+        ("PUT", ["global-settings"]) => {
+            let settings = serde_json::from_value::<GlobalSettings>(b["settings"].clone())
+                .map_err(|e| bad(format!("invalid global settings: {e}")))?;
+            J(json!(app.put_global_settings(settings, &user(b))?))
+        }
         ("GET", ["catalog"]) => {
             J(json!({ "claude": catalog("claude"), "codex": catalog("codex") }))
         }
 
         // projects
         ("GET", ["projects"]) => match q.get("path") {
-            Some(path) => J(record(app.project_at(&path)?, q)?),
+            Some(path) => J(record(app, app.project_at(&path)?, q)?),
             None => J(app.projects_page(page(q)?)?),
         },
-        ("GET", ["projects", p]) => J(record(app.project_view(id(p)?)?, q)?),
+        ("GET", ["projects", p]) => J(record(app, app.project_view(id(p)?)?, q)?),
         ("POST", ["projects"]) => J(app.add_project(&text(b, "path")?, &user(b))?),
         ("POST", ["projects", p, "remove"]) => {
             app.remove_project(id(p)?, &user(b))?;
@@ -853,6 +896,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
 
         // agents
         ("GET", ["agent-query"]) => J(record(
+            app,
             ParsedAgentQuery::parse(q.get("search").as_deref().unwrap_or(""))?.view(),
             q,
         )?),
@@ -870,7 +914,29 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             },
             page(q)?,
         )?),
-        ("GET", ["agents", a]) => J(record(app.agent_view_for(id(a)?, q.int("agent")?)?, q)?),
+        ("GET", ["agents", a]) => J(record(
+            app,
+            app.agent_view_for(id(a)?, q.int("agent")?)?,
+            q,
+        )?),
+        ("GET", ["agents", a, "permissions"]) => {
+            J(record(app, app.permissions(id(a)?, q.int("viewer")?)?, q)?)
+        }
+        ("PUT", ["agents", a, "permissions"]) => {
+            let grants =
+                serde_json::from_value::<Vec<crate::app::PermissionGrant>>(b["grants"].clone())
+                    .map_err(|e| bad(format!("invalid grants: {e}")))?;
+            J(app.set_permissions_if_current(id(a)?, grants, &text(b, "version")?, &user(b))?)
+        }
+        ("POST", ["controls"]) => {
+            let request = serde_json::from_value::<crate::app::ControlRequest>(b.clone())
+                .map_err(|e| bad(format!("invalid control request: {e}")))?;
+            J(app.controls(request, &user(b))?)
+        }
+        ("GET", ["threads", thread, "draft"]) => J(record(app, app.user_draft(id(thread)?)?, q)?),
+        ("PUT", ["threads", thread, "draft"]) => {
+            J(app.save_user_draft(id(thread)?, &text(b, "text")?, &text(b, "version")?)?)
+        }
         ("GET", ["agents", a, "project"]) => J(json!({"project":app.agent_project(id(a)?)?})),
         ("GET", ["agents", a, "log"]) => {
             let aid = id(a)?;
@@ -974,6 +1040,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             page(q)?,
         )?),
         ("GET", ["subscriptions", subscription]) => J(record(
+            app,
             app.subscription_view(id(subscription)?, q.int("viewer")?)?,
             q,
         )?),
@@ -987,10 +1054,12 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // threads and messages
-        ("GET", ["threads"]) => J(app.threads_page(
+        ("GET", ["threads"]) => J(app.sorted_threads_page(
             q.int("project")?,
             q.int("agent")?,
             q.int("viewer")?,
+            q.get("sort").as_deref().unwrap_or("latest_message"),
+            q.get("cursor").as_deref(),
             page(q)?,
         )?),
         ("POST", ["threads"]) => {
@@ -1012,12 +1081,15 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             J(json!({ "id": tid, "members": members, "private": private, "joinable": joinable }))
         }
         ("GET", ["threads", t]) => J(record(
+            app,
             app.thread_page(id(t)?, q.int("agent")?, page(q)?)?,
             q,
         )?),
-        ("GET", ["threads", t, "metadata"]) => {
-            J(record(app.thread_metadata(id(t)?, q.int("agent")?)?, q)?)
-        }
+        ("GET", ["threads", t, "metadata"]) => J(record(
+            app,
+            app.thread_metadata(id(t)?, q.int("agent")?)?,
+            q,
+        )?),
         ("GET", ["threads", t, "messages"]) => {
             J(app.messages_page(id(t)?, q.int("agent")?, page(q)?)?)
         }
@@ -1084,7 +1156,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             if !crate::harness::KNOWN.contains(&provider.as_str()) {
                 return Err(bad("unknown provider"));
             }
-            app.lock().db.execute("INSERT INTO usage_checks(provider,next_check) VALUES(?1,?2) ON CONFLICT(provider) DO UPDATE SET next_check=?2", rusqlite::params![provider,crate::app::now()])?;
+            app.lock().db.execute("INSERT INTO global.usage_checks(provider,next_check) VALUES(?1,?2) ON CONFLICT(provider) DO UPDATE SET next_check=?2", rusqlite::params![provider,crate::app::now()])?;
             J(json!({}))
         }
         ("POST", ["messages"]) => {
@@ -1099,7 +1171,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
                 .collect();
             J(json!({ "id": mid, "not_woken": not_woken }))
         }
-        ("GET", ["messages", m]) => J(record(app.message_for(id(m)?, q.int("agent")?)?, q)?),
+        ("GET", ["messages", m]) => J(record(app, app.message_for(id(m)?, q.int("agent")?)?, q)?),
         ("GET", ["inbox", a]) => {
             J(app.inbox_page(id(a)?, q.get("mark").as_deref().unwrap_or("new"), page(q)?)?)
         }
@@ -1117,7 +1189,7 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
 
         // locks
         ("GET", ["locks"]) => J(app.locks_page(q.int("project")?, page(q)?)?),
-        ("GET", ["locks", l]) => J(record(app.lock_view(id(l)?, q.int("project")?)?, q)?),
+        ("GET", ["locks", l]) => J(record(app, app.lock_view(id(l)?, q.int("project")?)?, q)?),
         ("POST", ["locks"]) => {
             // An agent's lock goes in its own project.
             let project = match opt_int(b, "agent").filter(|agent| *agent > 0) {
@@ -1163,11 +1235,12 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
         }
 
         // limits, activity, settings
-        ("GET", ["limits"]) => J(record(app.limits(q.int("project")?)?, q)?),
+        ("GET", ["limits"]) => J(record(app, app.limits(q.int("project")?)?, q)?),
         ("GET", ["activity"]) => {
             J(app.activity_page(q.int("project")?, page(q)?, q.int("agent")?)?)
         }
         ("GET", ["activity", a]) => J(record(
+            app,
             app.activity_view(id(a)?, q.int("project")?, q.int("agent")?)?,
             q,
         )?),
@@ -1186,20 +1259,23 @@ fn route(app: &Arc<App>, method: &str, p: &[&str], q: &Query, b: &Value) -> R<Re
             },
         )?),
         ("GET", ["history", event]) => J(record(
+            app,
             app.history_event(q.int("project")?, id(event)?, q.int("viewer")?)?,
             q,
         )?),
-        ("GET", ["receipts", event]) => {
-            J(record(app.receipt_view(id(event)?, q.int("agent")?)?, q)?)
-        }
+        ("GET", ["receipts", event]) => J(record(
+            app,
+            app.receipt_view(id(event)?, q.int("agent")?)?,
+            q,
+        )?),
         ("GET", ["notices", agent]) => J(app.notices_page(id(agent)?, page(q)?)?),
         ("GET", ["notices", agent, notice]) => {
-            J(record(app.notice_view(id(agent)?, id(notice)?)?, q)?)
+            J(record(app, app.notice_view(id(agent)?, id(notice)?)?, q)?)
         }
 
         // configs: Default (id 1), saved ones, and each project's choice
         ("GET", ["configs"]) => J(app.configs_page(page(q)?)?),
-        ("GET", ["configs", c]) => J(record(app.config_view(id(c)?)?, q)?),
+        ("GET", ["configs", c]) => J(record(app, app.config_view(id(c)?)?, q)?),
         ("POST", ["configs"]) => {
             let id = app.add_config(&text(b, "name")?, settings(b, "settings")?, &user(b))?;
             J(json!({ "id": id }))

@@ -26,11 +26,6 @@ CREATE TABLE IF NOT EXISTS subscription_starts (agent INTEGER PRIMARY KEY, at IN
 CREATE TABLE IF NOT EXISTS usage_reset_notices (
  provider TEXT NOT NULL, win TEXT NOT NULL, resets_at INTEGER NOT NULL,
  PRIMARY KEY(provider,win,resets_at));
-CREATE TABLE IF NOT EXISTS usage_observations (
- provider TEXT NOT NULL, win TEXT NOT NULL, used_pct REAL NOT NULL, resets_at INTEGER, at INTEGER NOT NULL,
- PRIMARY KEY(provider,win));
-INSERT OR IGNORE INTO usage_observations(provider,win,used_pct,resets_at,at)
- SELECT provider,win,used_pct,resets_at,at FROM usage;
 ";
 
 fn standard_windows(provider: &str) -> &'static [&'static str] {
@@ -53,7 +48,7 @@ pub(super) fn known_windows(st: &St, provider: &str) -> R<Vec<String>> {
         .collect();
     for row in rows(
         &st.db,
-        "SELECT win FROM usage WHERE provider=?1 UNION SELECT win FROM usage_observations WHERE provider=?1",
+        "SELECT win FROM global.usage WHERE provider=?1 UNION SELECT win FROM global.usage_observations WHERE provider=?1",
         [provider],
     )? {
         names.insert(row["win"].as_str().unwrap().into());
@@ -61,7 +56,7 @@ pub(super) fn known_windows(st: &St, provider: &str) -> R<Vec<String>> {
     Ok(names.into_iter().collect())
 }
 
-pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
+fn usage_shape(watch: &UsageWatch) -> R<UsageWatch> {
     if !crate::harness::KNOWN.contains(&watch.provider.as_str()) {
         return Err(bad("usage provider must be claude or codex"));
     }
@@ -73,10 +68,10 @@ pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
             if watch
                 .percent
                 .is_some_and(|n| n.is_finite() && (0.0..=100.0).contains(&n)) => {}
-        "reset" | "reset-due" if watch.percent.is_none() => {}
+        "reset-due" if watch.percent.is_none() => {}
         _ => {
             return Err(bad(
-                "usage condition is above/below with percent 0–100, or reset/reset-due without percent",
+                "usage condition is above/below with percent 0–100, or reset-due without percent",
             ));
         }
     }
@@ -90,10 +85,15 @@ pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
         }
         .into();
     }
+    Ok(watch)
+}
+
+pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
+    let watch = usage_shape(watch)?;
     let builtins = standard_windows(&watch.provider);
     let known = builtins.contains(&watch.window.as_str())
         || st.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage WHERE provider=?1 AND win=?2 UNION ALL SELECT 1 FROM usage_observations WHERE provider=?1 AND win=?2)",
+            "SELECT EXISTS(SELECT 1 FROM global.usage WHERE provider=?1 AND win=?2 UNION ALL SELECT 1 FROM global.usage_observations WHERE provider=?1 AND win=?2)",
             params![watch.provider, watch.window],
             |row| row.get::<_, bool>(0),
         )?;
@@ -101,7 +101,7 @@ pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
         let mut choices: BTreeSet<String> = builtins.iter().map(|s| (*s).into()).collect();
         for row in rows(
             &st.db,
-            "SELECT win FROM usage WHERE provider=?1 UNION SELECT win FROM usage_observations WHERE provider=?1 ORDER BY win LIMIT 13",
+            "SELECT win FROM global.usage WHERE provider=?1 UNION SELECT win FROM global.usage_observations WHERE provider=?1 ORDER BY win LIMIT 13",
             [&watch.provider],
         )? {
             choices.insert(row["win"].as_str().unwrap().into());
@@ -129,6 +129,228 @@ pub(super) fn normalize_usage(st: &St, watch: &UsageWatch) -> R<UsageWatch> {
         )));
     }
     Ok(watch)
+}
+
+pub(super) fn normalize_watch(db: &Connection, owner: i64, mut watch: AgentWatch) -> R<AgentWatch> {
+    watch.usage = watch.usage.as_ref().map(usage_shape).transpose()?;
+    let Some(agents) = &mut watch.agents else {
+        if !watch.states.is_empty() || watch.status_text {
+            return Err(bad("states and status_text require watched agents"));
+        }
+        return Ok(watch);
+    };
+    match agents {
+        WaitAgents::All(value) if value == "all" => {}
+        WaitAgents::All(_) => return Err(bad("agents must be all or an array of agent IDs")),
+        WaitAgents::Selected(ids) => {
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() || ids.len() > 200 {
+                return Err(bad("watch 1–200 agent IDs, or all"));
+            }
+            let project: i64 =
+                db.query_row("SELECT project FROM agents WHERE id=?1", [owner], |row| {
+                    row.get(0)
+                })?;
+            for agent in ids {
+                if *agent <= 0 || *agent == owner {
+                    return Err(bad("watch positive peer agent IDs, not yourself"));
+                }
+                let peer: Option<i64> = db
+                    .query_row("SELECT project FROM agents WHERE id=?1", [*agent], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let peer = peer.ok_or_else(|| not_found(format!("no agent {agent}")))?;
+                if peer != project {
+                    return Err(bad(format!("agent {agent} is in another project")));
+                }
+            }
+        }
+    }
+    watch.states.sort();
+    watch.states.dedup();
+    if watch.states.is_empty()
+        || watch
+            .states
+            .iter()
+            .any(|state| !STATES.contains(&state.as_str()))
+    {
+        return Err(bad(format!(
+            "states must contain lifecycle states: {}",
+            STATES.join(", ")
+        )));
+    }
+    Ok(watch)
+}
+
+fn archive_watch(db: &Connection, owner: i64, value: Option<String>) -> R<AgentWatch> {
+    let value = value.ok_or_else(|| bad("archive watch exceeds 64 KiB"))?;
+    let watch: AgentWatch = serde_json::from_str(&value)
+        .map_err(|error| bad(format!("invalid archive watch: {error}")))?;
+    let normalized = normalize_watch(db, owner, watch.clone())?;
+    if watch.usage.as_ref().map(|usage| &usage.window)
+        != normalized.usage.as_ref().map(|usage| &usage.window)
+    {
+        return Err(bad("archive watch uses a noncanonical usage window"));
+    }
+    Ok(normalized)
+}
+
+fn archive_cause(value: &str) -> R<Value> {
+    let cause: Value = serde_json::from_str(value)
+        .map_err(|error| bad(format!("invalid archive subscription cause: {error}")))?;
+    let invalid = || bad("invalid archive subscription cause");
+    let object = cause.as_object().ok_or_else(invalid)?;
+    let kind = cause["kind"].as_str().ok_or_else(invalid)?;
+    let fields: &[&str] = match kind {
+        "event" => &["event", "agent", "event_kind"],
+        "usage" => &["provider", "window", "used", "observed_at", "stale"],
+        "message" => &["message", "thread", "agent"],
+        "notice" => &["notice"],
+        "coordination" => &["event", "thread"],
+        "delivery" => &["delivery"],
+        "foreground-wait" => &["at"],
+        "timeout" | "canceled" => &[],
+        _ => return Err(invalid()),
+    };
+    if cause["summary"]
+        .as_str()
+        .is_none_or(|summary| summary.len() > 4096)
+        || object
+            .keys()
+            .any(|key| key != "kind" && key != "summary" && !fields.contains(&key.as_str()))
+        || fields.iter().any(|field| !object.contains_key(*field))
+    {
+        return Err(invalid());
+    }
+    for field in ["event", "message", "thread", "notice", "delivery"] {
+        if let Some(value) = object.get(field)
+            && !(field == "thread" && kind == "coordination" && value.is_null())
+            && value.as_i64().is_none_or(|id| id <= 0)
+        {
+            return Err(invalid());
+        }
+    }
+    if let Some(agent) = object.get("agent")
+        && !(kind == "event" && agent.is_null())
+        && agent.as_i64().is_none_or(|id| id < 0)
+    {
+        return Err(invalid());
+    }
+    if kind == "event"
+        && cause["event_kind"]
+            .as_str()
+            .is_none_or(|kind| kind.is_empty() || kind.len() > 256)
+    {
+        return Err(invalid());
+    }
+    if kind == "foreground-wait" && cause["at"].as_i64().is_none_or(|at| at < 0) {
+        return Err(invalid());
+    }
+    if kind == "usage" {
+        let watch = UsageWatch {
+            provider: cause["provider"].as_str().ok_or_else(invalid)?.into(),
+            window: cause["window"].as_str().ok_or_else(invalid)?.into(),
+            condition: "above".into(),
+            percent: cause["used"].as_f64(),
+        };
+        usage_shape(&watch)?;
+        if cause["observed_at"].as_i64().is_none_or(|at| at < 0) || !cause["stale"].is_boolean() {
+            return Err(invalid());
+        }
+    }
+    Ok(cause)
+}
+
+pub(super) fn validate_archive(db: &Connection) -> R<()> {
+    let mut statement = db.prepare(
+        "SELECT s.agent,s.project,a.project,s.mode,s.state,s.created_at,s.deadline,
+          s.completed_at,s.cursor,
+          CASE WHEN length(CAST(s.watch AS BLOB))<=65536 THEN s.watch END,
+          CASE WHEN length(CAST(s.completion AS BLOB))<=16384 THEN s.completion END,
+          s.completion IS NOT NULL
+         FROM subscriptions s LEFT JOIN agents a ON a.id=s.agent",
+    )?;
+    let mut saved = statement.query([])?;
+    while let Some(row) = saved.next()? {
+        let owner: i64 = row.get(0)?;
+        let project: i64 = row.get(1)?;
+        let owner_project: Option<i64> = row.get(2)?;
+        let mode: String = row.get(3)?;
+        let state: String = row.get(4)?;
+        let created: i64 = row.get(5)?;
+        let deadline: Option<i64> = row.get(6)?;
+        let completed: Option<i64> = row.get(7)?;
+        let cursor: i64 = row.get(8)?;
+        let watch = archive_watch(db, owner, row.get(9)?)?;
+        let completion: Option<String> = row.get(10)?;
+        let has_completion: bool = row.get(11)?;
+        if owner <= 0
+            || owner_project != Some(project)
+            || created < 0
+            || cursor < 0
+            || completed.is_some_and(|at| at < 0)
+            || !matches!(mode.as_str(), "once" | "persistent")
+            || !matches!(state.as_str(), "active" | "resolved" | "canceled")
+            || (mode == "persistent"
+                && (deadline.is_some()
+                    || state == "resolved"
+                    || (watch.agents.is_none() && watch.usage.is_none())))
+            || (mode == "once"
+                && !deadline.is_some_and(|at| {
+                    at.checked_sub(created)
+                        .is_some_and(|seconds| (1..=3600).contains(&seconds))
+                }))
+            || ((state == "active") != (completed.is_none() && !has_completion))
+            || ((state != "active") && (completed.is_none() || !has_completion))
+        {
+            return Err(bad("archive contains invalid subscription registration"));
+        }
+        if has_completion {
+            let cause = archive_cause(
+                &completion.ok_or_else(|| bad("archive completion exceeds 16 KiB"))?,
+            )?;
+            if (state == "canceled") != (cause["kind"] == "canceled") {
+                return Err(bad(
+                    "archive subscription completion does not match its state",
+                ));
+            }
+        }
+    }
+    let mut statement = db.prepare(
+        "SELECT agent_id,CASE WHEN length(CAST(filter AS BLOB))<=65536 THEN filter END,event_id
+         FROM wait_watch_cursors",
+    )?;
+    let mut saved = statement.query([])?;
+    while let Some(row) = saved.next()? {
+        let watch = archive_watch(db, row.get(0)?, row.get(1)?)?;
+        if row.get::<_, i64>(2)? < 0 || (watch.agents.is_none() && watch.usage.is_none()) {
+            return Err(bad("archive contains an invalid wait filter cursor"));
+        }
+    }
+    let mut statement = db.prepare(
+        "SELECT u.agent,s.agent,u.delivered,u.event_key,
+          CASE WHEN length(CAST(u.cause AS BLOB))<=16384 THEN u.cause END
+         FROM subscription_updates u LEFT JOIN subscriptions s ON s.id=u.subscription",
+    )?;
+    let mut saved = statement.query([])?;
+    while let Some(row) = saved.next()? {
+        let owner: i64 = row.get(0)?;
+        let subscription_owner: Option<i64> = row.get(1)?;
+        let delivered: i64 = row.get(2)?;
+        let key: String = row.get(3)?;
+        let cause: Option<String> = row.get(4)?;
+        if subscription_owner != Some(owner)
+            || !matches!(delivered, 0 | 1)
+            || key.is_empty()
+            || key.len() > 256
+        {
+            return Err(bad("archive contains an invalid subscription update"));
+        }
+        archive_cause(&cause.ok_or_else(|| bad("archive subscription cause exceeds 16 KiB"))?)?;
+    }
+    Ok(())
 }
 
 fn ceiling(st: &St) -> R<i64> {
@@ -163,8 +385,7 @@ pub(super) fn events(
          OR (kind='agent.status' AND ?8)))
        OR (json_extract(details,'$.provider')=?9 AND json_extract(details,'$.window')=?10 AND (
          (kind='usage.reset-due' AND ?11='reset-due') OR (kind='usage.observed' AND (
-          (?11='reset' AND json_extract(details,'$.reset')=1)
-          OR (?11='above' AND json_extract(details,'$.used')>?12 AND (json_extract(details,'$.before_used') IS NULL OR json_extract(details,'$.before_used')<=?12))
+          (?11='above' AND json_extract(details,'$.used')>?12 AND (json_extract(details,'$.before_used') IS NULL OR json_extract(details,'$.before_used')<=?12))
           OR (?11='below' AND json_extract(details,'$.used')<?12 AND (json_extract(details,'$.before_used') IS NULL OR json_extract(details,'$.before_used')>=?12)))))))
       ORDER BY id LIMIT ?14",
       params![st.agent(owner)?.project,after,through,all,owner,ids.to_string(),json!(watch.states).to_string(),watch.status_text,
@@ -185,14 +406,14 @@ pub(super) fn event_cause(event: &Value) -> Value {
 pub(super) fn initial_usage(st: &St, watch: &UsageWatch) -> R<Option<Value>> {
     let current = rows(
         &st.db,
-        "SELECT used_pct used,resets_at,at FROM usage WHERE provider=?1 AND win=?2",
+        "SELECT used_pct used,resets_at,at FROM global.usage WHERE provider=?1 AND win=?2",
         params![watch.provider, watch.window],
     )?
     .pop();
     let missing = current.is_none();
     let current = match current {
         Some(value) => Some(value),
-        None => rows(&st.db,"SELECT used_pct used,resets_at,at FROM usage_observations WHERE provider=?1 AND win=?2",params![watch.provider,watch.window])?.pop(),
+        None => rows(&st.db,"SELECT used_pct used,resets_at,at FROM global.usage_observations WHERE provider=?1 AND win=?2",params![watch.provider,watch.window])?.pop(),
     };
     let Some(current) = current else {
         return Ok(None);
@@ -454,7 +675,7 @@ pub(super) fn observe_usage(
 ) -> R<()> {
     let previous = rows(
         &st.db,
-        "SELECT used_pct used,resets_at FROM usage_observations WHERE provider=?1 AND win=?2",
+        "SELECT used_pct used,resets_at FROM global.usage_observations WHERE provider=?1 AND win=?2",
         params![provider, win],
     )?
     .pop();
@@ -462,14 +683,14 @@ pub(super) fn observe_usage(
         Some(value) => Some(value),
         None => rows(
             &st.db,
-            "SELECT used_pct used,resets_at FROM usage WHERE provider=?1 AND win=?2",
+            "SELECT used_pct used,resets_at FROM global.usage WHERE provider=?1 AND win=?2",
             params![provider, win],
         )?
         .pop(),
     };
     let observed_at = now();
     for table in ["usage", "usage_observations"] {
-        st.db.execute(&format!("INSERT OR REPLACE INTO {table}(provider,win,used_pct,resets_at,at) VALUES(?1,?2,?3,?4,?5)"),params![provider,win,used,resets_at,observed_at])?;
+        st.db.execute(&format!("INSERT OR REPLACE INTO global.{table}(provider,win,used_pct,resets_at,at) VALUES(?1,?2,?3,?4,?5)"),params![provider,win,used,resets_at,observed_at])?;
     }
     if previous
         .as_ref()
@@ -479,21 +700,18 @@ pub(super) fn observe_usage(
     }
     let before = previous.as_ref().and_then(|p| p["used"].as_f64());
     let before_reset = previous.as_ref().and_then(|p| p["resets_at"].as_i64());
-    let reset = before.is_some_and(|old| old >= 100.0 && used < 100.0)
-        || before_reset.zip(resets_at).is_some_and(|(old, new)| {
-            new > old && (old <= now() || before.is_some_and(|old_used| used < old_used))
-        });
-    for project in rows(&st.db, "SELECT id FROM projects", [])? {
-        st.event(project["id"].as_i64().unwrap(),None,None,"usage.observed","acom",json!({"provider":provider,"window":win,"before_used":before,"used":used,"before_reset":before_reset,"resets_at":resets_at,"reset":reset}))?;
-    }
-    Ok(())
+    accounts::record(
+        st,
+        "usage.observed",
+        json!({"provider":provider,"window":win,"before_used":before,"used":used,"before_reset":before_reset,"resets_at":resets_at}),
+    )
 }
 
 fn reset_due(st: &St) -> R<()> {
     for usage in rows(&st.db,"SELECT provider,win,resets_at,used_pct,at,stale FROM (
-      SELECT provider,win,resets_at,used_pct,at,0 stale FROM usage
-      UNION ALL SELECT provider,win,resets_at,used_pct,at,1 stale FROM usage_observations o
-        WHERE NOT EXISTS(SELECT 1 FROM usage u WHERE u.provider=o.provider AND u.win=o.win)
+      SELECT provider,win,resets_at,used_pct,at,0 stale FROM global.usage
+      UNION ALL SELECT provider,win,resets_at,used_pct,at,1 stale FROM global.usage_observations o
+        WHERE NOT EXISTS(SELECT 1 FROM global.usage u WHERE u.provider=o.provider AND u.win=o.win)
       ) known WHERE resets_at<=?1 AND resets_at IS NOT NULL
         AND NOT EXISTS(SELECT 1 FROM usage_reset_notices n WHERE n.provider=known.provider AND n.win=known.win AND n.resets_at=known.resets_at)",[now()])? {
         st.db.execute("INSERT INTO usage_reset_notices(provider,win,resets_at) VALUES(?1,?2,?3)",params![usage["provider"].as_str(),usage["win"].as_str(),usage["resets_at"].as_i64()])?;
@@ -580,6 +798,7 @@ impl App {
             "persistent"
         };
         let result=st.atomic(|st| {
+            accounts::catch_up(st)?;
             reset_due(st)?;
             let through=ceiling(st)?;
             if options.after.is_some_and(|after|after<0 || after>through) {return Err(bad("after must be between 0 and the latest event ID"));}
@@ -693,6 +912,274 @@ mod usage_tests {
     }
 
     #[test]
+    fn archive_validation_keeps_dynamic_windows_without_destination_observations() {
+        let app = app();
+        app.lock()
+            .db
+            .execute_batch(
+                "INSERT INTO global.usage_observations(provider,win,used_pct,at)
+               VALUES('codex','custom dynamic window',85,1);",
+            )
+            .unwrap();
+        app.subscribe(1, None, usage_options("codex", "custom dynamic window"))
+            .unwrap();
+        app.subscribe(1, Some(60), WaitOptions::default()).unwrap();
+        let st = app.lock();
+        st.db
+            .execute_batch("DELETE FROM global.usage; DELETE FROM global.usage_observations;")
+            .unwrap();
+        let before = st.db.total_changes();
+        validate_archive(&st.db).unwrap();
+        assert_eq!(st.db.total_changes(), before);
+    }
+
+    #[test]
+    fn archive_validation_keeps_active_deferred_waits_and_transferred_filters() {
+        let app = app();
+        let deferred = app.subscribe(1, Some(60), WaitOptions::default()).unwrap();
+        assert_eq!(deferred["state"], "active");
+        app.lock().db.execute_batch(
+            "INSERT INTO agents(id,project,name,task,harness,model,effort,state,launched_by,launched_at)
+             VALUES(2,1,'Peer','Review','codex','gpt-6-sol','medium','idle',1,0),
+                   (3,1,'Successor','Continue','codex','gpt-6-sol','medium','idle',1,0);",
+        ).unwrap();
+        app.subscribe(
+            1,
+            None,
+            WaitOptions {
+                agents: Some(WaitAgents::Selected(vec![2])),
+                states: Some(vec!["crashed".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let st = app.lock();
+        let filter = json!({"agents":[2],"states":["crashed"],"status_text":false,"usage":null});
+        st.db
+            .execute(
+                "INSERT INTO wait_watch_cursors(agent_id,filter,event_id) VALUES(1,?1,0)",
+                [filter.to_string()],
+            )
+            .unwrap();
+        App::inherit_memberships(&st, 1, 3).unwrap();
+        st.db
+            .execute("UPDATE agents SET state='replaced' WHERE id=1", [])
+            .unwrap();
+        validate_archive(&st.db).unwrap();
+        controls::validate_archive(&st.db).unwrap();
+        assert_eq!(
+            row(&st, deferred["id"].as_i64().unwrap()).unwrap()["agent"],
+            3
+        );
+    }
+
+    #[test]
+    fn archive_completion_shapes_cover_generated_causes_and_expired_delivery_ids() {
+        for cause in [
+            json!({"kind":"event","event":1,"agent":null,"event_kind":"usage.observed","summary":"event"}),
+            json!({"kind":"message","message":1,"thread":1,"agent":0,"summary":"message"}),
+            json!({"kind":"notice","notice":1,"summary":"notice"}),
+            json!({"kind":"coordination","event":1,"thread":null,"summary":"lock update"}),
+            json!({"kind":"delivery","delivery":1,"summary":"previous receipt"}),
+            json!({"kind":"foreground-wait","at":0,"summary":"foreground wait"}),
+            json!({"kind":"timeout","summary":"its timeout"}),
+            json!({"kind":"canceled","summary":"canceled by user"}),
+        ] {
+            assert_eq!(archive_cause(&cause.to_string()).unwrap(), cause);
+        }
+    }
+
+    #[test]
+    fn archive_validation_rejects_bad_watches_and_completions_without_writes() {
+        let app = app();
+        let id = app
+            .subscribe(1, None, usage_options("codex", "codex primary"))
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        for value in [
+            json!({"agents":null,"states":[],"status_text":false,
+                "usage":{"provider":"codex","window":"codex primary","condition":"above","percent":101}}),
+            json!({"agents":null,"states":[],"status_text":false,
+                "usage":{"provider":"codex","window":"codex primary","condition":"reset","percent":null}}),
+            json!({"agents":[1],"states":["idle"],"status_text":false,"usage":null}),
+            json!({"agents":[999],"states":["idle"],"status_text":false,"usage":null}),
+            json!({"agents":"all","states":["imaginary"],"status_text":false,"usage":null}),
+            json!({"agents":null,"states":[],"status_text":false,"usage":null,"ignored":true}),
+        ] {
+            let st = app.lock();
+            st.db
+                .execute(
+                    "UPDATE subscriptions SET watch=?2 WHERE id=?1",
+                    params![id, value.to_string()],
+                )
+                .unwrap();
+            let before = st.db.total_changes();
+            assert!(validate_archive(&st.db).is_err(), "{value}");
+            assert_eq!(st.db.total_changes(), before);
+        }
+        let st = app.lock();
+        let valid = json!({"agents":null,"states":[],"status_text":false,
+            "usage":{"provider":"codex","window":"codex primary","condition":"above","percent":80}});
+        st.db
+            .execute(
+                "UPDATE subscriptions SET watch=?2 WHERE id=?1",
+                params![id, valid.to_string()],
+            )
+            .unwrap();
+        for completion in ["{", "null", r#"{"kind":"unknown","summary":"invalid"}"#] {
+            st.db.execute("UPDATE subscriptions SET state='canceled',completed_at=1,completion=?2 WHERE id=?1",params![id,completion]).unwrap();
+            assert!(validate_archive(&st.db).is_err());
+        }
+        st.db.execute("UPDATE subscriptions SET state='active',completed_at=NULL,completion=NULL,watch=?2 WHERE id=?1",params![id,"x".repeat(65537)]).unwrap();
+        assert!(validate_archive(&st.db).unwrap_err().1.contains("64 KiB"));
+    }
+
+    #[test]
+    fn archive_validation_checks_saved_wait_filters_and_update_owners() {
+        let app = app();
+        app.subscribe(1, None, usage_options("codex", "codex primary"))
+            .unwrap();
+        let st = app.lock();
+        let filter = json!({"agents":"all","states":["idle"],"status_text":false,"usage":null});
+        st.db
+            .execute(
+                "INSERT INTO wait_watch_cursors(agent_id,filter,event_id) VALUES(1,?1,0)",
+                [filter.to_string()],
+            )
+            .unwrap();
+        validate_archive(&st.db).unwrap();
+        st.db
+            .execute("UPDATE wait_watch_cursors SET filter='{}'", [])
+            .unwrap();
+        assert!(validate_archive(&st.db).is_err());
+        st.db.execute("DELETE FROM wait_watch_cursors", []).unwrap();
+        st.db.execute("INSERT INTO subscription_updates(subscription,agent,at,event_key,cause) VALUES(1,999,1,'event:1',?1)",[json!({"kind":"timeout","summary":"its timeout"}).to_string()]).unwrap();
+        assert!(validate_archive(&st.db).is_err());
+    }
+
+    #[test]
+    fn inferred_reset_watches_reject_without_creating_state() {
+        let app = app();
+        let before = app.lock().db.total_changes();
+        for timeout in [None, Some(60)] {
+            let error = app
+                .subscribe(
+                    1,
+                    timeout,
+                    WaitOptions {
+                        usage: Some(watch("reset", None)),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.0, 400);
+            assert!(error.1.contains("reset-due"));
+            assert_eq!(app.lock().db.total_changes(), before);
+        }
+        let accepted = app
+            .subscribe(
+                1,
+                None,
+                WaitOptions {
+                    usage: Some(watch("reset-due", None)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(accepted["watch"]["usage"]["condition"], "reset-due");
+    }
+
+    #[test]
+    fn registration_catches_up_shared_events_before_choosing_its_baseline() {
+        let app = app();
+        let event = json!({"kind":"usage.observed","details":{"provider":"codex","window":"codex primary","before_used":null,"used":80,"resets_at":null}});
+        app.lock()
+            .db
+            .execute(
+                "WITH RECURSIVE seq(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM seq WHERE id<257)
+             INSERT INTO global.account_events(at,details) SELECT 0,?1 FROM seq",
+                [event.to_string()],
+            )
+            .unwrap();
+        let count = app
+            .lock()
+            .db
+            .query_row("SELECT count(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let error = app
+            .subscribe(1, None, usage_options("codex", "codex primary"))
+            .unwrap_err();
+        assert_eq!(error.0, 503);
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT event_id FROM account_cursor WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM subscriptions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row("SELECT count(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            count
+        );
+        app.sync_accounts().unwrap();
+        let registered = app
+            .subscribe(1, None, usage_options("codex", "codex primary"))
+            .unwrap();
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT event_id FROM account_cursor WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            257
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='usage.observed'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            257
+        );
+        assert_eq!(
+            app.lock()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM subscription_updates WHERE subscription=?1",
+                    [registered["id"].as_i64().unwrap()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn claude_display_aliases_match_registered_and_foreground_usage_events() {
         for (alias, canonical) in [
             ("five-hour", "five_hour"),
@@ -782,7 +1269,10 @@ mod usage_tests {
         }
         for window in ["custom_Bucket primary", "unusual-window", "limit"] {
             app.record_usage("codex", window, 70.0, None).unwrap();
-            app.lock().db.execute("DELETE FROM usage", []).unwrap();
+            app.lock()
+                .db
+                .execute("DELETE FROM global.usage", [])
+                .unwrap();
             let sub = app
                 .subscribe(1, None, usage_options("codex", window))
                 .unwrap();
@@ -796,7 +1286,7 @@ mod usage_tests {
             .unwrap();
         app.lock()
             .db
-            .execute("DELETE FROM usage_observations", [])
+            .execute("DELETE FROM global.usage_observations", [])
             .unwrap();
         assert!(
             app.subscribe(1, None, usage_options("codex", "only-current primary"))
@@ -887,7 +1377,10 @@ mod usage_tests {
         let app = app();
         app.record_usage("codex", "custom-bucket primary", 95.0, None)
             .unwrap();
-        app.lock().db.execute("DELETE FROM usage", []).unwrap();
+        app.lock()
+            .db
+            .execute("DELETE FROM global.usage", [])
+            .unwrap();
         let limits = app.limits(Some(1)).unwrap();
         let windows = &limits["usage_windows"];
         assert!(
@@ -949,7 +1442,7 @@ mod usage_tests {
         );
         app.lock()
             .db
-            .execute("DELETE FROM usage WHERE provider='codex'", [])
+            .execute("DELETE FROM global.usage WHERE provider='codex'", [])
             .unwrap();
         assert!(app.hook(1).unwrap().is_empty());
         app.record_usage("codex", "codex primary", 95.0, reset)
@@ -974,7 +1467,7 @@ mod usage_tests {
         app.record_usage("codex", "codex primary", 95.0, Some(now() + 3600))
             .unwrap();
         let st = app.lock();
-        st.db.execute("DELETE FROM usage", []).unwrap();
+        st.db.execute("DELETE FROM global.usage", []).unwrap();
         let initial = initial_usage(&st, &watch("above", Some(80.0)))
             .unwrap()
             .unwrap();
@@ -1000,7 +1493,7 @@ mod usage_tests {
         app.record_usage("codex", "codex primary", 95.0, Some(now() - 1))
             .unwrap();
         let st = app.lock();
-        st.db.execute("DELETE FROM usage", []).unwrap();
+        st.db.execute("DELETE FROM global.usage", []).unwrap();
         reset_due(&st).unwrap();
         reset_due(&st).unwrap();
         let due =
@@ -1025,7 +1518,10 @@ mod usage_tests {
         let home = app.home.clone();
         app.record_usage("codex", "codex primary", 100.0, None)
             .unwrap();
-        app.lock().db.execute("DELETE FROM usage", []).unwrap();
+        app.lock()
+            .db
+            .execute("DELETE FROM global.usage", [])
+            .unwrap();
         drop(app);
         let app = App::open(home, "http://127.0.0.1:0".into()).unwrap();
         let mut st = app.lock();
@@ -1038,7 +1534,7 @@ mod usage_tests {
         )
         .unwrap();
         assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0]["details"]["reset"], false);
+        assert!(observed[0]["details"].get("reset").is_none());
         st.atomic(|st| observe_usage(st, "codex", "codex primary", 0.0, None))
             .unwrap();
         let recovered = App::event_rows(
@@ -1048,7 +1544,8 @@ mod usage_tests {
         )
         .unwrap();
         assert_eq!(recovered[0]["details"]["before_used"], 100.0);
-        assert_eq!(recovered[0]["details"]["reset"], true);
+        assert_eq!(recovered[0]["details"]["used"], 0.0);
+        assert!(recovered[0]["details"].get("reset").is_none());
     }
 }
 

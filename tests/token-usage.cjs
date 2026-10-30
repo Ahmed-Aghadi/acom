@@ -7,6 +7,7 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const binary = process.env.ACOM_BINARY || path.resolve(__dirname, '../target/debug/acom');
+const { scoped, projectHome } = require('./fixture-workspace.cjs');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function until(check, label, timeout = 12000) {
@@ -27,7 +28,7 @@ let prompt='';process.stdin.on('data',data=>prompt+=data);process.stdin.on('end'
  if(!claude){fs.mkdirSync(dir,{recursive:true});if(!fs.existsSync(history))fs.writeFileSync(history,JSON.stringify({type:'session_meta',payload:{id:session}})+'\\n')}
  const emit=value=>console.log(JSON.stringify(value));
  emit(claude?{type:'system',subtype:'init',session_id:session}:{type:'thread.started',thread_id:session});
- previous.push({turn,session,history,args,pid:process.pid,prompt});fs.writeFileSync(file('runs'),JSON.stringify(previous));
+ previous.push({turn,session,history,args,pid:process.pid,prompt});fs.writeFileSync(file('runs')+'.pending',JSON.stringify(previous));fs.renameSync(file('runs')+'.pending',file('runs'));
  const commands=file('commands')+'-'+turn;let count=0;
  for(;;){
   const lines=fs.existsSync(commands)?fs.readFileSync(commands,'utf8').trim().split('\\n').filter(Boolean):[];
@@ -51,7 +52,7 @@ async function fixture(run) {
   for (const name of ['codex', 'claude']) fs.writeFileSync(path.join(bin, name), client, { mode: 0o700 });
   const env = { ...process.env, HOME: path.join(root, 'user'), ACOM_HOME: home, CODEX_HOME: path.join(root, 'codex'), CLAUDE_CONFIG_DIR: path.join(root, 'claude'), PATH: bin };
   for (const key of ['ACOM_ID', 'ACOM_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) delete env[key];
-  let server, url, errors = '', marker = 0;
+  let server, url, project, runtimeHome, errors = '', marker = 0;
   const start = async () => {
     const probe = net.createServer(); await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
     const port = probe.address().port; await new Promise(resolve => probe.close(resolve));
@@ -68,10 +69,10 @@ async function fixture(run) {
     await until(() => !server || server.exitCode !== null || server.signalCode !== null, 'fixture shutdown', 15000);
   };
   const api = async (method, route, body) => {
-    const response = await fetch(url + route, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const response = await fetch(url + scoped(route, project, body), { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = await response.json(); assert.equal(response.status, 200, `${method} ${route}: ${JSON.stringify(value)}`); return value;
   };
-  const file = (name, id) => path.join(home, `${name}-${id}`);
+  const file = (name, id) => path.join(runtimeHome, `${name}-${id}`);
   const runs = id => fs.existsSync(file('runs', id)) ? JSON.parse(fs.readFileSync(file('runs', id), 'utf8')) : [];
   const command = (id, value) => fs.appendFileSync(`${file('commands', id)}-${runs(id).at(-1).turn}`, JSON.stringify(value) + '\n');
   const emit = async (id, frames, side = false, nativeSession) => {
@@ -99,9 +100,11 @@ async function fixture(run) {
   };
   try {
     await start();
-    const project = (await api('POST', '/projects', { path: projectDir })).id;
-    const config = (await api('GET', '/configs/1')).settings;
-    config.auto_resume = false; config.usage_poll_secs = 3600; config.crash_retries = {};
+    project = (await api('POST', '/projects', { path: projectDir })).id;
+    runtimeHome = projectHome(home, project);
+    const config = (await api('GET', '/configs/default')).settings;
+    config.auto_resume = false; config.crash_retries = {};
+    await api('PUT', '/global-settings', {settings:{usage_poll_secs:3600,metrics_sample_secs:5}});
     config.limits.active = { soft: null, hard: null };
     for (const limits of [config.limits.active_per_harness, config.limits.usage]) for (const key of Object.keys(limits)) limits[key] = { soft: null, hard: null };
     await api('PUT', `/projects/${project}/config`, { custom: config });
@@ -126,12 +129,12 @@ async function fixture(run) {
     await run({ api, project, runs, emit, finish, launch, next, cli, view: id => api('GET', `/agents/${id}`), restart: async () => { await stop(); await start(); } });
   } finally {
     await stop();
-    for (const name of fs.readdirSync(home).filter(name => /^runs-\d+$/.test(name))) {
-      for (const { pid } of JSON.parse(fs.readFileSync(path.join(home, name), 'utf8'))) {
+    for (const name of runtimeHome ? fs.readdirSync(runtimeHome).filter(name => /^runs-\d+$/.test(name)) : []) {
+      for (const { pid } of JSON.parse(fs.readFileSync(path.join(runtimeHome, name), 'utf8'))) {
         try {
           const markers = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
           const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
-          if (markers.includes(`ACOM_HOME=${home}`) && ['codex', 'claude'].some(client => args.includes(path.join(bin, client)))) process.kill(pid, 'SIGKILL');
+          if (markers.includes(`ACOM_HOME=${runtimeHome}`) && ['codex', 'claude'].some(client => args.includes(path.join(bin, client)))) process.kill(pid, 'SIGKILL');
         } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
       }
     }
