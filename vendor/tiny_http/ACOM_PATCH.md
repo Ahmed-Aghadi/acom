@@ -11,6 +11,8 @@ Runtime changes:
 - `src/request.rs` rejects EOF inside a nonzero chunk instead of accepting a truncated chunked body as complete. Its decoder wrapper preserves empty-buffer reads.
 - `src/util/task_pool.rs` counts queued tasks as reservations of sleeping workers. New connections spawn a worker when all sleepers are already reserved, rather than waiting behind persistent connections that keep their workers busy.
 
+Build-only cleanup removes the unused `SequentialWriter` re-export in `src/util/mod.rs` and allows dead code on the intentional `Server: Sync + Send` assertion in `src/lib.rs`. The writer implementation and thread-safety check remain intact.
+
 Discard still waits for unread bytes or disconnection; these changes are not request timeouts, connection limits or general denial-of-service protection. Regressions cover bounded discard, exact body consumption, truncated/complete chunked bodies, empty-buffer reads and queued-worker reservations:
 
 ```sh
