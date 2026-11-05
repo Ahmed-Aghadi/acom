@@ -1,112 +1,105 @@
 # acom
 
-Launch and coordinate Claude Code and Codex agents across your projects from one local dashboard.
+Run Claude Code and Codex agents across your projects from one local dashboard.
 
-- Run agents from either provider, grouped by task or team.
-- Let agents exchange messages, launch helpers and coordinate shared work with named locks.
-- Set project-level usage, concurrency and context limits.
-- Configure crash retries, model replacement and usage recovery.
-- Inspect activity, pause or resume work, and keep conversations across turns.
-- Inspect token history, grant scoped agent controls, and export or restore projects.
+Give agents tasks, follow their work, and talk to them in threads. Agents can message each other, launch helpers, share named locks and subscribe to events through the `acom` CLI. You choose how they work together.
 
-![acom overview showing grouped agents, usage, lifecycle controls and shared locks](docs/images/overview.png)
+![Dark-mode overview with grouped agents, usage, activity and shared locks](docs/images/overview.png)
 
-*Actual UI with synthetic sample data. Usage is shown as unknown; no model turns were run for these screenshots.*
+Screenshots show the actual UI with synthetic sample data. Account usage is unknown; no model turns were run to capture them.
 
-[Quickstart](#quickstart) · [Working with agents](#working-with-agents) · [Troubleshooting](#troubleshooting) · [Documentation](#documentation)
-
-## Before running
-
-You need Linux, a Rust toolchain, Git, and at least one supported CLI (`claude` or `codex`) installed and signed in. The server must be able to find that CLI on its `PATH`. Linux process supervision uses `/proc`; other operating systems are not currently supported.
-
-**Agents run with full account permissions by default and share your project's files.** Review settings before launching in a trusted project. Locks and private threads are coordination tools, not a security sandbox. The web server binds to loopback and has no authentication: do not expose it publicly.
+[Quickstart](#quickstart) · [Conversations](#conversations) · [Search](#search) · [Limits and recovery](#limits-and-recovery) · [Documentation](#documentation)
 
 ## Quickstart
+
+You need Linux, Git, a Rust toolchain with C build tools, and at least one supported CLI (`claude` or `codex`) installed and signed in. The server must find the provider CLI on its `PATH`. No Node.js or npm installation is needed to build or run acom.
+
+**Agents run as your user, with tool-approval prompts bypassed by default.** They share your project files. Review settings before launching. acom is a trusted-local tool, not a security sandbox. Its unauthenticated server binds to loopback; do not expose it publicly.
 
 ```sh
 git clone https://github.com/Ahmed-Aghadi/acom.git
 cd acom
-cargo install --path .
+cargo install --locked --path .
 acom serve
 ```
 
-Open <http://127.0.0.1:7400/>. To use a different port, run `acom serve --port 7401`.
+Open <http://127.0.0.1:7400/>. Use `acom serve --port 7401` for another port.
 
-1. **Add a project:** choose the folder where agents should work.
-2. **Review Settings:** new projects use the read-only **Default** configuration. Choose **Custom** or **Save as new config** to change it; **Save** applies changes or a selected configuration.
-3. **Launch:** choose the provider CLI you installed and signed into, an available model and effort, then enter a task. Check the selected provider explicitly if only one CLI is installed.
-4. **Follow the work:** open **Details** for activity and configuration. Use **Threads** to create a conversation with the agent and send instructions. **Pause** stops its processes; **Resume** continues interrupted work when eligible.
+1. **Add a project.** Choose the folder where agents should work.
+2. **Review Settings.** New projects use read-only **Default**. Choose **Custom** or **Save as new config** to edit settings. **Save** applies your changes or selected configuration.
+3. **Launch an agent.** Choose an installed provider, a model your account can use, an effort level and a task. Catalog entries are not account-access checks.
+4. **Follow the work.** Overview groups agents and shows their state, status and usage. **Details** opens their task, activity, configuration and current threads.
 
-An agent that marks its task done is closed by default; use **Reopen** to continue. Messages do not wake closed agents. The [user guide](docs/usage.md) explains lifecycle states, limits and recovery.
+Agents receive their identity, task, limits and the built-in [agent guide](src/guide.md). One server manages all your projects, each with its own agents, threads, locks and settings.
 
-Models in the catalog are choices, not account-access checks. Select a model supported by your installed CLI and account.
+## Conversations
 
-## Working with agents
+Create a thread to talk with agents or let them coordinate with each other. Threads can have fixed members or follow live state/group filters, with public, private and no-self-join access modes. You remain able to view and manage every thread in your project.
 
-Each project has its own agents, threads, locks and settings. A single server handles all your projects. Agents receive their identity, task, rules and the built-in [agent guide](src/guide.md); they coordinate through the `acom` CLI.
+Messages support basic Markdown, original-text copying, message IDs and shareable references/links. Drafts save locally immediately and sync to the server, with conflict protection between tabs. A sending indicator distinguishes a pending message from one acom has saved.
 
-Threads let you talk with agents and let them talk with each other. They can be public or private, use fixed members or follow live agent-state/group filters. Drafts save locally immediately and sync to the server, with conflict protection between tabs.
+![Dark-mode conversation with agent replies, message IDs and an unread divider](docs/images/threads.png)
 
-Messages display basic Markdown and appear immediately with a sending indicator until acom confirms they are saved. Copy icons preserve original message text and make paths and agent details easy to reuse. Hide the sidebar for more space; the workspace expands with your viewport.
+Idle agents wake for new messages in their threads. Working agents receive notices through provider hooks. By default, an agent that finishes its task becomes **closed**: messages wait until you **Reopen** it. Membership changes alone do not wake agents.
 
-Find threads by title, exact thread ID or current members, matching all or any selected agents. Agent Details lists its current threads. Message metadata includes its ID, **Copy reference** and **Copy link**; links identify the project, thread and message.
+Named locks let agents coordinate changes to shared resources. They are advisory, have a configurable maximum TTL, and do not prevent file edits. Event subscriptions let agents wait for relevant lifecycle or usage changes without repeatedly polling.
 
-Search message text within one thread or across the selected project's complete accessible history, with optional thread, sender and date filters. Exact message-ID lookup is a separate mode, so a numeric text search stays a text search. Results show snippets; opening one highlights the message with surrounding context. Search previews and historical context leave read state unchanged; **Jump to latest** returns to ordinary live reading. Drafts and work marks are preserved.
+## Search
+
+Find agents by name, group, provider, model, state and other fields using the search box or visual **Filters** editor. Find threads by title, exact ID or current members, matching all or any selected agents.
+
+**Search messages** searches the selected project's complete thread history. **Find** in a conversation starts with that thread selected. Choose literal text or an exact message ID, with optional sender, thread and date filters. Numeric text stays a text search unless you select ID mode.
+
+![Dark-mode message search with highlighted matches across project threads](docs/images/search.png)
+
+Results are paginated. Opening a match highlights it with surrounding messages and keeps your draft. Search previews and historical context do not mark messages read; **Jump to latest** restores normal live reading.
 
 The CLI provides the same bounded discovery:
 
 ```sh
+acom agents --search 'state:idle OR pause_reason:limit'
 acom threads --members 2,5 --member-match all
-acom threads --id 12
-acom messages --search 'review findings' --thread 12
-acom messages --search 'review findings' --sender 2
-acom read 83 --thread 12
+acom messages --search 'boundary tests'
+acom read 3 --thread 1
 ```
 
-Omit `--thread` to search all accessible project threads; use `--threads 12,15` for a selected set. `messages --id 83` looks up an exact message ID with optional filters; `read 83` reads its full record without knowing the thread. `--from`/`--to` accept inclusive Unix seconds. Follow printed continuation commands instead of assuming one page is complete. Numeric IDs are project-local, and member filters mean current membership, not historical participation.
+IDs are project-local. User CLI commands resolve the project containing your current directory. Follow printed continuation commands for additional results; see the [user guide](docs/usage.md) for exact filters, quoting and message lookup.
 
-![acom threads showing a user and agents coordinating a review](docs/images/threads.png)
+## Limits and recovery
 
-Project Pause/Resume controls affect the selected project; global controls are under **All projects**. Agent-list filters never narrow those actions.
+- Set project-level concurrency, subscription-usage and context limits. Soft limits warn; configured hard limits act. Account usage is shared, but each project applies its own thresholds.
+- Configure same-model crash retries and replacement models, including cross-provider recovery. Recognized provider quota interruptions use usage recovery rather than crash replacement.
+- **Pause project** and **Resume project** affect the current project. Global controls are under **All projects**. Agent-list filters never narrow those actions.
+- Grant agents selected pause, resume, close or reopen controls over helpers, chosen agents or a project. No delegated controls are granted by default.
 
-Search plain text across agent metadata, or use exact fields:
-
-```text
-group:"Security review" state:paused,crashed reentrancy
-```
-
-Spaces combine conditions with AND; commas within a field give alternatives. This finds the exact group, either state, and `reentrancy` in the agent's metadata. Use `state:idle OR pause_reason:limit` for idle or limit-paused agents, and `NOT (state:closed OR state:replaced)` to exclude closed and replaced agents. Parentheses group conditions; precedence is NOT, AND, OR. The visual **Filters** editor supports Match all/any, exclusion and nested groups without query syntax. Click **Apply filters** to update results. See [agent search](docs/usage.md#finding-agents) for all fields and quoting rules.
-
-Use `name:"Launcher"` for an exact name, or `id:5` for one project-local agent. Details → **Delegated controls** lets you grant selected pause, resume, close or reopen actions to an agent, scoped to its directly launched workers, selected agents or the project. No permissions are granted by default. These are trusted-local coordination rules, not OS isolation.
+Reported tokens and context appear alongside activity. Historical charts support inspection, zoom and optional live following. Missing or incomplete accounting stays distinct from measured zero. See [limits, recovery and metrics](docs/usage.md) for their exact behavior.
 
 ## Data and shutdown
 
-acom stores data in `~/.acom`; set `ACOM_HOME` for a separate installation. Each project has a stable UUID and its own core database, optional metrics database and captured files under `projects/<UUID>/`. Numeric agent/thread/message IDs start independently in each project. Global settings, saved configurations and account observations live separately. Native conversations remain in provider storage unless explicitly archived. Agents edit project files, but acom keeps none of its own state there.
+acom stores state under `~/.acom`; set `ACOM_HOME` for an isolated installation. Projects have stable UUIDs and independent data directories; numeric agent, thread and message IDs may overlap between projects. Shared configurations and account observations live separately. No acom runtime state is written into your project source folder.
 
-**Settings → Storage → Calculate disk usage** checks allocated space on demand, split by project and core state, metrics, logs, native archives, trash and other data. Results may change while agents work; no scans run automatically. Optional history/captured-file cleanup does not remove messages or authoritative accounting. See [storage details](docs/usage.md#storage-restarts-and-upgrades).
+**Settings → Storage** calculates disk usage on demand. Optional metric history can be cleared or downsampled separately from core accounting. Project export/import uses uncompressed `.tar` snapshots, including applied settings and server-saved drafts, with optional captured logs and native transcripts. Imports start no agents and do not overwrite existing projects. Archives contain private data; keep them private.
 
-Project archives are uncompressed `.tar` files containing private project data. Export includes the applied configuration and server-saved drafts; logs and native transcripts are optional. Import validates in staging, never overwrites a project, and starts no workers. See [project archives](docs/usage.md#project-archives).
+Ctrl-C or SIGTERM stops owned workers and tools, then releases their locks. Interrupted working turns become **restart-paused**; idle agents and existing pauses retain their state. Restarting the server does not resume interrupted turns automatically. Use **Resume restart-paused** when ready.
 
-Ctrl-C or SIGTERM stops owned workers and their tools, then releases their locks. Interrupted turns become **restart-paused**; idle agents and existing manual/limit pauses retain their state. Starting the server does not automatically resume interrupted turns. Use **Resume restart-paused**, or `acom resume-restart` for all projects, when ready.
-
-This development format is intentionally incompatible with the previous shared database. Before upgrading, stop the old server and back up its entire data directory. Use a fresh `ACOM_HOME` and recreate configurations; there is no automatic migration or deletion. Current-format archives can be restored into another installation. See [storage, restarts and upgrades](docs/usage.md#storage-restarts-and-upgrades).
+Upgrading from the old shared-database format requires a fresh data directory, not an automatic migration. Stop the old server and back up its data first. See [storage, restarts and upgrades](docs/usage.md#storage-restarts-and-upgrades) and [project archives](docs/usage.md#project-archives).
 
 ## Troubleshooting
 
-- **`acom` is not found:** ensure Cargo's executable directory is on your shell's `PATH`.
-- **A provider CLI or model is unavailable:** check the server's `PATH`, CLI version and login. The server uses the standalone client it finds, not necessarily the one bundled with your editor. Choose an accessible model explicitly; acom does not silently substitute one.
-- **Usage is unknown or recovery is waiting:** open the provider's usage meter for the check error and **Check now**. Unknown is not zero; a reset estimate alone does not confirm available usage.
-- **The server says it is already running:** only one server may use a data directory. For an isolated instance, set a different `ACOM_HOME` and choose a different port.
+- **`acom` is not found:** put Cargo's executable directory on your shell's `PATH`.
+- **A CLI or model is unavailable:** check the server's `PATH`, provider login and account access. acom uses standalone CLIs and does not silently substitute an unavailable model.
+- **Usage is unknown or recovery is waiting:** open the usage meter for errors and **Check now**. Unknown is not zero, and an estimated reset time is not confirmed recovery.
+- **Another server owns the data directory:** stop that instance, or use a separate `ACOM_HOME` and port.
 
-Run `acom --help` for commands or `acom <command> --help` for options. User CLI commands act on the project containing your current directory.
+Run `acom --help` or `acom <command> --help` for command options. Only Linux is currently supported; process supervision relies on `/proc`.
 
 ## Documentation
 
-- [User guide](docs/usage.md): settings, threads, filters, waits, locks, limits, model changes, replacement and recovery.
-- [Agent guide](src/guide.md): the instructions supplied to launched agents; also available with `acom guide`.
-- [Model reference](src/models.md): model/provider comparisons and supported catalog choices; `acom models --catalog` lists IDs and efforts.
-- [Specification](SPEC.md): behavioral contracts and API details.
-- [Development](docs/development.md) and [contributor rules](AGENTS.md): testing, screenshot capture and planned behavior checks.
+- [User guide](docs/usage.md): workflows, settings, filters, lifecycle, limits and recovery.
+- [Agent guide](src/guide.md): instructions supplied to launched agents; also `acom guide`.
+- [Model reference](src/models.md): provider/model information and catalog choices.
+- [Specification](SPEC.md): behavioral contracts and HTTP API.
+- [Development](docs/development.md) and [contributor rules](AGENTS.md): implementation invariants, tests, screenshots and releases.
 
 ## Test
 
@@ -120,6 +113,6 @@ The [development instructions](docs/development.md#tests) cover isolated API/CLI
 
 ## License
 
-acom's own code is licensed under [MIT](LICENSE). Dependencies retain their licenses and attributions in [Third-party notices](THIRD_PARTY_NOTICES.txt). `acom licenses` prints both from the binary without a server.
+acom's own code is [MIT-licensed](LICENSE). Dependencies retain their licenses and attribution in [Third-party notices](THIRD_PARTY_NOTICES.txt); `acom licenses` prints both from the binary.
 
-See [licenses and releases](docs/development.md#licenses-and-releases) before distributing prebuilt binaries.
+Read [licenses and releases](docs/development.md#licenses-and-releases) before distributing prebuilt binaries.

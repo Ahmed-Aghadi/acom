@@ -90,11 +90,11 @@ async function main() {
       const message = db.prepare('INSERT INTO messages(id,thread_id,sender,text,at) VALUES(?,?,?,?,?)');
       [
         [1, 1, 0, 'Keep the pagination change small. Coordinate the implementation and review here.', now - 720],
-        [2, 1, 1, 'The cursor format is in place. I am adding boundary tests; api-routes is locked while I update the handlers.', now - 600],
-        [3, 1, 2, 'I reviewed the validation paths. Please include an invalid-cursor test and a page-boundary check for missing or duplicated records.', now - 420],
+        [2, 1, 1, 'The cursor format is ready.\n\n- Adding boundary tests for missing or duplicated records.\n- Holding `api-routes` while I update the handlers.', now - 600],
+        [3, 1, 2, 'Reviewed validation and permissions. Please cover an **invalid cursor** and a page-boundary check for missing or duplicated records.', now - 420],
         [4, 1, 3, 'The regression cases are ready. I will run them after the handler patch lands.', now - 240],
         [5, 1, 0, 'Agreed. Keep the existing request limits and document the continuation fields.', now - 120],
-        [6, 2, 4, 'The usage examples now show how to continue a bounded response.', now - 180],
+        [6, 2, 4, 'The usage examples now include page-boundary checks and bounded responses.', now - 180],
         [7, 3, 2, 'Review focus: validation, authorization and stable page boundaries.', now - 360],
       ].forEach(row => message.run(...row));
       db.exec('UPDATE members SET last_notified=(SELECT coalesce(max(id),0) FROM messages WHERE thread_id=members.thread_id) WHERE agent_id>0');
@@ -113,13 +113,14 @@ async function main() {
       db.exec('COMMIT');
     } finally { db.close(); }
     browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM || undefined, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1600, height: 1100 }, deviceScaleFactor: 1, colorScheme: 'light', locale: 'en-US', timezoneId: 'UTC' });
+    const page = await browser.newPage({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor: 1, colorScheme: 'dark', locale: 'en-US', timezoneId: 'UTC' });
     const pageErrors = [];
     page.on('pageerror', error => pageErrors.push(error.message));
     await page.goto(`${base}/?project=${project.id}`);
     await page.locator('#agents [data-agent]').nth(3).waitFor();
     await page.waitForFunction(() => document.querySelector('#live-text').textContent === 'live');
     await page.evaluate(() => document.fonts.ready);
+    assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
     assert.equal(await page.locator('#project-path').innerText(), '/workspace/sample-app');
     assert.equal(await page.locator('#agents [data-agent]').count(), 4);
     assert.equal(await page.locator('#usage').innerText().then(text => (text.match(/unknown/g) || []).length), 4);
@@ -128,7 +129,7 @@ async function main() {
     fs.mkdirSync(images, { recursive: true });
     await page.setViewportSize({ width: 1600, height: await page.evaluate(() => document.documentElement.scrollHeight) });
     await page.screenshot({ path: path.join(images, 'overview.png'), fullPage: true, animations: 'disabled' });
-    await page.setViewportSize({ width: 1600, height: 1100 });
+    await page.setViewportSize({ width: 1600, height: 1000 });
     await page.locator('[data-page="threads"]').click();
     await page.locator('[data-thread-filter="all"]').click();
     await page.locator('[data-thread="1"]').click();
@@ -136,6 +137,15 @@ async function main() {
     await page.locator('#messages').evaluate(node => node.scrollTop = 0);
     await page.mouse.move(0, 0);
     await page.screenshot({ path: path.join(images, 'threads.png'), fullPage: true, animations: 'disabled' });
+    await page.locator('#open-message-search').click();
+    await page.locator('#message-search-form [name=query]').fill('boundary');
+    await page.locator('#message-search-form button[type=submit]').click();
+    await page.locator('#message-search-results [data-message-result]').nth(2).waitFor();
+    assert.equal(await page.locator('#message-search-results [data-message-result]').count(), 3);
+    assert.equal(await page.locator('#message-search-results [data-message-result]').evaluateAll(rows => new Set(rows.map(row => row.dataset.resultThread)).size), 2);
+    assert.ok(await page.locator('#message-search-results mark').count() >= 3);
+    await page.mouse.move(0, 0);
+    await page.locator('#message-search-dialog').screenshot({ path: path.join(images, 'search.png'), animations: 'disabled' });
     assert.deepEqual(pageErrors, []);
     const agents = (await api('GET', `/agents?project=${project.id}`)).items;
     assert.deepEqual(agents.map(agent => agent.state).sort(), ['closed', 'idle', 'paused', 'working']);
@@ -147,7 +157,7 @@ async function main() {
     for (const dir of [path.join(runtimeHome, 'logs'), env.CODEX_HOME, env.CLAUDE_CONFIG_DIR]) {
       assert.ok(!fs.existsSync(dir) || fs.readdirSync(dir).length === 0, `capture must not create harness logs or native files: ${dir}`);
     }
-    console.log(`Captured overview.png and threads.png in ${images}; sample fixture only, no provider turns.`);
+    console.log(`Captured dark overview.png, threads.png and search.png in ${images}; sample fixture only, no provider turns.`);
   } finally {
     try { if (browser) await browser.close(); }
     finally {

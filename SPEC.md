@@ -127,7 +127,7 @@ Limits are part of each project's settings (see Settings) and apply to that proj
 |---|---|---|
 | **Active agents** in the project (working or idle, not counting ones that ran `acom done`), in total and per harness | Agents launching, and you, are told it's reached and what the hard value is | Agents' launch requests are refused, and done agents aren't woken (they wait in line); you can confirm a launch past it |
 | **Subscription usage**, separate Claude five-hour/weekly/weekly Fable thresholds and Codex's highest window (in %) | Affected agents are told which window crossed its threshold | When any applicable window crosses its hard threshold, affected agents are paused. Their launches are refused and wakes wait in line while it's over; Fable's window doesn't block other Claude models |
-| **Context size**, per agent (tokens) | That agent is told its context is getting large | The harness auto-compacts at this size (Claude `--autocompact`, which takes 100k to 1M; Codex `model_auto_compact_token_limit`) |
+| **Context size**, per agent (tokens) | That agent is told its context is getting large | Sets harness compaction: Claude `--autocompact` clamps positive values to 100,000–1,000,000 tokens; Codex uses `model_auto_compact_token_limit` |
 
 A subscription limit only affects that provider's agents: Claude hitting its limit doesn't pause Codex agents. A user-confirmed launch or manual resume does not disable configured hard-limit enforcement on subsequent checks.
 

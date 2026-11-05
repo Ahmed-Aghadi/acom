@@ -135,7 +135,7 @@ Agents can read retained notices with `acom notices [ID]`; shortened hook notice
 
 ## Limits and locks
 
-Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Without a hard usage threshold, even a 100% reading does not make acom pause agents or block launches/wakes. An explicit provider quota interruption is separate (see Recovery below). Default comes directly from the binary and is never stored in the database; copy it before changing settings.
+Each limit has an optional soft and hard value; leave a field empty in Settings for no limit. Hard context limits configure harness compaction; Claude clamps positive values to 100,000–1,000,000 tokens. Without a hard usage threshold, even a 100% reading does not make acom pause agents or block launches/wakes. An explicit provider quota interruption is separate (see Recovery below). Default comes directly from the binary and is never stored in the database; copy it before changing settings.
 
 Usage soft thresholds warn without forcibly stopping work. After a fresh below-soft reading, previously warned agents receive one scoped clear notice (per Claude window; aggregate for Codex), not an assertion that all limits cleared. Missing readings, failed checks, elapsed reset estimates and raising/removing thresholds alone do not establish recovery. A clear notice does not itself wake an idle agent; agents awaiting recovery can register a usage subscription/deferred wait before ending their turn.
 

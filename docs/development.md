@@ -52,6 +52,7 @@ node --test tests/token-usage.cjs
 node --test tests/cli-context.cjs
 node --test tests/search.cjs
 node --test tests/licenses.cjs
+node --test tests/docs.cjs
 cargo audit
 ```
 
@@ -66,7 +67,13 @@ ACOM_BROWSER_TEST=1 node --test tests/server.cjs
 ACOM_BROWSER_TEST=1 node --test tests/search.cjs
 ```
 
-For just the real-server browser setup/settings/filter flow, add `ACOM_BROWSER_TEST_ONLY=1` and `--test-name-pattern='single server'` to the last command.
+For just the real-server browser setup/settings/filter flow:
+
+```sh
+ACOM_BROWSER_TEST=1 ACOM_BROWSER_TEST_ONLY=1 node --test --test-name-pattern='single server' tests/server.cjs
+```
+
+`tests/docs.cjs` checks local Markdown links, heading anchors and README images offline using the existing bundled parser. It requires neither a built binary nor Playwright; external URLs are not fetched.
 
 ## Real-provider tests
 
@@ -91,13 +98,13 @@ Each model gets an isolated project, a medium-effort turn, then a same-session R
 
 ## Screenshots
 
-The README images are captured from the real server/UI with synthetic sample data. No model turns run, and usage remains unknown. The script uses a temporary data directory, an empty client PATH and isolated provider configuration; it never reads your acom database. It requires the optional Playwright setup above and a built binary.
+The README images show the actual dark-mode server/UI with synthetic sample data: Overview, a conversation and project-wide message search. No model turns run, and subscription usage remains unknown. The script uses a temporary data directory, an empty client PATH and isolated provider configuration; it never reads your acom database. It requires the optional Playwright setup above and a built binary.
 
 ```sh
 node scripts/screenshots.cjs
 ```
 
-Set `ACOM_BINARY` to an isolated binary when developing beside a running server. `PLAYWRIGHT_MODULE` and `PLAYWRIGHT_CHROMIUM` can select an existing Playwright installation/browser. The script replaces only `docs/images/overview.png` and `docs/images/threads.png`.
+Set `ACOM_BINARY` to an isolated binary when developing beside a running server. `PLAYWRIGHT_MODULE` and `PLAYWRIGHT_CHROMIUM` can select an existing Playwright installation/browser. The script replaces only `docs/images/overview.png`, `docs/images/threads.png` and `docs/images/search.png`. Inspect the captures before committing; passing functional checks does not establish readable screenshots.
 
 ## Future: real-agent behavior checks
 
