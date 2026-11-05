@@ -244,3 +244,14 @@ test('inactive views do not issue calls, and hostile labels stay plain text',asy
   await page.getByRole('button',{name:'Export snapshot',exact:true}).click();assert.equal(await page.evaluate(()=>calls.length),0);
   assert.equal(await page.locator('#host img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
 }));
+
+test('archive controls follow container width without overflowing or shrinking metadata',async()=>fixture(async page=>{
+  await open(page);
+  const wide=await page.locator('.project-data-body>fieldset').evaluateAll(items=>items.map(item=>{const bounds=item.getBoundingClientRect();return {left:bounds.left,top:bounds.top,width:bounds.width};}));
+  assert.equal(wide[0].top,wide[1].top);assert.ok(wide[1].left>wide[0].left);assert.ok(wide[2].width>wide[0].width);
+  await page.setViewportSize({width:390,height:900});
+  const layout=await page.locator('#host > section').evaluate(item=>({columns:getComputedStyle(item.querySelector('.project-data-body')).gridTemplateColumns.split(' ').length,page:document.documentElement.scrollWidth,viewport:innerWidth,labels:[...item.querySelectorAll('label')].map(label=>parseFloat(getComputedStyle(label).fontSize)),inputs:[...item.querySelectorAll('input:not([type=checkbox])')].map(input=>({width:input.getBoundingClientRect().width,parent:input.parentElement.getBoundingClientRect().width}))}));
+  assert.equal(layout.columns,1);assert.ok(layout.page<=layout.viewport);
+  assert.ok(layout.labels.every(size=>size>=12));assert.ok(layout.inputs.every(input=>input.width<=input.parent));
+  assert.equal(await page.evaluate(()=>calls.length),0,'responsive layout does not start storage or archive requests');
+}));

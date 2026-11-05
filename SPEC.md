@@ -254,7 +254,7 @@ The guide explains shared files/turns/states, automatic member messages, thread 
 
 ## UI
 
-Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshing every 2 seconds.
+Served at `http://127.0.0.1:7400/` (`serve` prints the URL). One page, refreshing every 2 seconds. Light and dark themes use neutral surfaces, shared control styles and readable metadata; lifecycle colors retain their meaning, and agent actions do not stretch with their rows.
 
 The sidebar can be hidden with the header toggle, with the preference saved in this browser. Mobile defaults to hidden and closes navigation after choosing a page. Compact chrome and an uncapped workspace use available viewport width; conversations fill the remaining height. Copy icons copy message text, project/folder paths and displayed agent-detail values without requiring selection. Clipboard failures retain the text and explain manual copying. Agent previews label custom descriptive status as **Status**, otherwise the launch task as **Task**; neither replaces the lifecycle badge.
 

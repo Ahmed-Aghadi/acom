@@ -103,3 +103,51 @@ test('maintenance previews remain bound to their project when context changes be
   assert.equal(posts.length,1);assert.equal(posts[0].path,'/p/project-a/metrics/maintenance');assert.equal(JSON.parse(posts[0].options.body).action,'preview_clear');
   await page.evaluate(()=>panel.destroy());
 }));
+
+test('narrow charts retain readable labels in a named scroll region without widening the page',async()=>browserTest(async page=>{
+  await page.setViewportSize({width:390,height:800});
+  await page.evaluate(rows=>{
+    document.documentElement.dataset.theme='dark';
+    document.documentElement.style.cssText='--bg:#141416;--panel:#1b1b1e;--ink:#eeeef0;--muted:#a0a1ab;--line:#34343a;--accent:#9aafff';
+    document.body.style.margin='16px';document.querySelector('#chart').style.width='100%';
+    window.chart=acomCharts.mount(document.querySelector('#chart'),{samples:rows,range:{from:100,to:200}});
+  },[sample(1,110,'10'),sample(2,190,'20')]);
+  const region=page.getByRole('region',{name:'total tokens chart. Scroll horizontally to view the plot.',exact:true});
+  const dimensions=await region.evaluate(item=>({width:item.clientWidth,scroll:item.scrollWidth,page:document.documentElement.scrollWidth,viewport:innerWidth,label:parseFloat(getComputedStyle(item.querySelector('text')).fontSize)*item.querySelector('svg').getBoundingClientRect().width/960}));
+  assert.ok(dimensions.scroll>dimensions.width);assert.ok(dimensions.page<=dimensions.viewport);assert.ok(dimensions.label>=12);
+  await region.focus();await region.press('ArrowRight');await page.waitForFunction(()=>document.querySelector('.acom-chart-viewport').scrollLeft>0);
+  assert.ok(await region.evaluate(item=>item.scrollLeft)>0,'the chart region supports keyboard horizontal scrolling');
+  const plot=page.locator('#chart svg');await plot.focus();await plot.press('Home');
+  assert.match(await page.locator('.acom-chart-readout').innerText(),/10 · final/);
+  const markerIsVisible=()=>region.evaluate(item=>{const bounds=item.getBoundingClientRect(),marker=item.querySelector('svg>g:nth-child(2)>circle').getBoundingClientRect();return marker.left>=bounds.left&&marker.right<=bounds.right;});
+  const pageY=await page.evaluate(()=>scrollY);
+  await plot.press('End');assert.equal(await markerIsVisible(),true,'End reveals its selected point inside the chart only');
+  assert.match(await page.locator('.acom-chart-readout').innerText(),/20 · final/);
+  await plot.press('Home');assert.equal(await markerIsVisible(),true,'Home reveals the first point again');
+  await plot.press('ArrowRight');assert.equal(await markerIsVisible(),true);
+  await plot.press('ArrowLeft');assert.equal(await markerIsVisible(),true);
+  assert.equal(await page.evaluate(()=>scrollY),pageY,'keyboard inspection does not move the page');
+  await region.evaluate(item=>item.scrollLeft=400);await page.evaluate(()=>chart.update({loading:true}));
+  assert.equal(await region.evaluate(item=>item.scrollLeft),400,'live redraw preserves manual horizontal position');
+  await plot.dispatchEvent('pointermove',{clientX:20,clientY:100,pointerType:'mouse'});
+  assert.equal(await region.evaluate(item=>item.scrollLeft),400,'pointer inspection never scrolls the plot');
+  const dark=await plot.locator('path').evaluate(item=>getComputedStyle(item).stroke);
+  await page.evaluate(()=>{document.documentElement.dataset.theme='light';document.documentElement.style.setProperty('--accent','#365ce5');});
+  assert.notEqual(await plot.locator('path').evaluate(item=>getComputedStyle(item).stroke),dark,'series colors follow the current theme without replacing the plot');
+}));
+
+test('wide charts bound plot height and text size without changing pointer inspection coordinates',async()=>browserTest(async page=>{
+  await page.evaluate(rows=>{
+    document.body.style.margin='0';document.querySelector('#chart').style.width='100%';
+    window.chart=acomCharts.mount(document.querySelector('#chart'),{samples:rows,range:{from:100,to:200}});
+  },[sample(1,110,'10'),sample(2,190,'20')]);
+  const plot=page.locator('#chart svg');
+  for(const width of [1600,2600]){
+    await page.setViewportSize({width,height:1000});
+    const dimensions=await plot.evaluate(item=>({height:item.getBoundingClientRect().height,label:parseFloat(getComputedStyle(item.querySelector('text')).fontSize)*item.getBoundingClientRect().width/960,page:document.documentElement.scrollWidth,viewport:innerWidth}));
+    assert.ok(dimensions.height<=380.5);assert.ok(dimensions.label>=12&&dimensions.label<=18);assert.ok(dimensions.page<=dimensions.viewport);
+    const bounds=await plot.boundingBox();
+    await page.mouse.move(bounds.x+bounds.width*.19,bounds.y+bounds.height/2);assert.match(await page.locator('.acom-chart-readout').innerText(),/10 · final/);
+    await page.mouse.move(bounds.x+bounds.width*.89,bounds.y+bounds.height/2);assert.match(await page.locator('.acom-chart-readout').innerText(),/20 · final/);
+  }
+}));

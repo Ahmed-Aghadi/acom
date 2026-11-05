@@ -73,6 +73,8 @@ For just the real-server browser setup/settings/filter flow:
 ACOM_BROWSER_TEST=1 ACOM_BROWSER_TEST_ONLY=1 node --test --test-name-pattern='single server' tests/server.cjs
 ```
 
+Keep UI surfaces, text and controls on the shared theme tokens in `src/ui.html`, including the chart and archive modules. Check both themes, empty/populated views and narrow layouts; metadata must stay readable and live updates must preserve selection and reading position. Design review follows [Unslop](https://github.com/heydamir/unslop/blob/main/skills/unslop/SKILL.md) by Damir Sokolovsky, licensed under CC BY 4.0; no external UI code, fonts or assets are bundled from it.
+
 `tests/docs.cjs` checks local Markdown links, heading anchors and README images offline using the existing bundled parser. It requires neither a built binary nor Playwright; external URLs are not fetched.
 
 ## Real-provider tests

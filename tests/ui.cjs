@@ -953,7 +953,8 @@ test('history panels load only on demand and keep project, agent and account req
   const projectRequest=data.wireRequests.find(request=>request.url.startsWith('/metrics/projects?'));
   assert.equal(new URL(projectRequest.url,'http://test').searchParams.get('projects'),projectId(1));
   assert.equal(new URL(projectRequest.url,'http://test').searchParams.get('scope'),'recorded_here');
-  await overview.getByLabel('Source',{exact:true}).selectOption('account');await overview.getByRole('status').filter({hasText:'stored envelopes loaded'}).waitFor();
+  const accountLoaded=page.waitForResponse(response=>{const url=new URL(response.url());return url.pathname==='/metrics'&&url.searchParams.get('entity')==='account:claude:five_hour';});
+  await overview.getByLabel('Source',{exact:true}).selectOption('account');await accountLoaded;await overview.getByRole('status').filter({hasText:'stored envelopes loaded'}).waitFor();
   assert.ok(data.wireRequests.some(request=>request.url.startsWith('/metrics/series?')));
   assert.ok(data.wireRequests.some(request=>request.url.startsWith('/metrics?')&&new URL(request.url,'http://test').searchParams.get('entity')==='account:claude:five_hour'));
   await page.locator('[data-action=details]').click();const agent=page.locator('#agent-history-host');
@@ -4568,15 +4569,19 @@ test('oversized thread summaries retain exact participation and unread filters w
   const title='Long thread title ☃ '.repeat(1800);
   data.threads=[conversation([incoming(1)],{title})]; data.readFailure=true;
   await manualPolling(page); await reloadPage(page); await page.locator('[data-page=threads]').click();
-  for(const filter of ['mine','unread','all']) {
+  const filterThreads=async filter=>{
     await page.locator(`[data-thread-filter=${filter}]`).click();
+    await page.waitForFunction(()=>document.querySelector('#thread-list').getAttribute('aria-busy')==='false');
+  };
+  for(const filter of ['mine','unread','all']) {
+    await filterThreads(filter);
     const row=page.locator('[data-thread="1"]');
     assert.equal(await row.count(),1);
     assert.match(await row.textContent(),/You’re a member.*1 message ·.*Member list exceeds the preview budget/);
     assert.doesNotMatch(await row.textContent(),/Agent-only|no members/);
   }
-  await page.locator('[data-thread-filter=agents]').click(); assert.equal(await page.locator('[data-thread="1"]').count(),0);
-  await page.locator('[data-thread-filter=unread]').click(); await page.locator('[data-thread="1"]').click();
+  await filterThreads('agents'); assert.equal(await page.locator('[data-thread="1"]').count(),0);
+  await filterThreads('unread'); await page.locator('[data-thread="1"]').click();
   await page.waitForFunction(()=>state.thread && !state.thread.loadingNew);
   assert.equal(await page.locator('.thread-header h2').textContent(),title);
   assert.deepEqual(await messageIds(page),[1]);
@@ -6752,6 +6757,55 @@ test('field-specific identity and task filters share visual and typed semantics 
   await page.waitForFunction(()=>state.pages.agentBrowser?.total===1&&state.agentBrowser[0]?.id===1);
 }));
 
+const designAgents=()=>['working','idle','paused','crashed'].map((state,index)=>({id:index+1,project:projectId(1),name:['Boundary review','Interface checks','Release notes','Recovery review'][index],state,pause_reason:state==='paused'?'limit':null,harness:index%2?'codex':'claude',model:index%2?'gpt-6.1-sol':'claude-sonnet-5-5',effort:'medium',group:index<2?'Review':'Delivery',task:'Review pagination boundaries and report any missing or duplicated messages.',status:state==='working'?'Checking the pagination boundaries':null,problem:state==='crashed'?'Connection interrupted before the turn completed.':null,context:12000,turns:4,launched_by:0,launched_at:1720000000,total_tokens:42000,token_usage_state:'final'}));
+
+for(const theme of ['light','dark'])test(`agent lifecycle controls stay compact beside tall content in ${theme} theme`,async()=>fixture(async(page,data)=>{
+  data.agents=designAgents();
+  data.agents[0].task='A detailed task with enough lines to require a taller body. '.repeat(12);
+  await manualPolling(page);await page.setViewportSize({width:1600,height:1000});await page.emulateMedia({colorScheme:theme});await reloadPage(page);
+  const controls=await page.locator('.agent-buttons button').evaluateAll(nodes=>nodes.map(node=>({label:node.textContent,height:node.getBoundingClientRect().height})));
+  assert.ok(controls.length>=12,'the populated fixture includes ordinary and crash-recovery controls');
+  assert.deepEqual(controls.filter(control=>control.height<32||control.height>40),[],'lifecycle buttons remain compact rather than stretching to the agent row height');
+}));
+
+for(const theme of ['light','dark'])for(const width of [1600,1024,390,320])test(`workspace design has readable metadata and bounded views in ${theme} theme at ${width}px`,async()=>fixture(async(page,data)=>{
+  await manualPolling(page);await page.setViewportSize({width,height:1000});await page.emulateMedia({colorScheme:theme});await reloadPage(page);
+  assert.equal(await page.locator('html').getAttribute('data-theme'),theme);
+  const capture=async name=>{
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${name} does not widen the viewport`);
+    assert.equal(await page.locator('dialog[open]').evaluateAll(nodes=>nodes.every(node=>{const box=node.getBoundingClientRect();return box.left>=0&&box.right<=innerWidth&&box.top>=0&&box.bottom<=innerHeight;})),true,`${name} keeps dialogs within the viewport`);
+    if(process.env.ACOM_UI_SCREENSHOT_DIR&&[1600,390].includes(width)){
+      fs.mkdirSync(process.env.ACOM_UI_SCREENSHOT_DIR,{recursive:true});
+      await page.evaluate(()=>document.activeElement?.blur());
+      await page.screenshot({path:path.join(process.env.ACOM_UI_SCREENSHOT_DIR,`design-${name}-${theme}-${width}.png`),fullPage:name!=='conversation'&&!await page.locator('dialog[open]').count()});
+    }
+  };
+  await capture('overview-empty');data.agents=designAgents();data.threads=[conversation([incoming(1,'The **boundary checks** are ready.\n\n- No missing records\n- No duplicated records'),{id:2,sender:0,at:1720000020,text:'Thanks. Please check the remaining page boundary.'}],{title:'Pagination review'})];
+  await page.evaluate(()=>refresh());
+  const metadata=await page.locator('.agent .meta,.agent .pill,.meter-label,.usage-heading span,.stat-note,.group-title,.panel-caption,button.small').evaluateAll(nodes=>nodes.filter(node=>node.checkVisibility()&&node.textContent.trim()).map(node=>({text:node.textContent.slice(0,60),size:parseFloat(getComputedStyle(node).fontSize)})));
+  assert.ok(metadata.length>20,'check populated agent and overview metadata, not an empty shell');
+  assert.deepEqual(metadata.filter(node=>node.size<12),[],'visible metadata and compact controls stay at least 12px');
+  const surfaces=await page.evaluate(()=>['--bg','--panel','--surface'].map(name=>{const probe=document.createElement('span');probe.style.color=`var(${name})`;document.body.append(probe);const rgb=getComputedStyle(probe).color.match(/[\d.]+/g).slice(0,3).map(Number);probe.remove();return {name,spread:Math.max(...rgb)-Math.min(...rgb)};}));
+  assert.ok(surfaces.every(surface=>surface.spread<=12),`workspace surfaces stay neutral rather than blue-tinted: ${JSON.stringify(surfaces)}`);
+  const contrast=await page.locator('.agent .meta,.agent .pill,.agent-buttons button,.meter-label,.stat-label,.stat-note,.group-title,.sidebar-label,.project-banner code,.navigation button').evaluateAll(nodes=>{
+    const rgb=value=>{const parts=value.match(/[\d.]+/g).map(Number);return [...parts.slice(0,3),parts[3]??1];};
+    const blend=(foreground,background)=>foreground.slice(0,3).map((value,index)=>value*foreground[3]+background[index]*(1-foreground[3]));
+    const luminance=color=>color.map(value=>{value/=255;return value<=.04045?value/12.92:((value+.055)/1.055)**2.4;}).reduce((sum,value,index)=>sum+value*[.2126,.7152,.0722][index],0);
+    return nodes.filter(node=>node.checkVisibility()&&!node.disabled&&node.textContent.trim()).map(node=>{
+      const ancestors=[];for(let parent=node;parent;parent=parent.parentElement)ancestors.unshift(parent);
+      const background=ancestors.reduce((color,parent)=>blend(rgb(getComputedStyle(parent).backgroundColor),color),[255,255,255]);
+      const foreground=blend(rgb(getComputedStyle(node).color),background),a=luminance(foreground),b=luminance(background);
+      return {text:node.textContent.slice(0,60),ratio:(Math.max(a,b)+.05)/(Math.min(a,b)+.05)};
+    });
+  });
+  assert.deepEqual(contrast.filter(node=>node.ratio<4.5),[],'metadata, state labels and enabled controls maintain normal-text contrast');
+  await capture('overview');
+  await page.locator('[data-action=details]').first().click();await page.locator('#agent-field-task').waitFor();await capture('agent-details');await page.locator('#agent-dialog .dialog-close').click();
+  await openLaunch(page);await capture('launch');await page.locator('#launch-dialog .dialog-close').click();
+  await openSidebar(page);await page.locator('[data-page=settings]').click();await page.waitForFunction(()=>serverSettings.value);await capture('settings');
+  await openSidebar(page);await page.locator('[data-page=threads]').click();await page.locator('[data-thread="1"]').click();await page.locator('[data-message="2"]').waitFor();await capture('conversation');
+}));
+
 for (const width of [1600,1024,390,320]) for (const scenario of ['empty','populated','large-counts']) test(`agent quick filters align and wrap at ${width}px with ${scenario}`,async()=>fixture(async(page,data)=>{
   data.agents=scenario==='empty'?[]:['working','idle','paused','crashed','done','closed','replaced'].map((state,index)=>({id:index+1,project:projectId(1),name:`Worker ${state}`,state}));
   await manualPolling(page);await page.setViewportSize({width,height:900});await reloadPage(page);
@@ -6875,7 +6929,7 @@ test('chat Markdown formats basic blocks and inline text while copying exact sou
   await message.waitFor();
   assert.equal(await message.locator('h1').count(),1,'Markdown headings render as headings');
   assert.equal(await message.locator('h1').textContent(),'Review');
-  assert.equal(await message.locator('h1').evaluate(node=>getComputedStyle(node).fontSize),'15px','chat headings do not inherit page-heading styling');
+  assert.equal(await message.locator('h1').evaluate(node=>getComputedStyle(node).fontSize),'16px','chat headings use the compact message type scale, not page-heading styling');
   assert.equal(await message.locator('strong').textContent(),'bold');
   assert.equal(await message.locator('em').textContent(),'italic');
   assert.equal(await message.locator('p code').textContent(),'x < y');

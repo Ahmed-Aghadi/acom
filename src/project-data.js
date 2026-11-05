@@ -5,17 +5,40 @@
   const node=(tag,text)=>{const item=document.createElement(tag);if(text!==undefined)item.textContent=text;return item;};
   const bytes=value=>typeof value==='number'&&Number.isFinite(value)&&value>=0?`${value.toLocaleString()} bytes`:'unknown size';
   const count=value=>Number.isSafeInteger(value)&&value>=0;
-  function styles(){if(document.getElementById('acom-project-data-style'))return;const style=node('style','.project-data{min-width:0}.project-data [hidden]{display:none!important}.project-data summary{cursor:pointer;font-weight:600}.project-data fieldset{display:grid;gap:.75rem;min-width:0;margin:1rem 0;padding:1rem;border:1px solid var(--line,#8793a440);border-radius:8px}.project-data legend{padding:0 .35rem;font-weight:600}.project-data label{display:grid;gap:.35rem}.project-data label:has(input[type=checkbox]){display:flex;align-items:center;gap:.5rem}.project-data input:not([type=checkbox]),.project-data select{width:100%;min-width:0}.project-data p{margin:.25rem 0;overflow-wrap:anywhere}.project-data button{justify-self:start}.project-data [role=status]{white-space:pre-wrap;overflow-wrap:anywhere;max-height:12rem;overflow:auto}.project-data pre{max-height:16rem;overflow:auto;overscroll-behavior:contain;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.8rem}');style.id='acom-project-data-style';document.head.append(style);}
+  function styles(){if(document.getElementById('acom-project-data-style'))return;const style=node('style',`
+    .project-data{min-width:0;font-size:14px;line-height:1.6;color:var(--ink,#eeeef0);container-type:inline-size}
+    .project-data [hidden]{display:none!important}
+    .project-data summary{cursor:pointer;font-size:14px;font-weight:600;line-height:1.5;padding:12px 0}
+    .project-data-body{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+    .project-data fieldset{display:grid;align-content:start;gap:12px;min-width:0;margin:0;padding:16px;border:1px solid var(--line,#34343a);border-radius:4px;background:var(--panel,#1b1b1e)}
+    .project-data legend{padding:0 8px;font-size:14px;font-weight:600;color:var(--ink,#eeeef0)}
+    .project-data label{display:grid;gap:4px;min-width:0;font-size:12px;color:var(--secondary,#bbbcc4)}
+    .project-data label:has(input[type=checkbox]){display:flex;align-items:start;gap:8px}
+    .project-data input[type=checkbox]{flex:none;margin:3px 0;accent-color:var(--accent,#9aafff)}
+    .project-data input:not([type=checkbox]),.project-data select{box-sizing:border-box;width:100%;min-width:0;min-height:36px;border:1px solid var(--line,#34343a);border-radius:4px;background:var(--bg,#141416);color:var(--ink,#eeeef0);font:inherit;padding:8px}
+    .project-data input[type=text]{font-family:var(--mono,ui-monospace,monospace);font-size:12px}
+    .project-data p{margin:0;font-size:12px;line-height:1.6;color:var(--muted,#a0a1ab);overflow-wrap:anywhere}
+    .project-data>details>p{margin-bottom:16px;font-family:var(--mono,ui-monospace,monospace)}
+    .project-data button{justify-self:start;box-sizing:border-box;min-height:32px;width:auto;border:1px solid var(--line,#34343a);border-radius:4px;background:var(--surface,#242427);color:var(--ink,#eeeef0);font:inherit;font-size:12px;padding:4px 12px;cursor:pointer}
+    .project-data button:hover:not(:disabled){border-color:var(--muted,#a0a1ab)}
+    .project-data button:disabled{opacity:.45;cursor:default}
+    .project-data :is(button,input,select,summary,pre):focus-visible{outline:2px solid var(--accent,#9aafff);outline-offset:3px}
+    .project-data [role=status]{white-space:pre-wrap;overflow-wrap:anywhere;max-height:192px;overflow:auto;overscroll-behavior:contain;font-variant-numeric:tabular-nums}
+    .project-data>details+[role=status]{margin-top:12px}
+    .project-data [role=status].inline-error{color:var(--danger,#e28b8b)}
+    .project-data pre{max-height:256px;overflow:auto;overscroll-behavior:contain;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--mono,ui-monospace,monospace);font-size:12px;line-height:1.6;padding:12px;border:1px solid var(--line,#34343a);border-radius:4px;background:var(--bg,#141416)}
+    @container (min-width:720px){.project-data-body{grid-template-columns:repeat(2,minmax(0,1fr))}.project-data-body>fieldset:last-child{grid-column:1/-1}}
+  `);style.id='acom-project-data-style';document.head.append(style);}
   function mount(host,options={}) {
     if(!host||typeof options.request!=='function')throw new TypeError('Project data host and request callback are required');
     styles();
     let context={...options},generation=0,destroyed=false,operation=null;
     const text=(item,value)=>{if(context.setText)context.setText(item,value);else if(item.textContent!==String(value))item.textContent=String(value);};
-    const drafts=new Map(),root=node('section'),details=node('details'),summary=node('summary','Project archives and captured files');
+    const drafts=new Map(),root=node('section'),details=node('details'),summary=node('summary','Project archives and captured files'),body=node('div');body.className='project-data-body';
     const projectLabel=node('p'),status=node('p');status.setAttribute('role','status');status.setAttribute('aria-live','polite');
-    root.className='project-data';details.append(summary,projectLabel);root.append(details,status);host.replaceChildren(root);
-    const group=title=>{const box=node('fieldset'),legend=node('legend',title);box.append(legend);details.append(box);return box;};
-    const field=(box,label,type='text')=>{const wrapper=node('label',label+' '),input=node('input');input.type=type;input.setAttribute('aria-label',label);wrapper.append(input);box.append(wrapper);return input;};
+    root.className='project-data';details.append(summary,projectLabel,body);root.append(details,status);host.replaceChildren(root);
+    const group=title=>{const box=node('fieldset'),legend=node('legend',title);box.append(legend);body.append(box);return box;};
+    const field=(box,label,type='text')=>{const wrapper=node('label',label+' '),input=node('input');input.type=type;input.setAttribute('aria-label',label);if(type==='checkbox')wrapper.prepend(input);else wrapper.append(input);box.append(wrapper);return input;};
     const button=(box,label,run)=>{const input=node('button',label);input.type='button';input.addEventListener('click',run);box.append(input);return input;};
     const note=(box,text)=>box.append(node('p',text));
     const exportBox=group('Export a project snapshot');
